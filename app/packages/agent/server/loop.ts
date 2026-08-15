@@ -2,7 +2,10 @@ import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import type { AgentMessage } from '../common/types';
 import type { Provider, ProviderMessage } from './providers/types';
-import { claimLease, guardedUpdate, releaseLease, SERVER_ID } from './lease';
+import {
+  claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
+  HEARTBEAT_MS, SERVER_ID,
+} from './lease';
 import { resolveTools, runTool, toolSchemas, type ToolSpec } from './tools';
 
 export interface RunConfig {
@@ -14,12 +17,27 @@ export interface RunConfig {
   flushMs?: number;
 }
 
+/**
+ * Sessions running a turn IN THIS PROCESS. `claimLease` succeeds on its
+ * "already ours" branch, so two concurrent `runTurn` calls in one process would
+ * both hold the lease and both pass every `guardedUpdate`; the read-then-`$inc`
+ * of `nextSeq` is not atomic, so both could insert at the same `seq`. The
+ * lease protects against a second SERVER, this Set against a second CALL —
+ * a double-submitting user reaching `Meteor.defer(() => runTurn(...))` twice.
+ */
+const running = new Set<string>();
+
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
 class DeltaWriter {
-  private buf: Array<{ kind: string; chunk: string }> = [];
+  private buf: Array<{ kind: string; chunk: string; seq: number }> = [];
   private seq = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
+  /** Non-reentrancy: the interval fires on a wall clock regardless of whether
+   *  the previous flush settled. Two overlapping flushes would interleave
+   *  their inserts and scramble the rendered text. */
+  private flushing = false;
+  private pending: Promise<void> | null = null;
 
   constructor(
     private sessionId: string,
@@ -30,28 +48,61 @@ class DeltaWriter {
     this.timer = setInterval(() => { void this.flush(); }, flushMs);
   }
 
-  push(kind: string, chunk: string) { this.buf.push({ kind, chunk }); }
+  /**
+   * `seq` is assigned HERE, in push order, never lazily inside `flush()`.
+   * Consecutive same-kind chunks coalesce into one run, so a run of tokens
+   * costs a single delta document (one Mongo round trip) instead of one per
+   * token — which is what this class's "O(chunk) on the wire" claim means.
+   * Coalescing at push time is also what keeps `seq` contiguous: one run, one
+   * seq, one document. `mergeView` walks back only while `seq` decrements by
+   * exactly 1, so any gap would silently truncate the rendered message.
+   */
+  push(kind: string, chunk: string) {
+    const last = this.buf[this.buf.length - 1];
+    if (last && last.kind === kind) { last.chunk += chunk; return; }
+    this.buf.push({ kind, chunk, seq: this.seq++ });
+  }
 
-  async flush(): Promise<void> {
-    if (this.buf.length === 0) return;
-    const batch = this.buf;
-    this.buf = [];
-    for (const item of batch) {
-      await AgentDeltas.insertAsync({
-        _id: Random.id(),
-        sessionId: this.sessionId,
-        messageId: this.messageId,
-        msgSeq: this.msgSeq,
-        seq: this.seq++,
-        kind: item.kind as any,
-        chunk: item.chunk,
-        at: new Date(),
-      } as any);
+  flush(): Promise<void> {
+    if (this.flushing) return this.pending ?? Promise.resolve();
+    if (this.buf.length === 0) return Promise.resolve();
+    this.flushing = true;
+    this.pending = this.drain().finally(() => { this.pending = null; });
+    return this.pending;
+  }
+
+  private async drain(): Promise<void> {
+    try {
+      // Loop rather than snapshot once: chunks pushed while an insert was in
+      // flight belong to this flush, not to a tick that may never come.
+      while (this.buf.length > 0) {
+        const batch = this.buf;
+        this.buf = [];
+        for (const item of batch) {
+          await AgentDeltas.insertAsync({
+            _id: Random.id(),
+            sessionId: this.sessionId,
+            messageId: this.messageId,
+            msgSeq: this.msgSeq,
+            seq: item.seq,
+            kind: item.kind as any,
+            chunk: item.chunk,
+            at: new Date(),
+          } as any);
+        }
+      }
+    } finally {
+      this.flushing = false;
     }
   }
 
   async stop(): Promise<void> {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    // Wait for an in-flight flush instead of skipping the tail: a bare
+    // `flush()` here would hit the non-reentrancy guard and return having
+    // written nothing.
+    const inFlight = this.pending;
+    if (inFlight) await inFlight;
     await this.flush();
   }
 }
@@ -68,10 +119,73 @@ function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
 }
 
 /**
- * Run one turn to completion. Assistant messages commit only at boundaries, so
- * an abandoned turn always leaves the transcript ending in `user` or `tool` —
- * the two states a turn can legally start from. Recovery is therefore just
- * calling this again.
+ * Erase an assistant message that was committed but whose turn was abandoned,
+ * together with the deltas streamed under its id and any tool results that
+ * answered it.
+ *
+ * The deltas matter as much as the message: an abandoned turn's deltas carry a
+ * `messageId` that is never committed, so `mergeView`'s committed-id
+ * suppression never fires and they render as a `streaming: true` ghost row
+ * forever — beside the recovering server's own deltas at the same `msgSeq`.
+ *
+ * The tool results matter because removing a `tool_use` while leaving its
+ * `tool_result` behind is the same 400 in mirror image.
+ *
+ * Never throws: a failed cleanup must not mask the abandonment it follows.
+ */
+async function discardTurn(
+  sessionId: string, messageId: string, toolCallIds: string[] = [],
+): Promise<void> {
+  try {
+    await AgentMessages.removeAsync({ _id: messageId } as any);
+    await AgentDeltas.removeAsync({ messageId } as any);
+    if (toolCallIds.length > 0) {
+      await AgentMessages.removeAsync(
+        { sessionId, role: 'tool', toolCallId: { $in: toolCallIds } } as any,
+      );
+    }
+  } catch { /* cleanup is best-effort by design */ }
+}
+
+/**
+ * Repair on entry. A turn abandoned between committing `assistant(toolCalls)`
+ * and writing its `role: 'tool'` results leaves a `tool_use` with no
+ * `tool_result` — which Anthropic and OpenAI both reject with a 400, on every
+ * retry, forever. Cleanup at the abandoning end (`discardTurn`) races the
+ * recovering server, so the recovering server checks for itself.
+ *
+ * Returns false if the lease is gone, in which case the caller must abandon
+ * without touching anything.
+ */
+async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
+  const msgs = await AgentMessages
+    .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+  const last = msgs[msgs.length - 1];
+  if (!last || last.role !== 'assistant' || !last.toolCalls?.length) return true;
+
+  const answered = new Set(
+    msgs.filter((m) => m.role === 'tool' && m.toolCallId).map((m) => m.toolCallId),
+  );
+  if (last.toolCalls.every((c) => answered.has(c.id))) return true;
+
+  // Under a lease guard: the touch proves we still own the session, and fails
+  // closed if another server took it between claim and repair.
+  const stillOurs = await guardedUpdate(sessionId, SERVER_ID, {
+    $set: { updatedAt: new Date() },
+  });
+  if (!stillOurs) return false;
+
+  await discardTurn(sessionId, last._id);
+  return true;
+}
+
+/**
+ * Run one turn to completion. Assistant messages commit only at boundaries and
+ * every abandonment path erases what it had already written, so the transcript
+ * a turn leaves behind always ends in `user` or `tool` — the two states a turn
+ * can legally start from. A recovering server additionally repairs on entry,
+ * because cleanup by the abandoning process is not guaranteed to run at all.
+ * Recovery is therefore just calling this again.
  */
 export async function runTurn(sessionId: string, config: RunConfig): Promise<void> {
   const maxIterations = config.maxIterations ?? 10;
@@ -79,88 +193,128 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   const tools = resolveTools(config.tools);
   const schemas = toolSchemas(tools);
 
-  if (!(await claimLease(sessionId))) return;   // another server owns this run
-
+  if (running.has(sessionId)) return;   // already running in THIS process
+  running.add(sessionId);
   try {
-    for (let iteration = 0; iteration < maxIterations; iteration += 1) {
-      const session = await AgentSessions.findOneAsync(sessionId);
-      if (!session) return;
+    if (!(await claimLease(sessionId))) return;   // another server owns this run
 
-      const history = await AgentMessages
-        .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+    // LEASE_MS is 30s; one provider call plus a tool round trip routinely
+    // exceeds that. Without this, losing the lease mid-turn is the normal case.
+    const beat = setInterval(() => {
+      void heartbeat(sessionId).catch(() => { /* the guards catch a lost lease */ });
+    }, HEARTBEAT_MS);
 
-      const messageId = Random.id();
-      const msgSeq = session.nextSeq;
-      if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
+    try {
+      if (!(await repairUnansweredToolUse(sessionId))) return;
 
-      const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
-      let text = '';
-      let thinking = '';
-      let toolCalls: Array<{ id: string; name: string; args: unknown }> | undefined;
-      let usage = { input: 0, output: 0 };
+      for (let iteration = 0; iteration < maxIterations; iteration += 1) {
+        const session = await AgentSessions.findOneAsync(sessionId);
+        if (!session) return;
 
-      try {
-        for await (const chunk of config.provider.stream({
-          model: config.model, system: config.system,
-          messages: toProviderMessages(history), tools: schemas,
-        })) {
-          if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
-          else if (chunk.kind === 'thinking') {
-            thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
-          } else if (chunk.kind === 'done') {
-            toolCalls = chunk.toolCalls;
-            usage = chunk.usage ?? usage;
+        const history = await AgentMessages
+          .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+
+        const messageId = Random.id();
+        const msgSeq = session.nextSeq;
+        if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
+
+        const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
+        let text = '';
+        let thinking = '';
+        let toolCalls: Array<{ id: string; name: string; args: unknown }> | undefined;
+        let usage = { input: 0, output: 0 };
+
+        try {
+          for await (const chunk of config.provider.stream({
+            model: config.model, system: config.system,
+            messages: toProviderMessages(history), tools: schemas,
+          })) {
+            if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
+            else if (chunk.kind === 'thinking') {
+              thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
+            } else if (chunk.kind === 'done') {
+              toolCalls = chunk.toolCalls;
+              usage = chunk.usage ?? usage;
+            }
           }
+        } finally {
+          await writer.stop();
         }
-      } finally {
-        await writer.stop();
-      }
 
-      // Commit is conditional on still owning the lease. Losing it means
-      // another server is redoing this turn; abandon without writing.
-      const stillOurs = await guardedUpdate(sessionId, SERVER_ID, {
-        $inc: {
-          nextSeq: 1,
-          'usage.input': usage.input,
-          'usage.output': usage.output,
-        },
-        $set: { updatedAt: new Date() },
-      });
-      if (!stillOurs) return;
-
-      await AgentMessages.insertAsync({
-        _id: messageId, sessionId, seq: msgSeq, role: 'assistant',
-        content: text, thinking: thinking || undefined,
-        toolCalls, usage, createdAt: new Date(),
-      } as any);
-
-      if (!toolCalls || toolCalls.length === 0) return;
-
-      await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'calling' } });
-
-      for (const call of toolCalls) {
-        const tool = tools.find((t) => t.name === call.name);
-        const result = tool
-          ? await runTool(tool, call.args, { userId: session.userId, sessionId })
-          : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
-
-        const after = await AgentSessions.findOneAsync(sessionId);
-        if (!after) return;
-        if (!(await guardedUpdate(sessionId, SERVER_ID, {
-          $inc: { nextSeq: 1, 'budgetSpent.toolCalls': 1 },
-        }))) return;
+        // Commit is conditional on still owning the lease. Losing it means
+        // another server is redoing this turn; abandon without writing — and
+        // take the deltas already streamed under this messageId with us, or
+        // they render as a permanent ghost message.
+        const stillOurs = await guardedUpdate(sessionId, SERVER_ID, {
+          $inc: {
+            nextSeq: 1,
+            'usage.input': usage.input,
+            'usage.output': usage.output,
+          },
+          $set: { updatedAt: new Date() },
+        });
+        if (!stillOurs) { await discardTurn(sessionId, messageId); return; }
 
         await AgentMessages.insertAsync({
-          _id: Random.id(), sessionId, seq: after.nextSeq, role: 'tool',
-          toolCallId: call.id,
-          content: JSON.stringify(result.ok ? result.value : result.error),
-          error: result.ok ? undefined : result.error,
-          createdAt: new Date(),
+          _id: messageId, sessionId, seq: msgSeq, role: 'assistant',
+          content: text, thinking: thinking || undefined,
+          toolCalls, usage, createdAt: new Date(),
         } as any);
+
+        if (!toolCalls || toolCalls.length === 0) return;
+
+        const callIds = toolCalls.map((c) => c.id);
+        await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'calling' } });
+
+        for (const call of toolCalls) {
+          // Ownership is checked BEFORE dispatch, not after. Adopted tools are
+          // real Meteor methods: running one we no longer own means the
+          // recovering server runs it a second time — a second charge, a
+          // second email. The window between this check and the tool's own
+          // side effect is irreducible without idempotency keys carried
+          // through to the tools themselves; this narrows the window, it does
+          // not close it.
+          if (!(await holdsLease(sessionId))) {
+            await discardTurn(sessionId, messageId, callIds);
+            return;
+          }
+
+          const tool = tools.find((t) => t.name === call.name);
+          const result = tool
+            ? await runTool(tool, call.args, { userId: session.userId, sessionId })
+            : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+
+          const after = await AgentSessions.findOneAsync(sessionId);
+          if (!after) return;
+          if (!(await guardedUpdate(sessionId, SERVER_ID, {
+            $inc: { nextSeq: 1, 'budgetSpent.toolCalls': 1 },
+          }))) {
+            // The assistant message is already committed but this result never
+            // will be: leaving it would strand a tool_use with no tool_result.
+            await discardTurn(sessionId, messageId, callIds);
+            return;
+          }
+
+          await AgentMessages.insertAsync({
+            _id: Random.id(), sessionId, seq: after.nextSeq, role: 'tool',
+            toolCallId: call.id,
+            content: JSON.stringify(result.ok ? result.value : result.error),
+            error: result.ok ? undefined : result.error,
+            createdAt: new Date(),
+          } as any);
+        }
       }
+    } finally {
+      clearInterval(beat);
+      // `stopped` is a deliberate terminal state set by an interrupt; idling it
+      // back would erase the user's decision.
+      const current = await AgentSessions.findOneAsync(sessionId);
+      if (current && current.phase !== 'stopped') {
+        await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
+      }
+      await releaseLease(sessionId);
     }
   } finally {
-    await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
-    await releaseLease(sessionId);
+    running.delete(sessionId);
   }
 }

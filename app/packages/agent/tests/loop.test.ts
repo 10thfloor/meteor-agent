@@ -1,4 +1,19 @@
 import { assert } from 'chai';
+import type { Provider } from '../server/providers/types';
+import type { AgentMessage } from '../common/types';
+
+/** Every unanswered `toolCalls[].id` in a transcript. A provider rejects a
+ *  `tool_use` with no matching `tool_result` with a 400 on every retry, so an
+ *  abandoned turn must never leave one behind. */
+const unansweredToolUses = (msgs: AgentMessage[]): string[] => {
+  const answered = new Set(
+    msgs.filter((m) => m.role === 'tool' && m.toolCallId).map((m) => m.toolCallId),
+  );
+  return msgs
+    .flatMap((m) => m.toolCalls ?? [])
+    .map((c) => c.id)
+    .filter((id) => !answered.has(id));
+};
 
 const seed = async (sessionId: string, text: string) => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
@@ -37,6 +52,11 @@ describe('turn loop', () => {
     const deltas = await AgentDeltas.find({ sessionId: 's1' }).fetchAsync();
     assert.isAbove(deltas.length, 0, 'tokens should have streamed');
     assert.equal(deltas[0].msgSeq, msgs[1].seq, 'deltas must carry the future seq');
+
+    // mergeView walks back only while seq decrements by exactly 1, so a gap —
+    // or a seq assigned out of push order — silently truncates the render.
+    const seqs = deltas.map((d) => d.seq).sort((a, b) => a - b);
+    seqs.forEach((s, i) => assert.equal(s, i, 'delta seqs must be contiguous from 0'));
   });
 
   it('reconstructs the same text from deltas as it commits', async function () {
@@ -87,26 +107,123 @@ describe('turn loop', () => {
     assert.equal(msgs[2].content, JSON.stringify({ found: 42 }));
   });
 
-  it('leaves the transcript resumable after an abandoned turn', async function () {
+  it('commits nothing when the lease is stolen mid-stream', async function () {
     this.timeout(30000);
-    const { AgentMessages, AgentSessions } = await import('../common/collections');
-    const { mockProvider } = await import('../server/providers/mock');
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
     const { runTurn } = await import('../server/loop');
 
     await seed('s4', 'hello');
-    // Another server steals the lease mid-turn.
-    await AgentSessions.updateAsync('s4', {
-      $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
-    } as any);
 
-    await runTurn('s4', {
-      model: 'mock', system: '', tools: [],
-      provider: mockProvider(() => ({ text: 'should not commit' })),
-    });
+    // Another server steals the lease BETWEEN yields — after the turn is
+    // underway. Stealing it before `runTurn` would make `claimLease` fail and
+    // the loop return having exercised nothing at all.
+    const stealer: Provider = {
+      async *stream() {
+        yield { kind: 'text', chunk: 'should ' };
+        await AgentSessions.updateAsync('s4', {
+          $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
+        } as any);
+        yield { kind: 'text', chunk: 'not commit' };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+
+    await runTurn('s4', { model: 'mock', system: '', tools: [], provider: stealer });
+
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's4', role: 'assistant' }).countAsync(), 0,
+      'no assistant message may commit once the lease is gone',
+    );
+    assert.equal(
+      await AgentDeltas.find({ sessionId: 's4' }).countAsync(), 0,
+      'orphaned deltas would render as a permanent streaming ghost row',
+    );
 
     const msgs = await AgentMessages.find({ sessionId: 's4' }, { sort: { seq: 1 } }).fetchAsync();
-    const last = msgs[msgs.length - 1];
-    assert.equal(last.role, 'user', 'transcript must end in user or tool to be resumable');
+    assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+  });
+
+  it('leaves no unanswered tool_use when the lease is stolen during a tool call', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s6', 'look it up');
+    let call = 0;
+    await runTurn('s6', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'lookup', description: 'x', args: { type: 'object', properties: {} },
+        // The steal lands after the assistant(toolCalls) row is committed and
+        // before its tool result can be written — the exact window that used
+        // to strand a tool_use forever.
+        run: async () => {
+          await AgentSessions.updateAsync('s6', {
+            $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
+          } as any);
+          return { found: 42 };
+        },
+      }],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [{ id: 't1', name: 'lookup', args: {} }] }
+          : { text: 'it is 42' };
+      }),
+    });
+
+    const msgs = await AgentMessages.find({ sessionId: 's6' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [],
+      'an abandoned tool turn must not leave a tool_use the provider will 400 on',
+    );
+    assert.equal(
+      msgs.filter((m) => m.role === 'assistant').length, 0,
+      'the assistant row whose tool results never landed must be removed',
+    );
+    assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+    assert.equal(
+      await AgentDeltas.find({ sessionId: 's6' }).countAsync(), 0,
+      'the abandoned turn must take its deltas with it',
+    );
+  });
+
+  it('repairs an unanswered tool_use left behind by a previous run', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // Hand-seed what a crash between commit and tool dispatch leaves behind:
+    // [user, assistant(toolCalls)] with no tool results, and a free lease.
+    await seed('s7', 'look it up');
+    await AgentMessages.insertAsync({
+      _id: 'a-orphan', sessionId: 's7', seq: 1, role: 'assistant', content: '',
+      toolCalls: [{ id: 't-dead', name: 'lookup', args: {} }], createdAt: new Date(),
+    } as any);
+    await AgentDeltas.insertAsync({
+      _id: 'd-orphan', sessionId: 's7', messageId: 'a-orphan', msgSeq: 1, seq: 0,
+      kind: 'text', chunk: 'half an answer', at: new Date(),
+    } as any);
+    await AgentSessions.updateAsync('s7', { $set: { nextSeq: 2 } } as any);
+
+    await runTurn('s7', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const msgs = await AgentMessages.find({ sessionId: 's7' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.isUndefined(
+      msgs.find((m) => m._id === 'a-orphan'), 'the dangling assistant must be repaired away',
+    );
+    assert.deepEqual(unansweredToolUses(msgs), []);
+    assert.equal(msgs[msgs.length - 1].role, 'assistant', 'the recovery turn must complete');
+    assert.equal(msgs[msgs.length - 1].content, 'recovered');
+    assert.equal(
+      await AgentDeltas.find({ messageId: 'a-orphan' }).countAsync(), 0,
+      'the orphan deltas must go with the message that never got answered',
+    );
   });
 
   it('sets phase back to idle and releases the lease when done', async function () {
