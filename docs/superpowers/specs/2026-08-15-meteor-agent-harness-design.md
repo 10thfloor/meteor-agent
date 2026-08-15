@@ -1,7 +1,7 @@
 # Design: a Pi-based agent harness for Meteor 3.5+
 
 **Date:** 2026-08-15
-**Status:** approved design, not yet implemented
+**Status:** approved design; de-risking spikes run 2026-08-15 (§12); not yet implemented
 **Package:** `10thfloor:agent` (Atmosphere, TypeScript)
 
 ---
@@ -34,13 +34,22 @@ an agent over DDP. It is not a coding agent that operates on Meteor codebases.
 
 `Npm.depends` accepts exact versions only and duplicates transitive installs.
 More importantly, `@earendil-works/pi-ai@0.84.2` is `"type": "module"` with an
-`exports` map using wildcard subpaths, and Meteor has not shipped `exports`
-support ([PR #13520](https://github.com/meteor/meteor/discussions/11727), open
-since late 2024). The package declares `main: ./dist/index.js`, so the root
-import should fall back cleanly, but subpath imports are a live risk.
+`exports` map, and Meteor has not shipped `exports` support
+([PR #13520](https://github.com/meteor/meteor/discussions/11727), open since
+late 2024).
 
-Mitigation: the app installs pi-ai itself (`meteor npm i @earendil-works/pi-ai`),
-and exactly one server-only module in this package imports it. See §8.
+**Spike S1 established that a normal `import` cannot work**, and the reason is
+one level deeper than expected. Meteor resolves pi-ai itself fine — it declares
+`main: ./dist/index.js`, and Meteor's `main` fallback finds it. It then fails on
+pi-ai's transitive dependency **`typebox`**, which declares *no* `main` at all:
+only an `exports` map pointing at `./build/index.mjs`. Meteor falls back to
+`main`, finds none, looks for `index.js`, and reports
+`Cannot find module 'typebox'`. Because the break is in a transitive dependency,
+no change to our own import style avoids it.
+
+The app still installs pi-ai itself (`meteor npm i @earendil-works/pi-ai`) — a
+production `meteor build` does carry it into the bundle (§8) — but it is reached
+through a runtime loader rather than an import. See §8.
 
 `engines: node >= 22.19.0` is satisfied — Meteor 3.5 ships Node 24.15.
 
@@ -294,11 +303,24 @@ function Chat({ sessionId }) {
 ## 6. Tool model
 
 The loop executes every tool inside
-`DDP._CurrentMethodInvocation.withValue(new DDPCommon.MethodInvocation({ userId, isSimulation: false }), fn)`.
+`DDP._CurrentMethodInvocation.withValue({ userId, isSimulation: false }, fn)`.
 In Meteor 3 that environment variable is backed by `AsyncLocalStorage`, so it
 survives every `await` inside the handler. The consequence is the point of the
 whole design: **`this.userId` and `Meteor.userAsync()` work inside an existing,
 unmodified method handler, because the agent invokes it the way DDP does.**
+
+Spike S2 confirmed all of this on 3.5, and simplified it: a **plain object**
+suffices as the invocation — no `DDPCommon.MethodInvocation` construction and no
+dependency on the `ddp-common` package. `_CurrentMethodInvocation` is the
+correct accessor (`_CurrentInvocation` also exists; both are objects). Context
+survived timer, Mongo, microtask, and `Promise.all` awaits, unmodified sync and
+async method handlers both saw the right `this.userId`, and four interleaved
+concurrent runs stayed isolated with no leakage.
+
+One caveat S2 surfaced: `Meteor.userId()` is contributed by `accounts-base`, not
+by core `meteor`. The harness reads userId through the environment variable
+directly so it does not hard-depend on `accounts-base`; apps that have it get
+`Meteor.userId()` working inside tools for free.
 
 Three ways a tool comes to exist:
 
@@ -355,13 +377,44 @@ interface Provider {
 Agent.provider(name, impl);
 ```
 
-Exactly one server-only module imports `@earendil-works/pi-ai`. If Meteor's
-bundler chokes on the exports map, the fix is confined to that file — a runtime
-load outside the bundler, or a pinned deep import. Nothing else in the package
-knows pi-ai exists.
+Exactly one server-only module reaches pi-ai. Nothing else in the package knows
+it exists. Per S1 that module cannot use `import` — it uses a runtime loader.
+
+**The loader, as validated by S1.** Three approaches were tested; only the third
+works:
+
+| Approach | Result |
+|---|---|
+| `import '@earendil-works/pi-ai'` (static) | ✗ `Cannot find module 'typebox'` at runtime |
+| `new Function('s','return import(s)')` | ✗ `A dynamic import callback was not specified` — Meteor's server bundle is CJS, so that context has no host import callback |
+| `createRequire(...)('@earendil-works/pi-ai')` | ✗ `ERR_PACKAGE_PATH_NOT_EXPORTED` — pi-ai's exports map declares only an `import` condition, no `require` |
+| **`.mjs` shim required via `createRequire`** | ✓ works in dev *and* in a production bundle |
+
+The working mechanism: write a one-line ESM shim
+(`export const load = (s) => import(s);`) into a `node_modules/.agent-loader/`
+directory, load it with Node's own `createRequire`, and call `load()`. Because
+the shim is a genuine ESM module it *has* a dynamic-import callback, and Node's
+resolver — which does understand exports maps — handles pi-ai and its whole
+transitive graph, `typebox` included.
+
+`new Function` is not used. The shim body is a fixed literal written by the
+package; the specifier is always a package-controlled constant and must never
+come from user input or model output.
+
+**Locating `node_modules` differs between dev and production**, and S1 caught
+this: a production `meteor build` places app npm dependencies under
+`programs/server/npm/node_modules`, not `programs/server/node_modules`. The
+loader walks up from `process.cwd()` checking **both** names. Verified against a
+real `meteor build --server-only` bundle: 46 exports, working subpath import,
+and a usable TypeBox schema
+(`{"type":"object","required":["orderId"],"properties":{"orderId":{"type":"string"}}}`).
+
+The loader runs once at startup and caches the namespace, so per-call cost is
+zero.
 
 The same seam carries `mockProvider(script)`: a deterministic scripted provider
-that makes the entire harness testable with no API key and no network.
+that makes the entire harness testable with no API key and no network — and,
+usefully, with no loader involved at all.
 
 ## 9. Compaction and budgets
 
@@ -408,21 +461,44 @@ correct.
 - Client tests cover the delta/message merge, including out-of-order delta
   arrival and eviction of a delta whose message already committed.
 
-## 12. Risks and de-risking spikes
+## 12. De-risking spikes — RUN, 2026-08-15
 
-These run before implementation, in this order. Each is small and each can
-invalidate part of the design.
+All four ran against a real Meteor 3.5.0 app (Node 24.15.0, MongoDB via
+`meteor run`). Spike source is in `spike/` at the repo root.
 
-| # | Spike | Invalidates if it fails |
+| # | Spike | Result |
 |---|---|---|
-| S1 | Import `@earendil-works/pi-ai` from a Meteor 3.5 server module — root import and one subpath | Decision 2's packaging; falls back to runtime loading outside the bundler |
-| S2 | Confirm `DDP._CurrentMethodInvocation.withValue` propagates `userId` across `await` boundaries in 3.5, and pin the exact accessor name | §6 — the entire tools-are-methods premise |
-| S3 | Publish a capped collection through `observeChangesAsync` and observe `removed` events on eviction behaving sanely client-side | Decision 3; falls back to a TTL-indexed regular collection |
-| S4 | Force a lease expiry with two runners and assert exactly-once commits | §10's guard, the highest-consequence correctness claim |
+| S1 | Import `@earendil-works/pi-ai` from a Meteor 3.5 server module | ✗ **failed as specified** — resolved via a runtime loader instead (§8). Root cause was the transitive dep `typebox`, not pi-ai. |
+| S2 | `DDP._CurrentMethodInvocation.withValue` propagates `userId` across awaits | ✓ **passed**, and simplified the design — a plain object works, no `DDPCommon` |
+| S3 | Capped-collection eviction visible through `observeChangesAsync` | ✓ **passed** — 120 inserted, 107 evicted, 107 `removed` events; evictions *are* in the oplog |
+| S4 | Exactly-once commit under two racing runners | ✓ **passed** — 200 iterations, 0 double claims, 0 lost claims, 0 double commits, exactly 200 messages |
 
-Additional known risks: pi-ai is pre-1.0 (0.84.2) and its API may move;
-compaction quality is model-dependent and will need tuning against real
-transcripts.
+**S1 changed the design** (see §2 and §8): pi-ai is reached through a runtime
+`.mjs` shim loader rather than an `import`, and the loader must check both
+`node_modules` and `npm/node_modules` to work in production. It did not change
+decision 2 or 4 — pi-ai is still the provider layer and still an app-level peer
+dependency.
+
+**S2 simplified §6** and confirmed the tools-are-methods premise, which was the
+highest-risk assumption in the design.
+
+**S3 and S4 confirmed their sections as written**, with no changes. S3 in
+particular removes the fallback-to-TTL-collection contingency.
+
+Remaining risks, not addressed by spikes:
+
+- pi-ai is pre-1.0 (0.84.2); its API may move. The provider seam in §8 is the
+  containment.
+- The loader depends on Meteor's server bundle staying CJS and on Node's
+  `require()` of a local `.mjs` file. Both are stable today; a Meteor move to
+  native ESM output would *simplify* this, not break it, but the loader should
+  try a plain `import()` first and fall back to the shim.
+- Compaction quality is model-dependent and needs tuning against real
+  transcripts.
+- Capped-collection sizing is a tuning problem: too small and a slow subscriber
+  can miss deltas for a message still streaming. Committed messages always
+  arrive, so the failure mode is a stutter rather than data loss, but the
+  default size should be derived from expected concurrency.
 
 ## 13. Open items
 
