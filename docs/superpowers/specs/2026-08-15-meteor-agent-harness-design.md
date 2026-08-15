@@ -183,9 +183,19 @@ Meteor.publish('agent.session',  function (agent: string, sessionId: string) { �
 Meteor.publish('agent.sessions', function (agent: string) { … });
 ```
 
-`agent.session` authorizes against `this.userId` and returns three cursors —
-the session document, its messages, and its deltas. `agent.sessions` returns
-session documents only, for a conversation list.
+`agent.session` returns three cursors — the session document, its messages, and
+its deltas. `agent.sessions` returns session documents only, for a conversation
+list.
+
+**Authorization must happen before the cursors are returned, not inside them.**
+Meteor publishes every cursor in a returned array independently, so scoping only
+the session cursor by `userId` leaves messages and deltas filtered by the
+caller-supplied `sessionId` alone — an IDOR handing any caller, including an
+unauthenticated one, another user's full transcript and live token stream. The
+handler is therefore `async`, performs one authorizing `findOneAsync` against
+`{ _id, agent, userId }`, returns `[]` (which publishes nothing and marks the
+subscription ready) when it does not match, and only then returns the cursors.
+This was a real defect caught in review, not a hypothetical.
 
 On the client the package maintains an unnamed client-only collection
 (`new Mongo.Collection(null)`) that merges committed messages with live deltas
