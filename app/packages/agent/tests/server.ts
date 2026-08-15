@@ -4,3 +4,4 @@ import './loader.test';
 import './capped.test';
 import './tools.test';
 import './lease.test';
+import './loop.test';
