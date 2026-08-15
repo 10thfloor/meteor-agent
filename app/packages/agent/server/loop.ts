@@ -145,6 +145,13 @@ function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
  */
 async function discardTurn(
   sessionId: string, messageId: string, turnSeq: number, toolCallIds: string[] = [],
+  // Seq of the next assistant message after this turn, when the caller knows
+  // it (repair-on-entry does — it already scans the whole transcript to find
+  // the window). Defaults to Infinity for the in-turn abandonment call sites
+  // below, which are always at the transcript tail: there is no later turn
+  // yet whose reused id could be mistaken for this one, so no upper bound is
+  // needed there.
+  upperBoundSeq: number = Infinity,
 ): Promise<void> {
   try {
     // Tool results first, deltas next, the assistant row LAST. The assistant
@@ -160,12 +167,14 @@ async function discardTurn(
       await AgentMessages.removeAsync({
         sessionId, role: 'tool',
         toolCallId: { $in: toolCallIds },
-        // Scoped to THIS turn. `Provider` is a user-implementable interface and
-        // tool call ids are only ever unique within one provider response — the
-        // mock in this very repo reuses `t1` across turns. Unscoped, abandoning
-        // turn N would delete turn 1's legitimate result and strand its
-        // `tool_use`. Tool rows always outrank the assistant they answer.
-        seq: { $gt: turnSeq },
+        // Scoped to THIS turn on both ends. `Provider` is a user-implementable
+        // interface and tool call ids are only ever unique within one provider
+        // response — the mock in this very repo reuses `t1` across turns.
+        // Without the upper bound, abandoning turn N would also delete a
+        // HEALTHY later turn's result whenever it reuses an id, stranding
+        // THAT turn's `tool_use` instead — self-healing on the next repair,
+        // but at the cost of a 400'd turn in between.
+        seq: { $gt: turnSeq, $lt: upperBoundSeq },
       } as any);
     }
     await AgentDeltas.removeAsync({ messageId } as any);
@@ -208,12 +217,29 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
   const msgs = await AgentMessages
     .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
 
-  const answered = new Set(
-    msgs.filter((m) => m.role === 'tool' && m.toolCallId).map((m) => m.toolCallId),
-  );
-  const stranded = msgs.filter(
-    (m) => m.role === 'assistant' && m.toolCalls?.some((c) => !answered.has(c.id)),
-  );
+  // A toolCall counts as answered only by a `tool` row inside ITS OWN turn's
+  // window — seq greater than the assistant's own seq, and less than the seq
+  // of the NEXT assistant message (unbounded if there isn't one). Matching
+  // across the whole session, as before, lets an EARLIER turn's result
+  // silently answer for a LATER, genuinely-unanswered call: tool call ids are
+  // only unique within one provider response (this repo's own `mockProvider`
+  // reuses `t1` on every turn), so `assistant(seq 1, t1)` answered by
+  // `tool(seq 2, t1)` would forever hide a second, truly-stranded
+  // `assistant(seq 5, t1)` — a permanent 400 with no self-heal.
+  const assistants = msgs.filter((m) => m.role === 'assistant');
+  const stranded: Array<{ msg: AgentMessage; windowEnd: number }> = [];
+  assistants.forEach((m, i) => {
+    if (!m.toolCalls || m.toolCalls.length === 0) return;
+    const windowEnd = assistants[i + 1]?.seq ?? Infinity;
+    const answeredInWindow = new Set(
+      msgs
+        .filter((t) => t.role === 'tool' && t.toolCallId && t.seq > m.seq && t.seq < windowEnd)
+        .map((t) => t.toolCallId),
+    );
+    if (m.toolCalls.some((c) => !answeredInWindow.has(c.id))) {
+      stranded.push({ msg: m, windowEnd });
+    }
+  });
   if (stranded.length === 0) return true;
 
   // Under a lease guard: the touch proves we still own the session, and fails
@@ -225,10 +251,13 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
 
   // Every stranded assistant, not just the first: a session that crashed twice
   // holds two of them, and leaving either behind is the same permanent 400.
-  // Each one takes its OWN partial answers with it — hence its call ids and its
-  // seq, which is what scopes the tool-row removal to that turn.
-  for (const m of stranded) {
-    await discardTurn(sessionId, m._id, m.seq, (m.toolCalls ?? []).map((c) => c.id));
+  // Each one takes its OWN partial answers with it — hence its call ids, its
+  // seq, and its window's upper bound, which together scope the tool-row
+  // removal to exactly that turn and no other.
+  for (const { msg: m, windowEnd } of stranded) {
+    await discardTurn(
+      sessionId, m._id, m.seq, (m.toolCalls ?? []).map((c) => c.id), windowEnd,
+    );
   }
   return true;
 }

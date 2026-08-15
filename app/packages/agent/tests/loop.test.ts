@@ -274,6 +274,61 @@ describe('turn loop', () => {
     assert.equal(msgs[msgs.length - 1].content, 'recovered', 'the recovery turn must complete');
   });
 
+  it('scopes tool-call answered-detection to its own turn window, not the whole session', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // `t1` is answered once, at seq 2 — then reused, unanswered, by a LATER
+    // assistant at seq 5. A session-wide "answered" set would see `t1` in the
+    // set from the seq-2 tool row and never flag the seq-5 assistant: a
+    // permanent 400 with no self-heal. Detection must be scoped to each
+    // assistant's own (seq, next-assistant-seq) window.
+    await seed('s10', 'look it up');
+    await AgentMessages.insertAsync({
+      _id: 'a1', sessionId: 's10', seq: 1, role: 'assistant', content: '',
+      toolCalls: [{ id: 't1', name: 'lookup', args: {} }], createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'tool1', sessionId: 's10', seq: 2, role: 'tool', toolCallId: 't1',
+      content: JSON.stringify({ found: 1 }), createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'a-done', sessionId: 's10', seq: 3, role: 'assistant', content: 'done',
+      createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'u2', sessionId: 's10', seq: 4, role: 'user', content: 'again', createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'a2', sessionId: 's10', seq: 5, role: 'assistant', content: '',
+      toolCalls: [{ id: 't1', name: 'lookup', args: {} }], createdAt: new Date(),
+    } as any);
+    await AgentSessions.updateAsync('s10', { $set: { nextSeq: 6 } } as any);
+
+    await runTurn('s10', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const msgs = await AgentMessages.find({ sessionId: 's10' }, { sort: { seq: 1 } }).fetchAsync();
+
+    assert.isUndefined(
+      msgs.find((m) => m._id === 'a2'),
+      'the seq-5 assistant with an unanswered t1 must be repaired away',
+    );
+    assert.isDefined(
+      msgs.find((m) => m._id === 'a1'),
+      'the seq-1 assistant, whose t1 WAS answered inside its own window, must survive untouched',
+    );
+    assert.isDefined(
+      msgs.find((m) => m._id === 'tool1'),
+      'the seq-2 tool row that answered seq-1 must survive untouched',
+    );
+    assert.equal(msgs[msgs.length - 1].content, 'recovered', 'the recovery turn must complete');
+  });
+
   it('does not dispatch a second tool once the lease is gone', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');
