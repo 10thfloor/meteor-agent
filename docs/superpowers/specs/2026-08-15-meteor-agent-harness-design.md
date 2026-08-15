@@ -24,7 +24,7 @@ an agent over DDP. It is not a coding agent that operates on Meteor codebases.
 
 | # | Decision | Rationale |
 |---|---|---|
-| 1 | Clean-sheet; no dependency on `durable:*` | Any Meteor 3.5 app can adopt it with stock `mongo`, `ddp`, `accounts-base`, `check` |
+| 1 | Clean-sheet; no dependency on `durable:*` | Any Meteor 3.5 app can adopt it with stock `mongo`, `ddp`, `ddp-common`, `check` (`accounts-base` optional — see §6) |
 | 2 | `@earendil-works/pi-ai` for providers; loop written natively | Provider quirks, streaming deltas, prompt caching, reasoning tokens and cost accounting are high-churn and thankless. The loop is where Meteor-ness lives, so we own it. |
 | 3 | Capped deltas collection + durable messages collection | O(chunk) on the wire instead of O(n²); cheap self-evicting writes; identical behaviour on 1 server or 12 |
 | 4 | Atmosphere package, TypeScript, pi-ai as an app-level peer dependency | `meteor add` ergonomics and `api.mainModule` client/server split; keeps pi-ai's ESM exports map out of Meteor's bundler |
@@ -302,23 +302,46 @@ function Chat({ sessionId }) {
 
 ## 6. Tool model
 
-The loop executes every tool inside
-`DDP._CurrentMethodInvocation.withValue({ userId, isSimulation: false }, fn)`.
+The loop builds a real invocation and makes it ambient:
+
+```ts
+const inv = new DDPCommon.MethodInvocation({
+  isSimulation: false, userId, connection: null, randomSeed: null,
+});
+await DDP._CurrentMethodInvocation.withValue(inv, () => …);
+```
+
 In Meteor 3 that environment variable is backed by `AsyncLocalStorage`, so it
 survives every `await` inside the handler. The consequence is the point of the
 whole design: **`this.userId` and `Meteor.userAsync()` work inside an existing,
 unmodified method handler, because the agent invokes it the way DDP does.**
 
-Spike S2 confirmed all of this on 3.5, and simplified it: a **plain object**
-suffices as the invocation — no `DDPCommon.MethodInvocation` construction and no
-dependency on the `ddp-common` package. `_CurrentMethodInvocation` is the
-correct accessor (`_CurrentInvocation` also exists; both are objects). Context
-survived timer, Mongo, microtask, and `Promise.all` awaits, unmodified sync and
-async method handlers both saw the right `this.userId`, and four interleaved
-concurrent runs stayed isolated with no leakage.
+`DDPCommon.MethodInvocation` is **required**, and the package declares
+`api.use('ddp-common')`. Spike S2b established why: a plain object works as an
+ambient carrier, but a handler invoked *directly* with one dies on
+`this.unblock is not a function`, and `this.unblock()` is common in real method
+bodies. A real invocation also carries `setUserId`, `connection`, and
+`randomSeed`, which handlers read.
 
-One caveat S2 surfaced: `Meteor.userId()` is contributed by `accounts-base`, not
-by core `meteor`. The harness reads userId through the environment variable
+S2b also clarified what S2 actually proved. `Meteor.callAsync` constructs its
+*own* `MethodInvocation` internally and inherits `userId` from the ambient one —
+so in S2 the handler never received the plain object at all. Two distinct roles
+were being conflated, and only the ambient one was tested.
+
+Accordingly, tools are dispatched two ways:
+
+- **Adopted methods** go through `Meteor.callAsync(name, args)` inside the
+  ambient context. Meteor derives a proper invocation, and the method's own
+  `check()` calls run as written.
+- **Inline and co-registered tools** are invoked directly with `inv` as `this`,
+  so the harness controls argument shape.
+
+S2 remains valid for what it did test: `_CurrentMethodInvocation` is the correct
+accessor, context survives timer, Mongo, microtask and `Promise.all` awaits, and
+four interleaved concurrent runs stayed isolated with no leakage.
+
+One further caveat: `Meteor.userId()` is contributed by `accounts-base`, not by
+core `meteor`. The harness reads userId through the environment variable
 directly so it does not hard-depend on `accounts-base`; apps that have it get
 `Meteor.userId()` working inside tools for free.
 
@@ -359,10 +382,25 @@ Per-tool `gate`: `'auto'` (default), `'ask'` (parks per §4.3), or a predicate
 `(ctx) => boolean | 'ask'`. Agent-wide, `canUse(tool, ctx)` is the backstop.
 Tools run as the session's user unless `runAs` says otherwise.
 
-Rate limiting is Meteor's, not ours. `DDPRateLimiter.addRule` gained async
-matchers in 3.5, so a per-user turn budget is a rule whose matcher performs a
-database lookup — enforced at the DDP layer before the method body, with no
-harness code involved.
+**Rate limiting splits in two, and this is a correction.** An earlier draft
+claimed adopted methods keep their `DDPRateLimiter` rules when an agent calls
+them. Spike S2b disproved it: with a 2-per-minute rule, five server-side
+`Meteor.callAsync` invocations all succeeded. `DDPRateLimiter` hooks the DDP
+message handler, so it never sees a server-originated call.
+
+What that means concretely:
+
+- **User-facing entry points** (`agent.send`, `agent.start`) are DDP methods and
+  *are* covered. `DDPRateLimiter.addRule` gained async matchers in 3.5, so a
+  per-user turn budget is a rule whose matcher performs a database lookup,
+  enforced before the method body with no harness code involved.
+- **Tool calls made by the loop** are not covered by anything Meteor provides.
+  The harness enforces them itself, via §9's budgets and per-tool limits.
+
+This makes §9's budgets load-bearing rather than a convenience: they are the
+only thing standing between a looping agent and unbounded tool execution. The
+honest summary of tools-are-methods is that you inherit the implementation, the
+`check()` validation, and `this.userId` — but not the rate limits.
 
 Configuration follows the `Meteor.settings.packages['10thfloor:agent']`
 convention that 3.5 itself uses for `packages.mongo.reactivity`. Provider
@@ -396,6 +434,28 @@ directory, load it with Node's own `createRequire`, and call `load()`. Because
 the shim is a genuine ESM module it *has* a dynamic-import callback, and Node's
 resolver — which does understand exports maps — handles pi-ai and its whole
 transitive graph, `typebox` included.
+
+**The loader is hedged, not hardcoded to the shim.** It tries in order:
+
+```ts
+async function loadPiAi() {
+  try {
+    return await import('@earendil-works/pi-ai');   // 1. plain — works if/when
+  } catch (e) {                                      //    PR #13520 lands
+    return await shimLoad('@earendil-works/pi-ai');  // 2. .mjs shim fallback
+  }
+}
+```
+
+Step 1 costs nothing and becomes the live path the moment Meteor ships `exports`
+support, at which point the shim can be deleted without touching a caller. The
+hedge is known to work because S1's failure mode is a *catchable runtime throw*
+from `modules-runtime` (`Cannot find module 'typebox'`), not a build error — the
+production build emitted warnings and still produced a working bundle.
+
+The same ordering guards the other direction: if Meteor ever emits native ESM
+server bundles, step 1 starts succeeding and step 2 goes unused. Neither change
+breaks a consumer.
 
 `new Function` is not used. The shim body is a fixed literal written by the
 package; the specifier is always a package-controlled constant and must never
@@ -463,13 +523,16 @@ correct.
 
 ## 12. De-risking spikes — RUN, 2026-08-15
 
-All four ran against a real Meteor 3.5.0 app (Node 24.15.0, MongoDB via
-`meteor run`). Spike source is in `spike/` at the repo root.
+The four planned spikes plus one follow-up (S2b) ran against a real Meteor
+3.5.0 app (Node 24.15.0, MongoDB via `meteor run`), with S1 additionally
+verified against a production `meteor build` bundle. Spike source is in `spike/`
+at the repo root.
 
 | # | Spike | Result |
 |---|---|---|
 | S1 | Import `@earendil-works/pi-ai` from a Meteor 3.5 server module | ✗ **failed as specified** — resolved via a runtime loader instead (§8). Root cause was the transitive dep `typebox`, not pi-ai. |
-| S2 | `DDP._CurrentMethodInvocation.withValue` propagates `userId` across awaits | ✓ **passed**, and simplified the design — a plain object works, no `DDPCommon` |
+| S2 | `DDP._CurrentMethodInvocation.withValue` propagates `userId` across awaits | ✓ **passed** — correct accessor pinned, context survives all await kinds, concurrent runs isolated |
+| S2b | Is a plain object sufficient, or is `DDPCommon.MethodInvocation` required? | ✗ **plain object insufficient** — direct invocation dies on `this.unblock is not a function`. `DDPCommon` required. Also disproved the DDPRateLimiter claim in §7. |
 | S3 | Capped-collection eviction visible through `observeChangesAsync` | ✓ **passed** — 120 inserted, 107 evicted, 107 `removed` events; evictions *are* in the oplog |
 | S4 | Exactly-once commit under two racing runners | ✓ **passed** — 200 iterations, 0 double claims, 0 lost claims, 0 double commits, exactly 200 messages |
 
@@ -479,8 +542,16 @@ All four ran against a real Meteor 3.5.0 app (Node 24.15.0, MongoDB via
 decision 2 or 4 — pi-ai is still the provider layer and still an app-level peer
 dependency.
 
-**S2 simplified §6** and confirmed the tools-are-methods premise, which was the
-highest-risk assumption in the design.
+**S2 confirmed the tools-are-methods premise**, which was the highest-risk
+assumption in the design.
+
+**S2b corrected two errors in §6 and §7.** A plain object is adequate only as an
+ambient carrier, not as a handler's `this` — `DDPCommon.MethodInvocation` is
+required and `ddp-common` is now a declared dependency. And adopted methods do
+*not* inherit their `DDPRateLimiter` rules when an agent calls them, which
+promotes §9's budgets from a convenience to the only limit on tool execution.
+S2b exists because the first review of S2 caught that it had tested the ambient
+role and generalised to both.
 
 **S3 and S4 confirmed their sections as written**, with no changes. S3 in
 particular removes the fallback-to-TTL-collection contingency.

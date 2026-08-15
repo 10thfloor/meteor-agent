@@ -19,3 +19,5 @@ hot-module-replacement@0.6.0  # Rebuilds the client if there is a change on the 
 
 mongo
 accounts-base
+ddp-rate-limiter
+ddp-common

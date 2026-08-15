@@ -274,6 +274,12 @@ Meteor.startup(async () => {
     record('S1c', 'pi-ai via Node createRequire / .mjs shim (fallback B)', ok, detail);
   });
   await run('S2', spikeS2);
+  await run('S2b', async () => {
+    const { s2bReport } = await import('./s2b.js');
+    const { detail } = await s2bReport();
+    const plainObjectSufficient = detail.directWithPlainObject?.ok === true;
+    record('S2b', 'Plain object vs DDPCommon.MethodInvocation', plainObjectSufficient, detail);
+  });
   await run('S3', spikeS3);
   await run('S4', spikeS4);
 
