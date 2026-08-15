@@ -43,7 +43,8 @@ definitions every later task imports.
 - Create: `app/packages/agent/common/names.ts`
 - Create: `app/packages/agent/server/index.ts`
 - Create: `app/packages/agent/client/index.ts`
-- Create: `app/packages/agent/tests/index.ts`
+- Create: `app/packages/agent/tests/server.ts`
+- Create: `app/packages/agent/tests/client.ts`
 - Create: `app/packages/agent/tests/smoke.test.ts`
 
 **Interfaces:**
@@ -258,7 +259,7 @@ suite. This is pure and isomorphic, so it needs no database.
 **Files:**
 - Create: `app/packages/agent/common/merge.ts`
 - Create: `app/packages/agent/tests/merge.test.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 - Reference: `spike/imports/merge.js`, `spike/server/s5.js`
 
 **Interfaces:**
@@ -496,7 +497,7 @@ The only file in the package permitted to know pi-ai exists. Per S1, a plain
 - Create: `app/packages/agent/server/providers/loader.ts`
 - Create: `app/packages/agent/server/providers/mock.ts`
 - Create: `app/packages/agent/tests/loader.test.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 
 **Interfaces:**
 - Consumes: nothing from earlier tasks.
@@ -765,7 +766,7 @@ git commit -m "feat(agent): hedged pi-ai loader, provider seam, mock provider (S
 - Create: `app/packages/agent/server/publications.ts`
 - Create: `app/packages/agent/tests/capped.test.ts`
 - Modify: `app/packages/agent/server/index.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 
 **Interfaces:**
 - Consumes: `NAMES`, `DELTA_CAP_BYTES`, the types from Task 1.
@@ -927,7 +928,9 @@ Meteor.startup(async () => {
 
 - [ ] **Step 9: Add a publication authorization test**
 
-Append to `app/packages/agent/tests/capped.test.ts`:
+Append to `app/packages/agent/tests/capped.test.ts` — again **without the
+`if (Meteor.isServer) { … }` wrapper**, de-indented, with any imports hoisted to
+the top of the file:
 
 ```ts
 if (Meteor.isServer) {
@@ -981,7 +984,7 @@ breaks any handler calling `this.unblock()`.
 **Files:**
 - Create: `app/packages/agent/server/tools.ts`
 - Create: `app/packages/agent/tests/tools.test.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 
 **Interfaces:**
 - Consumes: `ToolSchema` from `providers/types.ts`.
@@ -1236,7 +1239,7 @@ git commit -m "feat(agent): tool registry and dispatch via DDPCommon.MethodInvoc
 **Files:**
 - Create: `app/packages/agent/server/lease.ts`
 - Create: `app/packages/agent/tests/lease.test.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 
 **Interfaces:**
 - Consumes: `AgentSessions` from `common/collections.ts`.
@@ -1431,7 +1434,7 @@ boundaries, dispatches tool calls, and loops until the model stops asking.
 **Files:**
 - Create: `app/packages/agent/server/loop.ts`
 - Create: `app/packages/agent/tests/loop.test.ts`
-- Modify: `app/packages/agent/tests/index.ts`
+- Modify: `app/packages/agent/tests/server.ts`
 
 **Interfaces:**
 - Consumes: `runTool`, `resolveTools`, `toolSchemas` (Task 5); `claimLease`, `releaseLease`, `guardedUpdate`, `holdsLease`, `SERVER_ID` (Task 6); `Provider` (Task 3); collections (Task 4).
@@ -1793,9 +1796,10 @@ a real DDP connection.
 - Create: `app/packages/agent/server/methods.ts`
 - Create: `app/packages/agent/server/agent.ts`
 - Create: `app/packages/agent/client/agent.ts`
-- Create: `app/packages/agent/tests/integration.test.ts`
+- Create: `app/packages/agent/tests/integration.server.ts`
+- Create: `app/packages/agent/tests/integration.client.ts`
 - Create: `app/packages/agent/README.md`
-- Modify: `app/packages/agent/server/index.ts`, `client/index.ts`, `tests/index.ts`
+- Modify: `app/packages/agent/server/index.ts`, `client/index.ts`, `tests/server.ts`, `tests/client.ts`
 
 **Interfaces:**
 - Consumes: everything from Tasks 1–7.
