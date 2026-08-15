@@ -29,7 +29,9 @@ function findNodeModulesBase(): string | null {
   return null;
 }
 
-async function shimLoad(specifier: string): Promise<unknown> {
+// Exported as a test seam so the fallback path (directory walk, shim-file
+// creation, createRequire) can be exercised directly in tests. Not public API.
+export async function shimLoad(specifier: string): Promise<unknown> {
   const base = findNodeModulesBase();
   if (!base) {
     throw new Error(
@@ -52,7 +54,10 @@ async function shimLoad(specifier: string): Promise<unknown> {
 }
 
 /** Hedged: plain import first, so the shim disappears once Meteor ships
- *  `exports` support (PR #13520). Falls back to the shim on any failure. */
+ *  `exports` support (PR #13520). Falls back to the shim on any failure.
+ *
+ *  Returns the module namespace object as-is (not copied), so live bindings
+ *  stay live. Callers must not mutate the returned object. */
 export async function loadPiAi(): Promise<unknown> {
   if (cached) return cached;
   let ns: unknown;
@@ -61,10 +66,6 @@ export async function loadPiAi(): Promise<unknown> {
   } catch {
     ns = await shimLoad(PKG);
   }
-  // Both paths resolve through a dynamic import(), which yields a Module
-  // Namespace Exotic Object (Symbol.toStringTag === 'Module', not 'Object').
-  // Copy its own enumerable bindings into a plain object so consumers get an
-  // ordinary namespace rather than a foreign exotic type.
-  cached = { ...(ns as Record<string, unknown>) };
+  cached = ns;
   return cached;
 }
