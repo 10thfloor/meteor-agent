@@ -226,6 +226,126 @@ describe('turn loop', () => {
     );
   });
 
+  it('repairs an assistant whose tool calls were only partially answered', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // Parallel tool calls are the DEFAULT for Anthropic and OpenAI alike, so a
+    // kill between the first and second result is the common crash, not an
+    // exotic one. Tool rows carry a HIGHER seq than the assistant they answer,
+    // so what it leaves behind ends in a `tool` row — a transcript that looks
+    // healthy to anything that only inspects the tail, while `t2` stays
+    // unanswered and 400s every provider call from here to forever.
+    await seed('s8', 'look them both up');
+    await AgentMessages.insertAsync({
+      _id: 'a-partial', sessionId: 's8', seq: 1, role: 'assistant', content: '',
+      toolCalls: [
+        { id: 't1', name: 'lookup', args: {} },
+        { id: 't2', name: 'lookup', args: {} },
+      ],
+      createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'tool-t1', sessionId: 's8', seq: 2, role: 'tool', toolCallId: 't1',
+      content: JSON.stringify({ found: 1 }), createdAt: new Date(),
+    } as any);
+    await AgentSessions.updateAsync('s8', { $set: { nextSeq: 3 } } as any);
+
+    await runTurn('s8', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const msgs = await AgentMessages.find({ sessionId: 's8' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [],
+      'repair must scan the whole transcript, not just its tail',
+    );
+    assert.isUndefined(
+      msgs.find((m) => m._id === 'a-partial'),
+      'the half-answered assistant must be repaired away',
+    );
+    assert.isUndefined(
+      msgs.find((m) => m._id === 'tool-t1'),
+      'its landed partial answer must go with it, or it strands a tool_result',
+    );
+    assert.equal(msgs[msgs.length - 1].content, 'recovered', 'the recovery turn must complete');
+  });
+
+  it('does not dispatch a second tool once the lease is gone', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s9', 'look them both up');
+    let ranSecond = false;
+
+    // The takeover has to land AFTER the first result commits. Stealing from
+    // inside the first tool's `run` trips the post-hoc `guardedUpdate` instead
+    // — the branch the s6 test above already covers — and the loop returns
+    // before a second dispatch ever happens. Both guards test the identical
+    // lease predicate, so the only way to reach the pre-flight `holdsLease` is
+    // for another server to take over in the window between one tool result
+    // landing and the next dispatch. Hooking the insert puts the steal exactly
+    // there, with no timing race.
+    const original = (AgentMessages as any).insertAsync.bind(AgentMessages);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentMessages, 'insertAsync');
+    (AgentMessages as any).insertAsync = async (doc: any, ...rest: any[]) => {
+      const id = await original(doc, ...rest);
+      if (doc.role === 'tool' && doc.toolCallId === 't1') {
+        await AgentSessions.updateAsync('s9', {
+          $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
+        } as any);
+      }
+      return id;
+    };
+
+    try {
+      let call = 0;
+      await runTurn('s9', {
+        model: 'mock', system: '',
+        tools: [
+          {
+            name: 'first', description: 'x', args: { type: 'object', properties: {} },
+            run: async () => ({ found: 1 }),
+          },
+          {
+            name: 'second', description: 'x', args: { type: 'object', properties: {} },
+            run: async () => { ranSecond = true; return { found: 2 }; },
+          },
+        ],
+        provider: mockProvider(() => {
+          call += 1;
+          return call === 1
+            ? {
+              toolCalls: [
+                { id: 't1', name: 'first', args: {} },
+                { id: 't2', name: 'second', args: {} },
+              ],
+            }
+            : { text: 'never reached' };
+        }),
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(AgentMessages, 'insertAsync', descriptor);
+      else delete (AgentMessages as any).insertAsync;
+    }
+
+    assert.isFalse(
+      ranSecond,
+      'a tool is a real side effect — it must not run under a lease we no longer hold',
+    );
+    const msgs = await AgentMessages.find({ sessionId: 's9' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [],
+      'abandoning at the pre-flight must still take the whole turn with it',
+    );
+    assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+  });
+
   it('sets phase back to idle and releases the lease when done', async function () {
     this.timeout(30000);
     const { AgentSessions } = await import('../common/collections');

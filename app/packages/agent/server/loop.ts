@@ -45,7 +45,15 @@ class DeltaWriter {
     private msgSeq: number,
     flushMs: number,
   ) {
-    this.timer = setInterval(() => { void this.flush(); }, flushMs);
+    // The `.catch` is not decoration. A bare `void this.flush()` turns an
+    // `insertAsync` rejection into an unhandled promise rejection, which is
+    // fatal by default on Node >= 15 — a delta write failure would kill the
+    // whole turn, and deltas are ephemeral by design (capped, and superseded
+    // by the committed message). Swallow it: the next tick flushes whatever is
+    // still buffered, and `stop()` flushes the tail.
+    this.timer = setInterval(() => {
+      void this.flush().catch(() => { /* ephemeral: the next tick retries */ });
+    }, flushMs);
   }
 
   /**
@@ -132,18 +140,36 @@ function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
  * `tool_result` behind is the same 400 in mirror image.
  *
  * Never throws: a failed cleanup must not mask the abandonment it follows.
+ * Because it never throws, the ORDER of the removals is what decides which
+ * state a half-finished cleanup fails into — see below.
  */
 async function discardTurn(
-  sessionId: string, messageId: string, toolCallIds: string[] = [],
+  sessionId: string, messageId: string, turnSeq: number, toolCallIds: string[] = [],
 ): Promise<void> {
   try {
-    await AgentMessages.removeAsync({ _id: messageId } as any);
-    await AgentDeltas.removeAsync({ messageId } as any);
+    // Tool results first, deltas next, the assistant row LAST. The assistant
+    // row is the repair anchor: `repairUnansweredToolUse` finds an abandoned
+    // turn by looking for an assistant whose `tool_use` ids have no matching
+    // `tool_result`, so while that row survives the turn stays detectable. Fail
+    // part way through in this order and what is left is an unanswered
+    // assistant — which the next turn's repair-on-entry cleans up. Remove the
+    // assistant first (the old order) and a failure strands a `tool_result`
+    // whose `tool_use` is gone: the mirror-image 400, and one repair can never
+    // find. Fail toward the repairable state.
     if (toolCallIds.length > 0) {
-      await AgentMessages.removeAsync(
-        { sessionId, role: 'tool', toolCallId: { $in: toolCallIds } } as any,
-      );
+      await AgentMessages.removeAsync({
+        sessionId, role: 'tool',
+        toolCallId: { $in: toolCallIds },
+        // Scoped to THIS turn. `Provider` is a user-implementable interface and
+        // tool call ids are only ever unique within one provider response — the
+        // mock in this very repo reuses `t1` across turns. Unscoped, abandoning
+        // turn N would delete turn 1's legitimate result and strand its
+        // `tool_use`. Tool rows always outrank the assistant they answer.
+        seq: { $gt: turnSeq },
+      } as any);
     }
+    await AgentDeltas.removeAsync({ messageId } as any);
+    await AgentMessages.removeAsync({ _id: messageId } as any);
   } catch { /* cleanup is best-effort by design */ }
 }
 
@@ -154,19 +180,41 @@ async function discardTurn(
  * retry, forever. Cleanup at the abandoning end (`discardTurn`) races the
  * recovering server, so the recovering server checks for itself.
  *
+ * The scan is over the WHOLE transcript, never just its tail. Tool rows carry a
+ * higher `seq` than the assistant they answer, so the moment ONE of a parallel
+ * batch is answered the assistant stops being the last message — and parallel
+ * tool calls are the default for Anthropic and OpenAI both. A tail check calls
+ * `[…, assistant(t1,t2), tool(t1)]` healthy while `t2` 400s every provider call
+ * from then on, with no path back. That state is reachable by a plain SIGKILL
+ * (deploy, OOM) between two results, and equally by `discardTurn` swallowing
+ * its own failure.
+ *
  * Returns false if the lease is gone, in which case the caller must abandon
  * without touching anything.
  */
 async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
+  const session = await AgentSessions.findOneAsync(sessionId);
+  if (!session) return true;
+
+  // An approval gate parks the transcript on exactly the shape repair deletes:
+  // a `gate: 'ask'` tool commits `assistant(toolCalls)` and then waits, with no
+  // `tool_result`, for a human to answer. That wait is legitimate history, not
+  // an abandoned turn. Unreachable until Milestone 2 wires `pending`/`awaiting`
+  // — and the day it does, without this guard repair would silently eat the
+  // request the user is being asked to approve. Not dead code: load-bearing the
+  // moment gating lands.
+  if (session.phase === 'awaiting' || session.pending) return true;
+
   const msgs = await AgentMessages
     .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
-  const last = msgs[msgs.length - 1];
-  if (!last || last.role !== 'assistant' || !last.toolCalls?.length) return true;
 
   const answered = new Set(
     msgs.filter((m) => m.role === 'tool' && m.toolCallId).map((m) => m.toolCallId),
   );
-  if (last.toolCalls.every((c) => answered.has(c.id))) return true;
+  const stranded = msgs.filter(
+    (m) => m.role === 'assistant' && m.toolCalls?.some((c) => !answered.has(c.id)),
+  );
+  if (stranded.length === 0) return true;
 
   // Under a lease guard: the touch proves we still own the session, and fails
   // closed if another server took it between claim and repair.
@@ -175,7 +223,13 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
   });
   if (!stillOurs) return false;
 
-  await discardTurn(sessionId, last._id);
+  // Every stranded assistant, not just the first: a session that crashed twice
+  // holds two of them, and leaving either behind is the same permanent 400.
+  // Each one takes its OWN partial answers with it — hence its call ids and its
+  // seq, which is what scopes the tool-row removal to that turn.
+  for (const m of stranded) {
+    await discardTurn(sessionId, m._id, m.seq, (m.toolCalls ?? []).map((c) => c.id));
+  }
   return true;
 }
 
@@ -253,7 +307,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           },
           $set: { updatedAt: new Date() },
         });
-        if (!stillOurs) { await discardTurn(sessionId, messageId); return; }
+        if (!stillOurs) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
         await AgentMessages.insertAsync({
           _id: messageId, sessionId, seq: msgSeq, role: 'assistant',
@@ -275,7 +329,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // through to the tools themselves; this narrows the window, it does
           // not close it.
           if (!(await holdsLease(sessionId))) {
-            await discardTurn(sessionId, messageId, callIds);
+            await discardTurn(sessionId, messageId, msgSeq, callIds);
             return;
           }
 
@@ -291,7 +345,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           }))) {
             // The assistant message is already committed but this result never
             // will be: leaving it would strand a tool_use with no tool_result.
-            await discardTurn(sessionId, messageId, callIds);
+            await discardTurn(sessionId, messageId, msgSeq, callIds);
             return;
           }
 
