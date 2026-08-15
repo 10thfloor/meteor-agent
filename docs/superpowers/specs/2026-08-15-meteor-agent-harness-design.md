@@ -114,7 +114,9 @@ interface AgentDelta {
   _id: string;
   sessionId: string;
   messageId: string;             // pre-allocated id of the message being built
-  seq: number;
+  msgSeq: number;                // the message's FUTURE seq, so an in-flight
+                                 // message sorts correctly before it commits
+  seq: number;                   // delta index within the message, from 0
   kind: 'text' | 'thinking' | 'tool_args' | 'tool_output';
   chunk: string;
   at: Date;
@@ -190,6 +192,27 @@ On the client the package maintains an unnamed client-only collection
 by `messageId`. `Support.messages(sessionId)` returns a cursor over it, so
 consumers get a genuine minimongo cursor — sortable, filterable, and usable
 directly from Blaze, React, or Svelte with no adapter.
+
+**The merge renders the contiguous tail, not the contiguous prefix.** Spike S5
+established why: a capped collection evicts the *oldest* documents, so a gap in
+delta `seq` is always a missing **head**. A prefix-based merge would render an
+empty string for any message whose start had aged out. The merge instead walks
+back from the highest `seq` while the sequence decrements by one, renders that
+run, and sets `truncatedHead` so the UI can show a leading ellipsis. The
+committed message repairs it moments later.
+
+The other rules S5 fixes in place:
+
+- A committed message **supersedes** deltas for the same `messageId`. Deltas
+  that arrive, or are evicted, after commit are inert.
+- The merge is **order-independent and idempotent** — verified over 50
+  deterministic shuffles — because DDP gives no cross-collection ordering
+  guarantee.
+- Duplicate delivery is deduped by `_id`.
+- `thinking`, `tool_args`, and `tool_output` deltas are kept out of `content`.
+- In-flight messages sort by `msgSeq` (§4.1), which is why deltas carry the
+  message's future `seq`. Without it an in-flight message has no defined
+  position relative to committed ones.
 
 ```
 send() ─▶ method ─▶ [AgentMessages] ─▶ lease claim ─▶ loop
@@ -535,6 +558,7 @@ at the repo root.
 | S2b | Is a plain object sufficient, or is `DDPCommon.MethodInvocation` required? | ✗ **plain object insufficient** — direct invocation dies on `this.unblock is not a function`. `DDPCommon` required. Also disproved the DDPRateLimiter claim in §7. |
 | S3 | Capped-collection eviction visible through `observeChangesAsync` | ✓ **passed** — 120 inserted, 107 evicted, 107 `removed` events; evictions *are* in the oplog |
 | S4 | Exactly-once commit under two racing runners | ✓ **passed** — 200 iterations, 0 double claims, 0 lost claims, 0 double commits, exactly 200 messages |
+| S5 | §4.4 merge under eviction, reordering, duplication, and commit races | ✓ **passed** — 14/14 cases, but only after changing the merge from contiguous-prefix to contiguous-tail and adding `msgSeq` to the delta schema |
 
 **S1 changed the design** (see §2 and §8): pi-ai is reached through a runtime
 `.mjs` shim loader rather than an `import`, and the loader must check both
@@ -555,6 +579,19 @@ role and generalised to both.
 
 **S3 and S4 confirmed their sections as written**, with no changes. S3 in
 particular removes the fallback-to-TTL-collection contingency.
+
+**S5 changed §4.1 and §4.4.** The merge as originally specified would have
+rendered an empty string for any message whose head had been evicted — the exact
+case the capped collection makes routine. Reference implementation and its 14
+adversarial cases are in `spike/imports/merge.js` and `spike/server/s5.js`; they
+carry over into the package as its first unit tests.
+
+**Not covered by S5, and deliberately left to implementation:** the merge was
+tested as a pure function, not across a live DDP connection. What remains
+unverified is that the publication actually delivers `msgSeq` and both
+collections to minimongo, and that Tracker recomputes the cursor on delta
+arrival. That is wiring rather than design risk, and it is a required
+integration test in the plan.
 
 Remaining risks, not addressed by spikes:
 

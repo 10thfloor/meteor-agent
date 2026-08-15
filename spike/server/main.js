@@ -282,6 +282,14 @@ Meteor.startup(async () => {
   });
   await run('S3', spikeS3);
   await run('S4', spikeS4);
+  await run('S5', async () => {
+    const { s5Report } = await import('./s5.js');
+    const r = s5Report();
+    record('S5', `Merge logic (${r.total} cases)`, r.pass, {
+      total: r.total,
+      failures: r.failures,
+    });
+  });
 
   console.log('\n__SPIKE_REPORT_BEGIN__');
   console.log(JSON.stringify(results, null, 2));
