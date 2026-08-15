@@ -43,6 +43,15 @@ export interface ToolResult {
  * Make a REAL MethodInvocation ambient. S2b: a plain object is enough to carry
  * userId, but a handler invoked with one dies on `this.unblock is not a
  * function`, and real method bodies call it.
+ *
+ * Nuance: the adopted-tool path in `runTool` goes through `Meteor.callAsync`,
+ * which builds its OWN invocation for the handler's `this` and only reads
+ * `.userId`/`.connection` off the ambient one — so that path alone would
+ * tolerate a plain object here. The ambient invocation still has to be real
+ * because nothing guarantees every future caller reaches a handler via
+ * `callAsync`; code that invokes a handler directly with the ambient
+ * invocation as `this` (as `Meteor.server.method_handlers` allows) needs
+ * `this.unblock`/`this.setUserId` to exist.
  */
 export function withInvocation<T>(userId: string | null, fn: () => Promise<T>): Promise<T> {
   const invocation = new (DDPCommon as any).MethodInvocation({
@@ -62,23 +71,50 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         gate: 'auto' as const, kind: 'adopted' as const, method: spec,
       };
     }
-    if ('method' in spec) {
+    const hasMethod = 'method' in spec && spec.method !== undefined;
+    const hasRun = 'run' in spec && spec.run !== undefined;
+    if (hasMethod && hasRun) {
+      const label = (spec as any).name ?? (spec as any).method ?? '(unnamed)';
+      throw new Error(
+        `[10thfloor:agent] Tool spec has both "method" and "run" — pick one: ${label}`,
+      );
+    }
+    if (!hasMethod && !hasRun) {
+      const label = (spec as any).name ?? '(unnamed)';
+      throw new Error(
+        `[10thfloor:agent] Tool spec has neither "method" nor "run" — pick one: ${label}`,
+      );
+    }
+    if (hasMethod) {
+      const adopted = spec as AdoptedTool;
+      const name = adopted.name ?? adopted.method;
+      if (!name) {
+        throw new Error(
+          `[10thfloor:agent] Tool spec has no usable name: ${JSON.stringify(spec)}`,
+        );
+      }
       return {
-        name: spec.name ?? spec.method,
-        description: spec.description,
-        args: spec.args,
-        gate: spec.gate ?? 'auto',
+        name,
+        description: adopted.description,
+        args: adopted.args,
+        gate: adopted.gate ?? 'auto',
         kind: 'adopted' as const,
-        method: spec.method,
+        method: adopted.method,
       };
     }
+    const inline = spec as InlineTool;
+    if (!inline.name) {
+      throw new Error(
+        `[10thfloor:agent] Tool spec is missing "name": ${JSON.stringify(spec)}`,
+      );
+    }
     return {
-      name: spec.name,
-      description: spec.description,
-      args: spec.args,
-      gate: spec.gate ?? 'auto',
+      name: inline.name,
+      description: inline.description,
+      args: inline.args,
+      gate: inline.gate ?? 'auto',
       kind: 'inline' as const,
-      run: spec.run,
+      run: inline.run,
     };
   });
 }
