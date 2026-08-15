@@ -14,7 +14,14 @@
 
 - Meteor release: `METEOR@3.5` exactly or newer. Node 24.15.
 - Package name: `10thfloor:agent`. Version starts at `0.1.0`.
-- Package dependencies only: `ecmascript`, `typescript`, `mongo`, `ddp`, `check`, `random`, and `ddp-common` (server only). **No `durable:*` packages. No `accounts-base` dependency** — read userId through `DDP._CurrentMethodInvocation`, never assume `Meteor.userId` exists (S2).
+- Package dependencies only: `ecmascript`, `typescript`, `mongo`, `ddp`, `check`, `random`, `tracker`, and `ddp-common` (server only). **No `durable:*` packages. No `accounts-base` dependency** — read userId through `DDP._CurrentMethodInvocation`, never assume `Meteor.userId` exists (S2).
+- **Tests are split by architecture.** `Package.onTest` declares
+  `api.mainModule('tests/server.ts', 'server')` and
+  `api.mainModule('tests/client.ts', 'client')`. Server-side test files are
+  reached only from `tests/server.ts` and contain **no `if (Meteor.isServer)`
+  wrapper** — they already build server-only. A single dual-architecture test
+  entry would drag `server/tools.ts` (which imports the server-only
+  `ddp-common`) into the client bundle and fail the build.
 - `@earendil-works/pi-ai` is an **app-level peer dependency**, never `Npm.depends`. It is reached **only** through `server/providers/loader.ts` (S1). No other file may reference it.
 - All MongoDB access uses Meteor 3 async APIs: `insertAsync`, `updateAsync`, `findOneAsync`, `removeAsync`, `countAsync`, `observeChangesAsync`. Never the sync forms.
 - Tool dispatch **must** use `new DDPCommon.MethodInvocation(...)`. A plain object is not sufficient — handlers calling `this.unblock()` throw (S2b).
@@ -70,18 +77,20 @@ Package.describe({
 
 Package.onUse((api) => {
   api.versionsFrom('3.5');
-  api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random']);
+  api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random', 'tracker']);
   api.use(['ddp-common'], 'server');
   api.mainModule('server/index.ts', 'server');
   api.mainModule('client/index.ts', 'client');
 });
 
 Package.onTest((api) => {
-  api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random']);
+  api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random', 'tracker']);
   api.use(['ddp-common'], 'server');
   api.use('meteortesting:mocha');
   api.use('10thfloor:agent');
-  api.mainModule('tests/index.ts');
+  // Split by architecture: server tests must never reach the client bundle.
+  api.mainModule('tests/server.ts', 'server');
+  api.mainModule('tests/client.ts', 'client');
 });
 ```
 
@@ -208,10 +217,19 @@ describe('10thfloor:agent scaffold', () => {
 });
 ```
 
-Create `app/packages/agent/tests/index.ts`:
+Create `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
+```
+
+Create `app/packages/agent/tests/client.ts`:
+
+```ts
+// Client-side tests. Empty until Task 8's live DDP round trip. Keeping every
+// other test server-only is what stops server modules reaching the client
+// bundle, and keeps the reported test counts in this plan meaningful.
+export {};
 ```
 
 - [ ] **Step 7: Run the tests — expect PASS**
@@ -371,7 +389,7 @@ describe('mergeView', () => {
 
 - [ ] **Step 2: Register the test file**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -528,41 +546,36 @@ Create `app/packages/agent/tests/loader.test.ts`:
 
 ```ts
 import { assert } from 'chai';
-import { Meteor } from 'meteor/meteor';
+import { loadPiAi } from '../server/providers/loader';
 
-if (Meteor.isServer) {
-  describe('pi-ai loader', () => {
-    it('loads the pi-ai namespace despite the typebox exports map', async function () {
-      this.timeout(20000);
-      const { loadPiAi } = await import('../server/providers/loader');
-      const piai: any = await loadPiAi();
-      assert.isObject(piai);
-      assert.isAbove(Object.keys(piai).length, 10);
-    });
-
-    it('exposes a usable TypeBox Type through pi-ai', async function () {
-      this.timeout(20000);
-      const { loadPiAi } = await import('../server/providers/loader');
-      const piai: any = await loadPiAi();
-      const schema = piai.Type.Object({ orderId: piai.Type.String() });
-      assert.equal(schema.type, 'object');
-      assert.deepEqual(schema.required, ['orderId']);
-    });
-
-    it('caches the namespace across calls', async function () {
-      this.timeout(20000);
-      const { loadPiAi } = await import('../server/providers/loader');
-      const a = await loadPiAi();
-      const b = await loadPiAi();
-      assert.strictEqual(a, b);
-    });
+describe('pi-ai loader', () => {
+  it('loads the pi-ai namespace despite the typebox exports map', async function () {
+    this.timeout(20000);
+    const piai: any = await loadPiAi();
+    assert.isObject(piai);
+    assert.isAbove(Object.keys(piai).length, 10);
   });
-}
+
+  it('exposes a usable TypeBox Type through pi-ai', async function () {
+    this.timeout(20000);
+    const piai: any = await loadPiAi();
+    const schema = piai.Type.Object({ orderId: piai.Type.String() });
+    assert.equal(schema.type, 'object');
+    assert.deepEqual(schema.required, ['orderId']);
+  });
+
+  it('caches the namespace across calls', async function () {
+    this.timeout(20000);
+    const a = await loadPiAi();
+    const b = await loadPiAi();
+    assert.strictEqual(a, b);
+  });
+});
 ```
 
 - [ ] **Step 3: Register it**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -696,30 +709,35 @@ export function mockProvider(script: MockScript): Provider {
 Append to `app/packages/agent/tests/loader.test.ts`:
 
 ```ts
-if (Meteor.isServer) {
-  describe('mockProvider', () => {
-    it('streams text one chunk at a time then a done chunk', async () => {
-      const { mockProvider } = await import('../server/providers/mock');
-      const p = mockProvider(() => ({ text: 'hi' }));
-      const chunks = [];
-      for await (const c of p.stream({ model: 'm', system: '', messages: [], tools: [] })) {
-        chunks.push(c);
-      }
-      assert.deepEqual(chunks.map((c) => c.kind), ['text', 'text', 'done']);
-      assert.equal(chunks.filter((c) => c.kind === 'text').map((c: any) => c.chunk).join(''), 'hi');
-    });
+import { mockProvider } from '../server/providers/mock';
+import type { ProviderChunk } from '../server/providers/types';
 
-    it('passes tool calls through the done chunk', async () => {
-      const { mockProvider } = await import('../server/providers/mock');
-      const p = mockProvider(() => ({ toolCalls: [{ id: 't1', name: 'lookup', args: { q: 1 } }] }));
-      const out = [];
-      for await (const c of p.stream({ model: 'm', system: '', messages: [], tools: [] })) out.push(c);
-      const done: any = out[out.length - 1];
-      assert.equal(done.toolCalls[0].name, 'lookup');
-    });
+describe('mockProvider', () => {
+  it('streams text one chunk at a time then a done chunk', async () => {
+    const p = mockProvider(() => ({ text: 'hi' }));
+    const chunks: ProviderChunk[] = [];
+    for await (const c of p.stream({ model: 'm', system: '', messages: [], tools: [] })) {
+      chunks.push(c);
+    }
+    assert.deepEqual(chunks.map((c) => c.kind), ['text', 'text', 'done']);
+    assert.equal(
+      chunks.filter((c) => c.kind === 'text').map((c: any) => c.chunk).join(''),
+      'hi',
+    );
   });
-}
+
+  it('passes tool calls through the done chunk', async () => {
+    const p = mockProvider(() => ({ toolCalls: [{ id: 't1', name: 'lookup', args: { q: 1 } }] }));
+    const out: ProviderChunk[] = [];
+    for await (const c of p.stream({ model: 'm', system: '', messages: [], tools: [] })) out.push(c);
+    const done: any = out[out.length - 1];
+    assert.equal(done.toolCalls[0].name, 'lookup');
+  });
+});
 ```
+
+Note: the `import` lines go at the top of the file alongside the existing ones,
+not mid-file.
 
 - [ ] **Step 9: Run to verify pass**
 
@@ -769,7 +787,10 @@ export const AgentDeltas = new Mongo.Collection<AgentDelta>(NAMES.deltas);
 
 - [ ] **Step 2: Write the failing capped test**
 
-Create `app/packages/agent/tests/capped.test.ts`:
+Create `app/packages/agent/tests/capped.test.ts`. **Drop the
+`if (Meteor.isServer) { … }` wrapper shown below and de-indent its body** — per
+Global Constraints this file is reached only from `tests/server.ts` and is
+already server-only, so the guard is dead code:
 
 ```ts
 import { assert } from 'chai';
@@ -815,7 +836,7 @@ if (Meteor.isServer) {
 
 - [ ] **Step 3: Register it**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -968,7 +989,11 @@ breaks any handler calling `this.unblock()`.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `app/packages/agent/tests/tools.test.ts`:
+Create `app/packages/agent/tests/tools.test.ts`. **Drop the
+`if (Meteor.isServer) { … }` wrapper shown below and de-indent its body** — per
+Global Constraints this file is reached only from `tests/server.ts` and is
+already server-only, so the guard is dead code. The `Meteor.methods({…})`
+registration stays, at top level:
 
 ```ts
 import { assert } from 'chai';
@@ -1059,7 +1084,7 @@ if (Meteor.isServer) {
 
 - [ ] **Step 2: Register it**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -1219,7 +1244,10 @@ git commit -m "feat(agent): tool registry and dispatch via DDPCommon.MethodInvoc
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `app/packages/agent/tests/lease.test.ts`:
+Create `app/packages/agent/tests/lease.test.ts`. **Drop the
+`if (Meteor.isServer) { … }` wrapper shown below and de-indent its body** — per
+Global Constraints this file is reached only from `tests/server.ts` and is
+already server-only, so the guard is dead code:
 
 ```ts
 import { assert } from 'chai';
@@ -1298,7 +1326,7 @@ if (Meteor.isServer) {
 
 - [ ] **Step 2: Register it**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -1411,7 +1439,10 @@ boundaries, dispatches tool calls, and loops until the model stops asking.
 
 - [ ] **Step 1: Write the failing tests**
 
-Create `app/packages/agent/tests/loop.test.ts`:
+Create `app/packages/agent/tests/loop.test.ts`. **Drop the
+`if (Meteor.isServer) { … }` wrapper shown below and de-indent its body** — per
+Global Constraints this file is reached only from `tests/server.ts` and is
+already server-only, so the guard is dead code:
 
 ```ts
 import { assert } from 'chai';
@@ -1549,7 +1580,7 @@ if (Meteor.isServer) {
 
 - [ ] **Step 2: Register it**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -2029,39 +2060,45 @@ export { Agent } from './agent';
 
 - [ ] **Step 6: Write the live DDP integration test**
 
-Create `app/packages/agent/tests/integration.test.ts`:
+Two files, because the halves build for different architectures.
+
+Create `app/packages/agent/tests/integration.server.ts` — no tests, just the
+fixture the client half talks to:
+
+```ts
+import { Meteor } from 'meteor/meteor';
+import { Agent } from '../server/agent';
+import { mockProvider } from '../server/providers/mock';
+import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
+
+export const AGENT = 'itest';
+
+new Agent(AGENT, {
+  model: 'mock',
+  instructions: 'You are a test agent.',
+  tools: [],
+  provider: mockProvider(() => ({ text: 'live streamed reply' })),
+});
+
+Meteor.methods({
+  async 'itest.reset'() {
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+  },
+});
+```
+
+Create `app/packages/agent/tests/integration.client.ts`:
 
 ```ts
 import { assert } from 'chai';
 import { Meteor } from 'meteor/meteor';
+import { Agent } from '../client/agent';
 
 const AGENT = 'itest';
 
-if (Meteor.isServer) {
-  // Registered on both sides of the wire; the client half runs in a browser.
-  const { Agent } = require('../server/agent');
-  const { mockProvider } = require('../server/providers/mock');
-  new Agent(AGENT, {
-    model: 'mock',
-    instructions: 'You are a test agent.',
-    tools: [],
-    provider: mockProvider(() => ({ text: 'live streamed reply' })),
-  });
-
-  Meteor.methods({
-    async 'itest.reset'() {
-      const { AgentSessions, AgentMessages, AgentDeltas } =
-        await import('../common/collections');
-      await AgentSessions.removeAsync({});
-      await AgentMessages.removeAsync({});
-      await AgentDeltas.removeAsync({});
-    },
-  });
-}
-
-if (Meteor.isClient) {
-  const { Agent } = require('../client/agent');
-
+{
   describe('live DDP round trip', () => {
     it('delivers a streamed reply into the merged cursor', async function () {
       this.timeout(30000);
@@ -2104,9 +2141,9 @@ if (Meteor.isClient) {
 }
 ```
 
-- [ ] **Step 7: Register it**
+- [ ] **Step 7: Register both halves**
 
-Replace `app/packages/agent/tests/index.ts`:
+Replace `app/packages/agent/tests/server.ts`:
 
 ```ts
 import './smoke.test';
@@ -2116,7 +2153,13 @@ import './capped.test';
 import './tools.test';
 import './lease.test';
 import './loop.test';
-import './integration.test';
+import './integration.server';
+```
+
+Replace `app/packages/agent/tests/client.ts`:
+
+```ts
+import './integration.client';
 ```
 
 - [ ] **Step 8: Run to verify failure, then pass**

@@ -291,6 +291,12 @@ Meteor.startup(async () => {
     });
   });
 
+  await run('PROBE', async () => {
+    const { probeCappedDelete } = await import('./probe.js');
+    const d = await probeCappedDelete();
+    record('PROBE', 'Capped collection delete semantics', d.removeAll?.ok === true, d);
+  });
+
   console.log('\n__SPIKE_REPORT_BEGIN__');
   console.log(JSON.stringify(results, null, 2));
   console.log('__SPIKE_REPORT_END__');
