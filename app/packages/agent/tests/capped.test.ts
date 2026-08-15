@@ -1,6 +1,7 @@
 import { assert } from 'chai';
 import { Meteor } from 'meteor/meteor';
 import { MongoInternals } from 'meteor/mongo';
+import { NAMES } from '../common/names';
 
 describe('capped delta collection', () => {
   it('creates agent_deltas as capped and is idempotent', async function () {
@@ -34,6 +35,33 @@ describe('capped delta collection', () => {
     assert.equal(seqs[seqs.length - 1], 119, 'the newest document must survive');
     assert.isAbove(seqs[0], 0, 'the head must be what was evicted');
   });
+
+  it('rejects when agent_deltas exists but is not capped', async function () {
+    this.timeout(20000);
+    const { ensureCapped } = await import('../server/capped');
+    const db = MongoInternals.defaultRemoteCollectionDriver().mongo.db;
+
+    try {
+      await db.collection(NAMES.deltas).drop();
+    } catch { /* absent */ }
+    await db.createCollection(NAMES.deltas); // normal (uncapped) collection
+
+    try {
+      let threw: any;
+      try {
+        await ensureCapped();
+      } catch (e) {
+        threw = e;
+      }
+      assert.isDefined(threw, 'ensureCapped() must reject for an uncapped existing collection');
+      assert.include(threw.message, NAMES.deltas);
+    } finally {
+      // Recreate it capped so later tests in this run (other files also use
+      // agent_deltas) don't inherit an uncapped collection.
+      await db.collection(NAMES.deltas).drop();
+      await ensureCapped();
+    }
+  });
 });
 
 describe('publications', () => {
@@ -61,5 +89,91 @@ describe('publications', () => {
     const cursor = handler.call({ userId: 'u1' }, 'support');
     const ids = (await cursor.fetchAsync()).map((d: any) => d._id);
     assert.deepEqual(ids, ['mine']);
+  });
+
+  it('denies a non-owner of agent.session: publishes nothing', async () => {
+    const { registerPublications } = await import('../server/publications');
+    registerPublications();
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+
+    const sessionId = 'idor-session';
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'idor-msg-1', sessionId, seq: 0, role: 'user', content: 'secret',
+      createdAt: new Date(),
+    } as any);
+    await AgentDeltas.insertAsync({
+      _id: 'idor-delta-1', sessionId, messageId: 'idor-msg-1', msgSeq: 0, seq: 0,
+      kind: 'text', chunk: 'sec', at: new Date(),
+    } as any);
+
+    const handler = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const asOtherUser = await handler.call({ userId: 'u2' }, 'support', sessionId);
+    assert.deepEqual(asOtherUser, []);
+  });
+
+  it('denies an unauthenticated caller of agent.session: publishes nothing', async () => {
+    const { registerPublications } = await import('../server/publications');
+    registerPublications();
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+
+    const sessionId = 'idor-session-anon';
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'idor-msg-anon-1', sessionId, seq: 0, role: 'user', content: 'secret',
+      createdAt: new Date(),
+    } as any);
+    await AgentDeltas.insertAsync({
+      _id: 'idor-delta-anon-1', sessionId, messageId: 'idor-msg-anon-1', msgSeq: 0, seq: 0,
+      kind: 'text', chunk: 'sec', at: new Date(),
+    } as any);
+
+    const handler = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const asAnonymous = await handler.call({ userId: null }, 'support', sessionId);
+    assert.deepEqual(asAnonymous, []);
+  });
+
+  it('gives the owner of agent.session all three cursors, including the seeded message', async () => {
+    const { registerPublications } = await import('../server/publications');
+    registerPublications();
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+
+    const sessionId = 'owner-session';
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'owner-msg-1', sessionId, seq: 0, role: 'user', content: 'hello',
+      createdAt: new Date(),
+    } as any);
+
+    const handler = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const result = await handler.call({ userId: 'u1' }, 'support', sessionId);
+    assert.equal(result.length, 3);
+
+    const messages = await result[1].fetchAsync();
+    assert.isTrue(messages.some((m: any) => m._id === 'owner-msg-1'));
   });
 });
