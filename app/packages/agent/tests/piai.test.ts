@@ -239,6 +239,45 @@ describe('piAiProvider()', () => {
     assert.equal(model.provider, 'anthropic');
     assert.equal(model.api, 'anthropic-messages');
   });
+
+  it('stamps replayed assistant messages with the live model identity', async () => {
+    // pi-ai's transform-messages compares provider/api/model on replayed
+    // history against the live model (isSameModel); unstamped, every replayed
+    // message looks like it came from a FOREIGN model, and OpenAI Responses
+    // rewrites tool-call ids for foreign messages. User and toolResult
+    // messages carry no such identity and must stay unstamped.
+    const seen: any[] = [];
+    const fakeModels = {
+      getModel: () => ({ id: 'claude-sonnet-5', provider: 'anthropic', api: 'anthropic-messages' }),
+      async *streamSimple(_model: any, context: any) {
+        seen.push(context);
+        yield {
+          type: 'done', reason: 'stop',
+          message: { content: [], usage: { input: 1, output: 1 } },
+        };
+      },
+    };
+    const provider = createPiAiProvider(async () => fakeModels as any);
+    for await (const _c of provider.stream({
+      model: 'anthropic/claude-sonnet-5', system: '',
+      messages: [
+        { role: 'user', content: 'q' },
+        { role: 'assistant', content: 'a', toolCalls: [{ id: 't1', name: 'x', args: {} }] },
+        { role: 'tool', toolCallId: 't1', content: '{}' },
+      ],
+      tools: [],
+    })) { /* drain */ }
+
+    const ctx = seen[0];
+    const assistant = ctx.messages.find((m: any) => m.role === 'assistant');
+    assert.equal(assistant.provider, 'anthropic');
+    assert.equal(assistant.model, 'claude-sonnet-5');
+    assert.equal(assistant.api, 'anthropic-messages');
+    const user = ctx.messages.find((m: any) => m.role === 'user');
+    assert.isUndefined(user.provider, 'only assistant messages are stamped');
+    const tool = ctx.messages.find((m: any) => m.role === 'toolResult');
+    assert.isUndefined(tool.provider, 'only assistant messages are stamped');
+  });
 });
 
 // Live smoke: real network, real key. Skipped in CI and in every local run

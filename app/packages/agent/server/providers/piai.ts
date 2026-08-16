@@ -67,10 +67,12 @@ export interface PiAiModels {
  * so the result is a function of its arguments alone.
  *
  * pi-ai's `AssistantMessage` type additionally declares `api`, `provider`,
- * `model`, `usage` and `stopReason` as required, but those describe a RESPONSE;
- * no API implementation reads them back off replayed history (verified across
- * every `dist/api/*.js` converter), so this emits only what is actually read.
- * Thinking is likewise not replayed: pi-ai needs the provider's opaque
+ * `model`, `usage` and `stopReason`. The identity trio IS read off replayed
+ * history — `transform-messages`' `isSameModel` compares them against the live
+ * model, and OpenAI Responses normalizes tool-call ids for "foreign" messages —
+ * but the values require the resolved model object, which this pure function
+ * does not have. `createPiAiProvider` stamps them at stream time instead.
+ * Thinking is not replayed: pi-ai needs the provider's opaque
  * `thinkingSignature` to send a thinking block back, and the transcript does
  * not store one — Anthropic's converter downgrades an unsigned thinking block
  * to plain text anyway.
@@ -197,6 +199,19 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
           `Check the provider id and model id against pi-ai's catalog.`,
         );
       }
+      // Stamp replayed assistant messages with the live model's identity.
+      // pi-ai's converters compare `provider`/`api`/`model` on history against
+      // the live model (`isSameModel`) and, on OpenAI Responses, rewrite
+      // tool-call ids for messages that look "foreign" — which, unstamped,
+      // is ALL of them. The transcript does not record which model produced
+      // each message, so this assumes the session stayed on one model; a
+      // mid-session model switch makes older turns claim the new identity,
+      // which at worst downgrades pi-ai's same-model replay optimizations.
+      for (const m of context.messages) {
+        if (m.role === 'assistant') {
+          Object.assign(m, { provider, model: modelId, api: (model as any).api });
+        }
+      }
       for await (const ev of models.streamSimple(model, context)) {
         if (ev?.type === 'error') {
           // pi-ai terminates a failed stream with an event, not a rejection.
@@ -233,6 +248,10 @@ export function piAiProvider(): Provider {
         const all: any = await loadPiAi('providers/all');
         return all.builtinModels() as PiAiModels;
       })();
+      // Never cache a rejection: one transient load failure at first use must
+      // not poison every later turn for the process lifetime. The next turn
+      // rebuilds the promise from scratch.
+      builtins.catch(() => { builtins = null; });
     }
     return builtins;
   });

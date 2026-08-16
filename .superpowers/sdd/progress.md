@@ -68,3 +68,19 @@ Filed-for-M2 (from final review): loader writes into node_modules at runtime (re
   untested; heartbeat untested; gate:'ask' accepted-and-ignored (should reject in M1... left as-is);
   lease.serverId published to client; tool_args chunks discarded; findOneAndUpdate reactivity under
   polling observers unverified.
+
+== MILESTONE 2 (branch milestone-2-production, plan 2026-08-15-agent-harness-milestone-2.md) ==
+M2 Task 1: complete (2a8e3ce..5429bbc, review clean, 63+1 passing; implementer report lost to machine sleep, controller verified suite directly)
+  NOTE plan bug: brief's createRequire().resolve(PKG) throws ERR_PACKAGE_PATH_NOT_EXPORTED (pi-ai
+    exports only import/types conditions). Implementer read exports map manually — correct deviation.
+  Minor: no-write test no longer walks npm/node_modules variant; shim safety comment dropped.
+M2 Task 2: complete (5429bbc..HEAD, review Approved-with-issues, 81+1 passing, 1 pending live-smoke)
+  Probe found real API: Models.streamSimple(model, context) via builtinModels() under providers/all
+    subpath; loader gained subpath param (Map-keyed cache). Brief's presumed API was wrong as expected.
+  Fixed inline post-review: model-identity stamping on replayed assistant messages (isSameMode l/
+    foreign-id rewrite), catalog cache no longer caches rejections.
+  Carried to Task 3: use error `status`/pi-ai retryability; stream-throw delta cleanup (already in plan).
+  Carried to Task 5: pi-ai reports cacheRead/cacheWrite + its own computed usage.cost — widen usage
+    plumbing and prefer provider-reported cost over pricing math.
+  M3 ledger: AbortSignal so interrupt cancels the HTTP request; toolcall_delta contentIndex correlator;
+    ProviderMessage isError flag for tool results; converter-level request-body test via injectable fetch.
