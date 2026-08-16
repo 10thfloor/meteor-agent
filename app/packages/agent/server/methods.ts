@@ -71,6 +71,15 @@ export function registerMethods(): void {
         content: text, createdAt: new Date(),
       } as any);
 
+      // A new message is the resume signal after an interrupt: `stopped` is
+      // durable (the loop refuses to run while it stands, and its `finally`
+      // preserves it), so the send is what clears it. Conditional on the
+      // current phase so a send during a live turn does not stomp `streaming`.
+      await AgentSessions.updateAsync(
+        { _id: sessionId, phase: 'stopped' } as any,
+        { $set: { phase: 'idle' } } as any,
+      );
+
       const userId = this.userId ?? null;
       // Return immediately; the client watches the subscription for output.
       Meteor.defer(() => {

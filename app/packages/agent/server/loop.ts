@@ -243,6 +243,18 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
   const msgs = await AgentMessages
     .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
 
+  // Sweep deltas whose messageId was never committed. A hard crash (SIGKILL,
+  // OOM, pod roll) mid-stream leaves deltas under a messageId with no
+  // committed message: `discardTurn` never ran, `mergeView`'s committed-id
+  // suppression never fires, and the retry streams at the SAME msgSeq — so
+  // the client renders the dead half-answer as a second streaming row
+  // forever. We hold the lease, and this turn has written no deltas yet, so
+  // everything not belonging to a committed message is a crash orphan.
+  const committedIds = msgs.map((m) => m._id);
+  await AgentDeltas.removeAsync({
+    sessionId, messageId: { $nin: committedIds },
+  } as any);
+
   // A toolCall counts as answered only by a `tool` row inside ITS OWN turn's
   // window — seq greater than the assistant's own seq, and less than the seq
   // of the NEXT assistant message (unbounded if there isn't one). Matching
@@ -320,9 +332,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
         const session = await AgentSessions.findOneAsync(sessionId);
         if (!session) return;
+        // An interrupt is durable until the next send clears it (`agent.send`
+        // flips stopped→idle). Without this check the unconditional
+        // 'streaming' write below would silently erase a stop that landed
+        // between iterations — or between Meteor.defer and the first one.
+        if (session.phase === 'stopped') return;
 
         const history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+        const historyMaxSeq = history.length ? history[history.length - 1].seq : -1;
 
         const messageId = Random.id();
         // Deltas sort the in-flight row at the seq the message is EXPECTED to
@@ -391,7 +409,25 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           toolCalls, usage, createdAt: new Date(),
         } as any);
 
-        if (!toolCalls || toolCalls.length === 0) return;
+        // The committed message supersedes its deltas; remove them now rather
+        // than letting them accumulate. Without this, subscribing to an old
+        // session ships every token ever streamed in it, and the client
+        // re-merges the full delta history on every flush of the NEXT turn.
+        // Ordering is safe: the client receives the committed message first,
+        // and mergeView already suppresses deltas by committed id.
+        await AgentDeltas.removeAsync({ messageId } as any);
+
+        if (!toolCalls || toolCalls.length === 0) {
+          // A send that landed mid-stream committed a user message this turn
+          // never saw (its history was read before the interjection). Ending
+          // the turn here would strand that message unanswered until the user
+          // sends AGAIN — so loop instead, still bounded by maxIterations.
+          const interjected = await AgentMessages.findOneAsync({
+            sessionId, role: 'user', seq: { $gt: historyMaxSeq },
+          } as any);
+          if (interjected) continue;
+          return;
+        }
 
         const callIds = toolCalls.map((c) => c.id);
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'calling' } });

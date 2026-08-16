@@ -49,33 +49,73 @@ describe('turn loop', () => {
     assert.equal(msgs[1].role, 'assistant');
     assert.equal(msgs[1].content, 'hi there');
 
-    const deltas = await AgentDeltas.find({ sessionId: 's1' }).fetchAsync();
-    assert.isAbove(deltas.length, 0, 'tokens should have streamed');
-    assert.equal(deltas[0].msgSeq, msgs[1].seq, 'deltas must carry the future seq');
-
-    // mergeView walks back only while seq decrements by exactly 1, so a gap —
-    // or a seq assigned out of push order — silently truncates the render.
-    const seqs = deltas.map((d) => d.seq).sort((a, b) => a - b);
-    seqs.forEach((s, i) => assert.equal(s, i, 'delta seqs must be contiguous from 0'));
+    // The committed message supersedes its deltas, which are removed at
+    // commit — old sessions must not accumulate every token ever streamed.
+    const remaining = await AgentDeltas.find({ sessionId: 's1' }).countAsync();
+    assert.equal(remaining, 0, 'commit must clean up the deltas it supersedes');
   });
 
   it('reconstructs the same text from deltas as it commits', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentDeltas } = await import('../common/collections');
     const { mergeView } = await import('../common/merge');
-    const { mockProvider } = await import('../server/providers/mock');
     const { runTurn } = await import('../server/loop');
 
     await seed('s2', 'hello');
-    await runTurn('s2', {
+    // Deltas are removed at commit, so they must be captured DURING the
+    // stream: after the last text chunk, wait past the flush interval, then
+    // snapshot before yielding 'done'.
+    let captured: any[] = [];
+    const capturing: Provider = {
+      async *stream() {
+        for (const ch of 'streamed answer') yield { kind: 'text', chunk: ch };
+        await new Promise((r) => setTimeout(r, 200)); // > flushMs: all flushed
+        captured = await AgentDeltas.find({ sessionId: 's2' }).fetchAsync();
+        yield { kind: 'done', usage: { input: 1, output: 15 } };
+      },
+    };
+    await runTurn('s2', { model: 'mock', system: '', tools: [], provider: capturing });
+
+    const committed = await AgentMessages.findOneAsync({ sessionId: 's2', role: 'assistant' });
+    assert.isAbove(captured.length, 0, 'tokens should have streamed');
+    assert.equal(captured[0].msgSeq, committed!.seq, 'deltas must carry the future seq');
+
+    // mergeView walks back only while seq decrements by exactly 1, so a gap —
+    // or a seq assigned out of push order — silently truncates the render.
+    const seqs = captured.map((d) => d.seq).sort((a, b) => a - b);
+    seqs.forEach((s, i) => assert.equal(s, i, 'delta seqs must be contiguous from 0'));
+
+    const fromDeltas = mergeView([], captured).map((m) => m.content).join('');
+    assert.equal(fromDeltas, committed!.content);
+  });
+
+  it('sweeps crash-orphaned deltas on the next turn (repair-on-entry)', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-crash', 'hello');
+    // A SIGKILL mid-stream leaves deltas under a messageId that was never
+    // committed: discardTurn never ran, and nothing in mergeView suppresses
+    // them — they render as a permanently-streaming ghost row at the SAME
+    // msgSeq the retry will stream at. Repair-on-entry must sweep them.
+    await AgentDeltas.insertAsync({
+      _id: 'ghost-1', sessionId: 's-crash', messageId: 'never-committed',
+      msgSeq: 1, seq: 0, kind: 'text', chunk: 'half an ans', at: new Date(),
+    } as any);
+
+    await runTurn('s-crash', {
       model: 'mock', system: '', tools: [],
-      provider: mockProvider(() => ({ text: 'streamed answer' })),
+      provider: mockProvider(() => ({ text: 'clean retry' })),
     });
 
-    const deltas = await AgentDeltas.find({ sessionId: 's2' }).fetchAsync();
-    const fromDeltas = mergeView([], deltas).map((m) => m.content).join('');
-    const committed = await AgentMessages.findOneAsync({ sessionId: 's2', role: 'assistant' });
-    assert.equal(fromDeltas, committed!.content);
+    const ghosts = await AgentDeltas
+      .find({ sessionId: 's-crash', messageId: 'never-committed' }).countAsync();
+    assert.equal(ghosts, 0, 'crash-orphaned deltas must be swept on entry');
+    const committed = await AgentMessages
+      .findOneAsync({ sessionId: 's-crash', role: 'assistant' });
+    assert.equal(committed!.content, 'clean retry');
   });
 
   it('runs a tool call and feeds the result back', async function () {
@@ -525,10 +565,16 @@ describe('turn loop', () => {
     // The provider injects a REAL agent.send between yields — the exact
     // interleaving that used to hand the user message and the streaming
     // assistant the same seq (both read nextSeq before either $inc'd it).
+    // One-shot: the loop answers the interjection with a SECOND iteration,
+    // which calls the provider again.
+    let injected = false;
     const racing: Provider = {
       async *stream() {
         yield { kind: 'text', chunk: 'reply ' };
-        await sendHandler.call({ userId: 'u1' }, 'support', 's-race', 'second message');
+        if (!injected) {
+          injected = true;
+          await sendHandler.call({ userId: 'u1' }, 'support', 's-race', 'second message');
+        }
         yield { kind: 'text', chunk: 'text' };
         yield { kind: 'done', usage: { input: 1, output: 2 } };
       },
@@ -547,6 +593,61 @@ describe('turn loop', () => {
       msgs.filter((m) => m.role === 'user' && m.content === 'second message'), 1,
       'the mid-stream send must be committed, not lost',
     );
-    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 1);
+    // The interjection must be ANSWERED, not merely committed: the loop
+    // notices a user message it never saw and runs another iteration instead
+    // of ending the turn. Two user messages, two assistant replies, and the
+    // final message is the answer.
+    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 2,
+      'the mid-stream send must be answered by a second iteration');
+    assert.equal(msgs[msgs.length - 1].role, 'assistant');
+  });
+
+  it('rejects send and interrupt against a session the caller does not own', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('authtest', {
+      model: 'mock', instructions: 'x', tools: [],
+      provider: mockProvider(() => ({ text: 'ok' })),
+    });
+    // Registered so the wrong-agent case below fails on session lookup
+    // ('no-session'), not on registry lookup ('no-agent').
+    new Agent('authtest-other', {
+      model: 'mock', instructions: 'x', tools: [],
+      provider: mockProvider(() => ({ text: 'ok' })),
+    });
+
+    await AgentSessions.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: 'auth-s1', agent: 'authtest', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+
+    const rejects = async (fn: () => Promise<unknown>, label: string) => {
+      try { await fn(); } catch (e: any) {
+        assert.equal(e.error, 'no-session', label);
+        return;
+      }
+      assert.fail(`${label}: expected no-session, but the call succeeded`);
+    };
+
+    // Another user and an anonymous caller are both strangers to this session.
+    await rejects(() => send.call({ userId: 'u2' }, 'authtest', 'auth-s1', 'hi'), 'send as other user');
+    await rejects(() => send.call({ userId: null }, 'authtest', 'auth-s1', 'hi'), 'send as anonymous');
+    await rejects(() => interrupt.call({ userId: 'u2' }, 'authtest', 'auth-s1'), 'interrupt as other user');
+    // The wrong AGENT name is a stranger too, even for the owner.
+    await rejects(() => send.call({ userId: 'u1' }, 'authtest-other', 'auth-s1', 'hi'), 'send via wrong agent');
+    // And the owner through the right agent works.
+    const sid = await send.call({ userId: 'u1' }, 'authtest', 'auth-s1', 'hello');
+    assert.equal(sid, 'auth-s1');
   });
 });

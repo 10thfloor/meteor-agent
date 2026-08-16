@@ -49,6 +49,18 @@ import { mockProvider } from 'meteor/10thfloor:agent';
 Support.define({ model: 'mock', instructions: '…', provider: mockProvider(() => ({ text: 'hi' })) });
 ```
 
+## Anonymous sessions
+
+Sessions started without a login carry `userId: null` and behave as
+capability-URLs: anyone who knows the session id has full access, and no one
+can enumerate ids in bulk (`agent.sessions` publishes nothing to anonymous
+callers). Two consequences to design for: an anonymous session **stays**
+anonymous after the user logs in — it is not adopted by the account, and
+remains reachable by anyone holding the id — and inline tools receive
+model-supplied arguments unvalidated (adopted Meteor methods keep their own
+`check()` calls; validate inline tool args yourself until TypeBox validation
+lands in Milestone 2).
+
 ## Milestone 1 scope
 
 `provider` is required — the pi-ai adapter that would default it is Milestone 2.

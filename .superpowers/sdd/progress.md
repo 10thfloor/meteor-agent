@@ -56,3 +56,15 @@ Task 8: complete (commits 63fd2b8..HEAD, 1 Critical + 2 Important fixed INLINE b
     before each tool dispatch; partial discarded, stop preserved.
   Minors fixed: whole-doc view upsert, Tracker.nonreactive writes, non-empty prefix guard, unused export.
   Spec sections 4.3 and 4.4 updated (repair-on-entry, atomic seq, interrupt, anon enumeration).
+Final whole-branch review: MERGE AFTER MUST-FIXES -> all 4 must-fixes done inline (62+1 passing):
+  I1 crash-orphan delta sweep in repair-on-entry (+ crash-variant test)
+  I2 mid-turn send now ANSWERED via extra iteration (+ assertion upgraded)
+  I3 phase ownership: send clears stopped->idle; loop refuses to run while stopped stands
+  I4 deltas removed at commit (2 tests reworked to capture mid-stream)
+  + methods authorization test (send/interrupt vs other-user/anon/wrong-agent)
+  + README: anonymous capability-URL semantics, inline tool args unvalidated
+Filed-for-M2 (from final review): loader writes into node_modules at runtime (read-only container FS);
+  plain-import branch unverified under meteor build; discardTurn order + DeltaWriter drain error-path
+  untested; heartbeat untested; gate:'ask' accepted-and-ignored (should reject in M1... left as-is);
+  lease.serverId published to client; tool_args chunks discarded; findOneAndUpdate reactivity under
+  polling observers unverified.
