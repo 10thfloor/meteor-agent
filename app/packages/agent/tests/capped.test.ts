@@ -73,6 +73,32 @@ describe('publications', () => {
     assert.isFunction(handlers['agent.sessions']);
   });
 
+  it('publishes nothing from agent.sessions to an anonymous caller', async () => {
+    const { registerPublications } = await import('../server/publications');
+    registerPublications();
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    // Two ANONYMOUS sessions exist. userId: null matches every anonymous
+    // caller equally, so publishing them would let any logged-out browser
+    // enumerate other visitors' session ids — each of which unlocks the full
+    // transcript and send/interrupt. Anonymous sessions are capability-URLs;
+    // the capability model only holds if ids never leak in bulk.
+    const base = {
+      agent: 'support', phase: 'idle' as const, model: 'mock', nextSeq: 0,
+      usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    };
+    await AgentSessions.insertAsync({ ...base, _id: 'anon-1', userId: null } as any);
+    await AgentSessions.insertAsync({ ...base, _id: 'anon-2', userId: null } as any);
+
+    const handler = (Meteor.server as any).publish_handlers['agent.sessions'];
+    const result = handler.call({ userId: null }, 'support');
+    // Empty array = publish nothing (and mark ready); a cursor would enumerate.
+    assert.isArray(result);
+    assert.lengthOf(result, 0);
+  });
+
   it('scopes agent.sessions to the calling user', async () => {
     const { AgentSessions } = await import('../common/collections');
     await AgentSessions.removeAsync({});

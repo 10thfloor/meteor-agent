@@ -69,6 +69,9 @@ describe('live DDP round trip', () => {
 
     assert.isNotNull(streamed, 'no in-flight row was ever observed — deltas never crossed DDP');
     assert.equal(streamed.seq, assistant.seq, 'the in-flight row must carry the future msgSeq');
+    // Non-empty first: `startsWith('')` is vacuously true, so an in-flight row
+    // that never carried any text would otherwise pass the prefix check.
+    assert.isAbove(streamed.content.length, 0, 'in-flight row never carried any text');
     assert.isTrue(
       'live streamed reply'.startsWith(streamed.content),
       `in-flight text must be a prefix of the committed text, got "${streamed.content}"`,

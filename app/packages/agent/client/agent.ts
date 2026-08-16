@@ -43,13 +43,22 @@ export class Agent {
       const deltas = AgentDeltas.find({ sessionId }).fetch() as any[];
       const merged = mergeView(committed, deltas);
 
-      const keep = new Set(merged.map((m) => m._id));
-      this.view.find({}).forEach((doc) => {
-        if (!keep.has(doc._id)) this.view.remove(doc._id);
+      // Writes are nonreactive so this computation depends only on what it
+      // READS (messages + deltas), never on the view it maintains — otherwise
+      // every write here would re-trigger the autorun that made it.
+      Tracker.nonreactive(() => {
+        const keep = new Set(merged.map((m) => m._id));
+        this.view.find({}).forEach((doc) => {
+          if (!keep.has(doc._id)) this.view.remove(doc._id);
+        });
+        for (const m of merged) {
+          // Whole-document replace, not `$set`: a field-merge would leave
+          // stale in-flight fields (`truncatedHead`, `deltaCount`, a partial
+          // `thinking`) on the row after the real message commits without
+          // them.
+          this.view.upsert(m._id, m as any);
+        }
       });
-      for (const m of merged) {
-        this.view.upsert(m._id, { $set: m as any });
-      }
     });
   }
 

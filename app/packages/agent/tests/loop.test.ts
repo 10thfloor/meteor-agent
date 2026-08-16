@@ -417,4 +417,136 @@ describe('turn loop', () => {
     assert.equal(doc!.phase, 'idle');
     assert.isUndefined(doc!.lease);
   });
+
+  it('honors an interrupt mid-stream: no commit, no ghost deltas, phase stays stopped', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-int', 'hello');
+    // The interrupt lands between chunks, exactly as agent.interrupt would:
+    // phase flips to 'stopped' while the provider is mid-response.
+    const interrupting: Provider = {
+      async *stream() {
+        yield { kind: 'text', chunk: 'should ' };
+        await new Promise((r) => setTimeout(r, 30));
+        await AgentSessions.updateAsync('s-int', { $set: { phase: 'stopped' } } as any);
+        await new Promise((r) => setTimeout(r, 30));
+        yield { kind: 'text', chunk: 'never ' };
+        await new Promise((r) => setTimeout(r, 30));
+        yield { kind: 'text', chunk: 'commit' };
+        yield { kind: 'done', usage: { input: 1, output: 3 } };
+      },
+    };
+
+    await runTurn('s-int', {
+      model: 'mock', system: '', tools: [],
+      provider: interrupting, interruptCheckMs: 5,
+    });
+
+    const assistants = await AgentMessages
+      .find({ sessionId: 's-int', role: 'assistant' }).countAsync();
+    assert.equal(assistants, 0, 'an interrupted stream must not commit');
+    const deltas = await AgentDeltas.find({ sessionId: 's-int' }).countAsync();
+    assert.equal(deltas, 0, 'an interrupted stream must clean up its deltas');
+    const doc = await AgentSessions.findOneAsync('s-int');
+    assert.equal(doc!.phase, 'stopped', 'the finally must preserve the stop');
+  });
+
+  it('interrupt during tool dispatch discards the turn instead of stranding tool_use', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-int2', 'do two things');
+    let secondToolRan = false;
+    let call = 0;
+
+    await runTurn('s-int2', {
+      model: 'mock', system: '',
+      tools: [
+        {
+          name: 'first', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => {
+            // Interrupt lands while tool 1 runs; tool 2 must never dispatch.
+            await AgentSessions.updateAsync('s-int2', { $set: { phase: 'stopped' } } as any);
+            return 'one';
+          },
+        },
+        {
+          name: 'second', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { secondToolRan = true; return 'two'; },
+        },
+      ],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [
+              { id: 'i1', name: 'first', args: {} },
+              { id: 'i2', name: 'second', args: {} },
+            ] }
+          : { text: 'unreachable' };
+      }),
+    });
+
+    assert.isFalse(secondToolRan, 'the second tool must not run after an interrupt');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-int2' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'no stranded tool_use after interrupt');
+    assert.equal(
+      msgs[msgs.length - 1].role, 'user',
+      'the discarded turn must leave the transcript resumable',
+    );
+  });
+
+  it('a send landing mid-stream never duplicates a seq', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // Methods are already registered by the package's own Meteor.startup —
+    // registering again throws "already defined". Registry entries, by
+    // contrast, live in a Map and overwrite cleanly.
+    // mSend resolves its config from the registry; the deferred runTurn it
+    // schedules hits the in-process running guard and returns immediately.
+    new Agent('support', {
+      model: 'mock', instructions: 'x', tools: [],
+      provider: mockProvider(() => ({ text: 'unused' })),
+    });
+
+    await seed('s-race', 'first message');
+    const sendHandler = (Meteor.server as any).method_handlers[NAMES.mSend];
+
+    // The provider injects a REAL agent.send between yields — the exact
+    // interleaving that used to hand the user message and the streaming
+    // assistant the same seq (both read nextSeq before either $inc'd it).
+    const racing: Provider = {
+      async *stream() {
+        yield { kind: 'text', chunk: 'reply ' };
+        await sendHandler.call({ userId: 'u1' }, 'support', 's-race', 'second message');
+        yield { kind: 'text', chunk: 'text' };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+
+    await runTurn('s-race', {
+      model: 'mock', system: '', tools: [], provider: racing,
+    });
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-race' }, { sort: { seq: 1 } }).fetchAsync();
+    const seqs = msgs.map((m) => m.seq);
+    assert.equal(new Set(seqs).size, seqs.length,
+      `every message must own a unique seq, got [${seqs.join(', ')}]`);
+    assert.lengthOf(
+      msgs.filter((m) => m.role === 'user' && m.content === 'second message'), 1,
+      'the mid-stream send must be committed, not lost',
+    );
+    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 1);
+  });
 });

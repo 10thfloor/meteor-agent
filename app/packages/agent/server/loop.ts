@@ -15,6 +15,32 @@ export interface RunConfig {
   provider: Provider;
   maxIterations?: number;
   flushMs?: number;
+  /** How often the stream loop re-reads the session to honor an interrupt
+   *  (`phase: 'stopped'`). Tests lower it; the default keeps the cost to a few
+   *  indexed reads per response. */
+  interruptCheckMs?: number;
+}
+
+/**
+ * Atomically allocate the next message `seq` under the lease guard: one
+ * `findOneAndUpdate`, so no interleaving with `agent.send`'s own atomic
+ * allocation can hand out the same seq twice. Returns null when the lease is
+ * gone (or the session vanished) — the caller must abandon without writing.
+ *
+ * This exists because read-then-`$inc` is NOT atomic: the loop used to capture
+ * `nextSeq` before the stream and `$inc` at commit, so a user message sent
+ * mid-stream landed on the same seq the assistant then committed at.
+ */
+async function allocateSeq(
+  sessionId: string,
+  inc: Record<string, number> = {},
+): Promise<number | null> {
+  const before = await AgentSessions.rawCollection().findOneAndUpdate(
+    { _id: sessionId, 'lease.serverId': SERVER_ID } as any,
+    { $inc: { nextSeq: 1, ...inc }, $set: { updatedAt: new Date() } },
+    { returnDocument: 'before' },
+  );
+  return before ? (before as any).nextSeq : null;
 }
 
 /**
@@ -273,6 +299,7 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
 export async function runTurn(sessionId: string, config: RunConfig): Promise<void> {
   const maxIterations = config.maxIterations ?? 10;
   const flushMs = config.flushMs ?? 60;
+  const interruptCheckMs = config.interruptCheckMs ?? 250;
   const tools = resolveTools(config.tools);
   const schemas = toolSchemas(tools);
 
@@ -298,6 +325,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
 
         const messageId = Random.id();
+        // Deltas sort the in-flight row at the seq the message is EXPECTED to
+        // commit at. If a user message interjects mid-stream, the committed
+        // assistant lands one seq later (allocated atomically below) and the
+        // committed row simply supersedes the in-flight one at its new, still
+        // correct position — after the interjection, which is what a reader
+        // expects.
         const msgSeq = session.nextSeq;
         if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
 
@@ -306,6 +339,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         let thinking = '';
         let toolCalls: Array<{ id: string; name: string; args: unknown }> | undefined;
         let usage = { input: 0, output: 0 };
+        let interrupted = false;
+        let lastPhaseCheck = Date.now();
 
         try {
           for await (const chunk of config.provider.stream({
@@ -319,27 +354,39 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               toolCalls = chunk.toolCalls;
               usage = chunk.usage ?? usage;
             }
+            // Honor an interrupt WHILE streaming, not after. `agent.interrupt`
+            // sets `phase: 'stopped'`; without this check the stream runs to
+            // completion, commits, and dispatches its tools anyway — a stop
+            // button that only relabels the phase after the fact.
+            if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
+              lastPhaseCheck = Date.now();
+              const s = await AgentSessions.findOneAsync(sessionId);
+              if (!s || s.phase === 'stopped') { interrupted = true; break; }
+            }
           }
         } finally {
           await writer.stop();
         }
 
-        // Commit is conditional on still owning the lease. Losing it means
-        // another server is redoing this turn; abandon without writing — and
-        // take the deltas already streamed under this messageId with us, or
-        // they render as a permanent ghost message.
-        const stillOurs = await guardedUpdate(sessionId, SERVER_ID, {
-          $inc: {
-            nextSeq: 1,
-            'usage.input': usage.input,
-            'usage.output': usage.output,
-          },
-          $set: { updatedAt: new Date() },
+        if (interrupted) {
+          // Nothing committed yet: the partial exists only as deltas. Remove
+          // them or they render as a streaming ghost row forever.
+          await AgentDeltas.removeAsync({ messageId } as any);
+          return;
+        }
+
+        // Commit is conditional on still owning the lease, and the seq is
+        // allocated ATOMICALLY in the same write — see allocateSeq. Losing the
+        // lease means another server is redoing this turn; abandon without
+        // writing, taking the deltas streamed under this messageId with us.
+        const commitSeq = await allocateSeq(sessionId, {
+          'usage.input': usage.input,
+          'usage.output': usage.output,
         });
-        if (!stillOurs) { await discardTurn(sessionId, messageId, msgSeq); return; }
+        if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
         await AgentMessages.insertAsync({
-          _id: messageId, sessionId, seq: msgSeq, role: 'assistant',
+          _id: messageId, sessionId, seq: commitSeq, role: 'assistant',
           content: text, thinking: thinking || undefined,
           toolCalls, usage, createdAt: new Date(),
         } as any);
@@ -358,7 +405,17 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // through to the tools themselves; this narrows the window, it does
           // not close it.
           if (!(await holdsLease(sessionId))) {
-            await discardTurn(sessionId, messageId, msgSeq, callIds);
+            await discardTurn(sessionId, messageId, commitSeq, callIds);
+            return;
+          }
+
+          // An interrupt landing after the assistant committed with toolCalls
+          // must discard the turn exactly like an abandonment: committing SOME
+          // results and stopping would strand the rest as unanswered tool_use,
+          // and repair-on-entry would eat the turn next time anyway.
+          const phaseCheck = await AgentSessions.findOneAsync(sessionId);
+          if (!phaseCheck || phaseCheck.phase === 'stopped') {
+            await discardTurn(sessionId, messageId, commitSeq, callIds);
             return;
           }
 
@@ -367,19 +424,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             ? await runTool(tool, call.args, { userId: session.userId, sessionId })
             : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
 
-          const after = await AgentSessions.findOneAsync(sessionId);
-          if (!after) return;
-          if (!(await guardedUpdate(sessionId, SERVER_ID, {
-            $inc: { nextSeq: 1, 'budgetSpent.toolCalls': 1 },
-          }))) {
+          // Same atomic allocation as the commit: `agent.send` can interject
+          // between tool results, and read-then-$inc would hand both writers
+          // the same seq.
+          const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
+          if (toolSeq === null) {
             // The assistant message is already committed but this result never
             // will be: leaving it would strand a tool_use with no tool_result.
-            await discardTurn(sessionId, messageId, msgSeq, callIds);
+            await discardTurn(sessionId, messageId, commitSeq, callIds);
             return;
           }
 
           await AgentMessages.insertAsync({
-            _id: Random.id(), sessionId, seq: after.nextSeq, role: 'tool',
+            _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
             toolCallId: call.id,
             content: JSON.stringify(result.ok ? result.value : result.error),
             error: result.ok ? undefined : result.error,

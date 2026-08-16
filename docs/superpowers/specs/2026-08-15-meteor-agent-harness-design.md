@@ -162,11 +162,31 @@ document, picked up through that same watch. A user who reconnects onto a
 different app server, or a deploy that rolls a pod mid-turn, resolves through
 Mongo and nothing else. No Redis, no sticky sessions.
 
-**Recovery is not a replay mechanism.** Because assistant messages commit only
-at boundaries, an interrupted turn always leaves the transcript ending in `user`
-or `tool` — the two states a turn can legally start from. A half-streamed
-response existed only in the capped collection. Recovery is therefore "run the
-loop again," which is the same code path as a normal turn.
+**Recovery is not a replay mechanism — with one repair.** Because assistant
+messages commit only at boundaries, an interrupted turn *usually* leaves the
+transcript ending in `user` or `tool` — the two states a turn can legally start
+from. A half-streamed response existed only in the capped collection.
+
+The exception, found in review (Task 7): a turn abandoned between committing
+`assistant(toolCalls)` and writing all its `role: 'tool'` results leaves a
+`tool_use` with no matching `tool_result`, which Anthropic and OpenAI both
+reject with a 400 — on every retry, forever. Recovery therefore performs a
+**repair on entry**: after claiming the lease, scan the whole transcript (never
+just the tail — with parallel tool calls, one answered result hides the
+stranded assistant from a tail check) for any assistant whose `toolCalls[].id`
+has no `tool` row inside its own turn window, and discard that turn — tool rows
+first, deltas next, the assistant row last, so a half-finished cleanup fails
+toward the state repair can still detect. With that, recovery is "run the loop
+again," the same code path as a normal turn. Abandoning servers also clean up
+after themselves (`discardTurn`), but the repair is what makes recovery correct
+when they could not.
+
+Two further loop-level rules that fell out of review: every message `seq` is
+allocated by an atomic `findOneAndUpdate` `$inc` at write time — never
+read-then-increment, which hands a mid-stream `agent.send` and the committing
+assistant the same seq — and the stream loop re-reads `phase` between chunks so
+`interrupt()` actually stops the turn (uncommitted partial discarded, tools not
+dispatched) instead of relabelling it after the fact.
 
 **Approval gates park by exiting, not by blocking.** An `ask` gate writes
 `pending`, releases the lease, sets `phase: 'awaiting'`, and ends the loop.
@@ -185,7 +205,13 @@ Meteor.publish('agent.sessions', function (agent: string) { … });
 
 `agent.session` returns three cursors — the session document, its messages, and
 its deltas. `agent.sessions` returns session documents only, for a conversation
-list.
+list — and returns **nothing to an anonymous caller**. Sessions created without
+a login carry `userId: null`, which matches every anonymous caller equally, so
+publishing the null-owner list would let any logged-out browser enumerate other
+visitors' session ids — each of which unlocks the full transcript and
+send/interrupt. Anonymous sessions are capability-URLs: a client that knows a
+specific id keeps full access through `agent.session`, but ids must never be
+enumerable in bulk. (Found in review, Task 8.)
 
 **Authorization must happen before the cursors are returned, not inside them.**
 Meteor publishes every cursor in a returned array independently, so scoping only

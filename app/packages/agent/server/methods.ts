@@ -49,15 +49,26 @@ export function registerMethods(): void {
       check(text, String);
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
-      const session = await requireSession(agent, sessionId, this.userId ?? null);
+      await requireSession(agent, sessionId, this.userId ?? null);
+
+      // Seq allocation is ATOMIC (single findOneAndUpdate), not read-then-
+      // insert. A read-then-insert here races the in-flight turn loop: both
+      // read the same nextSeq and the user message lands on the same seq the
+      // assistant is about to commit at, making transcript order
+      // non-deterministic. The loop allocates its seqs the same way.
+      const before = await AgentSessions.rawCollection().findOneAndUpdate(
+        { _id: sessionId },
+        {
+          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 },
+          $set: { updatedAt: new Date() },
+        },
+        { returnDocument: 'before' },
+      );
+      if (!before) throw new Meteor.Error('no-session', 'Session not found');
 
       await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: session.nextSeq, role: 'user',
+        _id: Random.id(), sessionId, seq: (before as any).nextSeq, role: 'user',
         content: text, createdAt: new Date(),
-      } as any);
-      await AgentSessions.updateAsync(sessionId, {
-        $inc: { nextSeq: 1, 'budgetSpent.turns': 1 },
-        $set: { updatedAt: new Date() },
       } as any);
 
       const userId = this.userId ?? null;

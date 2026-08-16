@@ -33,8 +33,16 @@ export function registerPublications(): void {
 
   Meteor.publish(NAMES.pubSessions, function (agent: string) {
     check(agent, String);
+    // Anonymous sessions are deliberately NON-ENUMERABLE. `userId: null`
+    // matches every anonymous caller equally, so publishing the null-owner
+    // list would hand any anonymous browser up to 100 other visitors' session
+    // ids — and each id unlocks the full transcript (agent.session) plus
+    // send/interrupt, since requireSession also matches null for everyone.
+    // Anonymous use is a capability-URL model: it only holds if ids never
+    // leak in bulk. A logged-out client that KNOWS an id keeps working.
+    if (this.userId == null) return [];
     return AgentSessions.find(
-      { agent, userId: this.userId ?? null },
+      { agent, userId: this.userId },
       { sort: { updatedAt: -1 }, limit: 100 },
     );
   });

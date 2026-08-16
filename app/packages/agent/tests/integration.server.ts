@@ -10,7 +10,7 @@ import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections
  * registers an agent backed by the scripted provider (no API key, no network)
  * and a reset method so the client half starts from a clean transcript.
  */
-export const AGENT = 'itest';
+const AGENT = 'itest';
 
 /**
  * Put a wall-clock gap between chunks.
