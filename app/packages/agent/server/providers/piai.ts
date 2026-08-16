@@ -219,10 +219,31 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
           // turn aborts, nothing is committed, and `agent.send` logs it. The
           // message is pi-ai's own formatted error string, never a raw payload,
           // and this adapter writes nothing to Mongo.
-          throw new Error(
+          const err: any = new Error(
             `[10thfloor:agent] pi-ai stream failed (${ev.reason}): ` +
             `${ev.error?.errorMessage ?? 'unknown error'}`,
           );
+          // §10 retry hint, read by loop.ts's classifyProviderError
+          // (`e.retryable === true/false` short-circuits its status-based
+          // classification). An abort is a deliberate stop, never a transient
+          // failure worth retrying.
+          if (ev.reason === 'aborted') {
+            err.retryable = false;
+          } else {
+            // Reuse pi-ai's own transient-vs-terminal classifier (rate
+            // limits/timeouts/overloaded upstreams vs auth/quota errors)
+            // rather than re-implementing its pattern list. Defensive: a
+            // future pi-ai release that renames or drops this export must
+            // degrade to no hint — classifyProviderError's status-based
+            // fallback still applies — not a crash.
+            try {
+              const piai: any = await loadPiAi();
+              if (typeof piai.isRetryableAssistantError === 'function') {
+                err.retryable = piai.isRetryableAssistantError(ev.error);
+              }
+            } catch { /* no-hint fallback */ }
+          }
+          throw err;
         }
         for (const chunk of translateEvent(ev)) yield chunk;
       }

@@ -650,4 +650,58 @@ describe('turn loop', () => {
     const sid = await send.call({ userId: 'u1' }, 'authtest', 'auth-s1', 'hello');
     assert.equal(sid, 'auth-s1');
   });
+
+  it('retries a retryable provider failure and then succeeds', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-retry', 'hello');
+    let attempts = 0;
+    const flaky: Provider = {
+      async *stream() {
+        attempts += 1;
+        if (attempts < 3) { const e: any = new Error('rate limited'); e.status = 429; throw e; }
+        yield { kind: 'text', chunk: 'recovered' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    await runTurn('s-retry', { model: 'mock', system: '', tools: [], provider: flaky, retry: { attempts: 3, baseMs: 10 } });
+    assert.equal(attempts, 3);
+    const committed = await AgentMessages.findOneAsync({ sessionId: 's-retry', role: 'assistant' });
+    assert.equal(committed!.content, 'recovered');
+    assert.equal((await AgentSessions.findOneAsync('s-retry'))!.phase, 'idle');
+  });
+
+  it('does not retry a fatal provider error and surfaces a sanitized note', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-fatal', 'hello');
+    let attempts = 0;
+    const broken: Provider = {
+      // eslint-disable-next-line require-yield
+      async *stream() { attempts += 1; const e: any = new Error('invalid x-api-key sk-SECRET'); e.status = 401; throw e; },
+    };
+    await runTurn('s-fatal', { model: 'mock', system: '', tools: [], provider: broken, retry: { attempts: 3, baseMs: 10 } });
+    assert.equal(attempts, 1, 'a 401 must not be retried');
+    const note = await AgentMessages.findOneAsync({ sessionId: 's-fatal', role: 'note', kind: 'error' } as any);
+    assert.isDefined(note);
+    assert.notInclude(JSON.stringify(note), 'SECRET', 'raw provider messages must never reach the transcript');
+    assert.equal((await AgentSessions.findOneAsync('s-fatal'))!.phase, 'error');
+  });
+
+  it('exhausted retries also produce an error note, and no partial commit', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-exhaust', 'hello');
+    const alwaysDown: Provider = {
+      async *stream() { yield { kind: 'text', chunk: 'par' }; const e: any = new Error('boom'); e.status = 503; throw e; },
+    };
+    await runTurn('s-exhaust', { model: 'mock', system: '', tools: [], provider: alwaysDown, retry: { attempts: 2, baseMs: 10 } });
+    assert.equal(await AgentMessages.find({ sessionId: 's-exhaust', role: 'assistant' }).countAsync(), 0);
+    assert.equal(await AgentDeltas.find({ sessionId: 's-exhaust' }).countAsync(), 0, 'partial deltas cleaned per attempt');
+    assert.isDefined(await AgentMessages.findOneAsync({ sessionId: 's-exhaust', role: 'note', kind: 'error' } as any));
+    assert.equal((await AgentSessions.findOneAsync('s-exhaust'))!.phase, 'error');
+  });
 });

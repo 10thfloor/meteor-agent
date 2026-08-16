@@ -19,6 +19,31 @@ export interface RunConfig {
    *  (`phase: 'stopped'`). Tests lower it; the default keeps the cost to a few
    *  indexed reads per response. */
   interruptCheckMs?: number;
+  /** §10: bounded retry with exponential backoff for a provider stream that
+   *  throws mid-iteration. `attempts` counts the initial try (default 3);
+   *  `baseMs` is the base of `baseMs * 2^attemptIndex` (default 500). */
+  retry?: { attempts?: number; baseMs?: number };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => { setTimeout(resolve, ms); });
+}
+
+/** §10: 429, 5xx and network-ish errors retry; 4xx auth/request errors do
+ *  not. Anything unclassifiable is treated as retryable — a transient blip
+ *  should not permanently kill a session, and retries are bounded anyway.
+ *
+ *  An explicit `e.retryable` hint (set by an adapter that has better
+ *  information than an HTTP status — pi-ai's own transient-error classifier,
+ *  for one) short-circuits the status-based classification in either
+ *  direction. */
+export function classifyProviderError(e: any): 'retryable' | 'fatal' {
+  if (e?.retryable === true) return 'retryable';
+  if (e?.retryable === false) return 'fatal';
+  const status = e?.status ?? e?.statusCode ?? e?.response?.status;
+  if (status === 429 || (typeof status === 'number' && status >= 500)) return 'retryable';
+  if (typeof status === 'number' && status >= 400 && status < 500) return 'fatal';
+  return 'retryable';
 }
 
 /**
@@ -342,48 +367,111 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
         const historyMaxSeq = history.length ? history[history.length - 1].seq : -1;
 
-        const messageId = Random.id();
+        let messageId = Random.id();
         // Deltas sort the in-flight row at the seq the message is EXPECTED to
         // commit at. If a user message interjects mid-stream, the committed
         // assistant lands one seq later (allocated atomically below) and the
         // committed row simply supersedes the in-flight one at its new, still
         // correct position — after the interjection, which is what a reader
-        // expects.
+        // expects. Retries reuse this SAME msgSeq (only messageId changes per
+        // attempt): a retry is still logically the one reply this iteration
+        // owes the transcript.
         const msgSeq = session.nextSeq;
         if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
 
-        const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
+        const retryAttempts = config.retry?.attempts ?? 3;
+        const retryBaseMs = config.retry?.baseMs ?? 500;
+
         let text = '';
         let thinking = '';
         let toolCalls: Array<{ id: string; name: string; args: unknown }> | undefined;
         let usage = { input: 0, output: 0 };
         let interrupted = false;
-        let lastPhaseCheck = Date.now();
 
-        try {
-          for await (const chunk of config.provider.stream({
-            model: config.model, system: config.system,
-            messages: toProviderMessages(history), tools: schemas,
-          })) {
-            if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
-            else if (chunk.kind === 'thinking') {
-              thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
-            } else if (chunk.kind === 'done') {
-              toolCalls = chunk.toolCalls;
-              usage = chunk.usage ?? usage;
+        // §10: pi-ai's adapter (and any other Provider) turns a terminal
+        // provider failure into a THROW mid-iteration, not a rejected
+        // promise. One pass of this loop is one attempt: a fresh DeltaWriter
+        // over a fresh messageId, because a failed attempt's deltas are
+        // removed below and a retry must never stream under an id a
+        // straggler flush from the dead attempt could still land under.
+        for (let attemptIndex = 0; ; attemptIndex += 1) {
+          const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
+          text = '';
+          thinking = '';
+          toolCalls = undefined;
+          usage = { input: 0, output: 0 };
+          interrupted = false;
+          let lastPhaseCheck = Date.now();
+          let providerError: unknown = null;
+
+          try {
+            try {
+              for await (const chunk of config.provider.stream({
+                model: config.model, system: config.system,
+                messages: toProviderMessages(history), tools: schemas,
+              })) {
+                if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
+                else if (chunk.kind === 'thinking') {
+                  thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
+                } else if (chunk.kind === 'done') {
+                  toolCalls = chunk.toolCalls;
+                  usage = chunk.usage ?? usage;
+                }
+                // Honor an interrupt WHILE streaming, not after. `agent.interrupt`
+                // sets `phase: 'stopped'`; without this check the stream runs to
+                // completion, commits, and dispatches its tools anyway — a stop
+                // button that only relabels the phase after the fact.
+                if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
+                  lastPhaseCheck = Date.now();
+                  const s = await AgentSessions.findOneAsync(sessionId);
+                  if (!s || s.phase === 'stopped') { interrupted = true; break; }
+                }
+              }
+            } finally {
+              await writer.stop();
             }
-            // Honor an interrupt WHILE streaming, not after. `agent.interrupt`
-            // sets `phase: 'stopped'`; without this check the stream runs to
-            // completion, commits, and dispatches its tools anyway — a stop
-            // button that only relabels the phase after the fact.
-            if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
-              lastPhaseCheck = Date.now();
-              const s = await AgentSessions.findOneAsync(sessionId);
-              if (!s || s.phase === 'stopped') { interrupted = true; break; }
-            }
+          } catch (e) {
+            providerError = e;
           }
-        } finally {
-          await writer.stop();
+
+          if (providerError) {
+            // Per-attempt cleanup: this attempt's partial never commits, so
+            // its deltas must not linger as a streaming ghost row either.
+            await AgentDeltas.removeAsync({ messageId } as any);
+
+            const classification = classifyProviderError(providerError);
+            const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
+            if (classification === 'retryable' && hasMoreAttempts) {
+              if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;
+              await sleep(retryBaseMs * 2 ** attemptIndex);
+              // The interrupt check above only fires WHILE a stream is
+              // running; re-check here so an interrupt landing during the
+              // backoff sleep itself still stops the turn, instead of being
+              // silently overwritten by the next attempt's 'streaming' phase.
+              const afterSleep = await AgentSessions.findOneAsync(sessionId);
+              if (!afterSleep || afterSleep.phase === 'stopped') return;
+              messageId = Random.id(); // fresh id: the old deltas are gone
+              continue;
+            }
+
+            // Fatal, or every attempt exhausted: commit a sanitized note
+            // through the normal atomic path and end the turn in a
+            // terminal, visible phase. NEVER the raw provider message — it
+            // can carry request headers, key fragments, or other upstream
+            // detail that must not reach the transcript.
+            const noteSeq = await allocateSeq(sessionId);
+            if (noteSeq !== null) {
+              await AgentMessages.insertAsync({
+                _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'error',
+                error: { error: 'provider-failed', reason: 'The model request failed.' },
+                createdAt: new Date(),
+              } as any);
+              await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'error' } });
+            }
+            return;
+          }
+
+          break; // this attempt succeeded; fall through to commit below
         }
 
         if (interrupted) {
@@ -482,10 +570,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       }
     } finally {
       clearInterval(beat);
-      // `stopped` is a deliberate terminal state set by an interrupt; idling it
-      // back would erase the user's decision.
+      // `stopped` is a deliberate terminal state set by an interrupt, and
+      // `error` is the terminal state this turn just set on a fatal or
+      // exhausted provider failure — idling either back would erase the
+      // decision (the user's stop, or the failure the transcript note just
+      // recorded) that the phase exists to preserve.
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && current.phase !== 'stopped') {
+      if (current && current.phase !== 'stopped' && current.phase !== 'error') {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
       }
       await releaseLease(sessionId);

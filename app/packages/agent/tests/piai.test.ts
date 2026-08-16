@@ -221,6 +221,22 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
     assert.instanceOf(threw, Error);
     assert.include(String(threw.message), 'boom');
   });
+
+  it('marks a transient provider error event retryable via isRetryableAssistantError', async function () {
+    this.timeout(20000);
+    // '503 Service Unavailable' matches pi-ai's own RETRYABLE_PROVIDER_ERROR_PATTERN
+    // (§10's own error taxonomy, reused rather than re-implemented here).
+    const models = await fauxModels((piai) => [
+      piai.fauxAssistantMessage('', { stopReason: 'error', errorMessage: '503 Service Unavailable' }),
+    ]);
+    const provider = createPiAiProvider(async () => models as any);
+    let threw: any = null;
+    try {
+      for await (const _c of provider.stream(streamReq)) { /* drain */ }
+    } catch (e) { threw = e; }
+    assert.instanceOf(threw, Error);
+    assert.strictEqual(threw.retryable, true, 'a 503 should carry an explicit retryable hint');
+  });
 });
 
 describe('piAiProvider()', () => {

@@ -72,12 +72,14 @@ export function registerMethods(): void {
         content: text, createdAt: new Date(),
       } as any);
 
-      // A new message is the resume signal after an interrupt: `stopped` is
-      // durable (the loop refuses to run while it stands, and its `finally`
-      // preserves it), so the send is what clears it. Conditional on the
-      // current phase so a send during a live turn does not stomp `streaming`.
+      // A new message is the resume signal after an interrupt OR a provider
+      // failure: both `stopped` and `error` are durable (the loop refuses to
+      // run while either stands, and its `finally` preserves both), so the
+      // send is what clears them — matching §10's "the model usually
+      // recovers" philosophy for `error`. Conditional on the current phase so
+      // a send during a live turn does not stomp `streaming`.
       await AgentSessions.updateAsync(
-        { _id: sessionId, phase: 'stopped' } as any,
+        { _id: sessionId, phase: { $in: ['stopped', 'error'] } } as any,
         { $set: { phase: 'idle' } } as any,
       );
 
