@@ -1,7 +1,5 @@
-import path from 'path';
-import fs from 'fs';
 import { assert } from 'chai';
-import { loadPiAi, shimLoad } from '../server/providers/loader';
+import { loadPiAi } from '../server/providers/loader';
 import { mockProvider } from '../server/providers/mock';
 import type { ProviderChunk } from '../server/providers/types';
 
@@ -29,44 +27,50 @@ describe('pi-ai loader', () => {
   });
 });
 
-describe('pi-ai loader shim fallback', () => {
-  it('shimLoad resolves pi-ai through the createRequire shim, exposing a usable Type', async function () {
+describe('pi-ai loader v2 (no node_modules writes)', () => {
+  it('resolves the pi-ai entry to an absolute file path', async function () {
     this.timeout(20000);
-    const piai: any = await shimLoad('@earendil-works/pi-ai');
-    const schema = piai.Type.Object({ x: piai.Type.String() });
+    const { resolvePiAiEntry } = await import('../server/providers/loader');
+    const entry = resolvePiAiEntry();
+    assert.isTrue(entry.startsWith('/'), `expected absolute path, got ${entry}`);
+    assert.include(entry, '@earendil-works');
+  });
+
+  it('shimLoad imports a resolved file URL and yields a usable namespace', async function () {
+    this.timeout(20000);
+    const { resolvePiAiEntry, shimLoad } = await import('../server/providers/loader');
+    const { pathToFileURL } = await import('url');
+    const ns: any = await shimLoad(pathToFileURL(resolvePiAiEntry()).href);
+    const schema = ns.Type.Object({ x: ns.Type.String() });
     assert.equal(schema.type, 'object');
     assert.deepEqual(schema.required, ['x']);
   });
 
-  it('writes the shim file to disk under .agent-loader in the node_modules base', async function () {
+  it('never writes inside node_modules', async function () {
     this.timeout(20000);
-    await shimLoad('@earendil-works/pi-ai');
+    const fs = await import('fs');
+    const path = await import('path');
+    const { loadPiAi, resolvePiAiEntry, shimLoad } = await import('../server/providers/loader');
+    const { pathToFileURL } = await import('url');
+    // Exercise every load path, then assert the M1 shim dir does not exist.
+    await loadPiAi();
+    await shimLoad(pathToFileURL(resolvePiAiEntry()).href);
     let dir = process.cwd();
-    let shimPath: string | null = null;
     for (let i = 0; i < 8; i += 1) {
-      for (const c of ['node_modules', path.join('npm', 'node_modules')]) {
-        const candidate = path.join(dir, c, '.agent-loader', 'loader.mjs');
-        if (fs.existsSync(candidate)) {
-          shimPath = candidate;
-          break;
-        }
-      }
-      if (shimPath) break;
+      const candidate = path.join(dir, 'node_modules', '.agent-loader');
+      assert.isFalse(fs.existsSync(candidate), `stale shim dir at ${candidate}`);
       const parent = path.dirname(dir);
       if (parent === dir) break;
       dir = parent;
     }
-    assert.isNotNull(shimPath, 'expected loader.mjs to exist under a .agent-loader directory');
   });
 
-  it('rejects for a package that does not exist', async function () {
+  it('rejects on an unresolvable entry', async function () {
     this.timeout(20000);
+    const { shimLoad } = await import('../server/providers/loader');
     let threw = false;
-    try {
-      await shimLoad('@nonexistent-scope/definitely-not-real');
-    } catch {
-      threw = true;
-    }
+    try { await shimLoad('file:///nonexistent/definitely-not-real.mjs'); }
+    catch { threw = true; }
     assert.isTrue(threw);
   });
 });

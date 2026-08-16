@@ -1,5 +1,8 @@
 import path from 'path';
 import fs from 'fs';
+import { createRequire } from 'module';
+import { pathToFileURL } from 'url';
+import os from 'os';
 
 const PKG = '@earendil-works/pi-ai';
 
@@ -29,9 +32,21 @@ function findNodeModulesBase(): string | null {
   return null;
 }
 
-// Exported as a test seam so the fallback path (directory walk, shim-file
-// creation, createRequire) can be exercised directly in tests. Not public API.
-export async function shimLoad(specifier: string): Promise<unknown> {
+/**
+ * Resolve pi-ai's entry file the way Node's own ESM resolver would, which
+ * understands `exports` maps (Meteor's does not — the whole reason this file
+ * exists). We do NOT use `createRequire(...).resolve()` here: that walks the
+ * CJS resolution algorithm, which only honors the `require`/`node`/`default`
+ * conditions — never `import`. pi-ai's package.json declares `type: module`
+ * and an `exports["."]` with only `types`/`import` conditions (no `require`,
+ * no `default`), so `require.resolve` throws ERR_PACKAGE_PATH_NOT_EXPORTED
+ * even though a perfectly good ESM entry exists (verified empirically against
+ * the installed package). Instead we read the package's own package.json and
+ * pick its entry the same way the ESM resolver would: `exports["."].import`
+ * (or `.default`), falling back to `main` for CJS-style packages.
+ * Exported as a test seam.
+ */
+export function resolvePiAiEntry(): string {
   const base = findNodeModulesBase();
   if (!base) {
     throw new Error(
@@ -39,33 +54,57 @@ export async function shimLoad(specifier: string): Promise<unknown> {
       `meteor npm install --save ${PKG}`,
     );
   }
-  const shimDir = path.join(base, '.agent-loader');
-  const shimPath = path.join(shimDir, 'loader.mjs');
-  if (!fs.existsSync(shimPath)) {
-    fs.mkdirSync(shimDir, { recursive: true });
-    // Fixed literal. The specifier is always a package-controlled constant and
-    // must never come from user input or model output.
-    fs.writeFileSync(shimPath, 'export const load = (s) => import(s);\n');
-  }
-  // eslint-disable-next-line @typescript-eslint/no-var-requires
-  const { createRequire } = require('module');
-  const shim = createRequire(shimPath)(shimPath);
-  return shim.load(specifier);
+  const pkgDir = path.join(base, ...PKG.split('/'));
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+  const rootExport = pkgJson.exports?.['.'] ?? pkgJson.exports;
+  const rel =
+    (typeof rootExport === 'string' ? rootExport : rootExport?.import ?? rootExport?.default ?? rootExport?.require) ??
+    pkgJson.main ??
+    'index.js';
+  return path.join(pkgDir, rel);
 }
 
-/** Hedged: plain import first, so the shim disappears once Meteor ships
- *  `exports` support (PR #13520). Falls back to the shim on any failure.
- *
- *  Returns the module namespace object as-is (not copied), so live bindings
- *  stay live. Callers must not mutate the returned object. */
+/**
+ * Import an absolute file:// URL through a genuine ESM module. The shim lives
+ * in the OS temp dir — always writable, unlike node_modules on a read-only
+ * container filesystem (the M1 shim's fatal flaw). Because it receives a
+ * RESOLVED URL rather than a bare specifier, the shim's own location has no
+ * bearing on resolution, which is what makes the temp dir usable at all.
+ */
+export async function shimLoad(urlHref: string): Promise<unknown> {
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-loader-'));
+  const shimPath = path.join(shimDir, 'loader.mjs');
+  fs.writeFileSync(shimPath, 'export const load = (u) => import(u);\n');
+  try {
+    const shim = createRequire(shimPath)(shimPath);
+    return await shim.load(urlHref);
+  } finally {
+    try { fs.rmSync(shimDir, { recursive: true, force: true }); } catch { /* temp */ }
+  }
+}
+
+/**
+ * Hedged, in order of preference:
+ *  1. plain dynamic import of the bare specifier — becomes the only path the
+ *     day Meteor ships `exports` support (PR #13520);
+ *  2. dynamic import of the resolved file:// URL — works today in dev, no
+ *     writes anywhere;
+ *  3. temp-dir shim around the same URL — for a runtime whose import() is
+ *     intercepted.
+ * Returns the module namespace AS-IS (live bindings preserved); callers must
+ * not mutate it.
+ */
 export async function loadPiAi(): Promise<unknown> {
   if (cached) return cached;
-  let ns: unknown;
   try {
-    ns = await import(PKG);
+    cached = await import(PKG);
   } catch {
-    ns = await shimLoad(PKG);
+    const href = pathToFileURL(resolvePiAiEntry()).href;
+    try {
+      cached = await import(href);
+    } catch {
+      cached = await shimLoad(href);
+    }
   }
-  cached = ns;
   return cached;
 }
