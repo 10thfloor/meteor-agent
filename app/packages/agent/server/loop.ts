@@ -337,6 +337,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   const maxIterations = config.maxIterations ?? 10;
   const flushMs = config.flushMs ?? 60;
   const interruptCheckMs = config.interruptCheckMs ?? 250;
+  // `attempts` counts the INITIAL try, so 1 means "no retry" and 0 means
+  // nothing coherent at all: `attemptIndex + 1 < 0` is false on the first
+  // pass, so 0 silently behaved as 1 — a config that reads like "never call
+  // the provider" quietly calling it once. Floor it instead of trusting it.
+  const retryAttempts = Math.max(1, config.retry?.attempts ?? 3);
+  const retryBaseMs = config.retry?.baseMs ?? 500;
   const tools = resolveTools(config.tools);
   const schemas = toolSchemas(tools);
 
@@ -377,10 +383,6 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // attempt): a retry is still logically the one reply this iteration
         // owes the transcript.
         const msgSeq = session.nextSeq;
-        if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
-
-        const retryAttempts = config.retry?.attempts ?? 3;
-        const retryBaseMs = config.retry?.baseMs ?? 500;
 
         let text = '';
         let thinking = '';
@@ -395,6 +397,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // removed below and a retry must never stream under an id a
         // straggler flush from the dead attempt could still land under.
         for (let attemptIndex = 0; ; attemptIndex += 1) {
+          // Per ATTEMPT, not once per iteration: a retry that left the phase
+          // on 'retrying' for the whole of its own stream tells the client a
+          // retry is still pending while tokens are already arriving.
+          // 'retrying' must be visible only BETWEEN attempts.
+          if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
+
           const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
           text = '';
           thinking = '';
@@ -428,7 +436,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 }
               }
             } finally {
-              await writer.stop();
+              // A tail-flush rejection is NOT a provider failure. `stop()`
+              // propagates an `insertAsync` rejection, so a Mongo blip after a
+              // fully successful stream would land in `providerError`,
+              // classify retryable (no status), and re-stream the entire
+              // response — a second provider charge for a database hiccup.
+              // The commit is built from the in-memory `text`, not from
+              // deltas, so a lost tail flush costs nothing durable.
+              await writer.stop().catch(() => {
+                /* deltas are ephemeral; the commit supersedes them */
+              });
             }
           } catch (e) {
             providerError = e;
@@ -438,6 +455,20 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // Per-attempt cleanup: this attempt's partial never commits, so
             // its deltas must not linger as a streaming ghost row either.
             await AgentDeltas.removeAsync({ messageId } as any);
+
+            // A stop outranks BOTH the retry and the error note. Re-read the
+            // session once here because this branch is otherwise blind to an
+            // interrupt: an attempt that throws before yielding a single chunk
+            // (the ordinary 429/503 shape) never runs the in-stream check at
+            // all, and every write below is guarded on the LEASE only — so a
+            // `stopped` written by `agent.interrupt` while the attempt was
+            // failing would be overwritten with 'retrying', the after-sleep
+            // re-check would read back the value this branch itself wrote, and
+            // a later attempt would commit a message the user cancelled. The
+            // same hole let the fatal path stamp an error note over a stop.
+            // The `finally` preserves `stopped`, so returning is enough.
+            const live = await AgentSessions.findOneAsync(sessionId);
+            if (interrupted || !live || live.phase === 'stopped') return;
 
             const classification = classifyProviderError(providerError);
             const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
@@ -467,6 +498,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 createdAt: new Date(),
               } as any);
               await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'error' } });
+            } else {
+              // The only silent exit in this structure: the lease went to
+              // another server between the failure and the note, so neither
+              // the note nor the terminal phase can be written and the
+              // session is left showing whatever phase it last had.
+              console.warn(
+                `[10thfloor:agent] lost lease before error note; session ${sessionId} `
+                + 'may display a stale phase',
+              );
             }
             return;
           }

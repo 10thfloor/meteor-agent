@@ -704,4 +704,149 @@ describe('turn loop', () => {
     assert.isDefined(await AgentMessages.findOneAsync({ sessionId: 's-exhaust', role: 'note', kind: 'error' } as any));
     assert.equal((await AgentSessions.findOneAsync('s-exhaust'))!.phase, 'error');
   });
+
+  it('a stop landing during a failed attempt outranks the retry', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions, AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-stop-retry', 'hello');
+    let attempts = 0;
+    // The shape a 429/503 actually takes: the stream throws BEFORE yielding a
+    // single chunk, so the in-stream interrupt check never runs even once.
+    // The user's stop therefore reaches the retry branch and nowhere else —
+    // and the retry branch is the only place left that can honor it.
+    const saboteur: Provider = {
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        attempts += 1;
+        await AgentSessions.updateAsync('s-stop-retry', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        const e: any = new Error('rate limited'); e.status = 429; throw e;
+      },
+    };
+
+    await runTurn('s-stop-retry', {
+      model: 'mock', system: '', tools: [], provider: saboteur,
+      retry: { attempts: 3, baseMs: 10 },
+    });
+
+    assert.equal(attempts, 1, 'a stop must prevent the retry entirely');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-stop-retry', role: 'assistant' }).countAsync(), 0,
+      'a cancelled turn must never commit an assistant message',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-stop-retry', role: 'note' } as any).countAsync(), 0,
+      'a stop outranks the error note too — the user cancelled, nothing failed at them',
+    );
+    assert.equal(await AgentDeltas.find({ sessionId: 's-stop-retry' }).countAsync(), 0);
+    assert.equal((await AgentSessions.findOneAsync('s-stop-retry'))!.phase, 'stopped',
+      'retry must not overwrite the stop with `retrying`/`error`');
+  });
+
+  it('shows phase `retrying` between attempts and sleeps a real backoff', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-retry-phase', 'hello');
+    let attempts = 0;
+    const flaky: Provider = {
+      async *stream() {
+        attempts += 1;
+        if (attempts === 1) { const e: any = new Error('down'); e.status = 503; throw e; }
+        yield { kind: 'text', chunk: 'back up' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    // `retrying` is only observable BETWEEN attempts, so poll for it rather
+    // than reading the phase after the fact — by then it is `idle` again.
+    const seenPhases = new Set<string>();
+    const sampler = setInterval(() => {
+      void AgentSessions.findOneAsync('s-retry-phase')
+        .then((s) => { if (s) seenPhases.add(s.phase); })
+        .catch(() => { /* sampling is best-effort */ });
+    }, 15);
+
+    const startedAt = Date.now();
+    try {
+      await runTurn('s-retry-phase', {
+        model: 'mock', system: '', tools: [], provider: flaky,
+        retry: { attempts: 2, baseMs: 120 },
+      });
+    } finally { clearInterval(sampler); }
+    const elapsed = Date.now() - startedAt;
+
+    assert.equal(attempts, 2);
+    assert.isTrue(seenPhases.has('retrying'),
+      `the retry must be visible to the client, saw [${[...seenPhases].join(', ')}]`);
+    // Floor only. CI is slow and the sleep is bounded from below by design;
+    // asserting an upper bound would just be a flake generator.
+    assert.isAtLeast(elapsed, 120, 'the backoff must be a real sleep, not a no-op');
+    const committed = await AgentMessages.findOneAsync({ sessionId: 's-retry-phase', role: 'assistant' });
+    assert.equal(committed!.content, 'back up');
+  });
+
+  it('streams every attempt under a fresh messageId', async function () {
+    this.timeout(30000);
+    const { AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-retry-ids', 'hello');
+    let attempts = 0;
+    let firstAttemptIds: string[] = [];
+    let secondAttemptDeltas: any[] = [];
+    // Same mid-stream capture idiom as the 'reconstructs' test: deltas are
+    // removed the moment an attempt ends, so they must be read from inside
+    // the stream, after a wait longer than the flush interval.
+    const flaky: Provider = {
+      async *stream() {
+        attempts += 1;
+        yield { kind: 'text', chunk: 'partial ' };
+        yield { kind: 'text', chunk: 'answer' };
+        await new Promise((r) => { setTimeout(r, 200); });
+        const live = await AgentDeltas.find({ sessionId: 's-retry-ids' }).fetchAsync();
+        if (attempts === 1) {
+          firstAttemptIds = [...new Set(live.map((d: any) => d.messageId))];
+          const e: any = new Error('down'); e.status = 503; throw e;
+        }
+        secondAttemptDeltas = live;
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+
+    await runTurn('s-retry-ids', {
+      model: 'mock', system: '', tools: [], provider: flaky,
+      retry: { attempts: 2, baseMs: 10 },
+    });
+
+    assert.isAbove(firstAttemptIds.length, 0, 'attempt 1 should have streamed deltas');
+    assert.isAbove(secondAttemptDeltas.length, 0, 'attempt 2 should have streamed deltas');
+    const dead = new Set(firstAttemptIds);
+    secondAttemptDeltas.forEach((d: any) => assert.isFalse(
+      dead.has(d.messageId),
+      'a retry must stream under a fresh messageId, or a straggler flush from '
+      + 'the dead attempt lands under the live one',
+    ));
+    assert.equal(
+      secondAttemptDeltas.filter((d: any) => dead.has(d.messageId)).length
+      + (await AgentDeltas.find({ messageId: { $in: [...dead] } } as any).countAsync()),
+      0, 'no delta from the failed attempt may survive',
+    );
+  });
+});
+
+describe('classifyProviderError()', () => {
+  it('lets an adapter hint outrank the status, and defaults to retryable', async () => {
+    const { classifyProviderError } = await import('../server/loop');
+    // An adapter that classified the error itself (pi-ai's own transient
+    // taxonomy) knows more than the status line, in BOTH directions.
+    assert.equal(classifyProviderError({ retryable: false, status: 503 }), 'fatal');
+    assert.equal(classifyProviderError({ retryable: true, status: 401 }), 'retryable');
+    // 408 is a timeout, but the current table treats the whole 4xx range as
+    // fatal. Pinned deliberately: change the table, change this line.
+    assert.equal(classifyProviderError({ status: 408 }), 'fatal');
+    // Unclassifiable (a socket hang-up, a DNS blip) retries — bounded anyway.
+    assert.equal(classifyProviderError({}), 'retryable');
+  });
 });
