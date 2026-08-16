@@ -23,9 +23,14 @@ Support.define({
   model: 'anthropic/claude-sonnet-5',
   instructions: ({ userId }) => `You help user ${userId}.`,
   tools: ['orders.lookup'],
-  provider: myProvider,   // required in Milestone 1 — see below
 });
 ```
+
+`model` is `<provider>/<model-id>` as pi-ai names them (`anthropic/claude-sonnet-5`,
+`openai/gpt-5`, `openrouter/moonshotai/kimi-k2`). With no `provider` of your own,
+the turn streams through pi-ai, which reads its API key from the environment —
+`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends, resolved per provider. This
+package adds no key plumbing of its own.
 
 ## Use it from the client
 
@@ -61,12 +66,12 @@ model-supplied arguments unvalidated (adopted Meteor methods keep their own
 `check()` calls; validate inline tool args yourself until TypeBox validation
 lands in Milestone 2).
 
-## Milestone 1 scope
+## Scope
 
-`provider` is required — the pi-ai adapter that would default it is Milestone 2.
-Also deferred: approval gates, budgets and cost accounting, compaction, provider
-retry/backoff, an automatic orphan-claim watcher (a turn abandoned by a server
-restart is recovered on the next `send`, not automatically), and
-`DDPRateLimiter` rules on `agent.send`.
+`provider` is optional: leave it out and the agent streams through pi-ai;
+supply one for a mock or a custom backend. Still deferred: approval gates,
+budgets and cost accounting, compaction, provider retry/backoff, an automatic
+orphan-claim watcher (a turn abandoned by a server restart is recovered on the
+next `send`, not automatically), and `DDPRateLimiter` rules on `agent.send`.
 
 See `docs/superpowers/specs/` for the full design.

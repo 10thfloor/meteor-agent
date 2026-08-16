@@ -5,6 +5,7 @@ import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildSystemPrompt } from './registry';
 import { runTurn } from './loop';
+import { piAiProvider } from './providers/piai';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -92,7 +93,11 @@ export function registerMethods(): void {
           model: config.model,
           system: buildSystemPrompt(config, { userId }),
           tools: config.tools ?? [],
-          provider: config.provider,
+          // `provider` is optional as of Milestone 2: an agent that names none
+          // streams through pi-ai. Resolved HERE rather than at define() time
+          // so defineAgent stays a pure registration and pi-ai is loaded only
+          // when a turn actually runs.
+          provider: config.provider ?? piAiProvider(),
           maxIterations: config.maxIterations,
         }).catch((e) => {
           console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);

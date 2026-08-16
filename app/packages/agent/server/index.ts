@@ -9,6 +9,7 @@ export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections
 export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export { mockProvider } from './providers/mock';
+export { piAiProvider } from './providers/piai';
 export type { Provider, ProviderChunk, ProviderRequest } from './providers/types';
 
 Meteor.startup(async () => {

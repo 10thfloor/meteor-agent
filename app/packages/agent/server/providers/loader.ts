@@ -17,7 +17,8 @@ const PKG = '@earendil-works/pi-ai';
  */
 const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
 
-let cached: unknown = null;
+/** One namespace per export key ('.', './providers/all', …). */
+const cache = new Map<string, unknown>();
 
 function findNodeModulesBase(): string | null {
   let dir = process.cwd();
@@ -32,8 +33,47 @@ function findNodeModulesBase(): string | null {
   return null;
 }
 
+/** Pick the file a conditions object points at, preferring ESM. */
+function pickCondition(entry: unknown): string | undefined {
+  if (typeof entry === 'string') return entry;
+  const e = entry as Record<string, unknown> | null | undefined;
+  const v = e?.import ?? e?.default ?? e?.require;
+  return typeof v === 'string' ? v : undefined;
+}
+
 /**
- * Resolve pi-ai's entry file the way Node's own ESM resolver would, which
+ * Resolve one key of an `exports` map, honoring `*` patterns the way Node
+ * does. pi-ai declares `"./providers/*": { import: "./dist/providers/*.js" }`,
+ * which is the only way to reach `builtinModels()` — the built-in model
+ * catalog is deliberately absent from the root entry so it can be tree-shaken.
+ */
+function resolveExportKey(exportsMap: unknown, key: string): string | undefined {
+  if (typeof exportsMap === 'string') return key === '.' ? exportsMap : undefined;
+  if (!exportsMap || typeof exportsMap !== 'object') return undefined;
+  const map = exportsMap as Record<string, unknown>;
+
+  // A conditions-only object (`{ import: "./x.js" }`) IS the "." target.
+  const hasSubpaths = Object.keys(map).some((k) => k === '.' || k.startsWith('./'));
+  if (!hasSubpaths) return key === '.' ? pickCondition(map) : undefined;
+
+  if (map[key] !== undefined) return pickCondition(map[key]);
+
+  for (const [pattern, target] of Object.entries(map)) {
+    const star = pattern.indexOf('*');
+    if (star === -1) continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (key.length < prefix.length + suffix.length) continue;
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    const wildcard = key.slice(prefix.length, key.length - suffix.length);
+    const file = pickCondition(target);
+    if (file) return file.replace('*', wildcard);
+  }
+  return undefined;
+}
+
+/**
+ * Resolve a pi-ai entry file the way Node's own ESM resolver would, which
  * understands `exports` maps (Meteor's does not — the whole reason this file
  * exists). We do NOT use `createRequire(...).resolve()` here: that walks the
  * CJS resolution algorithm, which only honors the `require`/`node`/`default`
@@ -42,11 +82,13 @@ function findNodeModulesBase(): string | null {
  * no `default`), so `require.resolve` throws ERR_PACKAGE_PATH_NOT_EXPORTED
  * even though a perfectly good ESM entry exists (verified empirically against
  * the installed package). Instead we read the package's own package.json and
- * pick its entry the same way the ESM resolver would: `exports["."].import`
+ * pick its entry the same way the ESM resolver would: `exports[key].import`
  * (or `.default`), falling back to `main` for CJS-style packages.
- * Exported as a test seam.
+ *
+ * `subpath` selects a deep export, e.g. `'providers/all'`. Exported as a test
+ * seam.
  */
-export function resolvePiAiEntry(): string {
+export function resolvePiAiEntry(subpath?: string): string {
   const base = findNodeModulesBase();
   if (!base) {
     throw new Error(
@@ -56,11 +98,12 @@ export function resolvePiAiEntry(): string {
   }
   const pkgDir = path.join(base, ...PKG.split('/'));
   const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
-  const rootExport = pkgJson.exports?.['.'] ?? pkgJson.exports;
-  const rel =
-    (typeof rootExport === 'string' ? rootExport : rootExport?.import ?? rootExport?.default ?? rootExport?.require) ??
-    pkgJson.main ??
-    'index.js';
+  const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
+  let rel = resolveExportKey(pkgJson.exports, key);
+  if (!rel && key === '.') rel = pkgJson.main ?? 'index.js';
+  if (!rel) {
+    throw new Error(`[10thfloor:agent] ${PKG} does not export "${key}"`);
+  }
   return path.join(pkgDir, rel);
 }
 
@@ -93,18 +136,26 @@ export async function shimLoad(urlHref: string): Promise<unknown> {
  *     intercepted.
  * Returns the module namespace AS-IS (live bindings preserved); callers must
  * not mutate it.
+ *
+ * `subpath` loads a deep export instead of the root one — `'providers/all'`
+ * for the built-in model catalog. Each key is cached separately.
  */
-export async function loadPiAi(): Promise<unknown> {
-  if (cached) return cached;
+export async function loadPiAi(subpath?: string): Promise<unknown> {
+  const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
+  const hit = cache.get(key);
+  if (hit) return hit;
+  const specifier = subpath ? `${PKG}/${subpath.replace(/^\.?\//, '')}` : PKG;
+  let ns: unknown;
   try {
-    cached = await import(PKG);
+    ns = await import(specifier);
   } catch {
-    const href = pathToFileURL(resolvePiAiEntry()).href;
+    const href = pathToFileURL(resolvePiAiEntry(subpath)).href;
     try {
-      cached = await import(href);
+      ns = await import(href);
     } catch {
-      cached = await shimLoad(href);
+      ns = await shimLoad(href);
     }
   }
-  return cached;
+  cache.set(key, ns);
+  return ns;
 }

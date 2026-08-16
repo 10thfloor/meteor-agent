@@ -2,12 +2,19 @@ import type { Provider } from './providers/types';
 import type { ToolSpec } from './tools';
 
 export interface AgentConfig {
+  /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
+   *  custom `provider` gives the string its own meaning. */
   model: string;
   instructions: string | string[] | ((ctx: { userId: string | null }) => string);
   tools?: ToolSpec[];
-  /** Required in Milestone 1. The pi-ai adapter that would default this is
-   *  Milestone 2; until then every agent supplies its provider explicitly. */
-  provider: Provider;
+  /** Optional. Defaults to `piAiProvider()`, which resolves `model` against
+   *  pi-ai's built-in catalog and reads API keys from the environment. Supply
+   *  one explicitly for a mock (see `mockProvider`) or a custom backend. */
+  provider?: Provider;
+  /** $ per million tokens, for cost accounting. Consumed in Milestone 2's
+   *  budget work; pi-ai reports its own per-model rates, so this is an
+   *  override, not a requirement. */
+  pricing?: { input: number; output: number };
   maxIterations?: number;
 }
 
