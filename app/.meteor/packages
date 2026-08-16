@@ -1,0 +1,24 @@
+# Meteor packages used by this project, one per line.
+# Check this file (and the other files in this directory) into your repository.
+#
+# 'meteor add' and 'meteor remove' will edit this file for you,
+# but you can also edit it by hand.
+
+meteor@2.3.1                  # Shared foundation for all Meteor packages
+static-html@1.5.0             # Define static page content in .html files
+standard-minifier-css@1.10.1   # CSS minifier run for production mode
+standard-minifier-js@3.2.0    # JS minifier run for production mode
+es5-shim@4.8.1                # ECMAScript 5 compatibility for older browsers
+ecmascript@0.18.1              # Enable ECMAScript2015+ syntax in app code
+typescript@5.10.1              # Enable TypeScript syntax in .ts and .tsx modules
+shell-server@0.7.0            # Server-side component of the `meteor shell` command
+webapp@2.2.0                  # Serves a Meteor app over HTTP
+ddp                     # The protocol and client/server libraries that Meteor uses to send data
+server-render@0.4.4           # Support for server-side rendering
+hot-module-replacement@0.6.0  # Rebuilds the client if there is a change on the client without restarting the server
+
+mongo
+ddp-common
+check
+random
+meteortesting:mocha
