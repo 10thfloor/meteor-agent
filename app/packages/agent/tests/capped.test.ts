@@ -251,6 +251,62 @@ describe('applyRateLimits', () => {
     assert.equal(added, 4);
   });
 
+  it('adds six rules when interrupts is configured alongside sends and starts', async () => {
+    // `interrupts` gets the identical two-rule treatment, not a cheaper one:
+    // it is an unauthenticated-reachable write, so the anonymous-isolation
+    // pair rule and the per-user cap on multi-connection multiplication both
+    // apply exactly as they do to sends.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: 5, intervalMs: 60000 },
+        starts: { count: 3, intervalMs: 30000 },
+        interrupts: { count: 10, intervalMs: 10000 },
+      },
+    });
+    assert.equal(added, 6);
+  });
+
+  it('registers a rule that actually matches an agent.interrupt invocation', async () => {
+    // Same seam and the same caveat as the agent.send case below: rules are
+    // never removable, so this asserts the match count INCREASED and that the
+    // new rule is scoped to agent.interrupt rather than to every method.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mInterrupt,
+      userId: 'rl-user-2', connectionId: 'rl-conn-2', clientAddress: '127.0.0.1',
+    };
+    const sendInput = { ...input, name: NAMES.mSend };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    const sendBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
+
+    applyRateLimits({ rateLimit: { interrupts: { count: 1, intervalMs: 60000 } } });
+
+    const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    assert.isAbove(
+      after.length, before.length,
+      'the newly-registered rule must match a real agent.interrupt invocation',
+    );
+    const sendAfter = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
+    assert.equal(
+      sendAfter.length, sendBefore.length,
+      'an interrupts entry must not add rules to agent.send',
+    );
+  });
+
+  it('throws naming the field for a malformed interrupts entry', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { interrupts: { count: 4, intervalMs: 0 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a non-positive intervalMs must throw');
+    assert.include(threw.message, 'interrupts.intervalMs');
+  });
+
   it('throws naming the field for a non-positive count', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     let threw: any;

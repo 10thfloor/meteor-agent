@@ -912,6 +912,60 @@ describe('turn loop', () => {
     assert.equal(sid, 'auth-s1');
   });
 
+  it('a send clears a stranded error phase and the deferred turn recovers', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('recover', {
+      model: 'mock', instructions: 'x', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    // The state a fatal provider failure leaves behind: a terminal `error`
+    // phase and a note explaining it. §10's position is that the model usually
+    // recovers, so a send is the resume signal — and clearing the phase is what
+    // makes it one.
+    await seed('s-error-clear', 'first message', 'recover');
+    await AgentMessages.insertAsync({
+      _id: 'err-note', sessionId: 's-error-clear', seq: 1, role: 'note', kind: 'error',
+      error: { error: 'provider-failed', reason: 'The model request failed.' },
+      createdAt: new Date(),
+    } as any);
+    await AgentSessions.updateAsync(
+      { _id: 's-error-clear' } as any,
+      { $set: { phase: 'error', nextSeq: 2 } } as any,
+    );
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    await send.call({ userId: 'u1' }, 'recover', 's-error-clear', 'try again');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-error-clear', role: 'assistant' }).countAsync()) === 1,
+      'the deferred turn to answer the send that cleared the error',
+    );
+
+    // The phase is the whole point. The loop's `finally` treats `error` as
+    // terminal and PRESERVES it, so without mSend's conditional clear this
+    // session would answer perfectly while still displaying a failure forever —
+    // and a UI keying its retry affordance off `phase === 'error'` would offer
+    // to retry a turn that already succeeded.
+    const doc = (await AgentSessions.findOneAsync('s-error-clear'))!;
+    assert.equal(doc.phase, 'idle', 'a send must clear the error phase it recovered from');
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-error-clear' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.equal(msgs[msgs.length - 1].content, 'recovered');
+    // Clearing the phase is not rewriting history: the failure note stays in
+    // the transcript, and both user messages are still there.
+    assert.isDefined(await AgentMessages.findOneAsync('err-note'));
+    assert.lengthOf(msgs.filter((m) => m.role === 'user'), 2);
+  });
+
   it('retries a retryable provider failure and then succeeds', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');

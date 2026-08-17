@@ -122,8 +122,9 @@ tries again. Your transcript UI should render three note kinds: `error`,
 
 ```json
 { "packages": { "10thfloor:agent": { "rateLimit": {
-  "sends":  { "count": 10, "intervalMs": 60000 },
-  "starts": { "count": 5,  "intervalMs": 60000 }
+  "sends":      { "count": 10, "intervalMs": 60000 },
+  "starts":     { "count": 5,  "intervalMs": 60000 },
+  "interrupts": { "count": 30, "intervalMs": 60000 }
 } } } }
 ```
 
@@ -176,6 +177,54 @@ One `Agent` instance renders one session at a time: `subscribe()` repoints the
 merged view at the session you pass it and evicts the previous one. Construct a
 second `Agent` to watch two sessions side by side.
 
+**Tear down on unmount.** `subscribe()` starts a subscription and a
+`Tracker.autorun` that live until you stop them; `stop()` stops both and clears
+the merged view. It is idempotent, and `subscribe()` works again afterwards.
+
+```tsx
+useEffect(() => () => Support.stop(sessionId), [sessionId]);
+```
+
+The `sessionId` argument is an optional guard: pass it and the teardown is
+skipped if the instance has already been re-subscribed to a newer session, so a
+late unmount cleanup cannot kill the live one.
+
+## Headless one-shots, and composing agents
+
+`ask` is the whole conversation in one call — no session to start, subscribe to
+or clean up. It is server-only, because there is no UI on the other end of it.
+
+```ts
+const answer: string = await Support.ask('where is my order?', { userId });
+```
+
+It creates a throwaway session, runs exactly one turn with the agent's real
+config (tools, budgets, retries, compaction), returns the final assistant
+message, and deletes the session and its transcript before returning. Two
+rejections instead of a half-answer: `ask-parked` when the turn hits a
+`gate: 'ask'` tool (nobody is there to approve it — keep ask-gated tools on
+interactive agents), and `ask-failed` when the provider failed terminally or a
+budget stopped the run, with `reason` naming which.
+
+Because an agent's `ask` is a plain async function returning a string, it is
+also a legal tool body — which is how agents compose:
+
+```ts
+const Researcher = new Agent('researcher', { model, instructions, tools: [] });
+
+Writer.define({
+  model, instructions,
+  tools: [{
+    name: 'research', description: 'Ask the researcher', args: schema,
+    run: ({ topic }, ctx) => Researcher.ask(topic, { userId: ctx.userId }),
+  }],
+});
+```
+
+The inner run is a session of its own, so the outer agent's `toolCalls` budget
+limits how often the specialist is consulted and the specialist's own budget
+limits what each consultation may spend.
+
 ## Testing without an API key
 
 ```ts
@@ -203,7 +252,10 @@ Milestone 2 shipped the production core: the pi-ai provider (default), retry
 and error surfacing, approval gates, budgets and cost accounting, and DDP rate
 limits. Milestone 3 is in progress and has added compaction, an interrupt that
 cancels the provider request, the orphan-claim watcher with approval timeouts,
-and the finished tool surface — `Agent.method()` co-registration and validated
-tool arguments. Still to come in it: `Agent.ask()`.
+the finished tool surface — `Agent.method()` co-registration and validated
+tool arguments — plus `Agent.ask()` for headless one-shots and agent
+composition, client teardown via `stop()`, and rate limiting for
+`agent.interrupt`. Still to come in it: the production-bundle verification
+sweep.
 
 See `docs/superpowers/specs/` for the full design.
