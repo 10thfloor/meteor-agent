@@ -131,6 +131,15 @@ async function recordVerdict(
       approved: verdict === 'approved', by: ctx.userId, reason,
       createdAt: new Date(),
     } as any);
+  } else {
+    // No seq means the session vanished between the verdict write and here.
+    // The verdict itself is already durable and the tool may well execute, so
+    // the missing row is an audit gap, not a cosmetic one: say so rather than
+    // letting an approved side effect leave no trace of who authorized it.
+    console.warn(
+      `[10thfloor:agent] session ${sessionId} vanished before its ${verdict} `
+      + 'note could be written; the approval has no audit row',
+    );
   }
 
   deferTurn(sessionId, config, ctx.userId);
@@ -201,8 +210,6 @@ export function registerMethods(): void {
       check(agent, String);
       check(sessionId, String);
       await requireSession(agent, sessionId, this.userId ?? null);
-      // The loop's `finally` preserves a `stopped` phase rather than idling it
-      // back, so this survives the in-flight turn winding down.
       // The loop's `finally` preserves a `stopped` phase rather than idling it
       // back, so this survives the in-flight turn winding down.
       //

@@ -1328,6 +1328,301 @@ describe('approval gates', () => {
     assert.isUndefined(doc.pending, 'the dead marker must not outlive the turn');
     assert.equal(doc.phase, 'idle');
   });
+
+  it('resumes the parked turn, not an older one that reused the same call id', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // Tool call ids are unique only within ONE provider response — this repo's
+    // own mock reuses `t1` on every turn. Turn 1 asked for `t1` and was
+    // answered at seq 2; turn 2 asked for `t1` again and parked on a gate.
+    // Locating the batch by "first assistant carrying this id" finds the OLD,
+    // already-answered turn: the approval is silently voided (the tool never
+    // runs, `pending` is cleared) while the real `tool_use` stays unanswered.
+    await seed('s-locate', 'refund please');
+    await AgentMessages.insertAsync({
+      _id: 'old-a', sessionId: 's-locate', seq: 1, role: 'assistant', content: '',
+      toolCalls: [{ id: 't1', name: 'refund', args: {} }], createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'old-tool', sessionId: 's-locate', seq: 2, role: 'tool', toolCallId: 't1',
+      content: JSON.stringify({ did: 'an older refund' }), createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'parked-a', sessionId: 's-locate', seq: 3, role: 'assistant', content: '',
+      toolCalls: [{ id: 't1', name: 'refund', args: { amt: 5 } }], createdAt: new Date(),
+    } as any);
+    // The state approve() leaves behind: verdict recorded, phase back to idle,
+    // lease free — the parking run exited long ago.
+    await AgentSessions.updateAsync('s-locate', {
+      $set: {
+        nextSeq: 4,
+        phase: 'idle',
+        pending: {
+          toolCallId: 't1', name: 'refund', args: { amt: 5 },
+          requestedAt: new Date(), verdict: 'approved', by: 'u1',
+        },
+      },
+    } as any);
+
+    const ran: string[] = [];
+    await runTurn('s-locate', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'refund', description: 'x', gate: 'ask',
+        args: { type: 'object', properties: {} },
+        run: async () => { ran.push('refund'); return { did: 'refund' }; },
+      }],
+      provider: mockProvider(() => ({ text: 'all done' })),
+    });
+
+    assert.deepEqual(ran, ['refund'], 'the approval must run the tool the PARKED turn asked for');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-locate' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.isDefined(msgs.find((m) => m._id === 'old-a'), "turn 1's assistant must survive");
+    assert.isDefined(msgs.find((m) => m._id === 'old-tool'), "turn 1's answer must survive");
+    assert.isDefined(
+      msgs.find((m) => m._id === 'parked-a'),
+      'the parked assistant IS the request being approved',
+    );
+    assert.isDefined(
+      msgs.find((m) => m.role === 'tool' && m.toolCallId === 't1' && m.seq > 3),
+      'the parked call must be answered inside ITS OWN window, not by turn 1',
+    );
+    assert.deepEqual(unansweredToolUses(msgs), []);
+    assert.isUndefined((await AgentSessions.findOneAsync('s-locate'))!.pending);
+  });
+
+  it('a verdict landing while the parking run winds down still runs the tool', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // approve/deny record a verdict and defer a resume. A verdict landing
+    // between the park write and the parking run's releaseLease/running.delete
+    // makes that deferred resume a no-op — it finds the session still running
+    // in-process (or still leased, from another server) and returns, and
+    // nothing retries. Residue: verdict recorded, phase idle, tool never ran,
+    // UI says done. Here the verdict is written with NO defer at all, so the
+    // ONLY thing that can pick it up is the winding-down run's own self-check.
+    const original = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      const n = await original(sel, mod, ...rest);
+      // The park is the only write that sets `pending`.
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake' } as any,
+          { $set: { 'pending.verdict': 'approved', 'pending.by': 'u1', phase: 'idle' } } as any,
+        );
+      }
+      return n;
+    };
+
+    let state: { ran: string[]; providerCalls: number } | null = null;
+    try {
+      state = await buildFixture('s-wake', 'gate-wake', [
+        { id: 'g1', name: 'refund', gate: 'ask' },
+      ]);
+    } finally {
+      if (descriptor) Object.defineProperty(AgentSessions, 'updateAsync', descriptor);
+      else delete (AgentSessions as any).updateAsync;
+    }
+    assert.isTrue(injected, 'the verdict must have landed on the park write');
+
+    await waitFor(
+      async () => state!.ran.length === 1,
+      'the winding-down run to notice the verdict and execute the approved tool',
+    );
+
+    assert.deepEqual(state!.ran, ['refund'], 'a dropped wake-up loses an approved tool');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-wake' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the woken batch must close cleanly');
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.isDefined(row, 'the approved call must be answered');
+    assert.isUndefined((await AgentSessions.findOneAsync('s-wake'))!.pending);
+  });
+
+  it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent } = await import('../server/registry');
+
+    const state = await buildFixture('s-stop-verdict', 'gate-stopverdict', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+    const config = getAgent('gate-stopverdict')!;
+
+    // Exactly what agent.approve writes, followed by an interrupt that lands
+    // before the resumed run reaches the tool. Running it anyway is a real
+    // side effect the user just cancelled — and dispatchCalls would then
+    // discard the assistant AND the executed call's row, leaving a transcript
+    // that says "approved" with no record it ever ran.
+    await AgentSessions.updateAsync('s-stop-verdict', {
+      $set: { 'pending.verdict': 'approved', 'pending.by': 'u1', phase: 'idle' },
+    } as any);
+    await AgentSessions.updateAsync('s-stop-verdict', {
+      $set: { phase: 'stopped' },
+    } as any);
+
+    await runTurn('s-stop-verdict', {
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+    });
+
+    assert.deepEqual(state.ran, [], 'a stop must cancel an approved tool that has not run yet');
+    let doc = (await AgentSessions.findOneAsync('s-stop-verdict'))!;
+    assert.equal(doc.phase, 'stopped', 'the interrupt is durable until a send clears it');
+    assert.deepInclude(
+      doc.pending as any, { toolCallId: 'g1', verdict: 'approved' },
+      'the verdict must survive: it is what makes the next send resume this batch',
+    );
+    let msgs = await AgentMessages
+      .find({ sessionId: 's-stop-verdict' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(msgs.filter((m) => m.role === 'tool'), 0, 'nothing ran, so nothing answered');
+    assert.lengthOf(
+      msgs.filter((m) => m.role === 'assistant'), 1,
+      'the parked assistant must survive a refusal to run',
+    );
+
+    // The send clears the stop; the verdict is still standing, so the batch
+    // resumes rather than stranding its tool_use.
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    await send.call({ userId: 'u1' }, 'gate-stopverdict', 's-stop-verdict', 'go ahead');
+
+    await waitFor(async () => state.ran.length === 1, 'the send to resume the approved call');
+    msgs = await AgentMessages
+      .find({ sessionId: 's-stop-verdict' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the resumed batch must close cleanly');
+    doc = (await AgentSessions.findOneAsync('s-stop-verdict'))!;
+    assert.isUndefined(doc.pending, 'the spent verdict must be cleared');
+  });
+
+  it('a send while awaiting is queued, then answered once the verdict resumes', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-queue', 'gate-queue', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+
+    // A send while awaiting does not cancel the approval and does not wake
+    // anything: `agent.send` clears 'stopped'/'error' only, and the loop exits
+    // on 'awaiting'. The message is QUEUED — and the think loop that runs after
+    // the verdict is what has to answer it, or it sits there forever.
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    await send.call({ userId: 'u1' }, 'gate-queue', 's-queue', 'and hurry');
+
+    const parked = (await AgentSessions.findOneAsync('s-queue'))!;
+    assert.equal(parked.phase, 'awaiting', 'a send must not cancel a live approval request');
+    assert.deepInclude(parked.pending as any, { toolCallId: 'g1' });
+    assert.isUndefined((parked.pending as any).verdict, 'a send is not a verdict');
+    assert.deepEqual(state.ran, [], 'and it must not run the gated tool either');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-queue', 's-queue');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-queue', role: 'assistant' }).countAsync()) === 2,
+      'the resumed turn to answer the queued message',
+    );
+
+    assert.deepEqual(state.ran, ['refund']);
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-queue' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), []);
+    assert.lengthOf(
+      msgs.filter((m) => m.role === 'user' && m.content === 'and hurry'), 1,
+      'the queued message must be committed exactly once',
+    );
+    assert.equal(msgs[msgs.length - 1].role, 'assistant', 'and it must be ANSWERED, not just stored');
+    assert.equal(msgs[msgs.length - 1].content, 'all done');
+    assert.isUndefined((await AgentSessions.findOneAsync('s-queue'))!.pending);
+  });
+
+  it('a stop landing between the phase check and the park is not overwritten', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-park-race', 'do both');
+    let firstRan = false;
+    let refundRan = false;
+    let sabotaged = false;
+
+    // The park write is the last thing a gated call does, and the phase it
+    // acted on was read before the previous tool ran — a window as long as
+    // that tool takes. Guarded on the lease alone, the park overwrites a
+    // `stopped` that landed inside it: a cancelled turn resurrected as an
+    // approval request that only approve/deny can ever clear. The stop is
+    // injected immediately after the gated call's own phase check reads a
+    // healthy phase, which is the only way into that window.
+    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    (AgentSessions as any).findOneAsync = async (sel: any, ...rest: any[]) => {
+      const doc = await original(sel, ...rest);
+      // `holdsLease` passes a selector OBJECT; the dispatch phase check passes
+      // the bare id — so this fires on the phase check and nowhere else.
+      if (firstRan && !sabotaged && sel === 's-park-race') {
+        sabotaged = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-park-race' } as any, { $set: { phase: 'stopped' } } as any,
+        );
+      }
+      return doc;
+    };
+
+    try {
+      await runTurn('s-park-race', {
+        model: 'mock', system: '',
+        tools: [
+          {
+            name: 'logit', description: 'x', gate: 'auto',
+            args: { type: 'object', properties: {} },
+            run: async () => { firstRan = true; return 'logged'; },
+          },
+          {
+            name: 'refund', description: 'x', gate: 'ask',
+            args: { type: 'object', properties: {} },
+            run: async () => { refundRan = true; return 'refunded'; },
+          },
+        ],
+        provider: mockProvider(() => ({
+          toolCalls: [
+            { id: 'p1', name: 'logit', args: {} },
+            { id: 'p2', name: 'refund', args: {} },
+          ],
+        })),
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
+      else delete (AgentSessions as any).findOneAsync;
+    }
+
+    assert.isTrue(sabotaged, 'the stop must have landed inside the park window');
+    assert.isFalse(refundRan, 'a gated tool never runs at the park itself');
+    const doc = (await AgentSessions.findOneAsync('s-park-race'))!;
+    assert.equal(doc.phase, 'stopped', 'the park must not overwrite an interrupt');
+    assert.isUndefined(
+      doc.pending, 'a cancelled turn must not leave an approval request standing',
+    );
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-park-race' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [], 'the abandoned batch must take its tool_use with it',
+    );
+    assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+  });
 });
 
 describe('classifyProviderError()', () => {

@@ -43,6 +43,23 @@ Support.messages(sessionId).fetch();   // reactive, includes in-flight tokens
 Support.status(sessionId);             // 'idle' | 'streaming' | 'calling' | …
 ```
 
+A tool declared `gate: 'ask'` parks the turn instead of running: the status goes
+to `'awaiting'` and `pending(sessionId)` returns the call the agent wants to
+make, so you can render it and let a human decide.
+
+```ts
+const ask = Support.pending(sessionId);   // { toolCallId, name, args, … } | undefined
+if (ask) await Support.approve(sessionId);
+// …or refuse, with a reason the model gets to see:
+await Support.deny(sessionId, 'too large');
+```
+
+Nothing waits server-side while a session is parked — no process, no timer — so
+the request survives a deploy, and the verdict is what resumes the turn. A
+denial is answered, not dropped: the model sees the refusal and routes around
+it. Who may answer is the session's owner by default; give the agent an
+`approve(ctx)` predicate to narrow that further.
+
 One `Agent` instance renders one session at a time: `subscribe()` repoints the
 merged view at the session you pass it and evicts the previous one. Construct a
 second `Agent` to watch two sessions side by side.
@@ -69,9 +86,9 @@ lands in Milestone 2).
 ## Scope
 
 `provider` is optional: leave it out and the agent streams through pi-ai;
-supply one for a mock or a custom backend. Still deferred: approval gates,
-budgets and cost accounting, compaction, provider retry/backoff, an automatic
-orphan-claim watcher (a turn abandoned by a server restart is recovered on the
-next `send`, not automatically), and `DDPRateLimiter` rules on `agent.send`.
+supply one for a mock or a custom backend. Still deferred: budgets and cost
+accounting, compaction, an automatic orphan-claim watcher (a turn abandoned by a
+server restart is recovered on the next `send`, not automatically), and
+`DDPRateLimiter` rules on `agent.send`.
 
 See `docs/superpowers/specs/` for the full design.
