@@ -55,6 +55,22 @@ describe('pi-ai adapter mapping', () => {
     assert.equal((messages[2] as any).isError, false);
   });
 
+  it('round-trips isError onto pi-ai\'s ToolResultMessage', () => {
+    // The transcript's `error` field becomes `ProviderMessage.isError` in the
+    // loop's toProviderMessages, and lands here. A tool result the model is not
+    // told failed is one it has to infer failure from.
+    const { messages } = toPiAiRequest({
+      ...req,
+      messages: [
+        ...req.messages.slice(0, 2),
+        { role: 'tool', toolCallId: 't1', content: '{"error":"denied"}', isError: true },
+      ],
+    }, 0).context;
+    assert.equal((messages[2] as any).isError, true);
+    // Absent stays false, not undefined: pi-ai's ToolResultMessage requires it.
+    assert.equal((toPiAiRequest(req, 0).context.messages[2] as any).isError, false);
+  });
+
   it('recovers toolName for a tool result from the call that produced it', () => {
     // pi-ai's ToolResultMessage requires `toolName`; ProviderMessage has no such
     // field, so it is resolved from the preceding assistant's toolCalls by id.

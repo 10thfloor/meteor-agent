@@ -439,15 +439,35 @@ async function maybeCompact(
   return true;
 }
 
-function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
+/**
+ * The transcript, as the provider sees it — the single boundary between what
+ * is stored and what is sent.
+ *
+ * Notes are dropped: `kind:'error'`, `'budget'`, `'approval'`, `'compaction'`
+ * are the harness's own bookkeeping in a role no provider knows, and
+ * `assembleContext` is what turns a compaction note back into something the
+ * model reads.
+ *
+ * `error` becomes `isError`, and only on the rows that have one. The row's
+ * `content` is already the error's JSON, but a tool result carries a
+ * first-class failure flag on every provider worth the name, and a model told
+ * a result failed treats it differently from one it has to infer failure from.
+ * The error OBJECT stays behind: `isError` is a boolean on the wire, and the
+ * `{error, reason}` detail is already in the content.
+ */
+export function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
   return msgs
     .filter((m) => m.role !== 'note')
-    .map((m) => ({
-      role: m.role as ProviderMessage['role'],
-      content: m.content,
-      toolCalls: m.toolCalls,
-      toolCallId: m.toolCallId,
-    }));
+    .map((m) => {
+      const out: ProviderMessage = {
+        role: m.role as ProviderMessage['role'],
+        content: m.content,
+        toolCalls: m.toolCalls,
+        toolCallId: m.toolCallId,
+      };
+      if (m.error) out.isError = true;
+      return out;
+    });
 }
 
 /**

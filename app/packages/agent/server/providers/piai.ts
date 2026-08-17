@@ -126,10 +126,11 @@ function toPiAiMessage(
       toolCallId: m.toolCallId ?? '',
       toolName: toolNames.get(m.toolCallId ?? '') ?? '',
       content: [{ type: 'text', text: m.content ?? '' }],
-      // ProviderMessage has no error flag; the transcript's `error` field is
-      // dropped by the loop's toProviderMessages. Tool failures reach the model
-      // as their JSON content either way.
-      isError: false,
+      // The transcript's `error` field, carried this far by the loop's
+      // `toProviderMessages` as `ProviderMessage.isError`. pi-ai's
+      // ToolResultMessage requires the flag, so an absent one is `false` —
+      // a successful result — rather than omitted.
+      isError: m.isError === true,
       timestamp: now,
     };
   }

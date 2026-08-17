@@ -10,9 +10,16 @@ export { NAMES } from '../common/names';
 export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
+export {
+  validateToolArgs, setToolArgsValidator, defineAgentMethod,
+  type ToolSpec, type InlineTool, type AdoptedTool, type ToolContext,
+  type AgentMethodOptions, type ValidationResult, type ArgsValidator,
+} from './tools';
 export { mockProvider } from './providers/mock';
 export { piAiProvider } from './providers/piai';
-export type { Provider, ProviderChunk, ProviderRequest } from './providers/types';
+export type {
+  Provider, ProviderChunk, ProviderRequest, ProviderMessage,
+} from './providers/types';
 export { startWatcher, type Watcher, type WatcherOptions } from './watcher';
 
 /**

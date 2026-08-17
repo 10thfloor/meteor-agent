@@ -9,6 +9,12 @@ export interface ProviderMessage {
   content?: string;
   toolCalls?: Array<{ id: string; name: string; args: unknown }>;
   toolCallId?: string;
+  /** `role: 'tool'` only, and set only when true: this result is a FAILURE.
+   *  The content already says so in JSON, but providers carry a first-class
+   *  error flag on a tool result and read it — Anthropic renders it as
+   *  `is_error`, which changes how the model treats the block. Set from the
+   *  transcript row's `error` field by `toProviderMessages`. */
+  isError?: boolean;
 }
 
 export interface ProviderRequest {

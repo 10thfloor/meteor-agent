@@ -49,6 +49,60 @@ Support.define({
 });
 ```
 
+## Tools
+
+A tool is a Meteor method the model may call. Three ways to give an agent one:
+
+```ts
+tools: [
+  'orders.lookup',                                  // adopt a method you already have
+  { method: 'orders.lookup', description, args },   //   …with a description for the model
+  { name: 'total', description, args, run, gate },  // inline: no method, runs in-process
+]
+```
+
+`args` is a JSON Schema — it is what the model is shown, and what its arguments
+are checked against.
+
+**Co-registration** defines the method and the tool at once, so your UI and the
+model call the same code through the same schema:
+
+```ts
+import { Agent } from 'meteor/10thfloor:agent';
+
+// server/orders.ts
+export const lookup = Agent.method('orders.lookup', {
+  description: 'Look up an order by id',
+  args: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+  run(args) { return Orders.findOneAsync({ _id: args.id, userId: this.userId }); },
+});
+
+Support.define({ ..., tools: [lookup] });        // the model calls it
+await Meteor.callAsync('orders.lookup', { id }); // your UI calls it
+```
+
+`run` gets the method invocation as `this`, so `this.userId` and
+`this.unblock()` behave exactly as in a hand-written method. Arguments are
+checked before it runs either way: a DDP caller gets
+`Meteor.Error('invalid-args', reason)`, and the model gets an `invalid-args`
+tool result naming the field it got wrong — which it usually corrects on the
+next call, since a bad argument answers the call rather than failing the turn.
+
+Inline tools are checked the same way. The shipped checker is deliberately
+minimal — `type`, object `required`/`properties`, and array `items` — and
+accepts anything it cannot model, so it only ever rejects arguments that are
+structurally wrong. A tool that needs more should adopt a real method and keep
+its own `check()`, or the app can install a full JSON Schema validator:
+
+```ts
+import { setToolArgsValidator } from 'meteor/10thfloor:agent';
+setToolArgsValidator((schema, args) => (myCheck(schema, args)
+  ? { ok: true } : { ok: false, reason: 'field "id" must be a string' }));
+```
+
+A `reason` is fed back to the model and stored in the published transcript, so
+name the offending field — never echo its value.
+
 **Budgets** are the only brake on loop-initiated work. `turns` refuses the
 (N+1)th `send` with `budget-exhausted`; `spend` and `toolCalls` stop a running
 turn with a `role:'note', kind:'budget'` row in the transcript and
@@ -136,18 +190,20 @@ capability-URLs: anyone who knows the session id has full access, and no one
 can enumerate ids in bulk (`agent.sessions` publishes nothing to anonymous
 callers). Two consequences to design for: an anonymous session **stays**
 anonymous after the user logs in — it is not adopted by the account, and
-remains reachable by anyone holding the id — and inline tools receive
-model-supplied arguments unvalidated (adopted Meteor methods keep their own
-`check()` calls; validate inline tool args yourself until TypeBox validation
-lands in Milestone 3).
+remains reachable by anyone holding the id — and every tool runs with
+`this.userId === null`, so an ownership check written as "belongs to the
+caller" matches nothing. Model-supplied arguments are structurally checked
+against the tool's schema before dispatch (see **Tools**), but a check is not
+an authorization: a tool reachable by an anonymous session should decide what
+it will do for a caller with no user at all.
 
 ## Scope
 
 Milestone 2 shipped the production core: the pi-ai provider (default), retry
 and error surfacing, approval gates, budgets and cost accounting, and DDP rate
 limits. Milestone 3 is in progress and has added compaction, an interrupt that
-cancels the provider request, and the orphan-claim watcher with approval
-timeouts. Still to come in it: TypeBox validation of inline tool args,
-`Agent.method()` co-registration, and `Agent.ask()`.
+cancels the provider request, the orphan-claim watcher with approval timeouts,
+and the finished tool surface — `Agent.method()` co-registration and validated
+tool arguments. Still to come in it: `Agent.ask()`.
 
 See `docs/superpowers/specs/` for the full design.
