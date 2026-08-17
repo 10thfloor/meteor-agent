@@ -43,11 +43,26 @@ Support.define({
             approval: 3600000 },             // each optional; see below
   pricing: { input: 3, output: 15 },         // $/Mtok fallback when the provider
                                              // does not report its own cost
-  retry: { attempts: 3, baseMs: 500 },       // provider retry with backoff
+  retry: { attempts: 3, baseMs: 500,
+           maxDelayMs: 10000 },              // full-jitter backoff, capped
+  context: { window: 200000, compactAt: 0.8,
+             keep: 6 },                      // compaction; omit to disable
+  maxIterations: 10,                         // model calls per turn
+  maxResultChars: 8000,                      // tool results truncated past this
+  canUse: (tool, { userId }) => true,        // agent-level tool backstop
   approve: ({ userId }) => userId !== null,  // who may answer ask-gates
   provider: mockProvider(...),               // omit for pi-ai
 });
 ```
+
+**Compaction** keeps long conversations inside the model's context window
+without losing history: past `window * compactAt` estimated tokens, everything
+older than the last `keep` messages is summarized into a `kind:'compaction'`
+note and the MODEL's view restarts from that summary — the transcript keeps
+every message and your UI keeps rendering all of it. The cut never separates a
+tool call from its result, a failed summarization silently degrades to an
+uncompacted turn, and the summarization call is billed like any other model
+call.
 
 ## Tools
 
