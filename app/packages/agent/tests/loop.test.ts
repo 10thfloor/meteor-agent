@@ -1089,6 +1089,9 @@ describe('turn loop', () => {
 
     // `retrying` is only observable BETWEEN attempts, so poll for it rather
     // than reading the phase after the fact — by then it is `idle` again.
+    // Full jitter draws the backoff from [0, cap], so an unpinned run can put
+    // the whole retrying window under the sampler's period — a 1-in-N flake.
+    // Pin Math.random for the duration so the window is the full cap.
     const seenPhases = new Set<string>();
     const sampler = setInterval(() => {
       void AgentSessions.findOneAsync('s-retry-phase')
@@ -1096,12 +1099,17 @@ describe('turn loop', () => {
         .catch(() => { /* sampling is best-effort */ });
     }, 15);
 
+    const realRandom = Math.random;
+    Math.random = () => 0.99;
     try {
       await runTurn('s-retry-phase', {
         model: 'mock', system: '', tools: [], provider: flaky,
         retry: { attempts: 2, baseMs: 120 },
       });
-    } finally { clearInterval(sampler); }
+    } finally {
+      Math.random = realRandom;
+      clearInterval(sampler);
+    }
 
     assert.equal(attempts, 2);
     assert.isTrue(seenPhases.has('retrying'),

@@ -134,3 +134,13 @@ M3 Task 2: complete INLINE (compaction, 136+1 passing; review pending — 529s o
   Model view restarts from the newest compaction note; transcript untouched; cut never splits a
   tool batch (walk-back off tool rows); failed compaction degrades to an uncompacted turn silently;
   summarization usage/cost accrues in the note's atomic allocateSeq.
+M3 Task 3: complete (7a5d633, 143+1 verified by controller; agent's report lost to machine sleep).
+  writeVerdict factored as the shared single-winner core; recordTimeoutVerdict (by:null, timedOut);
+  watcher = observer + 15s sweep (orphans, approval timeouts, unconsumed verdicts); boot-gated on
+  settings watcher:false and test mode. Review still owed (with Tasks 1-2) at final review.
+M3 Task 4: complete (c4dabf1, 159+1). Minimal structural validator (probe: pi-ai re-exports only
+  typebox Type; its validateToolArguments coerces input and echoes raw args — unusable). Validation
+  lives in runTool (one guard covers all dispatch paths). isError threaded end to end.
+  FINAL-REVIEW DECISION NEEDED: minimal checker accepts $ref/oneOf/unions unconditionally — "validated"
+  != "JSON Schema validated"; documented, escape hatch via setToolArgsValidator.
+  Controller fixed inline: retrying-phase sampler flake (Math.random pinned for the window).
