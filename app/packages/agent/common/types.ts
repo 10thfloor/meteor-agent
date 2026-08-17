@@ -62,6 +62,11 @@ export interface AgentMessage {
   approved?: boolean;
   by?: string | null;
   reason?: string;
+  /** `kind: 'compaction'` notes only. `summary` is what the MODEL sees in
+   *  place of everything at-or-before seq `upto`; the transcript itself keeps
+   *  every message — compaction changes the model's view, never history. */
+  summary?: string;
+  upto?: number;
   /** `cost` is present only when the PROVIDER priced the call; the harness's
    *  own `pricing` fallback accrues to the session total without claiming the
    *  message carries a provider-reported figure. */

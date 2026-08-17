@@ -27,6 +27,9 @@ export interface RunConfig {
    *  (default 3); the delay is uniform in
    *  `[0, min(maxDelayMs, baseMs * 2^attemptIndex)]` (defaults 500 / 10_000). */
   retry?: { attempts?: number; baseMs?: number; maxDelayMs?: number };
+  /** §9 compaction thresholds (defaults 200_000 / 0.8 / 6); absent =
+   *  compaction disabled. */
+  context?: { window?: number; compactAt?: number; keep?: number };
   /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
    *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
    *  `mSend`, not here — by the time a turn runs, the send it would refuse has
@@ -273,6 +276,154 @@ class DeltaWriter {
     if (inFlight) await inFlight;
     await this.flush();
   }
+}
+
+/** The newest `kind:'compaction'` note, or null. Only the newest matters:
+ *  each compaction's summary already folds the previous one in. */
+export function latestCompaction(
+  msgs: AgentMessage[],
+): { seq: number; summary: string; upto: number } | null {
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    const m = msgs[i] as any;
+    if (m.role === 'note' && m.kind === 'compaction' && typeof m.upto === 'number') {
+      return { seq: m.seq, summary: m.summary ?? '', upto: m.upto };
+    }
+  }
+  return null;
+}
+
+/**
+ * What the MODEL sees: from the newest compaction note, its summary as a
+ * leading user message, then every non-note message after the note's `upto`.
+ * With no compaction, the whole (note-filtered) transcript. The transcript
+ * itself is never touched — compaction changes this view only.
+ */
+export function assembleContext(msgs: AgentMessage[]): ProviderMessage[] {
+  const c = latestCompaction(msgs);
+  if (!c) return toProviderMessages(msgs);
+  return [
+    { role: 'user', content: `[Earlier conversation, compacted]\n${c.summary}` },
+    ...toProviderMessages(msgs.filter((m) => m.seq > c.upto)),
+  ];
+}
+
+/**
+ * Estimated tokens the next provider call will carry. The last assistant's
+ * provider-reported `usage.input` is ground truth for the context size at
+ * THAT call; chars/4 approximates what has landed since. Take the max — the
+ * estimate feeds a threshold, so erring high compacts a little early, erring
+ * low silently never compacts. `lastReportedInput` must come from an
+ * assistant NEWER than the latest compaction, or it describes a view that no
+ * longer exists (the caller enforces this).
+ */
+export function estimateContext(
+  assembled: ProviderMessage[], lastReportedInput?: number,
+): number {
+  const chars = JSON.stringify(assembled).length;
+  return Math.max(lastReportedInput ?? 0, Math.ceil(chars / 4));
+}
+
+/**
+ * The seq to compact up to (inclusive), keeping the last `keep` non-note
+ * messages — or null when there is nothing worth compacting. The cut NEVER
+ * splits an assistant-with-toolCalls from its tool results: a summarized
+ * `tool_use` whose `tool_result` survives in the tail (or vice versa) is the
+ * same unmatched-pair 400 the repair machinery exists to prevent, introduced
+ * by our own bookkeeping. Tool rows sit directly after their assistant, so
+ * walking the cut backward off any tool row lands it on the owning
+ * assistant, which is then KEPT whole with its results.
+ */
+export function findCompactionCut(msgs: AgentMessage[], keep: number): number | null {
+  const c = latestCompaction(msgs);
+  const eligible = msgs.filter(
+    (m) => m.role !== 'note' && (!c || m.seq > c.upto),
+  );
+  if (eligible.length <= keep) return null;
+  let cut = eligible.length - keep; // index of the first KEPT message
+  while (cut > 0 && eligible[cut].role === 'tool') cut -= 1;
+  if (cut <= 0) return null;
+  return eligible[cut - 1].seq;
+}
+
+/**
+ * §9. Summarize everything older than the last `keep` messages into a
+ * `kind:'compaction'` note, using the turn's own provider. Failure is
+ * DEGRADED, never fatal: the turn proceeds uncompacted (too-long context is
+ * the provider's error to report, and the next iteration tries again), and no
+ * error note is written — compaction is bookkeeping, not the user's request.
+ * Returns true when a note was committed (the caller re-reads history).
+ */
+async function maybeCompact(
+  sessionId: string, config: RunConfig, history: AgentMessage[],
+): Promise<boolean> {
+  const ctx = config.context;
+  if (!ctx) return false;
+  const window = ctx.window ?? 200_000;
+  const compactAt = ctx.compactAt ?? 0.8;
+  const keep = ctx.keep ?? 6;
+
+  const prior = latestCompaction(history);
+  const assembled = assembleContext(history);
+  const lastAssistant = [...history].reverse()
+    .find((m) => m.role === 'assistant' && typeof m.usage?.input === 'number');
+  // A reported input from BEFORE the latest compaction describes the
+  // pre-compaction view; using it would re-trigger forever.
+  const reported = lastAssistant && (!prior || lastAssistant.seq > prior.seq)
+    ? lastAssistant.usage!.input : undefined;
+  if (estimateContext(assembled, reported) <= window * compactAt) return false;
+
+  const upto = findCompactionCut(history, keep);
+  if (upto === null) return false;
+  if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'compacting' } }))) return false;
+
+  const head = history.filter(
+    (m) => m.role !== 'note' && (!prior || m.seq > prior.upto) && m.seq <= upto,
+  );
+  let summary = '';
+  let usage = { input: 0, output: 0 } as { input: number; output: number; cost?: number };
+  try {
+    for await (const chunk of config.provider.stream({
+      model: config.model,
+      system:
+        'You compact conversation history for an agent. Produce a concise brief '
+        + 'the agent can continue from, structured as: Goal, Progress, Decisions, '
+        + 'Open items. Preserve identifiers, numbers, and constraints exactly. '
+        + 'Output only the brief.',
+      messages: [
+        ...(prior ? [{
+          role: 'user' as const,
+          content: `[Earlier conversation, compacted]\n${prior.summary}`,
+        }] : []),
+        ...toProviderMessages(head),
+        { role: 'user' as const, content: 'Compact the conversation above now, as instructed.' },
+      ],
+      tools: [],
+    })) {
+      if (chunk.kind === 'text') summary += chunk.chunk;
+      else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
+    }
+  } catch (e) {
+    console.warn(
+      `[10thfloor:agent] compaction failed for session ${sessionId}; proceeding uncompacted:`,
+      (e as Error)?.message,
+    );
+    return false;
+  }
+  if (!summary.trim()) return false;
+
+  // The summarization call is a real model call: its usage and cost accrue
+  // exactly as a think's do, in the same atomic write as the note's seq.
+  const noteSeq = await allocateSeq(sessionId, {
+    'usage.input': usage.input,
+    'usage.output': usage.output,
+    'usage.cost': accruedCost(usage, config.pricing),
+  });
+  if (noteSeq === null) return false;
+  await AgentMessages.insertAsync({
+    _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'compaction',
+    summary, upto, usage, createdAt: new Date(),
+  } as any);
+  return true;
 }
 
 function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
@@ -873,8 +1024,18 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           return;
         }
 
-        const history = await AgentMessages
+        let history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+
+        // §9: compact BEFORE this iteration's provider call, so the call that
+        // would have overflowed is the one that benefits. A committed note
+        // changes the assembled view; re-read so this iteration streams
+        // against it (the note also occupies a seq).
+        if (await maybeCompact(sessionId, config, history)) {
+          history = await AgentMessages
+            .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+        }
+
         const historyMaxSeq = history.length ? history[history.length - 1].seq : -1;
 
         let messageId = Random.id();
@@ -923,7 +1084,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             try {
               for await (const chunk of config.provider.stream({
                 model: config.model, system: config.system,
-                messages: toProviderMessages(history), tools: schemas,
+                // The COMPACTED view when a compaction note stands; the raw
+                // (note-filtered) transcript otherwise.
+                messages: assembleContext(history), tools: schemas,
                 signal: abort.signal,
               })) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }

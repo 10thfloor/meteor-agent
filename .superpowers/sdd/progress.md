@@ -123,3 +123,14 @@ M3 backlog additions from final review: spurious extra turn from the wake self-c
 Suite at M2 close: 122 server (+1 pending live-smoke) + 1 client, 0 failures.
 
 == MILESTONE 3 (branch milestone-3-spec-v1, plan 2026-08-16-agent-harness-milestone-3.md) ==
+M3 Task 1: complete (a15a894..2d54621, 129+1 passing). Tests by interrupted subagent, implementation
+  INLINE by controller after repeated 529s; per-task review NOT yet done (529s) — final review must
+  scrutinize this diff. Self-checked: no stale backoff floor assertion; 408 pin updated to retryable.
+  Probe: ProviderRequestOptions.signal (types.d.ts:50) reaches streamSimple via third arg.
+  Residual for Task 3: a resume that fails before consuming its verdict leaves it unconsumed with no
+  wake — the watcher sweep should notice standing verdicts on idle sessions.
+  Note: abort() fires only at the mid-stream check; the other two detection points have no live request.
+M3 Task 2: complete INLINE (compaction, 136+1 passing; review pending — 529s on subagents).
+  Model view restarts from the newest compaction note; transcript untouched; cut never splits a
+  tool batch (walk-back off tool rows); failed compaction degrades to an uncompacted turn silently;
+  summarization usage/cost accrues in the note's atomic allocateSeq.

@@ -2337,3 +2337,219 @@ describe('backoffDelay()', () => {
       .forEach((d) => assert.isAtMost(d, 8));
   });
 });
+
+describe('compaction (§9)', () => {
+  const seedLong = async (sessionId: string) => {
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 5, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    const pad = 'x'.repeat(80);
+    const rows: Array<[number, string, string]> = [
+      [0, 'user', `OLD-1 ${pad}`], [1, 'assistant', `OLD-2 ${pad}`],
+      [2, 'user', `OLD-3 ${pad}`], [3, 'assistant', `OLD-4 ${pad}`],
+      [4, 'user', 'ask now'],
+    ];
+    for (const [seq, role, content] of rows) {
+      await AgentMessages.insertAsync({
+        _id: `m${seq}`, sessionId, seq, role, content, createdAt: new Date(),
+      } as any);
+    }
+  };
+
+  it('compacts before the call that would overflow, and the model sees the summary', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seedLong('s-compact');
+    const requests: any[] = [];
+    const scripted: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        const isCompaction = req.system.includes('compact');
+        for (const ch of (isCompaction ? 'SUMMARY-BRIEF' : 'final answer')) {
+          yield { kind: 'text', chunk: ch };
+        }
+        yield { kind: 'done', usage: { input: 7, output: 3 } };
+      },
+    };
+    await runTurn('s-compact', {
+      model: 'mock', system: 'be helpful', tools: [], provider: scripted,
+      context: { window: 100, compactAt: 0.5, keep: 2 },
+    });
+
+    const note = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact', role: 'note', kind: 'compaction' } as any,
+    );
+    assert.isDefined(note, 'a compaction note must be committed');
+    assert.equal((note as any).summary, 'SUMMARY-BRIEF');
+    assert.equal((note as any).upto, 2, 'keep=2 keeps OLD-4 and "ask now"');
+
+    // Two provider calls: the compaction, then the think against the view.
+    assert.lengthOf(requests, 2);
+    const think = requests[1];
+    assert.include(think.messages[0].content, '[Earlier conversation, compacted]');
+    assert.include(think.messages[0].content, 'SUMMARY-BRIEF');
+    const flat = JSON.stringify(think.messages);
+    assert.notInclude(flat, 'OLD-2', 'compacted messages must not reach the model');
+    assert.include(flat, 'OLD-4', 'kept messages must');
+
+    // The TRANSCRIPT keeps everything: 5 seeded + note + assistant reply.
+    assert.equal(await AgentMessages.find({ sessionId: 's-compact' }).countAsync(), 7);
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact', role: 'assistant', content: 'final answer' } as any,
+    );
+    assert.isDefined(reply, 'the turn must complete after compacting');
+  });
+
+  it('a failed compaction degrades to an uncompacted turn, never an error', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seedLong('s-compact-fail');
+    const failing: Provider = {
+      async *stream(req) {
+        if (req.system.includes('compact')) {
+          const e: any = new Error('summarizer down'); e.status = 503; throw e;
+        }
+        yield { kind: 'text', chunk: 'answered anyway' };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+    await runTurn('s-compact-fail', {
+      model: 'mock', system: '', tools: [], provider: failing,
+      context: { window: 100, compactAt: 0.5, keep: 2 },
+    });
+
+    assert.equal(
+      await AgentMessages.find(
+        { sessionId: 's-compact-fail', role: 'note' } as any,
+      ).countAsync(),
+      0, 'no compaction note and no error note — compaction failure is silent degradation',
+    );
+    // The seeded transcript already contains assistants; the reply is the
+    // NEWEST assistant row, not the first match.
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact-fail', role: 'assistant' } as any,
+      { sort: { seq: -1 } } as any,
+    );
+    assert.equal((reply as any).content, 'answered anyway');
+    assert.equal((await AgentSessions.findOneAsync('s-compact-fail'))!.phase, 'idle');
+  });
+
+  it('repair still works with a compaction note standing', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: 's-compact-repair', agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 3, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'r0', sessionId: 's-compact-repair', seq: 0, role: 'user',
+      content: 'hello', createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'r1', sessionId: 's-compact-repair', seq: 1, role: 'note', kind: 'compaction',
+      summary: 'earlier stuff', upto: 0, createdAt: new Date(),
+    } as any);
+    // A crash-stranded assistant AFTER the note: unanswered tool_use.
+    await AgentMessages.insertAsync({
+      _id: 'r2', sessionId: 's-compact-repair', seq: 2, role: 'assistant',
+      content: '', toolCalls: [{ id: 'dead1', name: 'gone', args: {} }],
+      createdAt: new Date(),
+    } as any);
+
+    await runTurn('s-compact-repair', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-compact-repair' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the stranded turn must be repaired');
+    assert.isDefined(msgs.find((m) => m.role === 'assistant' && m.content === 'recovered'));
+    const note = msgs.find((m) => (m as any).kind === 'compaction');
+    assert.isDefined(note, 'the compaction note is history and must survive repair');
+  });
+});
+
+describe('compaction pure functions', () => {
+  const msg = (seq: number, role: string, extra: any = {}) => ({
+    _id: `p${seq}`, sessionId: 's', seq, role, createdAt: new Date(0), ...extra,
+  });
+
+  it('findCompactionCut keeps the last `keep` and never splits a batch', async () => {
+    const { findCompactionCut } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'a' }),
+      msg(1, 'assistant', { toolCalls: [{ id: 't1', name: 'x', args: {} }] }),
+      msg(2, 'tool', { toolCallId: 't1', content: '{}' }),
+      msg(3, 'user', { content: 'b' }),
+      msg(4, 'assistant', { content: 'c' }),
+      msg(5, 'user', { content: 'd' }),
+    ];
+    // keep=3: cut lands on a non-tool row — plain boundary.
+    assert.equal(findCompactionCut(msgs, 3), 2);
+    // keep=4: the naive cut lands ON the tool row; walking back keeps the
+    // whole batch (assistant AND its result) in the tail.
+    assert.equal(findCompactionCut(msgs, 4), 0);
+    // keep >= eligible: nothing to compact.
+    assert.isNull(findCompactionCut(msgs, 6));
+    // Walking back to the start: nothing summarizable without splitting.
+    assert.isNull(findCompactionCut([
+      msg(0, 'assistant', { toolCalls: [{ id: 't1', name: 'x', args: {} }] }),
+      msg(1, 'tool', { toolCallId: 't1', content: '{}' }),
+    ] as any, 1));
+  });
+
+  it('findCompactionCut starts after the previous compaction', async () => {
+    const { findCompactionCut } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'old' }),
+      msg(1, 'note', { kind: 'compaction', summary: 's', upto: 0 }),
+      msg(2, 'user', { content: 'a' }), msg(3, 'assistant', { content: 'b' }),
+      msg(4, 'user', { content: 'c' }),
+    ];
+    // eligible = seqs 2,3,4; keep=1 -> cut before seq 4 -> upto 3.
+    assert.equal(findCompactionCut(msgs, 1), 3);
+  });
+
+  it('assembleContext swaps compacted history for the summary', async () => {
+    const { assembleContext } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'old question' }),
+      msg(1, 'assistant', { content: 'old answer' }),
+      msg(2, 'note', { kind: 'compaction', summary: 'THE-BRIEF', upto: 1 }),
+      msg(3, 'user', { content: 'new question' }),
+    ];
+    const out = assembleContext(msgs);
+    assert.lengthOf(out, 2);
+    assert.include(out[0].content, 'THE-BRIEF');
+    assert.equal(out[1].content, 'new question');
+  });
+
+  it('estimateContext takes the max of reported input and chars/4', async () => {
+    const { estimateContext } = await import('../server/loop');
+    const small = [{ role: 'user' as const, content: 'hi' }];
+    assert.equal(estimateContext(small, 999), 999);
+    const noReport = estimateContext(small);
+    assert.isAbove(noReport, 0);
+    assert.isBelow(noReport, 50);
+  });
+});

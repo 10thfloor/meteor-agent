@@ -34,6 +34,12 @@ export interface AgentConfig {
     spend?: number | string;
   };
   maxIterations?: number;
+  /** §9 compaction. When the estimated context exceeds `window * compactAt`
+   *  tokens, everything older than the last `keep` messages is summarized into
+   *  a `kind:'compaction'` note and the MODEL's view restarts from that
+   *  summary. The transcript keeps every message. Defaults 200_000 / 0.8 / 6.
+   *  Omit `context` entirely to disable compaction. */
+  context?: { window?: number; compactAt?: number; keep?: number };
   /** §10. Provider retry: `attempts` counts the initial try (default 3),
    *  backoff is `baseMs * 2^attemptIndex` (default 500). Only transient
    *  failures (429/5xx/network) retry; auth and request errors fail fast. */
