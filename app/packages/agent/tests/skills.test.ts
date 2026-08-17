@@ -1,0 +1,516 @@
+import { assert } from 'chai';
+import type { Provider, ProviderRequest } from '../server/providers/types';
+
+/** A session in the shape every entry into a turn expects, seeded for one
+ *  named agent. Same helper the loop tests use, agent-parameterized because
+ *  skills and hook contexts are both read off the SESSION's agent. */
+const seed = async (sessionId: string, text: string, agent: string) => {
+  const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+  await AgentSessions.removeAsync({});
+  await AgentMessages.removeAsync({});
+  await AgentDeltas.removeAsync({});
+  await AgentSessions.insertAsync({
+    _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
+    nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+    budgetSpent: { turns: 0, toolCalls: 0 },
+    createdAt: new Date(), updatedAt: new Date(),
+  } as any);
+  await AgentMessages.insertAsync({
+    _id: 'u-msg', sessionId, seq: 0, role: 'user', content: text, createdAt: new Date(),
+  } as any);
+};
+
+/** A long transcript whose estimated context blows a tiny window — the only
+ *  way to make the loop issue a COMPACTION request, which is half of what
+ *  `beforeProviderRequest`'s `purpose` exists to distinguish. */
+const seedLong = async (sessionId: string, agent: string) => {
+  const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+  await AgentSessions.removeAsync({});
+  await AgentMessages.removeAsync({});
+  await AgentDeltas.removeAsync({});
+  await AgentSessions.insertAsync({
+    _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
+    nextSeq: 5, usage: { input: 0, output: 0, cost: 0 },
+    budgetSpent: { turns: 0, toolCalls: 0 },
+    createdAt: new Date(), updatedAt: new Date(),
+  } as any);
+  const pad = 'x'.repeat(80);
+  const rows: Array<[number, string, string]> = [
+    [0, 'user', `OLD-1 ${pad}`], [1, 'assistant', `OLD-2 ${pad}`],
+    [2, 'user', `OLD-3 ${pad}`], [3, 'assistant', `OLD-4 ${pad}`],
+    [4, 'user', 'ask now'],
+  ];
+  for (const [seq, role, content] of rows) {
+    await AgentMessages.insertAsync({
+      _id: `m${seq}`, sessionId, seq, role, content, createdAt: new Date(),
+    } as any);
+  }
+};
+
+const SKILLS = [
+  { name: 'refunds', description: 'How to process a refund.', content: 'REFUND-BODY-MARKER' },
+  { name: 'shipping', description: 'When parcels arrive.', content: 'SHIPPING-BODY-MARKER' },
+];
+
+describe('skills', () => {
+  it('lists name and description in the system prompt, never the content', async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: ProviderRequest | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    defineAgent('skilled-listing', {
+      model: 'mock', instructions: 'You are helpful.', provider: capturing, skills: SKILLS,
+    });
+    await seed('sk-listing', 'hi', 'skilled-listing');
+    await runTurn('sk-listing', buildRunConfig(getAgent('skilled-listing')!, 'u1'));
+
+    const req = seen! as ProviderRequest;
+    assert.include(req.system, 'You are helpful.');
+    assert.include(req.system, '## Skills');
+    assert.include(req.system, '- refunds — How to process a refund.');
+    assert.include(req.system, '- shipping — When parcels arrive.');
+    assert.include(
+      req.system,
+      "Load a skill's full instructions with the skill tool when its description matches the task.",
+    );
+    // The token economy, asserted rather than assumed: descriptions always,
+    // bodies never.
+    assert.notInclude(req.system, 'REFUND-BODY-MARKER');
+    assert.notInclude(req.system, 'SHIPPING-BODY-MARKER');
+
+    // The loader exists only because this agent has skills, and it is offered
+    // to the model like any other tool.
+    assert.deepEqual(req.tools.map((t) => t.name), ['skill']);
+  });
+
+  it('the skill tool loads a skill body into the tool row', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'sk1', name: 'skill', args: { name: 'refunds' } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        for (const ch of 'refunded') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 8 } };
+      },
+    };
+    defineAgent('skilled-load', {
+      model: 'mock', instructions: 'x', provider: scripted, skills: SKILLS,
+    });
+    await seed('sk-load', 'refund please', 'skilled-load');
+    await runTurn('sk-load', buildRunConfig(getAgent('skilled-load')!, 'u1'));
+
+    const row = await AgentMessages.findOneAsync({ sessionId: 'sk-load', role: 'tool' } as any);
+    assert.isDefined(row, 'the skill tool must answer with a tool row');
+    assert.include((row as any).content, 'REFUND-BODY-MARKER');
+    assert.isUndefined((row as any).error, 'a loaded skill is a success');
+    // The OTHER skill's body is not delivered by loading this one.
+    assert.notInclude((row as any).content, 'SHIPPING-BODY-MARKER');
+  });
+
+  it('an unknown skill name answers a structured error naming the available skills', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'sk1', name: 'skill', args: { name: 'refunds-v2' } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    defineAgent('skilled-unknown', {
+      model: 'mock', instructions: 'x', provider: scripted, skills: SKILLS,
+    });
+    await seed('sk-unknown', 'go', 'skilled-unknown');
+    await runTurn('sk-unknown', buildRunConfig(getAgent('skilled-unknown')!, 'u1'));
+
+    const row = await AgentMessages.findOneAsync({ sessionId: 'sk-unknown', role: 'tool' } as any);
+    assert.equal((row as any).error.error, 'unknown-skill');
+    // Names only: the descriptions are already in the system prompt, and
+    // repeating them here would spend the tokens the design exists to save.
+    assert.include((row as any).error.reason, 'refunds, shipping');
+    assert.notInclude((row as any).error.reason, 'How to process a refund.');
+    // The turn still finishes — an unknown skill is a result the model routes
+    // around, not a failure.
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 'sk-unknown', role: 'assistant', content: 'ok' } as any,
+    );
+    assert.isDefined(reply);
+  });
+
+  it("an app's own tool named skill wins, and the built-in is skipped with one warn", async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { _resetSkillWarnings } = await import('../server/tools');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: ProviderRequest | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req;
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    defineAgent('skilled-collision', {
+      model: 'mock',
+      instructions: 'x',
+      provider: capturing,
+      skills: SKILLS,
+      tools: [{
+        name: 'skill',
+        description: "THE APP'S OWN SKILL TOOL",
+        args: { type: 'object', properties: {} },
+        run: async () => 'app',
+      }],
+    });
+    await seed('sk-collision', 'go', 'skilled-collision');
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      _resetSkillWarnings();
+      await runTurn('sk-collision', buildRunConfig(getAgent('skilled-collision')!, 'u1'));
+    } finally {
+      console.warn = originalWarn;
+    }
+
+    const req = seen! as ProviderRequest;
+    // Exactly one `skill`, and it is the app's: a provider rejects a duplicate
+    // tool name outright, so shipping both would break the whole turn.
+    assert.deepEqual(req.tools.map((t) => t.name), ['skill']);
+    assert.equal(req.tools[0].description, "THE APP'S OWN SKILL TOOL");
+    assert.lengthOf(warnings, 1);
+    assert.include(warnings[0], 'built-in skill loader');
+  });
+
+  it('refuses a malformed skill at define time', async function () {
+    const { defineAgent } = await import('../server/registry');
+    const base = { model: 'mock', instructions: 'x' } as any;
+
+    assert.throws(
+      () => defineAgent('bad-dup', {
+        ...base,
+        skills: [
+          { name: 'refunds', description: 'a', content: 'A' },
+          { name: 'refunds', description: 'b', content: 'B' },
+        ],
+      }),
+      /Two skills are named "refunds"/,
+    );
+    assert.throws(
+      () => defineAgent('bad-name', {
+        ...base, skills: [{ name: 'not a name!', description: 'a', content: 'A' }],
+      }),
+      /must be 1-64 letters, digits or hyphens/,
+    );
+    assert.throws(
+      () => defineAgent('bad-content', {
+        ...base, skills: [{ name: 'refunds', description: 'a' } as any],
+      }),
+      /needs a non-empty "content" string/,
+    );
+    assert.throws(
+      () => defineAgent('bad-description', {
+        ...base, skills: [{ name: 'refunds', description: '  ', content: 'A' } as any],
+      }),
+      /needs a non-empty "description" string/,
+    );
+  });
+});
+
+describe('hooks', () => {
+  it('refuses an unknown hook name at registration', async () => {
+    const { Agent } = await import('../server/agent');
+    try {
+      assert.throws(
+        () => (Agent as any).hook('beforeToolCall', () => {}),
+        /Unknown hook "beforeToolCall"/,
+      );
+      assert.throws(
+        () => (Agent as any).hook('afterToolResult', 'not a function'),
+        /needs a function/,
+      );
+    } finally {
+      Agent.clearHooks();
+    }
+  });
+
+  it('beforeProviderRequest observes and patches the think request', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    const contexts: any[] = [];
+    let seen: ProviderRequest | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req;
+        for (const ch of 'answered') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 8 } };
+      },
+    };
+
+    await seed('hk-before', 'hello', 'support');
+    try {
+      // Observer: returns nothing, so the request must pass through unchanged
+      // by it.
+      Agent.hook('beforeProviderRequest', (req, ctx) => { contexts.push(ctx); });
+      Agent.hook('beforeProviderRequest', (req) => ({
+        ...req, system: `${req.system} [PREAMBLE 2026-08-17]`,
+      }));
+      await runTurn('hk-before', {
+        model: 'mock', system: 'be helpful', tools: [], provider: capturing,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    assert.lengthOf(contexts, 1);
+    assert.deepEqual(contexts[0], {
+      agent: 'support', sessionId: 'hk-before', purpose: 'think',
+    });
+    const req = seen! as ProviderRequest;
+    assert.equal(req.system, 'be helpful [PREAMBLE 2026-08-17]');
+    // The harness re-stamps its own abort signal after the hooks, so a hook
+    // that rebuilds the request cannot disable the interrupt.
+    assert.isDefined(req.signal, 'the interrupt signal must survive a rebuilt request');
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 'hk-before', role: 'assistant' } as any,
+    );
+    assert.equal((reply as any).content, 'answered');
+  });
+
+  it('hooks run in registration order, each seeing the previous one\'s patch', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen = '';
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req.system;
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    await seed('hk-order', 'hello', 'support');
+    try {
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}-A` }));
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}-B` }));
+      await runTurn('hk-order', {
+        model: 'mock', system: 'base', tools: [], provider: capturing,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    assert.equal(seen, 'base-A-B', 'the second hook must see the first one\'s output');
+  });
+
+  it('beforeProviderRequest sees the compaction request too, and can replace it', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    const purposes: string[] = [];
+    const scripted: Provider = {
+      async *stream(req) {
+        // The app's summarizer, recognizable because the hook wrote it.
+        if (req.system.startsWith('CUSTOM-SUMMARIZER')) {
+          for (const ch of 'BRIEF-FROM-THE-HOOK') yield { kind: 'text', chunk: ch };
+        } else {
+          for (const ch of 'final answer') yield { kind: 'text', chunk: ch };
+        }
+        yield { kind: 'done', usage: { input: 7, output: 3 } };
+      },
+    };
+
+    await seedLong('hk-compact', 'support');
+    try {
+      Agent.hook('beforeProviderRequest', (req, ctx) => {
+        purposes.push(ctx.purpose);
+        // The summarizer hook, for free: swap the compaction request wholesale.
+        if (ctx.purpose !== 'compaction') return undefined;
+        return { ...req, system: 'CUSTOM-SUMMARIZER: one line only.' };
+      });
+      await runTurn('hk-compact', {
+        model: 'mock', system: 'be helpful', tools: [], provider: scripted,
+        context: { window: 100, compactAt: 0.5, keep: 2 },
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    assert.deepEqual(purposes, ['compaction', 'think'],
+      'every provider request runs the hook, compaction included');
+    const note = await AgentMessages.findOneAsync(
+      { sessionId: 'hk-compact', role: 'note', kind: 'compaction' } as any,
+    );
+    assert.equal((note as any).summary, 'BRIEF-FROM-THE-HOOK',
+      'the replaced compaction request is what actually ran');
+  });
+
+  it('afterToolResult rewrites a result before the row is written', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    const observed: any[] = [];
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'c1', name: 'lookup', args: { id: 7 } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    await seed('hk-after', 'look it up', 'support');
+    try {
+      Agent.hook('afterToolResult', (result, call, ctx) => {
+        observed.push({ result, call, ctx });
+        return {
+          ok: true,
+          value: JSON.stringify(result.value).replace(/4111\d+/, '[REDACTED]'),
+        };
+      });
+      await runTurn('hk-after', {
+        model: 'mock',
+        system: '',
+        tools: [{
+          name: 'lookup',
+          description: 'x',
+          args: { type: 'object', properties: {} },
+          run: async () => ({ card: '4111111111111111' }),
+        }],
+        provider: scripted,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    // The ROW is the assertion that matters: the hook runs before truncation
+    // and before the write, so the transcript never held the original.
+    const row = await AgentMessages.findOneAsync({ sessionId: 'hk-after', role: 'tool' } as any);
+    assert.include((row as any).content, '[REDACTED]');
+    assert.notInclude((row as any).content, '4111111111111111');
+
+    assert.lengthOf(observed, 1);
+    assert.deepEqual(observed[0].result, { ok: true, value: { card: '4111111111111111' } });
+    assert.deepEqual(observed[0].call, { id: 'c1', name: 'lookup', args: { id: 7 } });
+    assert.deepEqual(observed[0].ctx, {
+      agent: 'support', sessionId: 'hk-after', userId: 'u1',
+    });
+  });
+
+  it('a hook that throws — or returns junk — is skipped with one warn per kind, and the turn completes', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream(req) {
+        calls += 1;
+        assert.equal(req.system, 'be helpful', 'a thrown hook must leave the request alone');
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'c1', name: 'lookup', args: {} }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        for (const ch of 'survived') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 8 } };
+      },
+    };
+
+    await seed('hk-throw', 'go', 'support');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      Agent.hook('beforeProviderRequest', () => { throw new Error('extension is broken'); });
+      // The other way a hook goes wrong: it returns something that is not a
+      // request at all (a `&&` chain, a forgotten `await`). Same treatment.
+      Agent.hook('beforeProviderRequest', () => true as any);
+      Agent.hook('afterToolResult', () => { throw new Error('redactor is broken'); });
+      await runTurn('hk-throw', {
+        model: 'mock',
+        system: 'be helpful',
+        tools: [{
+          name: 'lookup',
+          description: 'x',
+          args: { type: 'object', properties: {} },
+          run: async () => 'the real value',
+        }],
+        provider: scripted,
+      });
+    } finally {
+      console.warn = originalWarn;
+      Agent.clearHooks();
+    }
+
+    // Two provider calls' worth of failures, one tool result's worth — and one
+    // warning per KIND, not one per occurrence. Three kinds fired here, and
+    // "a hook threw" must not suppress "a hook returned junk".
+    assert.lengthOf(warnings, 3);
+    assert.include(warnings.join('\n'), 'a beforeProviderRequest hook threw and was skipped');
+    assert.include(warnings.join('\n'), 'not a provider request');
+    assert.include(warnings.join('\n'), 'an afterToolResult hook threw and was skipped');
+
+    const row = await AgentMessages.findOneAsync({ sessionId: 'hk-throw', role: 'tool' } as any);
+    assert.include((row as any).content, 'the real value', 'the un-hooked result stands');
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 'hk-throw', role: 'assistant', content: 'survived' } as any,
+    );
+    assert.isDefined(reply, 'a broken extension must not kill the turn');
+    assert.equal((await AgentSessions.findOneAsync('hk-throw'))!.phase, 'idle');
+  });
+
+});

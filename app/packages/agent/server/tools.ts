@@ -818,6 +818,171 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
   return out;
 }
 
+/* ------------------------------------------------------------------ *
+ * Skills
+ * ------------------------------------------------------------------ */
+
+/**
+ * A named block of instructions the model loads ON DEMAND.
+ *
+ * The token economy is the whole point: `name` and `description` are always in
+ * the system prompt (a listing — see `buildSystemPrompt`), and `content` is
+ * NEVER there. A model that decides a skill's description matches the task
+ * calls the built-in `skill` tool and gets the body as a tool result. Ten
+ * skills therefore cost ten lines of prompt on every call instead of ten
+ * documents.
+ */
+export interface Skill {
+  /** Letters, digits and hyphens, 1-64 characters. It is what the model passes
+   *  to the `skill` tool, so it has to be typo-resistant and stable. */
+  name: string;
+  /** ONE line. It is in the prompt on every single call, and it is the only
+   *  thing the model has to decide with. */
+  description: string;
+  /** The instructions themselves, delivered only when asked for. */
+  content: string;
+}
+
+/** The name of the built-in loader tool. Not configurable: it is named in the
+ *  system prompt's own instruction sentence, and a rename would have to travel
+ *  with it. */
+export const SKILL_TOOL_NAME = 'skill';
+
+const SKILL_NAME = /^[a-z0-9-]{1,64}$/i;
+
+/**
+ * Validate `skills` at DEFINE time, so a bad skill is a startup error.
+ *
+ * The failure mode this prevents is quiet: a skill whose `content` is missing
+ * lists perfectly well in the prompt, and only fails when a model that trusted
+ * the listing calls for a body that is not there — inside a turn, as a tool
+ * error, blamed on the model. Duplicate names are the same story with a worse
+ * ending: the listing shows two, the loader can only ever return one.
+ */
+export function validateSkills(skills: unknown): void {
+  if (skills === undefined) return;
+  if (!Array.isArray(skills)) {
+    throw new Error('[10thfloor:agent] skills must be an array of { name, description, content }.');
+  }
+  const seen = new Set<string>();
+  for (const skill of skills) {
+    const s = skill as Partial<Skill>;
+    if (!s || typeof s !== 'object' || typeof s.name !== 'string' || !SKILL_NAME.test(s.name)) {
+      throw new Error(
+        '[10thfloor:agent] A skill\'s "name" must be 1-64 letters, digits or hyphens; '
+        + `got ${JSON.stringify((s as any)?.name)}`,
+      );
+    }
+    for (const field of ['description', 'content'] as const) {
+      if (typeof s[field] !== 'string' || s[field]!.trim() === '') {
+        throw new Error(
+          `[10thfloor:agent] Skill "${s.name}" needs a non-empty "${field}" string`
+          + `${field === 'content' ? ' — the instructions the skill tool delivers' : ''}.`,
+        );
+      }
+    }
+    if (seen.has(s.name)) {
+      throw new Error(
+        `[10thfloor:agent] Two skills are named "${s.name}"; the listing would show both `
+        + 'and the loader could only ever return one.',
+      );
+    }
+    seen.add(s.name);
+  }
+}
+
+/**
+ * The built-in loader, as an inline tool built at RUN time from the agent's
+ * skills. It exists only for an agent that has skills — an empty `skill` tool
+ * is a name in every prompt that can only ever answer "no".
+ *
+ * An unknown name answers a structured `unknown-skill` (through `Meteor.Error`,
+ * which `runTool` turns into `{ ok: false, error: { error, reason } }` like any
+ * other tool failure) listing the available NAMES only: their descriptions are
+ * already in the system prompt, and repeating them into a tool result would
+ * spend the tokens the design exists to save.
+ *
+ * Loading is idempotent and unlimited: calling it twice returns the same body,
+ * and a model may load several skills in one turn. Each load costs one
+ * `budget.toolCalls`, exactly like any other tool call.
+ */
+export function skillTool(skills: Skill[]): ResolvedTool {
+  const byName = new Map(skills.map((s) => [s.name, s]));
+  const available = skills.map((s) => s.name).join(', ');
+  return {
+    name: SKILL_TOOL_NAME,
+    description:
+      'Load the full instructions for one of the skills listed in the system prompt. '
+      + `Available skills: ${available}.`,
+    args: {
+      type: 'object',
+      properties: { name: { type: 'string' } },
+      required: ['name'],
+      additionalProperties: false,
+    },
+    gate: 'auto',
+    kind: 'inline',
+    run: async (args: { name?: string }) => {
+      const found = byName.get(String(args?.name));
+      if (!found) {
+        throw new Meteor.Error(
+          'unknown-skill',
+          `No skill named "${String(args?.name)}". Available skills: ${available}.`,
+        );
+      }
+      return found.content;
+    },
+  };
+}
+
+/** One warn per distinct message, same latch (and same reason) as `warnMcp`'s:
+ *  a collision recurs on every turn, and one line per model call would bury
+ *  the notice that matters. */
+const warnedSkillKinds = new Set<string>();
+
+export function warnSkill(message: string): void {
+  const kind = message.slice(0, 40);
+  if (warnedSkillKinds.has(kind)) return;
+  warnedSkillKinds.add(kind);
+  console.warn(`[10thfloor:agent] ${message}`);
+}
+
+/** TEST SEAM, not public API: the warn latch above is per process, so a test
+ *  that asserts on the collision warning has to be able to arm it. Not
+ *  re-exported from server/index.ts. */
+export function _resetSkillWarnings(): void {
+  warnedSkillKinds.clear();
+}
+
+/**
+ * Append the built-in `skill` tool to an agent's expanded tool list.
+ *
+ * Called AFTER `expandMcpTools`, which is what makes the collision rule
+ * decidable at all: a whole-server MCP spec's tool names are not known until
+ * discovery has run, so appending earlier could let a discovered `skill` shadow
+ * the built-in silently — two entries with one name, and a provider rejects a
+ * duplicate tool list outright.
+ *
+ * COLLISION POLICY: the app's tool wins and the built-in is skipped, with one
+ * warning. An app tool named `skill` is something the app deliberately defined
+ * and may already be calling from a UI; the built-in is a harness convenience.
+ * Silently overriding an app's own tool would be the worse surprise. The cost
+ * is that the prompt's Skills listing then points at a loader that is not ours
+ * — hence the warning naming exactly that.
+ */
+export function withSkillTool(tools: ResolvedTool[], skills?: Skill[]): ResolvedTool[] {
+  if (!skills || skills.length === 0) return tools;
+  if (tools.some((t) => t.name === SKILL_TOOL_NAME)) {
+    warnSkill(
+      `this agent defines its own tool named "${SKILL_TOOL_NAME}", so the built-in skill `
+      + 'loader is not added — the Skills listing in the system prompt will be served by '
+      + 'your tool, or not at all. Rename one of them.',
+    );
+    return tools;
+  }
+  return [...tools, skillTool(skills)];
+}
+
 export function toolSchemas(tools: ResolvedTool[]): ToolSchema[] {
   return tools.map((t) => ({
     name: t.name, description: t.description, parameters: t.args,

@@ -12,11 +12,16 @@ export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
-  fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS,
+  fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS, SKILL_TOOL_NAME,
   type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
-  type ArgsValidator, type TypeboxValue,
+  type ArgsValidator, type TypeboxValue, type Skill, type ToolResult,
 } from './tools';
+export type {
+  HookName, HookMap, HookPurpose, HookToolCall,
+  BeforeProviderRequestHook, AfterToolResultHook,
+  ProviderRequestHookContext, ToolResultHookContext,
+} from './hooks';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
 export {
   stopMcp, _setMcpClientFactory,

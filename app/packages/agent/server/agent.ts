@@ -9,6 +9,7 @@ import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
 import { registerMcpServer, type McpServerDef } from './mcp/client';
+import { clearHooks, registerHook, type HookMap, type HookName } from './hooks';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -204,6 +205,40 @@ export class Agent {
    */
   static mcpServer(name: string, def: McpServerDef): void {
     registerMcpServer(name, def);
+  }
+
+  /**
+   * Register a hook — the package's extension surface, and the replacement for
+   * Pi's extension API (see server/hooks.ts for the whole contract).
+   *
+   *   Agent.hook('beforeProviderRequest', (req, ctx) => ({
+   *     ...req, system: `${req.system}\n\nToday is ${new Date().toDateString()}.`,
+   *   }));
+   *   Agent.hook('afterToolResult', (result) => redact(result));
+   *
+   * STATIC and GLOBAL, like `Agent.method` and `Agent.mcpServer`: a hook is
+   * installed into the process, not into one agent. Every hook's `ctx` carries
+   * the agent name, so a per-agent hook is one `if` away — and per-agent
+   * REGISTRATION is a v3 candidate, not an omission.
+   *
+   * Hooks run in registration order, each seeing the previous one's output.
+   * Returning nothing keeps the value; returning a replacement swaps it. A hook
+   * that throws is skipped with one warning — a broken extension must not kill
+   * turns. An unknown hook name throws HERE, at registration, rather than
+   * silently never running.
+   */
+  static hook<N extends HookName>(name: N, fn: HookMap[N]): void {
+    registerHook(name, fn);
+  }
+
+  /**
+   * Remove every registered hook. A TEST SEAM: hooks are global and registered
+   * once at startup in an app, so the only caller with a reason to clear them
+   * is a test that must not leak one into the next test's turn (call it in a
+   * `finally`).
+   */
+  static clearHooks(): void {
+    clearHooks();
   }
 }
 

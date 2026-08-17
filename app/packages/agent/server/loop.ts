@@ -7,10 +7,13 @@ import {
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
 import {
-  expandMcpTools, resolveTools, runTool, toolSchemas,
-  type ResolvedTool, type ToolContext, type ToolResult, type ToolSpec,
+  expandMcpTools, resolveTools, runTool, toolSchemas, withSkillTool,
+  type ResolvedTool, type Skill, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
 import { runSubagent, type SubagentDispatch } from './subagent';
+import {
+  runAfterToolResult, runBeforeProviderRequest, type ToolResultHookContext,
+} from './hooks';
 
 export interface RunConfig {
   model: string;
@@ -50,6 +53,11 @@ export interface RunConfig {
    *  routes around — never a park, never a throw. */
   canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
     => boolean | Promise<boolean>;
+  /** The agent's skills. Their descriptions are already in `system` (see
+   *  `buildSystemPrompt`); the loop reads this only to decide whether to add
+   *  the built-in `skill` tool and what it can load. Absent or empty = no
+   *  loader tool at all. */
+  skills?: Skill[];
 }
 
 /** Threaded into every dispatch path as one bundle so a future path cannot
@@ -514,7 +522,7 @@ export function findCompactionCut(msgs: AgentMessage[], keep: number): number | 
  * Returns true when a note was committed (the caller re-reads history).
  */
 async function maybeCompact(
-  sessionId: string, config: RunConfig, history: AgentMessage[],
+  sessionId: string, agent: string, config: RunConfig, history: AgentMessage[],
   schemas: ToolSchema[] = [], interruptCheckMs = 250,
 ): Promise<boolean> {
   const ctx = config.context;
@@ -561,7 +569,13 @@ async function maybeCompact(
       .catch(() => { /* best-effort */ });
   }, interruptCheckMs);
   try {
-    for await (const chunk of config.provider.stream({
+    // The SECOND `beforeProviderRequest` seam, and the reason the hook carries
+    // a `purpose` at all: this request is the harness's own initiative, not the
+    // user's, and an app that wants its own summarizer replaces it here
+    // (`ctx.purpose === 'compaction'`) rather than through a bespoke option.
+    // `signal` is re-stamped below for the same reason it is on the think path:
+    // cancelling this call is the harness's job, not the hook's.
+    const request = await runBeforeProviderRequest({
       model: config.model,
       system:
         'You compact conversation history for an agent. Produce a concise brief '
@@ -582,8 +596,8 @@ async function maybeCompact(
       // the brief; a tool call in its reply is discarded anyway (only text
       // chunks accumulate below).
       tools: schemas,
-      signal: abort.signal,
-    })) {
+    }, { agent, sessionId, purpose: 'compaction' });
+    for await (const chunk of config.provider.stream({ ...request, signal: abort.signal })) {
       if (chunk.kind === 'text') summary += chunk.chunk;
       else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
     }
@@ -836,6 +850,10 @@ type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
 
 interface TurnAnchor {
   userId: string | null;
+  /** The session's agent name — half of every hook's ctx. Read off the session
+   *  document rather than threaded through `RunConfig`: a CHILD session's
+   *  agent is the child's, and the session is the only place that is true. */
+  agent: string;
   /** The committed assistant carrying the `tool_use`s — the discard anchor. */
   messageId: string;
   assistantSeq: number;
@@ -865,6 +883,9 @@ async function dispatchCalls(
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
     return 'abandoned';
   };
+  const hookCtx: ToolResultHookContext = {
+    agent: turn.agent, sessionId, userId: turn.userId,
+  };
 
   for (const call of calls) {
     // §7's backstop, BEFORE the gate: a tool the agent may not use must never
@@ -873,10 +894,13 @@ async function dispatchCalls(
     // nothing dispatched), and the model routes around it.
     if (limits.canUse
       && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
-      const denied: ToolResult = {
+      // Through the hook like every other row: a refusal is still something
+      // entering a published transcript, and `afterToolResult`'s contract is
+      // that nothing reaches a row unseen.
+      const denied: ToolResult = await runAfterToolResult({
         ok: false,
         error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
-      };
+      }, call, hookCtx);
       const deniedSeq = await allocateSeq(sessionId);
       if (deniedSeq === null) return abandon();
       await AgentMessages.insertAsync({
@@ -971,7 +995,7 @@ async function dispatchCalls(
       return 'parked';
     }
 
-    const { result, childSessionId } = tool
+    const dispatched = tool
       ? await dispatchTool(tool, call.args, {
         userId: turn.userId, sessionId, toolCallId: call.id,
       })
@@ -981,6 +1005,12 @@ async function dispatchCalls(
         } as ToolResult,
         childSessionId: undefined,
       };
+    const { childSessionId } = dispatched;
+    // The `afterToolResult` seam: BEFORE `toolResultContent`'s truncation and
+    // before the row is written, so a hook sees the whole result and its
+    // replacement is what gets truncated, stored, published and sent to the
+    // model. A throwing hook leaves `dispatched.result` standing — see hooks.ts.
+    const result = await runAfterToolResult(dispatched.result, call, hookCtx);
 
     // Same atomic allocation as the commit: `agent.send` can interject between
     // tool results, and read-then-$inc would hand both writers the same seq.
@@ -1056,6 +1086,7 @@ async function resumeParkedTurn(
   pending: NonNullable<AgentSession['pending']>,
   tools: ResolvedTool[],
   userId: string | null,
+  agent: string,
   budget: RunConfig['budget'],
   limits: DispatchLimits,
 ): Promise<DispatchOutcome> {
@@ -1077,6 +1108,7 @@ async function resumeParkedTurn(
   const calls = assistant.toolCalls ?? [];
   const turn: TurnAnchor = {
     userId,
+    agent,
     messageId: assistant._id,
     assistantSeq: assistant.seq,
     batchIds: calls.map((c) => c.id),
@@ -1154,6 +1186,14 @@ async function resumeParkedTurn(
         userId, sessionId, toolCallId: call.id,
       }));
     }
+
+    // The same `afterToolResult` seam the streaming path runs, at the same
+    // point (before truncation, before the row): an approved tool's output, a
+    // denial and an `mcp-unavailable` all reach the transcript through here, so
+    // a redaction hook cannot be dodged by parking a call.
+    result = await runAfterToolResult(result, call, {
+      agent, sessionId, userId,
+    });
 
     // A denied call was never dispatched, so it costs no tool budget.
     const seq = await allocateSeq(
@@ -1246,7 +1286,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // own copy of every MCP server. Under the heartbeat, a slow discovery
       // cannot cost us the lease either. Nothing above reads `tools` or
       // `schemas`, so there is nothing to reorder around.
-      const tools = await expandMcpTools(resolveTools(config.tools));
+      //
+      // The built-in `skill` loader joins the list AFTER expansion, for a
+      // reason that only shows up with MCP in the tree: a whole-server spec's
+      // tool names are not known until discovery has run, so appending earlier
+      // could put two tools named `skill` in front of a provider that rejects
+      // duplicates outright. Appending here makes the collision visible, and
+      // `withSkillTool` resolves it in the app's favor with one warning.
+      const tools = withSkillTool(
+        await expandMcpTools(resolveTools(config.tools)), config.skills,
+      );
       const schemas = toolSchemas(tools);
 
       if (!(await repairUnansweredToolUse(sessionId))) return;
@@ -1296,7 +1345,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         } else {
           resumed = true;
           const outcome = await resumeParkedTurn(
-            sessionId, entry.pending, tools, entry.userId, config.budget, limits,
+            sessionId, entry.pending, tools, entry.userId, entry.agent,
+            config.budget, limits,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -1339,7 +1389,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // would have overflowed is the one that benefits. A committed note
         // changes the assembled view; re-read so this iteration streams
         // against it (the note also occupies a seq).
-        if (await maybeCompact(sessionId, config, history, schemas, interruptCheckMs)) {
+        if (await maybeCompact(
+          sessionId, session.agent, config, history, schemas, interruptCheckMs,
+        )) {
           history = await AgentMessages
             .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
         }
@@ -1400,13 +1452,24 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           const abort = new AbortController();
 
           try {
+            // The `beforeProviderRequest` seam for the turn's own call. Run per
+            // ATTEMPT rather than once per iteration, so a retry re-runs the
+            // chain instead of resending a request a hook built before the
+            // backoff (a hook stamping the current time is the obvious case).
+            //
+            // `signal` is attached AFTER the hooks and never handed to them to
+            // preserve: a hook that rebuilds the request wholesale must not be
+            // able to silently disable the interrupt — cancellation is the
+            // harness's contract with the user, not the extension's.
+            const request = await runBeforeProviderRequest({
+              model: config.model, system: config.system,
+              // The COMPACTED view when a compaction note stands; the raw
+              // (note-filtered) transcript otherwise.
+              messages: assembleContext(history), tools: schemas,
+            }, { agent: session.agent, sessionId, purpose: 'think' });
             try {
               for await (const chunk of config.provider.stream({
-                model: config.model, system: config.system,
-                // The COMPACTED view when a compaction note stands; the raw
-                // (note-filtered) transcript otherwise.
-                messages: assembleContext(history), tools: schemas,
-                signal: abort.signal,
+                ...request, signal: abort.signal,
               })) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
@@ -1577,6 +1640,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
         const outcome = await dispatchCalls(sessionId, toolCalls, tools, {
           userId: session.userId,
+          agent: session.agent,
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,

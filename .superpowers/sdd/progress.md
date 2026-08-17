@@ -248,3 +248,33 @@ M4 Task 3: complete (session forking, 228+1 passing + 1 client, from 218). agent
   asserting a real agent.fork invocation matches. Full report: .superpowers/sdd/task-3-report.md
   Carry: fork of a huge transcript is O(n) docs in one method call (only rateLimit.starts bounds it);
   the copy is not transactional, so a crash mid-copy leaks inert orphan message rows nothing reaps.
+M4 Task 3 (forking): complete (6234f0a, review Approved; 2 Lows fixed in 7867439 — note-drop semantics
+  pinned+documented, divergence comment, nextSeq justification). Info kept: copied childSessionId
+  points at source's children (correct: same userId audience); child's parent still names the source.
+M4 Task 4 (MCP): complete (c5743e2 + fixes 7867439, 249+2+1 passing). 3 Mediums fixed: 15s discovery
+  deadline + 30s failure cooldown (cooldown != poisoned cache — success clears), expansion moved
+  inside claimLease + concurrent; env probe note corrected (SDK 1.30.0 merges getDefaultEnvironment
+  itself — our merge is insurance); whole-server resume misreport -> pending.mcpServer carries the
+  origin, down-at-resume now says mcp-unavailable. Lows: missing-name warn, dead export removed,
+  separate MCP warn latch, server-map snapshot in the test seam.
+  Ledger: watcher.test.ts 1-run flake noted by two agents (untouched files) — watch it.
+M4 Task 5 (skills + hooks): complete (5d95cac, 260+2 passing + 1 client, from 249 — +11). Skills:
+  config `skills:[{name,description,content}]`, validated at define time (name /^[a-z0-9-]{1,64}$/i,
+  unique, non-empty description+content); buildSystemPrompt appends a `## Skills` listing (names +
+  descriptions ONLY) plus one instruction sentence; built-in inline `skill` tool built at run time,
+  unknown name -> Meteor.Error('unknown-skill') listing available NAMES only. Collision policy: the
+  loader is appended AFTER expandMcpTools (MCP names are unknown before discovery), and an app tool
+  named `skill` WINS with one latched warn — documented + tested.
+  Hooks: new server/hooks.ts. Global registration (Agent.hook / Agent.clearHooks test seam), unknown
+  name throws at registration, registration order, void=keep / object=replace behind a minimal shape
+  check, throw-or-junk = skipped with one warn per KIND. beforeProviderRequest runs at BOTH provider
+  call sites (think, per attempt; and maybeCompact's summarizer) with ctx.purpose — the summarizer
+  hook falls out for free, traced in a test. afterToolResult runs at all THREE tool-row sites
+  (canUse refusal, streamed dispatch, parked resume), before truncation and the row write — a
+  stronger invariant than "after every dispatch", chosen so a redaction hook cannot be dodged.
+  Decisions: hooks NOT in RunConfig (four turn entries would each have to remember them; global
+  matches Pi's extension model — per-agent = v3), agent name for ctx read off the SESSION document
+  (a child reports the child agent), and `signal` is re-stamped AFTER the hooks so a rebuilt request
+  cannot disable the interrupt. Full report: .superpowers/sdd/task-5-report.md
+  Carry: skill bodies obey maxResultChars (no special case); canUse can deny `skill` while the
+  prompt listing stands.

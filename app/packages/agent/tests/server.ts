@@ -9,6 +9,7 @@ import './loop.test';
 import './ask.test';
 import './subagent.test';
 import './mcp.test';
+import './skills.test';
 import './fork.test';
 import './watcher.test';
 import './integration.server';

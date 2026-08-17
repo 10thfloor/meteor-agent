@@ -1,5 +1,5 @@
 import type { Provider } from './providers/types';
-import type { ToolSpec } from './tools';
+import { validateSkills, type Skill, type ToolSpec } from './tools';
 import type { RunConfig } from './loop';
 import { piAiProvider } from './providers/piai';
 
@@ -9,6 +9,16 @@ export interface AgentConfig {
   model: string;
   instructions: string | string[] | ((ctx: { userId: string | null }) => string);
   tools?: ToolSpec[];
+  /**
+   * On-demand prompt fragments. Each skill's `name` and `description` are
+   * appended to the system prompt as a listing; its `content` is NOT — the
+   * model loads that through the built-in `skill` tool, which exists only when
+   * an agent has skills. See `Skill` and `buildSystemPrompt`.
+   *
+   * The economy is the point: a skill costs one line per model call until it is
+   * needed, and its full body only in the turn that needs it.
+   */
+  skills?: Skill[];
   /** Optional. Defaults to `piAiProvider()`, which resolves `model` against
    *  pi-ai's built-in catalog and reads API keys from the environment. Supply
    *  one explicitly for a mock (see `mockProvider`) or a custom backend. */
@@ -186,6 +196,7 @@ export function defineAgent(name: string, config: AgentConfig): void {
   assertFiniteNumber(config.retry?.baseMs, 'retry.baseMs', { min: 0 });
   assertFiniteNumber(config.retry?.maxDelayMs, 'retry.maxDelayMs', { min: 0 });
   assertFiniteNumber(config.maxResultChars, 'maxResultChars', { min: 1 });
+  validateSkills(config.skills);
   registry.set(name, config);
 }
 
@@ -223,14 +234,44 @@ export function buildRunConfig(config: AgentConfig, userId: string | null): RunC
     context: config.context,
     maxResultChars: config.maxResultChars,
     canUse: config.canUse,
+    // Hooks are NOT threaded here, deliberately: they are registered globally
+    // with `Agent.hook` and the loop imports their runners directly. Passing
+    // them through `RunConfig` would mean every entry into a turn (send,
+    // watcher recovery, `ask`, a subagent's child run) had to remember to carry
+    // them, and one that forgot would silently skip an app's redaction. Skills
+    // go the other way for the opposite reason: they are per-agent by
+    // definition, so they belong to the config.
+    skills: config.skills,
   };
 }
 
+/** The single instruction that makes the listing actionable. It names the tool,
+ *  so `SKILL_TOOL_NAME` and this sentence travel together. */
+const SKILLS_INSTRUCTION =
+  "Load a skill's full instructions with the skill tool when its description "
+  + 'matches the task.';
+
+/**
+ * The system prompt: the agent's own instructions, plus a `## Skills` listing
+ * when it has skills.
+ *
+ * The listing carries names and DESCRIPTIONS ONLY. A skill's content never
+ * appears here — that is the entire token economy, and putting it in the prompt
+ * "just for the small ones" would be the first step back to a prompt that grows
+ * with the library.
+ */
 export function buildSystemPrompt(
   config: AgentConfig, ctx: { userId: string | null },
 ): string {
   const i = config.instructions;
-  if (typeof i === 'function') return i(ctx);
-  if (Array.isArray(i)) return i.join('\n\n');
-  return i;
+  let prompt: string;
+  if (typeof i === 'function') prompt = i(ctx);
+  else if (Array.isArray(i)) prompt = i.join('\n\n');
+  else prompt = i;
+
+  const skills = config.skills ?? [];
+  if (skills.length === 0) return prompt;
+
+  const listing = skills.map((s) => `- ${s.name} — ${s.description}`).join('\n');
+  return `${prompt}\n\n## Skills\n\n${listing}\n\n${SKILLS_INSTRUCTION}`;
 }

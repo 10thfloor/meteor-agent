@@ -39,6 +39,7 @@ Support.define({
   model: 'anthropic/claude-sonnet-5',
   instructions: [...],                       // string | fn(ctx) | array
   tools: ['orders.lookup', { name, description, args, run, gate: 'ask' }],
+  skills: [{ name: 'refunds', description, content }],   // see Skills
   budget: { turns: 20, toolCalls: 40, spend: '$1.00',
             approval: 3600000 },             // each optional; see below
   pricing: { input: 3, output: 15 },         // $/Mtok fallback when the provider
@@ -255,6 +256,126 @@ every other result.
 through the same `runTool` an inline tool is, so `gate: 'ask'` parks it, a
 `canUse` refusal never reaches the server, arguments are checked against the
 discovered schema before the call, and each call costs one `budget.toolCalls`.
+
+## Skills
+
+A skill is a block of instructions the model loads **only when it needs it**.
+
+```ts
+Support.define({
+  ...,
+  skills: [
+    { name: 'refunds',
+      description: 'Rules and steps for issuing a refund.',
+      content: await Assets.getTextAsync('skills/refunds.md') },
+    { name: 'shipping',
+      description: 'Carriers, SLAs and what to tell a customer about delays.',
+      content: SHIPPING_PLAYBOOK },
+  ],
+});
+```
+
+**The economy is the whole point.** Every skill's `name` and `description` are
+appended to the system prompt as a listing — two dozen words each, on every
+model call:
+
+```
+## Skills
+
+- refunds — Rules and steps for issuing a refund.
+- shipping — Carriers, SLAs and what to tell a customer about delays.
+
+Load a skill's full instructions with the skill tool when its description matches the task.
+```
+
+A skill's `content` is **never** in the prompt. When the model decides a
+description matches the task, it calls the built-in `skill` tool with the name
+and gets the body back as a tool result. Ten playbooks cost ten lines per call
+instead of ten documents, and the turn that needs one pays for one.
+
+The `skill` tool exists only for an agent that has skills — nothing is added to
+an agent without them. Loading is idempotent, a model may load several in one
+turn, and each load costs one `budget.toolCalls` like any other tool call. An
+unknown name answers a structured `{ error: 'unknown-skill' }` listing the
+available names (their descriptions are already in the prompt). A skill body
+longer than `maxResultChars` is truncated like any other result — raise it, or
+split the skill.
+
+Names are 1-64 letters, digits or hyphens, unique within an agent, and all
+three fields are required: a skill with no `content` lists perfectly and fails
+only when a model that trusted the listing asks for it, so it is refused at
+`define()` time instead.
+
+If your app already has a tool named `skill`, **your tool wins** and the
+built-in loader is skipped with one warning — an app's own tool, possibly
+called from a UI, is not something a harness convenience should silently
+override. Rename one of them.
+
+## Hooks
+
+Hooks are this package's **extension surface** — what Pi's extension API turns
+into when the host process is a Meteor server. Two seams, registered globally:
+
+```ts
+import { Agent } from 'meteor/10thfloor:agent';
+
+// Every request that leaves for the provider.
+Agent.hook('beforeProviderRequest', (req, ctx) => ({
+  ...req,
+  system: `${req.system}\n\nToday is ${new Date().toDateString()}.`,
+}));
+
+// Every tool result that enters a transcript.
+Agent.hook('afterToolResult', (result, call, ctx) => {
+  if (!result.ok || call.name !== 'orders.lookup') return;      // keep it
+  return { ...result, value: redactCardNumbers(result.value) }; // replace it
+});
+```
+
+`beforeProviderRequest(req, ctx) => req | void` runs for **every** provider
+request — the turn's own call and compaction's summarization alike — once per
+retry attempt, with
+`ctx = { agent, sessionId, purpose: 'think' | 'compaction' }`. The abort signal
+is re-attached after your hook runs, so rebuilding the request wholesale cannot
+disable the interrupt.
+
+`afterToolResult(result, call, ctx) => result | void` runs for every tool row a
+turn writes — inline, adopted, subagent and MCP dispatches, and the structured
+refusals (`not-allowed`, `unknown-tool`, a denied approval) that never reached
+a tool body — with `ctx = { agent, sessionId, userId }`. It runs **before**
+`maxResultChars` truncation and before the row is written, so your replacement
+is what gets stored, published and sent to the model.
+
+Three rules for both:
+
+- hooks run in **registration order**, each seeing the previous one's output;
+- **returning nothing keeps the value** — an observer needs no return statement;
+- a hook that **throws**, or returns the wrong shape, is skipped with one
+  warning and the value it was given stands. A broken extension must not kill
+  turns.
+
+An unknown hook name throws at registration rather than silently never running.
+`Agent.clearHooks()` removes them all; it is a **test seam** (call it in a
+`finally`), not a lifecycle.
+
+**The custom summarizer comes for free.** `purpose === 'compaction'` is the
+compaction request, and returning a replacement swaps it wholesale — your own
+system prompt, your own model, your own message selection — so there is no
+bespoke summarizer option to configure:
+
+```ts
+Agent.hook('beforeProviderRequest', (req, ctx) => {
+  if (ctx.purpose !== 'compaction') return;
+  return { ...req, model: 'anthropic/claude-haiku-4-5', system: OUR_SUMMARIZER };
+});
+```
+
+Registration is **global**, not per agent: a hook is installed into the process,
+exactly as a Pi extension is, and threading a hook list through `RunConfig`
+would mean every entry into a turn (a send, watcher recovery, `ask`, a
+subagent's child run) had to remember to carry it — and one that forgot would
+silently skip your redaction. Every `ctx` carries the agent's name, so a
+per-agent hook is one `if` away; per-agent *registration* is a v3 candidate.
 
 ## Use it from the client
 
@@ -550,11 +671,20 @@ JSON-Schema validation of tool arguments through typebox when it is reachable
 attribution of streamed arguments so parallel tool calls arrive as separate
 streams (`toolArgs` on an in-flight row), **subagents** — a named agent
 behind a tool call, running a child session with a live, persistent transcript
-(see **Subagents**) — and **session forking** at batch-safe cut points (see
-**Forking**).
+(see **Subagents**), **session forking** at batch-safe cut points (see
+**Forking**), **MCP servers** as tool sources (see **MCP servers**), **skills**
+— on-demand prompt fragments listed in the prompt and loaded through a built-in
+tool (see **Skills**) — and the **hook surface** (see **Hooks**).
+
+**The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
+`afterToolResult` are the two seams this package offers an app for changing what
+the harness does, and they replace Pi's extension API rather than reproducing
+it: an extension there is a module a host process installs, and here the host
+process is your Meteor server. A custom summarizer needs no option of its own —
+it is `beforeProviderRequest` with `ctx.purpose === 'compaction'`.
 
 Sketched in the original design but deliberately NOT implemented (v2
 candidates): a global `Agent.provider()` registry, a manual `compact()` call,
-`runAs`, and a custom summarizer hook.
+and `runAs`.
 
 See `docs/superpowers/specs/` for the full design.
