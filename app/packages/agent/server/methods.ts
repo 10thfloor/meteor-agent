@@ -3,9 +3,8 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { getAgent, buildSystemPrompt, resolveBudget, type AgentConfig } from './registry';
+import { getAgent, buildRunConfig, type AgentConfig } from './registry';
 import { runTurn } from './loop';
-import { piAiProvider } from './providers/piai';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -43,27 +42,10 @@ async function requireSession(agent: string, sessionId: string, userId: string |
  */
 export function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
   Meteor.defer(() => {
-    runTurn(sessionId, {
-      model: config.model,
-      system: buildSystemPrompt(config, { userId }),
-      tools: config.tools ?? [],
-      // `provider` is optional as of Milestone 2: an agent that names none
-      // streams through pi-ai. Resolved HERE rather than at define() time so
-      // defineAgent stays a pure registration and pi-ai is loaded only when a
-      // turn actually runs.
-      provider: config.provider ?? piAiProvider(),
-      maxIterations: config.maxIterations,
-      // §9. `spend` is reduced to dollars here rather than in the loop, so the
-      // loop compares numbers and `'$1.00'` is parsed once per turn instead of
-      // once per iteration. It cannot throw at this point: `defineAgent`
-      // already parsed the same value at startup and refused a bad one.
-      budget: resolveBudget(config.budget),
-      pricing: config.pricing,
-      retry: config.retry,
-      context: config.context,
-      maxResultChars: config.maxResultChars,
-      canUse: config.canUse,
-    }).catch((e) => {
+    // `buildRunConfig` is shared with `Agent.ask` and with a subagent's child
+    // run, so a turn runs on identical terms however it was started — see the
+    // note there.
+    runTurn(sessionId, buildRunConfig(config, userId)).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
   });

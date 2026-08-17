@@ -8,8 +8,9 @@ import {
 } from './lease';
 import {
   resolveTools, runTool, toolSchemas,
-  type ResolvedTool, type ToolResult, type ToolSpec,
+  type ResolvedTool, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
+import { runSubagent, type SubagentDispatch } from './subagent';
 
 export interface RunConfig {
   model: string;
@@ -56,6 +57,28 @@ export interface RunConfig {
 interface DispatchLimits {
   maxResultChars: number;
   canUse?: RunConfig['canUse'];
+}
+
+/**
+ * The ONE way a resolved tool is run, whatever its kind.
+ *
+ * Inline and adopted tools go to `runTool`, which owns argument validation,
+ * the ambient method invocation and error sanitization. A SUBAGENT does not:
+ * it is not a tool body but a nested TURN, so it needs `runTurn` — which lives
+ * here, in the module that imports tools.ts. Routing it from inside `runTool`
+ * would close an import cycle (tools -> subagent -> loop -> tools), so the
+ * split is here instead, at the single point both dispatch paths (a streamed
+ * batch and an approved park's resume) already share. `runSubagent` therefore
+ * takes `runTurn` as an argument: dependency in, no cycle.
+ *
+ * The extra return field is the child's session id, which the caller records on
+ * the tool row so a client can find and subscribe to the child transcript.
+ */
+async function dispatchTool(
+  tool: ResolvedTool, args: unknown, ctx: ToolContext,
+): Promise<SubagentDispatch> {
+  if (tool.kind === 'subagent') return runSubagent(tool, args, ctx, runTurn);
+  return { result: await runTool(tool, args, ctx) };
 }
 
 /** The transcript row content for a tool result, truncated explicitly. */
@@ -897,12 +920,24 @@ async function dispatchCalls(
       return 'parked';
     }
 
-    const result = tool
-      ? await runTool(tool, call.args, { userId: turn.userId, sessionId })
-      : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+    const { result, childSessionId } = tool
+      ? await dispatchTool(tool, call.args, {
+        userId: turn.userId, sessionId, toolCallId: call.id,
+      })
+      : {
+        result: {
+          ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
+        } as ToolResult,
+        childSessionId: undefined,
+      };
 
     // Same atomic allocation as the commit: `agent.send` can interject between
     // tool results, and read-then-$inc would hand both writers the same seq.
+    //
+    // §9: ONE tool call is what a subagent costs the parent, exactly like any
+    // other tool. Whatever the child spent accrues to the CHILD's session under
+    // the child agent's own config — see `runSubagent`. Nothing extra is
+    // charged here, and nothing needs to be.
     const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
     // The assistant message is already committed but this result never will
     // be: leaving it would strand a tool_use with no tool_result.
@@ -913,6 +948,9 @@ async function dispatchCalls(
       toolCallId: call.id,
       content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
+      // The handle on the child transcript. Present even for a parked or failed
+      // child — that session is exactly what a human needs to open.
+      childSessionId,
       createdAt: new Date(),
     } as any);
   }
@@ -1023,6 +1061,7 @@ async function resumeParkedTurn(
 
     const tool = tools.find((t) => t.name === call.name);
     let result: ToolResult;
+    let childSessionId: string | undefined;
     if (pending.verdict === 'denied') {
       // A denial is ANSWERED, not dropped. The model has to see the refusal in
       // the transcript to route around it; a missing result would strand the
@@ -1036,7 +1075,12 @@ async function resumeParkedTurn(
       result = { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
     } else {
       if (!(await holdsLease(sessionId))) return abandon();
-      result = await runTool(tool, call.args, { userId, sessionId });
+      // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
+      // approved by a human opens its child session here exactly as an
+      // ungated one would have opened it there.
+      ({ result, childSessionId } = await dispatchTool(tool, call.args, {
+        userId, sessionId, toolCallId: call.id,
+      }));
     }
 
     // A denied call was never dispatched, so it costs no tool budget.
@@ -1049,6 +1093,7 @@ async function resumeParkedTurn(
       _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
       content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
+      childSessionId,
       createdAt: new Date(),
     } as any);
   }

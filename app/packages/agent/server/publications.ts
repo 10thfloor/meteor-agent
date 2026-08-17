@@ -18,6 +18,16 @@ export function registerPublications(): void {
     // a userId) BEFORE returning anything, and return nothing at all if that
     // lookup fails. Do not "simplify" this back into three independently-scoped
     // find() calls — messages/deltas have no userId to scope by.
+    //
+    // SUBAGENT children need no case of their own here, and deliberately get
+    // none. A child session carries the parent's `userId` verbatim (see
+    // `runSubagent`), so the lookup below authorizes exactly the people the
+    // parent authorizes — including the anonymous capability-URL owner, for whom
+    // "knows the id" is the credential and the child's id is only ever learned
+    // from the parent's own tool row. The `agent` argument is the child's agent
+    // name, not the parent's: a client follows `childSessionId` with
+    // `new Agent('<the subagent>').subscribe(childSessionId)`, and the scope
+    // check is the same one that stops agent A driving agent B's transcript.
     const session = await AgentSessions.findOneAsync({
       _id: sessionId,
       agent,
@@ -45,8 +55,16 @@ export function registerPublications(): void {
     // Anonymous use is a capability-URL model: it only holds if ids never
     // leak in bulk. A logged-out client that KNOWS an id keeps working.
     if (this.userId == null) return [];
+    // CHILDREN ARE EXCLUDED. A subagent's session is a real session with a real
+    // transcript, but it is not a conversation the user started — it is one
+    // turn's internal work. Listing it here would put a stranger's name and a
+    // fragment of a tool call at the top of a "your conversations" list, sorted
+    // by `updatedAt` above everything the user actually said, and would do it
+    // once per subagent call. A client that wants a child reaches it the way it
+    // learns about it: `childSessionId` on the parent's tool row, then
+    // `agent.session`, which serves children without a special case.
     return AgentSessions.find(
-      { agent, userId: this.userId },
+      { agent, userId: this.userId, parent: { $exists: false } },
       // `lease` omitted here too — see the matching comment on `pubSession`.
       { sort: { updatedAt: -1 }, limit: 100, fields: { lease: 0 } },
     );

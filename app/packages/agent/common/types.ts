@@ -36,6 +36,26 @@ export interface AgentSession {
   };
   lease?: { serverId: string; until: Date };
   budgetSpent: { turns: number; toolCalls: number };
+  /**
+   * SUBAGENT sessions only: which parent session's tool call opened this one.
+   * Its presence is what makes a session a CHILD — `agent.sessions` excludes
+   * them (`parent: { $exists: false }`) so a session list stays
+   * conversation-level, while `agent.session` serves a child exactly as it
+   * serves any other session: the child inherits the parent's `userId`, so the
+   * publication's ownership check needs no special case.
+   *
+   * The parent's tool row carries the mirror image (`childSessionId`), which is
+   * how a client holding the parent finds the child to subscribe to.
+   */
+  parent?: { sessionId: string; toolCallId: string };
+  /**
+   * How many subagent hops deep this session is. Absent (read as 0) on a root
+   * session; `parent.depth + 1` on a child. The guard that keeps agents
+   * composing agents from fork-bombing: past `MAX_SUBAGENT_DEPTH` the tool call
+   * is REFUSED with a structured `subagent-depth` result the model can route
+   * around, and no child session is created at all.
+   */
+  depth?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -51,6 +71,14 @@ export interface AgentMessage {
   thinking?: string;
   toolCalls?: AgentToolCall[];
   toolCallId?: string;
+  /** `role: 'tool'` rows answering a SUBAGENT call only: the child session the
+   *  call ran. It is the handle — a client holding this transcript subscribes
+   *  to `agent.session` with the child agent's name and this id to follow the
+   *  child's own live transcript. Present even when the result is an error
+   *  (`subagent-parked`, `subagent-failed`), because the child session exists
+   *  and is exactly what a human needs to look at; absent when no child was
+   *  ever created (`subagent-depth`, an unknown agent name). */
+  childSessionId?: string;
   error?: { error: string; reason?: string };
   kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval';
   /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say

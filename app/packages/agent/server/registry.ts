@@ -1,5 +1,7 @@
 import type { Provider } from './providers/types';
 import type { ToolSpec } from './tools';
+import type { RunConfig } from './loop';
+import { piAiProvider } from './providers/piai';
 
 export interface AgentConfig {
   /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
@@ -189,6 +191,39 @@ export function defineAgent(name: string, config: AgentConfig): void {
 
 export function getAgent(name: string): AgentConfig | undefined {
   return registry.get(name);
+}
+
+/**
+ * The registry config as the LOOP consumes it — the one assembly every entry
+ * into a turn goes through.
+ *
+ * There are now four of them (`agent.send`/`approve`/`deny` via `deferTurn`,
+ * the watcher's recovery, `Agent.ask`, and a subagent's child run), and a turn
+ * that ran under different terms depending on how it was started would make
+ * every one of them untestable as a proxy for the others. `provider` is
+ * resolved HERE rather than at define() time so `defineAgent` stays a pure
+ * registration and pi-ai is loaded only when a turn actually runs; `spend` is
+ * reduced to dollars here so the loop compares numbers (it cannot throw at this
+ * point — `defineAgent` already parsed the same value at startup and refused a
+ * bad one).
+ *
+ * `userId` is what `instructions` and every tool's `ctx.userId` see. A child
+ * session passes its INHERITED owner, which is the parent's.
+ */
+export function buildRunConfig(config: AgentConfig, userId: string | null): RunConfig {
+  return {
+    model: config.model,
+    system: buildSystemPrompt(config, { userId }),
+    tools: config.tools ?? [],
+    provider: config.provider ?? piAiProvider(),
+    maxIterations: config.maxIterations,
+    budget: resolveBudget(config.budget),
+    pricing: config.pricing,
+    retry: config.retry,
+    context: config.context,
+    maxResultChars: config.maxResultChars,
+    canUse: config.canUse,
+  };
 }
 
 export function buildSystemPrompt(

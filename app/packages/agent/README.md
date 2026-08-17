@@ -66,13 +66,14 @@ call.
 
 ## Tools
 
-A tool is a Meteor method the model may call. Three ways to give an agent one:
+A tool is a Meteor method the model may call. Four ways to give an agent one:
 
 ```ts
 tools: [
   'orders.lookup',                                  // adopt a method you already have
   { method: 'orders.lookup', description, args },   //   …with a description for the model
   { name: 'total', description, args, run, gate },  // inline: no method, runs in-process
+  { subagent: 'researcher', description },          // another agent (see Subagents)
 ]
 ```
 
@@ -242,7 +243,79 @@ The `sessionId` argument is an optional guard: pass it and the teardown is
 skipped if the instance has already been re-subscribed to a newer session, so a
 late unmount cleanup cannot kill the live one.
 
-## Headless one-shots, and composing agents
+## Subagents
+
+A `{ subagent }` tool spec puts one agent behind another's tool call. Calling it
+runs a **child session** of the named agent — a real session with its own
+transcript, its own budgets and its own live stream — and answers the parent's
+tool call with the child's final assistant message.
+
+```ts
+new Agent('researcher', { model, instructions: 'You look things up.', tools: [...] });
+
+Writer.define({
+  model, instructions,
+  tools: [{ subagent: 'researcher', description: 'Ask the researcher to look something up' }],
+});
+```
+
+The default argument schema is one string:
+`{ type: 'object', properties: { prompt: { type: 'string' } }, required: ['prompt'] }`,
+and `args.prompt` becomes the child's first user message. Pass your own `args`
+if you want more structure — the whole argument object is then serialized as
+JSON into that first message (declare a `prompt` string property to keep the
+plain-prose form). `name` defaults to the agent's name; `gate: 'ask'` works
+exactly as on any other tool, and gates the *opening* of the child session.
+
+**The child persists, and streams.** The parent's tool row carries
+`childSessionId`, which is the handle:
+
+```ts
+const rows = Writer.messages(sessionId);
+const call = rows.find((m) => m.role === 'tool' && m.childSessionId);
+const child = new Agent('researcher');          // the CHILD's agent name
+child.subscribe(call.childSessionId);           // …and watch it live
+```
+
+Nothing in the client API changes for a child. `agent.session` authorizes by
+`userId`, and a child inherits the parent session's owner, so exactly the people
+who can read the parent can read the child. `agent.sessions` **excludes**
+children (`parent: { $exists: false }`) so a session list stays
+conversation-level — one turn's internal work does not belong at the top of a
+"your conversations" list.
+
+**Three structured failures**, all of them tool results the model reads and
+routes around rather than exceptions that kill a turn:
+
+| result | when | child session |
+| --- | --- | --- |
+| `subagent-parked` | the child hit a `gate: 'ask'` tool | created, **left parked** |
+| `subagent-failed` | the child failed terminally, or a budget stopped it | created |
+| `subagent-depth` | the call would nest more than 3 deep | none |
+
+`subagent-parked` is the same reasoning as `ask-parked`: the parent's turn must
+not hang waiting for a human it cannot reach. The difference is the escape
+hatch — the child's session is real and stays `awaiting`, so a person can
+approve or deny it through the ordinary `agent.approve` / `agent.deny` path
+(using the *child's* agent name and session id) and the child completes on its
+own. The parent has already moved on. Give subagents no ask-gates if you want
+the delegation to be self-contained, or build a UI that surfaces the parked
+child.
+
+The depth guard is a fork-bomb bound: an agent that lists itself, or two that
+list each other, would otherwise recurse until the process gave out. Sessions
+carry `depth` (absent = 0, `parent.depth + 1` on a child), and the fourth hop is
+refused before any document is written.
+
+**Budgets compose, they do not merge.** The parent spends exactly one
+`budgetSpent.toolCalls` per subagent call, like any other tool; everything the
+child spends — turns, tool calls, dollars — accrues to the *child's* session
+under the *child agent's* registry config. So you bound a subagent-heavy parent
+from two directions: the parent's `toolCalls` caps how many consultations
+happen, and each child agent's own `budget.spend` caps what one consultation may
+cost.
+
+## Headless one-shots
 
 `ask` is the whole conversation in one call — no session to start, subscribe to
 or clean up. It is server-only, because there is no UI on the other end of it.
@@ -260,23 +333,11 @@ interactive agents), and `ask-failed` when the provider failed terminally or a
 budget stopped the run, with `reason` naming which.
 
 Because an agent's `ask` is a plain async function returning a string, it is
-also a legal tool body — which is how agents compose:
-
-```ts
-const Researcher = new Agent('researcher', { model, instructions, tools: [] });
-
-Writer.define({
-  model, instructions,
-  tools: [{
-    name: 'research', description: 'Ask the researcher', args: schema,
-    run: ({ topic }, ctx) => Researcher.ask(topic, { userId: ctx.userId }),
-  }],
-});
-```
-
-The inner run is a session of its own, so the outer agent's `toolCalls` budget
-limits how often the specialist is consulted and the specialist's own budget
-limits what each consultation may spend.
+also a legal tool body — but for agent composition prefer a `{ subagent }` tool
+spec (see **Subagents**): it runs the same nested turn and keeps the child
+session, so the work streams live, stays readable afterwards, and can still be
+approved if it parks. `ask` is for the case with nothing to watch and nothing
+to keep: a cron job, a webhook, a Meteor method.
 
 ## Testing without an API key
 
@@ -339,9 +400,11 @@ for headless one-shots and agent composition, the `canUse` tool backstop,
 
 Milestone 4 is closing out the remaining tiers. Shipped so far: full
 JSON-Schema validation of tool arguments through typebox when it is reachable
-(with a structural fallback and one warning when it is not), and per-tool-call
+(with a structural fallback and one warning when it is not), per-tool-call
 attribution of streamed arguments so parallel tool calls arrive as separate
-streams (`toolArgs` on an in-flight row).
+streams (`toolArgs` on an in-flight row), and **subagents** — a named agent
+behind a tool call, running a child session with a live, persistent transcript
+(see **Subagents**).
 
 Sketched in the original design but deliberately NOT implemented (v2
 candidates): a global `Agent.provider()` registry, a manual `compact()` call,

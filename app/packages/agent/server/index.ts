@@ -12,11 +12,12 @@ export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
-  fullValidationAvailable, setTypeboxValueLoader,
-  type ToolSpec, type InlineTool, type AdoptedTool, type ToolContext,
-  type AgentMethodOptions, type ValidationResult, type ArgsValidator,
-  type TypeboxValue,
+  fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS,
+  type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
+  type ToolContext, type AgentMethodOptions, type ValidationResult,
+  type ArgsValidator, type TypeboxValue,
 } from './tools';
+export { MAX_SUBAGENT_DEPTH } from './subagent';
 export { mockProvider } from './providers/mock';
 export { piAiProvider } from './providers/piai';
 export type {

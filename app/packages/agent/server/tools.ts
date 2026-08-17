@@ -5,7 +5,15 @@ import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
 
-export interface ToolContext { userId: string | null; sessionId: string }
+export interface ToolContext {
+  userId: string | null;
+  sessionId: string;
+  /** The id of the tool call currently being dispatched. Set by every loop
+   *  dispatch path; optional only because a direct `runTool` caller (a test,
+   *  a host driving one tool) has no call to name. A subagent needs it: it is
+   *  half of the child's `parent` lineage. */
+  toolCallId?: string;
+}
 
 export type InlineTool = {
   name: string;
@@ -23,16 +31,51 @@ export type AdoptedTool = {
   gate?: 'auto' | 'ask';
 };
 
-export type ToolSpec = InlineTool | AdoptedTool | string;
+/**
+ * A named agent behind a tool call. Calling it runs a CHILD SESSION of the
+ * named agent — a real session with its own transcript, its own budgets and its
+ * own live stream — and answers the parent's tool call with the child's final
+ * assistant text (the `Agent.ask` contract). Unlike `ask`, the child persists:
+ * the parent's tool row records `childSessionId`, and a client can subscribe to
+ * it and watch.
+ *
+ * `name` defaults to the agent's own name — a tool called `researcher` calling
+ * the agent `researcher` is the shape that reads best in a transcript. Override
+ * it when one agent is behind two differently-described tools.
+ */
+export type SubagentTool = {
+  subagent: string;
+  description: string;
+  /** Defaults to `SUBAGENT_ARGS`. A custom schema is legal; see
+   *  `subagentPrompt` in server/subagent.ts for how its arguments become the
+   *  child's first user message. */
+  args?: unknown;
+  name?: string;
+  gate?: 'auto' | 'ask';
+};
+
+/** The default subagent argument schema: one string, the child's first user
+ *  message. Deliberately minimal — a subagent is given a task in prose, and
+ *  every additional field is one more thing the parent model can get wrong. */
+export const SUBAGENT_ARGS = {
+  type: 'object',
+  properties: { prompt: { type: 'string' } },
+  required: ['prompt'],
+} as const;
+
+export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | string;
 
 export interface ResolvedTool {
   name: string;
   description: string;
   args: unknown;
   gate: 'auto' | 'ask';
-  kind: 'inline' | 'adopted';
+  kind: 'inline' | 'adopted' | 'subagent';
   method?: string;
   run?: (args: any, ctx: ToolContext) => Promise<unknown>;
+  /** `kind: 'subagent'` only: the REGISTRY NAME of the agent to run. Resolved
+   *  to a config at dispatch, never here — see `resolveTools`. */
+  subagent?: string;
 }
 
 export interface ToolResult {
@@ -491,17 +534,47 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
     }
     const hasMethod = 'method' in spec && spec.method !== undefined;
     const hasRun = 'run' in spec && spec.run !== undefined;
-    if (hasMethod && hasRun) {
-      const label = (spec as any).name ?? (spec as any).method ?? '(unnamed)';
+    const hasSubagent = 'subagent' in spec && (spec as any).subagent !== undefined;
+    const chosen = [hasMethod, hasRun, hasSubagent].filter(Boolean).length;
+    if (chosen > 1) {
+      const label = (spec as any).name ?? (spec as any).method
+        ?? (spec as any).subagent ?? '(unnamed)';
       throw new Error(
-        `[10thfloor:agent] Tool spec has both "method" and "run" — pick one: ${label}`,
+        `[10thfloor:agent] Tool spec has more than one of "method", "run" and `
+        + `"subagent" — pick one: ${label}`,
       );
     }
-    if (!hasMethod && !hasRun) {
+    if (chosen === 0) {
       const label = (spec as any).name ?? '(unnamed)';
       throw new Error(
-        `[10thfloor:agent] Tool spec has neither "method" nor "run" — pick one: ${label}`,
+        `[10thfloor:agent] Tool spec has none of "method", "run" and "subagent" — `
+        + `pick one: ${label}`,
       );
+    }
+    if (hasSubagent) {
+      const sub = spec as SubagentTool;
+      if (typeof sub.subagent !== 'string' || sub.subagent === '') {
+        throw new Error(
+          `[10thfloor:agent] Tool spec's "subagent" must be an agent name: `
+          + `${JSON.stringify(spec)}`,
+        );
+      }
+      // The NAME is not resolved to a config here, deliberately. Agents
+      // register in whatever order their server files load, and a writer that
+      // lists `{ subagent: 'researcher' }` is routinely defined before the
+      // researcher is — validating here would make correctness depend on file
+      // order, which is exactly the kind of startup failure nobody can
+      // reproduce. The lookup happens at DISPATCH (server/subagent.ts), where a
+      // missing agent is a structured `unknown-agent` tool result the model
+      // reads and routes around, not a thrown turn.
+      return {
+        name: sub.name ?? sub.subagent,
+        description: sub.description,
+        args: sub.args ?? SUBAGENT_ARGS,
+        gate: sub.gate ?? 'auto',
+        kind: 'subagent' as const,
+        subagent: sub.subagent,
+      };
     }
     if (hasMethod) {
       const adopted = spec as AdoptedTool;
@@ -678,6 +751,24 @@ export async function runTool(
   // A failure is a RESULT, never a throw: the model reads `invalid-args`, sees
   // which field it got wrong, and usually corrects on the next call. Throwing
   // would abandon a turn over a typo.
+  //
+  // SUBAGENTS are not dispatched here at all. A subagent is not a tool body: it
+  // is a nested TURN, and running one needs `runTurn`, which lives in the loop
+  // that imports this module. Routing it from here would mean an import cycle
+  // (tools -> subagent -> loop -> tools), so the loop's own `dispatchTool`
+  // routes `kind: 'subagent'` to `runSubagent` before ever reaching this
+  // function. Anything landing here with one is a caller that bypassed the
+  // loop; say so rather than falling into `tool.run!` and reporting the
+  // resulting TypeError as a tool failure.
+  if (tool.kind === 'subagent') {
+    return {
+      ok: false,
+      error: {
+        error: 'tool-failed',
+        reason: 'A subagent runs as a child session and must be dispatched by the turn loop.',
+      },
+    };
+  }
   if (tool.kind === 'inline') {
     const verdict = await validateToolArgs(tool.args, args);
     if (!verdict.ok) {
