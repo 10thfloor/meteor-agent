@@ -3,7 +3,7 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { getAgent, buildSystemPrompt } from './registry';
+import { getAgent, buildSystemPrompt, type AgentConfig } from './registry';
 import { runTurn } from './loop';
 import { piAiProvider } from './providers/piai';
 
@@ -24,6 +24,116 @@ async function requireSession(agent: string, sessionId: string, userId: string |
   const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, userId } as any);
   if (!session) throw new Meteor.Error('no-session', 'Session not found');
   return session;
+}
+
+/**
+ * Wake a run: return to the caller immediately and let the turn stream in the
+ * background, watched through the subscription.
+ *
+ * Every method that starts work goes through this, so a send and an approval
+ * resume a session on identical terms — same registry config, same pi-ai
+ * fallback, same error containment.
+ *
+ * The `.catch` is load-bearing, not decoration: an unhandled rejection is
+ * fatal by default on Node >= 15, so a bare `void runTurn(...)` would let one
+ * bad provider call take down the whole app server.
+ */
+function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
+  Meteor.defer(() => {
+    runTurn(sessionId, {
+      model: config.model,
+      system: buildSystemPrompt(config, { userId }),
+      tools: config.tools ?? [],
+      // `provider` is optional as of Milestone 2: an agent that names none
+      // streams through pi-ai. Resolved HERE rather than at define() time so
+      // defineAgent stays a pure registration and pi-ai is loaded only when a
+      // turn actually runs.
+      provider: config.provider ?? piAiProvider(),
+      maxIterations: config.maxIterations,
+    }).catch((e) => {
+      console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
+    });
+  });
+}
+
+/**
+ * The shared body of `agent.approve` and `agent.deny`: authorize, decide once,
+ * record the verdict in the transcript, and wake the parked run.
+ *
+ * Order is the whole design here. Authorization comes first (`requireSession`,
+ * then the agent's own `approve` predicate) so a refused caller changes
+ * nothing at all — the run stays parked and the transcript stays clean. The
+ * verdict write is conditional on the state it read (`phase: 'awaiting'`, no
+ * verdict yet) rather than on a re-read, so two people clicking Approve at the
+ * same instant produce exactly one winner and exactly one side effect; the
+ * loser is told `no-pending` rather than being handed a silent success for a
+ * tool it never authorized.
+ */
+async function recordVerdict(
+  ctx: { userId: string | null },
+  agent: string,
+  sessionId: string,
+  verdict: 'approved' | 'denied',
+  reason?: string,
+): Promise<void> {
+  const config = getAgent(agent);
+  if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+  const session = await requireSession(agent, sessionId, ctx.userId);
+
+  if (session.phase !== 'awaiting' || !session.pending || session.pending.verdict) {
+    throw new Meteor.Error('no-pending', 'Nothing is waiting for approval');
+  }
+
+  // Ownership says the caller may drive this session; `config.approve` says
+  // whether they may answer for it. A four-eyes policy ("not the same person
+  // who asked") lives here, and returning false must leave the request
+  // standing for someone who can.
+  if (config.approve && !(await config.approve({ userId: ctx.userId }))) {
+    throw new Meteor.Error('not-allowed', 'You may not answer this approval');
+  }
+
+  const $set: Record<string, unknown> = {
+    'pending.verdict': verdict,
+    'pending.by': ctx.userId,
+    phase: 'idle',
+    updatedAt: new Date(),
+  };
+  // Only when given: `$set` with an undefined value is not a field write.
+  if (reason !== undefined) $set['pending.reason'] = reason;
+
+  const won = await AgentSessions.updateAsync(
+    {
+      _id: sessionId,
+      phase: 'awaiting',
+      'pending.verdict': { $exists: false },
+    } as any,
+    { $set } as any,
+  );
+  // Zero matched means someone else answered between our read and our write.
+  if (won !== 1) throw new Meteor.Error('no-pending', 'Nothing is waiting for approval');
+
+  // The verdict is history: who decided, which way, and why. Structured
+  // fields, never prose — a UI renders it and an audit reads it.
+  //
+  // The seq comes from a direct atomic allocation rather than the loop's
+  // `allocateSeq`, which guards on the lease: a parked run holds no lease (it
+  // exited), so this is the same shape `agent.send` uses to interleave safely
+  // with a running turn.
+  const before = await AgentSessions.rawCollection().findOneAndUpdate(
+    { _id: sessionId },
+    { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
+    { returnDocument: 'before' },
+  );
+  if (before) {
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq: (before as any).nextSeq,
+      role: 'note', kind: 'approval',
+      approved: verdict === 'approved', by: ctx.userId, reason,
+      createdAt: new Date(),
+    } as any);
+  }
+
+  deferTurn(sessionId, config, ctx.userId);
 }
 
 export function registerMethods(): void {
@@ -83,28 +193,7 @@ export function registerMethods(): void {
         { $set: { phase: 'idle' } } as any,
       );
 
-      const userId = this.userId ?? null;
-      // Return immediately; the client watches the subscription for output.
-      Meteor.defer(() => {
-        // The .catch is load-bearing, not decoration. Milestone 1 deliberately
-        // lets a provider error propagate out of runTurn (retry, backoff and
-        // the `error` note are Milestone 2), and an unhandled rejection is
-        // fatal by default on Node >= 15 — so a bare `void runTurn(...)` would
-        // let one bad provider call take down the whole app server.
-        runTurn(sessionId, {
-          model: config.model,
-          system: buildSystemPrompt(config, { userId }),
-          tools: config.tools ?? [],
-          // `provider` is optional as of Milestone 2: an agent that names none
-          // streams through pi-ai. Resolved HERE rather than at define() time
-          // so defineAgent stays a pure registration and pi-ai is loaded only
-          // when a turn actually runs.
-          provider: config.provider ?? piAiProvider(),
-          maxIterations: config.maxIterations,
-        }).catch((e) => {
-          console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
-        });
-      });
+      deferTurn(sessionId, config, this.userId ?? null);
       return sessionId;
     },
 
@@ -114,9 +203,31 @@ export function registerMethods(): void {
       await requireSession(agent, sessionId, this.userId ?? null);
       // The loop's `finally` preserves a `stopped` phase rather than idling it
       // back, so this survives the in-flight turn winding down.
+      // The loop's `finally` preserves a `stopped` phase rather than idling it
+      // back, so this survives the in-flight turn winding down.
+      //
+      // A session parked on an approval is stopped the same way, and `pending`
+      // is deliberately LEFT in place: the interrupt cancels the wait, not the
+      // record of what was asked. `approve`/`deny` require `phase: 'awaiting'`
+      // and so refuse from here on, and the next `agent.send` clears the stop
+      // — at which point the resumed turn discards the dead request rather
+      // than leaving its `tool_use` unanswered.
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
       } as any);
+    },
+
+    async [NAMES.mApprove](this: any, agent: string, sessionId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      await recordVerdict({ userId: this.userId ?? null }, agent, sessionId, 'approved');
+    },
+
+    async [NAMES.mDeny](this: any, agent: string, sessionId: string, reason?: string) {
+      check(agent, String);
+      check(sessionId, String);
+      check(reason, Match.Maybe(String));
+      await recordVerdict({ userId: this.userId ?? null }, agent, sessionId, 'denied', reason);
     },
   });
 }

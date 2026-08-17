@@ -101,4 +101,23 @@ export class Agent {
   interrupt(sessionId: string): Promise<void> {
     return Meteor.callAsync(NAMES.mInterrupt, this.name, sessionId);
   }
+
+  /**
+   * The tool call waiting on a human answer, or undefined when nothing is
+   * parked. Reactive, like `status()` — render it beside `status(id) ===
+   * 'awaiting'` to show what is being asked, then call `approve`/`deny`.
+   */
+  pending(sessionId: string) {
+    return (this.session(sessionId) as any)?.pending;
+  }
+
+  approve(sessionId: string): Promise<void> {
+    return Meteor.callAsync(NAMES.mApprove, this.name, sessionId);
+  }
+
+  /** `reason` reaches the model as the denied tool result, so it is the model's
+   *  only account of why — worth writing for it, not just for the log. */
+  deny(sessionId: string, reason?: string): Promise<void> {
+    return Meteor.callAsync(NAMES.mDeny, this.name, sessionId, reason);
+  }
 }

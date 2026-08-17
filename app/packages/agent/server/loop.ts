@@ -1,12 +1,15 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import type { AgentMessage } from '../common/types';
+import type { AgentMessage, AgentSession } from '../common/types';
 import type { Provider, ProviderMessage } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
-import { resolveTools, runTool, toolSchemas, type ToolSpec } from './tools';
+import {
+  resolveTools, runTool, toolSchemas,
+  type ResolvedTool, type ToolResult, type ToolSpec,
+} from './tools';
 
 export interface RunConfig {
   model: string;
@@ -326,6 +329,225 @@ async function repairUnansweredToolUse(sessionId: string): Promise<boolean> {
 }
 
 /**
+ * What a batch of tool calls did to the turn that owns it.
+ *
+ * `parked` and `abandoned` both mean the caller must return WITHOUT falling
+ * into the think loop — one because a human owes us an answer, the other
+ * because the turn no longer exists. Only `completed` means every call in the
+ * batch now carries a `tool` row, which is the precondition for asking the
+ * model what to do next.
+ */
+type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
+
+interface TurnAnchor {
+  userId: string | null;
+  /** The committed assistant carrying the `tool_use`s — the discard anchor. */
+  messageId: string;
+  assistantSeq: number;
+  /** EVERY call id of that assistant, not just the ones still to run: a
+   *  discard has to take the whole batch's results with it. */
+  batchIds: string[];
+}
+
+/**
+ * Dispatch tool calls for one committed assistant, in order, answering each
+ * with a `tool` row — or parking the turn on the first `gate: 'ask'` call.
+ *
+ * Shared by the streaming path and the resume path so a call is gated by the
+ * SAME rule wherever it is reached: approving one call says nothing about the
+ * next one, and a batch resumed after an approval must re-gate its remainder
+ * rather than inherit the verdict.
+ */
+async function dispatchCalls(
+  sessionId: string,
+  calls: Array<{ id: string; name: string; args: unknown }>,
+  tools: ResolvedTool[],
+  turn: TurnAnchor,
+): Promise<DispatchOutcome> {
+  const abandon = async (): Promise<DispatchOutcome> => {
+    await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
+    return 'abandoned';
+  };
+
+  for (const call of calls) {
+    // Ownership is checked BEFORE dispatch, not after. Adopted tools are real
+    // Meteor methods: running one we no longer own means the recovering server
+    // runs it a second time — a second charge, a second email. The window
+    // between this check and the tool's own side effect is irreducible without
+    // idempotency keys carried through to the tools themselves; this narrows
+    // the window, it does not close it.
+    if (!(await holdsLease(sessionId))) return abandon();
+
+    // An interrupt landing after the assistant committed with toolCalls must
+    // discard the turn exactly like an abandonment: committing SOME results
+    // and stopping would strand the rest as unanswered tool_use, and
+    // repair-on-entry would eat the turn next time anyway.
+    const phaseCheck = await AgentSessions.findOneAsync(sessionId);
+    if (!phaseCheck || phaseCheck.phase === 'stopped') return abandon();
+
+    const tool = tools.find((t) => t.name === call.name);
+
+    if ((tool?.gate ?? 'auto') === 'ask') {
+      // Park by EXITING: no process waits here, no timer runs, nothing is
+      // held. The committed assistant plus this marker plus `phase:
+      // 'awaiting'` ARE the parked state, so it survives a deploy, a crash and
+      // a lease expiry alike — approve/deny wake it by deferring a fresh
+      // `runTurn`. `repairUnansweredToolUse`'s awaiting/pending guard is what
+      // keeps the deliberately-unanswered `tool_use` from being read as an
+      // abandoned turn and discarded.
+      const parked = await guardedUpdate(sessionId, SERVER_ID, {
+        $set: {
+          phase: 'awaiting',
+          pending: {
+            toolCallId: call.id, name: call.name, args: call.args, requestedAt: new Date(),
+          },
+        },
+      });
+      // Losing the lease here means another server is redoing this turn: the
+      // park never became durable, so the half-answered batch must go.
+      if (!parked) return abandon();
+      return 'parked';
+    }
+
+    const result = tool
+      ? await runTool(tool, call.args, { userId: turn.userId, sessionId })
+      : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+
+    // Same atomic allocation as the commit: `agent.send` can interject between
+    // tool results, and read-then-$inc would hand both writers the same seq.
+    const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
+    // The assistant message is already committed but this result never will
+    // be: leaving it would strand a tool_use with no tool_result.
+    if (toolSeq === null) return abandon();
+
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
+      toolCallId: call.id,
+      content: JSON.stringify(result.ok ? result.value : result.error),
+      error: result.ok ? undefined : result.error,
+      createdAt: new Date(),
+    } as any);
+  }
+
+  return 'completed';
+}
+
+/** The assistant that owns a parked call, plus the window its results live in.
+ *  Tool call ids are unique only within one provider response, so the window
+ *  (this assistant's seq → the next assistant's) is what decides which rows
+ *  count as answers to THIS batch. */
+function locateBatch(msgs: AgentMessage[], toolCallId: string) {
+  const assistants = msgs.filter((m) => m.role === 'assistant');
+  const i = assistants.findIndex((m) => (m.toolCalls ?? []).some((c) => c.id === toolCallId));
+  if (i === -1) return null;
+  const assistant = assistants[i];
+  const windowEnd = assistants[i + 1]?.seq ?? Infinity;
+  const answered = new Set(
+    msgs
+      .filter((t) => t.role === 'tool' && t.toolCallId
+        && t.seq > assistant.seq && t.seq < windowEnd)
+      .map((t) => t.toolCallId),
+  );
+  return { assistant, windowEnd, answered };
+}
+
+/**
+ * Resolve a parked call whose verdict has been recorded, then finish the rest
+ * of its batch.
+ *
+ * Resolving only the answered call would strand its siblings: the park happens
+ * at the FIRST gated call, so every later call in that assistant's batch was
+ * never dispatched at all. A `tool_use` with no `tool_result` is a 400 from
+ * every provider, forever — so the remainder is re-dispatched here, each call
+ * running or parking again on its OWN gate, and the think loop is reached only
+ * when the whole batch is answered.
+ */
+async function resumeParkedTurn(
+  sessionId: string,
+  pending: NonNullable<AgentSession['pending']>,
+  tools: ResolvedTool[],
+  userId: string | null,
+): Promise<DispatchOutcome> {
+  const msgs = await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+  const batch = locateBatch(msgs, pending.toolCallId);
+  if (!batch) {
+    // The assistant is gone (a discard got here first). There is nothing left
+    // to answer, so the marker is the only stale thing: drop it and let the
+    // turn proceed as an ordinary one.
+    await guardedUpdate(sessionId, SERVER_ID, { $unset: { pending: 1 } });
+    return 'completed';
+  }
+  const { assistant, answered } = batch;
+  const calls = assistant.toolCalls ?? [];
+  const turn: TurnAnchor = {
+    userId,
+    messageId: assistant._id,
+    assistantSeq: assistant.seq,
+    batchIds: calls.map((c) => c.id),
+  };
+  const abandon = async (): Promise<DispatchOutcome> => {
+    await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
+    return 'abandoned';
+  };
+
+  const call = calls.find((c) => c.id === pending.toolCallId);
+  // `answered` covers the crash-between-result-and-$unset case: the row is
+  // already committed, so re-running the tool would be a second real-world
+  // side effect for one approval.
+  if (call && !answered.has(pending.toolCallId)) {
+    // Visible progress while an approved tool runs, without erasing an
+    // interrupt that landed between the verdict and this write — hence
+    // conditional on the phase as well as guarded on the lease.
+    await AgentSessions.updateAsync(
+      { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
+      { $set: { phase: 'calling', updatedAt: new Date() } } as any,
+    );
+
+    const tool = tools.find((t) => t.name === call.name);
+    let result: ToolResult;
+    if (pending.verdict === 'denied') {
+      // A denial is ANSWERED, not dropped. The model has to see the refusal in
+      // the transcript to route around it; a missing result would strand the
+      // call and a silent success would be a lie.
+      result = { ok: false, error: { error: 'denied', reason: pending.reason } };
+    } else if (!tool) {
+      // Approved, but the tool is no longer in the config — a rename or a
+      // removal deployed while the request sat on someone's screen. Same
+      // answer the streaming path gives an unknown call, so the batch closes
+      // cleanly instead of wedging on a name that no longer exists.
+      result = { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+    } else {
+      if (!(await holdsLease(sessionId))) return abandon();
+      result = await runTool(tool, call.args, { userId, sessionId });
+    }
+
+    // A denied call was never dispatched, so it costs no tool budget.
+    const seq = await allocateSeq(
+      sessionId, pending.verdict === 'denied' ? {} : { 'budgetSpent.toolCalls': 1 },
+    );
+    if (seq === null) return abandon();
+
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
+      content: JSON.stringify(result.ok ? result.value : result.error),
+      error: result.ok ? undefined : result.error,
+      createdAt: new Date(),
+    } as any);
+  }
+
+  // The verdict is spent the moment its call is answered. Clearing the marker
+  // is what stops the next entry from reading this run as still parked — and
+  // it must happen BEFORE the remainder re-dispatches, or a second gate's park
+  // would overwrite a marker that still carried the first one's verdict.
+  if (!(await guardedUpdate(sessionId, SERVER_ID, { $unset: { pending: 1 } }))) return abandon();
+
+  const remaining = calls.filter(
+    (c) => c.id !== pending.toolCallId && !answered.has(c.id),
+  );
+  return dispatchCalls(sessionId, remaining, tools, turn);
+}
+
+/**
  * Run one turn to completion. Assistant messages commit only at boundaries and
  * every abandonment path erases what it had already written, so the transcript
  * a turn leaves behind always ends in `user` or `tool` — the two states a turn
@@ -359,6 +581,48 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
     try {
       if (!(await repairUnansweredToolUse(sessionId))) return;
+
+      // An approval gate is resolved BEFORE the think loop, because the
+      // transcript currently ends in an unanswered `tool_use`: streaming from
+      // here would 400 on every provider. Once the batch is answered the
+      // history ends in a `tool` row — the ordinary shape an iteration expects.
+      const entry = await AgentSessions.findOneAsync(sessionId);
+      if (!entry) return;
+      if (entry.pending) {
+        if (!entry.pending.verdict) {
+          // Still parked. 'awaiting' is a live request waiting on a human, and
+          // 'stopped' is that same request with an interrupt over it — neither
+          // is ours to answer, and both leave the marker for approve/deny (or
+          // a later send) to resolve. Re-entry here is the recovering-server
+          // case: exit exactly as the parking run did.
+          if (entry.phase === 'awaiting' || entry.phase === 'stopped') return;
+
+          // Any other phase means the park was OVERTAKEN: `agent.interrupt`
+          // stopped it and a later `agent.send` cleared the stop to 'idle'.
+          // approve/deny require 'awaiting', so nothing can ever answer this
+          // call now — and an unanswered `tool_use` 400s every provider call
+          // from here on. Discard the dead turn exactly as an interrupt during
+          // dispatch already does, then answer the message the user just sent.
+          const msgs = await AgentMessages
+            .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+          const batch = locateBatch(msgs, entry.pending.toolCallId);
+          if (batch) {
+            await discardTurn(
+              sessionId, batch.assistant._id, batch.assistant.seq,
+              (batch.assistant.toolCalls ?? []).map((c) => c.id), batch.windowEnd,
+            );
+          }
+          if (!(await guardedUpdate(sessionId, SERVER_ID, { $unset: { pending: 1 } }))) return;
+        } else {
+          const outcome = await resumeParkedTurn(
+            sessionId, entry.pending, tools, entry.userId,
+          );
+          // 'parked' means the NEXT gate in the same batch is now waiting on a
+          // human; 'abandoned' means the turn is gone. Either way the think
+          // loop must not run.
+          if (outcome !== 'completed') return;
+        }
+      }
 
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
         const session = await AgentSessions.findOneAsync(sessionId);
@@ -560,63 +824,30 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         const callIds = toolCalls.map((c) => c.id);
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'calling' } });
 
-        for (const call of toolCalls) {
-          // Ownership is checked BEFORE dispatch, not after. Adopted tools are
-          // real Meteor methods: running one we no longer own means the
-          // recovering server runs it a second time — a second charge, a
-          // second email. The window between this check and the tool's own
-          // side effect is irreducible without idempotency keys carried
-          // through to the tools themselves; this narrows the window, it does
-          // not close it.
-          if (!(await holdsLease(sessionId))) {
-            await discardTurn(sessionId, messageId, commitSeq, callIds);
-            return;
-          }
-
-          // An interrupt landing after the assistant committed with toolCalls
-          // must discard the turn exactly like an abandonment: committing SOME
-          // results and stopping would strand the rest as unanswered tool_use,
-          // and repair-on-entry would eat the turn next time anyway.
-          const phaseCheck = await AgentSessions.findOneAsync(sessionId);
-          if (!phaseCheck || phaseCheck.phase === 'stopped') {
-            await discardTurn(sessionId, messageId, commitSeq, callIds);
-            return;
-          }
-
-          const tool = tools.find((t) => t.name === call.name);
-          const result = tool
-            ? await runTool(tool, call.args, { userId: session.userId, sessionId })
-            : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
-
-          // Same atomic allocation as the commit: `agent.send` can interject
-          // between tool results, and read-then-$inc would hand both writers
-          // the same seq.
-          const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
-          if (toolSeq === null) {
-            // The assistant message is already committed but this result never
-            // will be: leaving it would strand a tool_use with no tool_result.
-            await discardTurn(sessionId, messageId, commitSeq, callIds);
-            return;
-          }
-
-          await AgentMessages.insertAsync({
-            _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
-            toolCallId: call.id,
-            content: JSON.stringify(result.ok ? result.value : result.error),
-            error: result.ok ? undefined : result.error,
-            createdAt: new Date(),
-          } as any);
-        }
+        const outcome = await dispatchCalls(sessionId, toolCalls, tools, {
+          userId: session.userId,
+          messageId,
+          assistantSeq: commitSeq,
+          batchIds: callIds,
+        });
+        // A park exits the turn with the batch deliberately unanswered; an
+        // abandonment has already erased it. Only a fully answered batch may
+        // go round again and ask the model what to do with the results.
+        if (outcome !== 'completed') return;
       }
     } finally {
       clearInterval(beat);
-      // `stopped` is a deliberate terminal state set by an interrupt, and
-      // `error` is the terminal state this turn just set on a fatal or
-      // exhausted provider failure — idling either back would erase the
-      // decision (the user's stop, or the failure the transcript note just
-      // recorded) that the phase exists to preserve.
+      // `stopped` is a deliberate terminal state set by an interrupt, `error`
+      // is the terminal state this turn just set on a fatal or exhausted
+      // provider failure, and `awaiting` is a live approval request — idling
+      // any of them back would erase the decision (the user's stop, the
+      // failure the transcript note just recorded, or the question a human is
+      // being asked) that the phase exists to preserve. For `awaiting` the
+      // damage would be worse than cosmetic: approve/deny only fire on that
+      // phase, so idling it back would strand the parked call permanently.
+      const terminal = ['stopped', 'error', 'awaiting'];
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && current.phase !== 'stopped' && current.phase !== 'error') {
+      if (current && !terminal.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
       }
       await releaseLease(sessionId);

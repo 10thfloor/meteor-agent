@@ -15,13 +15,13 @@ const unansweredToolUses = (msgs: AgentMessage[]): string[] => {
     .filter((id) => !answered.has(id));
 };
 
-const seed = async (sessionId: string, text: string) => {
+const seed = async (sessionId: string, text: string, agent = 'support') => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
   await AgentSessions.removeAsync({});
   await AgentMessages.removeAsync({});
   await AgentDeltas.removeAsync({});
   await AgentSessions.insertAsync({
-    _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+    _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
     nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
     budgetSpent: { turns: 0, toolCalls: 0 },
     createdAt: new Date(), updatedAt: new Date(),
@@ -833,6 +833,500 @@ describe('turn loop', () => {
       + (await AgentDeltas.find({ messageId: { $in: [...dead] } } as any).countAsync()),
       0, 'no delta from the failed attempt may survive',
     );
+  });
+});
+
+describe('approval gates', () => {
+  /** Deferred work (the resume a verdict schedules) exposes no promise to
+   *  await, so every wait here is bounded by a deadline and fails loudly
+   *  rather than hanging the suite. */
+  const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+    const deadline = Date.now() + ms;
+    for (;;) {
+      // eslint-disable-next-line no-await-in-loop
+      if (await cond()) return;
+      if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => { setTimeout(r, 25); });
+    }
+  };
+
+  /**
+   * Register an agent, seed a session for it, and run one turn whose first
+   * provider response asks for `calls`. Registration is load-bearing: approve
+   * and deny resume through the REGISTRY config, exactly as a real caller
+   * would, so the tools and provider the method finds have to be the same
+   * objects this fixture drives the initial park with.
+   */
+  const buildFixture = async (
+    sessionId: string,
+    agentName: string,
+    calls: Array<{ id: string; name: string; gate: 'auto' | 'ask' }>,
+    extra: Record<string, unknown> = {},
+  ) => {
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    const state = { ran: [] as string[], providerCalls: 0 };
+    const provider = mockProvider(() => {
+      state.providerCalls += 1;
+      return state.providerCalls === 1
+        ? { toolCalls: calls.map((c) => ({ id: c.id, name: c.name, args: { amt: 5 } })) }
+        : { text: 'all done' };
+    });
+    const tools = calls.map((c) => ({
+      name: c.name,
+      description: 'x',
+      gate: c.gate,
+      args: { type: 'object', properties: {} },
+      run: async () => { state.ran.push(c.name); return { did: c.name }; },
+    }));
+
+    new Agent(agentName, {
+      model: 'mock', instructions: '', tools, provider, ...extra,
+    } as any);
+    await seed(sessionId, 'refund please', agentName);
+    await runTurn(sessionId, { model: 'mock', system: '', tools, provider });
+    return state;
+  };
+
+  it('parks on an ask-gated tool: pending set, lease released, nothing dispatched', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await seed('s-gate', 'refund please');
+    let toolRan = false;
+    await runTurn('s-gate', {
+      model: 'mock',
+      system: '',
+      tools: [{
+        name: 'refund',
+        description: 'x',
+        gate: 'ask',
+        args: { type: 'object', properties: {} },
+        run: async () => { toolRan = true; return 'refunded'; },
+      }],
+      provider: mockProvider(() => ({ toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5 } }] })),
+    });
+
+    assert.isFalse(toolRan, 'an ask-gated tool must not run before a human answers');
+    const doc = (await AgentSessions.findOneAsync('s-gate'))!;
+    assert.equal(doc.phase, 'awaiting');
+    assert.deepInclude(doc.pending as any, { toolCallId: 'g1', name: 'refund' });
+    assert.isUndefined(doc.lease, 'a parked run holds no lease');
+
+    // The assistant carrying the tool_use is COMMITTED — it is legitimate
+    // history, and the thing the human is being asked to approve.
+    const assistant = await AgentMessages.findOneAsync({ sessionId: 's-gate', role: 'assistant' });
+    assert.isDefined(assistant);
+    assert.isDefined(assistant!.toolCalls);
+    assert.equal(assistant!.toolCalls![0].id, 'g1');
+    // No result row: the batch is deliberately unanswered while parked.
+    assert.equal(await AgentMessages.find({ sessionId: 's-gate', role: 'tool' }).countAsync(), 0);
+  });
+
+  it('approve wakes the run, executes the parked tool, and continues the turn', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-approve', 'gate-approve', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+    assert.equal((await AgentSessions.findOneAsync('s-approve'))!.phase, 'awaiting');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-approve', 's-approve');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-approve', role: 'assistant' }).countAsync()) === 2,
+      'the resumed turn to produce a final assistant reply',
+    );
+
+    assert.deepEqual(state.ran, ['refund'], 'approval must run the tool exactly once');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-approve' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'no tool_use may be left stranded');
+
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.isDefined(row, 'the approved call must be answered');
+    assert.isUndefined(row.error);
+    assert.equal(row.content, JSON.stringify({ did: 'refund' }));
+
+    const note = msgs.find((m) => m.role === 'note' && (m as any).kind === 'approval') as any;
+    assert.isDefined(note, 'the verdict belongs in the transcript');
+    assert.isTrue(note.approved);
+    assert.equal(note.by, 'u1');
+    assert.isUndefined(note.content, 'notes carry structured fields, not prose');
+
+    const doc = (await AgentSessions.findOneAsync('s-approve'))!;
+    assert.isUndefined(doc.pending, 'the marker must be cleared once resolved');
+    assert.equal(doc.phase, 'idle');
+    assert.equal(msgs[msgs.length - 1].content, 'all done');
+  });
+
+  it('deny writes a denied tool result the model can see, and continues', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-deny', 'gate-deny', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+
+    const deny = (Meteor.server as any).method_handlers[NAMES.mDeny];
+    await deny.call({ userId: 'u1' }, 'gate-deny', 's-deny', 'too large');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-deny', role: 'assistant' }).countAsync()) === 2,
+      'the denied turn to continue rather than wedge',
+    );
+
+    assert.deepEqual(state.ran, [], 'a denied tool must never run');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-deny' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), []);
+
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.isDefined(row, 'the model must SEE the refusal, not just miss a result');
+    assert.deepEqual(row.error, { error: 'denied', reason: 'too large' });
+    assert.include(row.content!, 'denied');
+
+    const note = msgs.find((m) => m.role === 'note' && (m as any).kind === 'approval') as any;
+    assert.isFalse(note.approved);
+    assert.equal(note.reason, 'too large');
+
+    const doc = (await AgentSessions.findOneAsync('s-deny'))!;
+    assert.isUndefined(doc.pending);
+    assert.equal(msgs[msgs.length - 1].content, 'all done');
+  });
+
+  it('a parked run survives repair-on-entry untouched', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent } = await import('../server/registry');
+
+    await buildFixture('s-park-repair', 'gate-repair', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+    const config = getAgent('gate-repair')!;
+
+    // Re-entering with no verdict is the recovering-server case: repair must
+    // read `pending`/`awaiting` as legitimate history, not as an abandoned
+    // turn, and the loop must exit still parked rather than re-streaming over
+    // an unanswered tool_use.
+    await runTurn('s-park-repair', {
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+    });
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-park-repair' }, { sort: { seq: 1 } }).fetchAsync();
+    const assistants = msgs.filter((m) => m.role === 'assistant');
+    assert.lengthOf(assistants, 1, 'repair must not discard the parked assistant');
+    assert.equal(assistants[0].toolCalls![0].id, 'g1');
+    assert.deepEqual(
+      unansweredToolUses(msgs), ['g1'],
+      'the unanswered call is the REQUEST — it must survive until a human answers',
+    );
+
+    const doc = (await AgentSessions.findOneAsync('s-park-repair'))!;
+    assert.equal(doc.phase, 'awaiting');
+    assert.deepInclude(doc.pending as any, { toolCallId: 'g1' });
+    assert.isUndefined((doc.pending as any).verdict);
+    assert.isUndefined(doc.lease);
+  });
+
+  it('approving one call of a mixed batch still answers the auto-gated rest', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // The park happens at call 1, so call 2 was never dispatched. Resuming
+    // ONLY call 1 would leave `g2` a stranded tool_use — a permanent 400.
+    const state = await buildFixture('s-batch-mixed', 'gate-mixed', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+      { id: 'g2', name: 'logit', gate: 'auto' },
+    ]);
+    assert.deepEqual(state.ran, [], 'the park precedes every dispatch in the batch');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-mixed', 's-batch-mixed');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-batch-mixed', role: 'assistant' }).countAsync()) === 2,
+      'the resumed batch to finish and the think loop to reply',
+    );
+
+    assert.deepEqual(state.ran, ['refund', 'logit'], 'the whole batch must run, in order');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-batch-mixed' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [],
+      'the rest of the batch must be answered, not stranded',
+    );
+    assert.lengthOf(msgs.filter((m) => m.role === 'tool'), 2);
+    assert.isUndefined((await AgentSessions.findOneAsync('s-batch-mixed'))!.pending);
+    assert.equal(msgs[msgs.length - 1].content, 'all done');
+  });
+
+  it('approving one call of an all-gated batch parks again on the next gate', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-batch-gated', 'gate-both', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+      { id: 'g2', name: 'escalate', gate: 'ask' },
+    ]);
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-both', 's-batch-gated');
+
+    // Each remaining call is re-gated on its OWN declaration: approving g1
+    // says nothing about g2.
+    await waitFor(
+      async () => {
+        const s = await AgentSessions.findOneAsync('s-batch-gated');
+        return (s?.pending as any)?.toolCallId === 'g2';
+      },
+      'the second gate to park',
+    );
+
+    assert.deepEqual(state.ran, ['refund'], 'only the approved call may run');
+    let doc = (await AgentSessions.findOneAsync('s-batch-gated'))!;
+    assert.equal(doc.phase, 'awaiting');
+    assert.isUndefined((doc.pending as any).verdict, 'the re-park must carry no verdict');
+    assert.isUndefined(doc.lease, 'the re-parked run holds no lease either');
+    let msgs = await AgentMessages
+      .find({ sessionId: 's-batch-gated' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), ['g2']);
+    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 1, 'the think loop must not run yet');
+
+    // And the second verdict finishes the batch.
+    await approve.call({ userId: 'u1' }, 'gate-both', 's-batch-gated');
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-batch-gated', role: 'assistant' }).countAsync()) === 2,
+      'the second approval to finish the batch and continue the turn',
+    );
+
+    assert.deepEqual(state.ran, ['refund', 'escalate']);
+    msgs = await AgentMessages
+      .find({ sessionId: 's-batch-gated' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'no stranded tool_use at any exit');
+    doc = (await AgentSessions.findOneAsync('s-batch-gated'))!;
+    assert.isUndefined(doc.pending);
+    assert.lengthOf(msgs.filter((m) => m.role === 'note' && (m as any).kind === 'approval'), 2);
+  });
+
+  it('rejects approve and deny from a non-owner and from an anonymous caller', async function () {
+    this.timeout(30000);
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    await buildFixture('s-auth', 'gate-auth', [{ id: 'g1', name: 'refund', gate: 'ask' }]);
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    const deny = (Meteor.server as any).method_handlers[NAMES.mDeny];
+    const rejects = async (fn: () => Promise<unknown>, code: string, label: string) => {
+      try { await fn(); } catch (e: any) {
+        assert.equal(e.error, code, label);
+        return;
+      }
+      assert.fail(`${label}: expected ${code}, but the call succeeded`);
+    };
+
+    await rejects(() => approve.call({ userId: 'u2' }, 'gate-auth', 's-auth'), 'no-session', 'approve as other user');
+    await rejects(() => approve.call({ userId: null }, 'gate-auth', 's-auth'), 'no-session', 'approve as anonymous');
+    await rejects(() => deny.call({ userId: 'u2' }, 'gate-auth', 's-auth', 'no'), 'no-session', 'deny as other user');
+    await rejects(() => deny.call({ userId: null }, 'gate-auth', 's-auth', 'no'), 'no-session', 'deny as anonymous');
+  });
+
+  it('rejects approve when nothing is pending', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('gate-nopending', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => ({ text: 'unused' })),
+    });
+    await seed('s-nopending', 'hello', 'gate-nopending');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    try {
+      await approve.call({ userId: 'u1' }, 'gate-nopending', 's-nopending');
+    } catch (e: any) {
+      assert.equal(e.error, 'no-pending');
+      return;
+    }
+    assert.fail('approving an idle session must not succeed');
+  });
+
+  it('lets exactly one of two racing approvers win', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-race-approve', 'gate-race', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    // Both callers read the parked state before either writes: the verdict
+    // write is what has to break the tie, not the pre-check.
+    const results = await Promise.allSettled([
+      approve.call({ userId: 'u1' }, 'gate-race', 's-race-approve'),
+      approve.call({ userId: 'u1' }, 'gate-race', 's-race-approve'),
+    ]);
+    const won = results.filter((r) => r.status === 'fulfilled');
+    const lost = results.filter((r) => r.status === 'rejected');
+    assert.lengthOf(won, 1, 'exactly one approver may win');
+    assert.lengthOf(lost, 1, 'the loser gets an error, never a silent success');
+    assert.equal((lost[0] as PromiseRejectedResult).reason.error, 'no-pending');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-race-approve', role: 'assistant' }).countAsync()) === 2,
+      'the single winning resume to finish',
+    );
+    assert.deepEqual(state.ran, ['refund'], 'a raced approval must not run the tool twice');
+    const notes = await AgentMessages
+      .find({ sessionId: 's-race-approve', role: 'note', kind: 'approval' } as any).countAsync();
+    assert.equal(notes, 1, 'one verdict, one note');
+  });
+
+  it('refuses a caller that config.approve rejects', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture(
+      's-notallowed', 'gate-notallowed',
+      [{ id: 'g1', name: 'refund', gate: 'ask' }],
+      { approve: async () => false },
+    );
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    try {
+      await approve.call({ userId: 'u1' }, 'gate-notallowed', 's-notallowed');
+      assert.fail('config.approve returning false must block the verdict');
+    } catch (e: any) {
+      assert.equal(e.error, 'not-allowed');
+    }
+
+    assert.deepEqual(state.ran, [], 'a blocked approval must not run the tool');
+    const doc = (await AgentSessions.findOneAsync('s-notallowed'))!;
+    assert.equal(doc.phase, 'awaiting', 'the run must stay parked');
+    assert.isUndefined((doc.pending as any).verdict);
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-notallowed', role: 'note' } as any).countAsync(), 0,
+      'a refused verdict is not transcript history',
+    );
+  });
+
+  it('answers an approved call whose tool is gone with the unknown-tool result', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-gone', 'gate-gone', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+
+    // Redefine the agent WITHOUT the tool: a rename or a removal deployed
+    // while the request sat on someone's screen. The gate declaration is what
+    // parked the call, so the resume still owes it an answer — and a
+    // `tool_use` left unanswered because a name moved is a permanent 400.
+    new Agent('gate-gone', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => ({ text: 'all done' })),
+    });
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-gone', 's-gone');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-gone', role: 'assistant' }).countAsync()) === 2,
+      'the resumed turn to close the batch and reply',
+    );
+
+    assert.deepEqual(state.ran, [], 'there is no tool left to run');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-gone' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'a vanished tool must not strand its call');
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.equal(row.error!.error, 'unknown-tool');
+    assert.isUndefined((await AgentSessions.findOneAsync('s-gone'))!.pending);
+  });
+
+  it('an interrupt cancels the park, and the next send is answered not wedged', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const state = await buildFixture('s-park-stop', 'gate-stop', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ]);
+
+    const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+    await interrupt.call({ userId: 'u1' }, 'gate-stop', 's-park-stop');
+
+    // The stop cancels the WAIT, not the record of what was asked.
+    const stopped = (await AgentSessions.findOneAsync('s-park-stop'))!;
+    assert.equal(stopped.phase, 'stopped');
+    assert.deepInclude(stopped.pending as any, { toolCallId: 'g1' });
+
+    // And a verdict is no longer answerable: approve/deny require 'awaiting'.
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    try {
+      await approve.call({ userId: 'u1' }, 'gate-stop', 's-park-stop');
+      assert.fail('an interrupted park must not accept a verdict');
+    } catch (e: any) {
+      assert.equal(e.error, 'no-pending');
+    }
+
+    // The send clears the stop. The dead request must go with it — otherwise
+    // its unanswered tool_use 400s every provider call from here on, and the
+    // message the user just sent is never answered at all.
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    await send.call({ userId: 'u1' }, 'gate-stop', 's-park-stop', 'never mind');
+
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync({
+        sessionId: 's-park-stop', role: 'assistant', content: 'all done',
+      } as any)),
+      'the send after an interrupted park to be answered',
+    );
+
+    assert.deepEqual(state.ran, [], 'a cancelled gate never runs its tool');
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-park-stop' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the cancelled request must not strand a call');
+    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 1, 'the dead turn was discarded');
+    const doc = (await AgentSessions.findOneAsync('s-park-stop'))!;
+    assert.isUndefined(doc.pending, 'the dead marker must not outlive the turn');
+    assert.equal(doc.phase, 'idle');
   });
 });
 

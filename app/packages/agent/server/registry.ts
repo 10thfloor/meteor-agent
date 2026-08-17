@@ -16,6 +16,14 @@ export interface AgentConfig {
    *  override, not a requirement. */
   pricing?: { input: number; output: number };
   maxIterations?: number;
+  /**
+   * Who may answer a `gate: 'ask'` approval, on top of the ownership check
+   * every method already makes. Omit it and the session's owner decides —
+   * which for an anonymous capability-URL session means whoever holds the id,
+   * exactly as `send` and `interrupt` already work. Return false to refuse:
+   * the caller gets `Meteor.Error('not-allowed')` and the run stays parked.
+   */
+  approve?: (ctx: { userId: string | null }) => boolean | Promise<boolean>;
 }
 
 const registry = new Map<string, AgentConfig>();
