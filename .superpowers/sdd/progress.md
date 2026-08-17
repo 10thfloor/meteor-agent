@@ -121,3 +121,63 @@ M3 backlog additions from final review: spurious extra turn from the wake self-c
   proven to register, never to throttle; drain-remainder comment assumes failed insert never landed
   (lost-ack duplicate seq truncates in-flight render transiently).
 Suite at M2 close: 122 server (+1 pending live-smoke) + 1 client, 0 failures.
+
+== MILESTONE 3 (branch milestone-3-spec-v1, plan 2026-08-16-agent-harness-milestone-3.md) ==
+M3 Task 1: complete (a15a894..2d54621, 129+1 passing). Tests by interrupted subagent, implementation
+  INLINE by controller after repeated 529s; per-task review NOT yet done (529s) — final review must
+  scrutinize this diff. Self-checked: no stale backoff floor assertion; 408 pin updated to retryable.
+  Probe: ProviderRequestOptions.signal (types.d.ts:50) reaches streamSimple via third arg.
+  Residual for Task 3: a resume that fails before consuming its verdict leaves it unconsumed with no
+  wake — the watcher sweep should notice standing verdicts on idle sessions.
+  Note: abort() fires only at the mid-stream check; the other two detection points have no live request.
+M3 Task 2: complete INLINE (compaction, 136+1 passing; review pending — 529s on subagents).
+  Model view restarts from the newest compaction note; transcript untouched; cut never splits a
+  tool batch (walk-back off tool rows); failed compaction degrades to an uncompacted turn silently;
+  summarization usage/cost accrues in the note's atomic allocateSeq.
+M3 Task 3: complete (7a5d633, 143+1 verified by controller; agent's report lost to machine sleep).
+  writeVerdict factored as the shared single-winner core; recordTimeoutVerdict (by:null, timedOut);
+  watcher = observer + 15s sweep (orphans, approval timeouts, unconsumed verdicts); boot-gated on
+  settings watcher:false and test mode. Review still owed (with Tasks 1-2) at final review.
+M3 Task 4: complete (c4dabf1, 159+1). Minimal structural validator (probe: pi-ai re-exports only
+  typebox Type; its validateToolArguments coerces input and echoes raw args — unusable). Validation
+  lives in runTool (one guard covers all dispatch paths). isError threaded end to end.
+  FINAL-REVIEW DECISION NEEDED: minimal checker accepts $ref/oneOf/unions unconditionally — "validated"
+  != "JSON Schema validated"; documented, escape hatch via setToolArgsValidator.
+  Controller fixed inline: retrying-phase sampler flake (Math.random pinned for the window).
+M3 Task 5: complete (b13d927, 170+1). ask() with finally-cleanup; client stop() asserted inside the
+  live round trip (rate-limit budget documented in integration.client.ts); rateLimit.interrupts.
+  Noted: ask has no wall-clock timeout (maxIterations+budgets are the brake); a crash mid-ask leaves
+  a throwaway session the watcher sweeps once — single path where a throwaway outlives its call.
+M3 Task 6: complete (177+1 server, 1 client). verify-build.sh: production bundle proves branch 1
+  (bare import) FAILS with ERR_MODULE_NOT_FOUND and branch 2 (file:// URL) wins; branch 3 (temp shim)
+  also verified live. FINDING: app never had `10thfloor:agent` in .meteor/packages, so every prior
+  `meteor build` shipped zero agent code — added, script now fails early without it.
+  FINDING (real bug): pi-ai's Usage is required on a replayed AssistantMessage and its context
+  estimator derefs it unguarded (utils/estimate.js:4 via api/simple-options.js:6) — every turn after
+  the first threw before the HTTP call on the real Anthropic path; toPiAiRequest now stamps a zero
+  usage (zero so pi-ai falls back to its char estimate rather than a fabricated window).
+  createPiAiProvider gained an options seam (signal written last, loop keeps cancellation).
+  FINAL-REVIEW DECISION NEEDED: the probe is a hand-kept PORT of loader.ts, guarded only by a marker
+  grep — logic drift in loader.ts would not be caught.
+M3 Task 6: complete (233d557, 177+1). Production-build script found: (1) package absent from
+  app/.meteor/packages — all prior builds shipped no agent code; (2) adapter crash on turn 2 of any
+  real Anthropic session (pi-ai estimator dereferences usage on replayed AssistantMessages) — zero-
+  usage stamp fix, threading REAL transcript usage is a noted follow-up. Bare import FAILS in
+  production bundles (ERR_MODULE_NOT_FOUND); file:// URL branch is the production path; shim verified.
+  Probe script is a hand-kept port of loader.ts guarded by marker grep — drift risk noted.
+M3 final whole-branch review: MERGE AFTER MUST-FIXES -> all applied inline (185+1 passing):
+  H1 window-based compaction cut (interjected-user batch split closed, reverse-order cascade)
+  H2 compaction request carries tool schemas (tools:[] with tool blocks = Anthropic 400)
+  H3 interrupt during compaction: phase-conditional compacting/streaming writes + abortable
+    summarization with its own phase poll
+  M4 ruling applied: Agent.method fails CLOSED at registration on unenforceable schema keywords
+  Landed from completeness table: canUse backstop (before gates), maxResultChars (default 8000),
+    retry.maxDelayMs on the public type, context/retry/maxResultChars define-time validation
+  I5-I8: README config surface + compaction section; watcher warn-once; client test try/finally;
+    ask.test clean() drains stragglers until quiescent
+  Spec §5/§7 patched to the SHIPPED surface (Agent.provider, manual compact(), runAs, custom
+    summarizer, predicate gates -> explicitly v2 candidates; budget.idle -> approval ms)
+  Accepted debt (noted, not fixed): watcher race test proves running-Set not claimLease (retitle owed);
+    two console.warn patches installed pre-try; assert.throws without matchers x3; observer projection
+    includes lease (extra findOne per heartbeat); post-compaction consecutive user rows unverified
+    against live Anthropic; wake residual (verdict consumed while approve-defer queued) -> v2 token.

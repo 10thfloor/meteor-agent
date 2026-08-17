@@ -113,3 +113,106 @@ describe('mergeView', () => {
     assert.isFalse(mergeView(committed, [])[0].streaming);
   });
 });
+
+describe('mergeView note rows', () => {
+  // WHY HERE AND NOT IN A CLIENT RENDER TEST. `client/agent.ts` renders nothing
+  // itself — it is a reactive store whose whole output is `mergeView(messages,
+  // deltas)`, and `mergeView` is shared common/ code with no Meteor, DDP or DOM
+  // dependency. A client integration test would need a live subscription, a
+  // real turn to produce each note kind, and a DOM assertion, to end up
+  // exercising this same pure function; the only thing it would add is
+  // confidence in Meteor's own reactivity, which the existing client
+  // integration test already covers for ordinary rows. The risk that IS worth a
+  // test is `mergeView` silently mangling a note: dropping the kind-specific
+  // fields a UI renders (which limit tripped, who approved, what was
+  // summarized), reordering notes away from the message they explain, or
+  // treating one as an in-flight assistant row and stamping `streaming: true`
+  // on transcript history. All four are asserted below, on the server, with no
+  // fixture beyond plain objects.
+
+  const note = (
+    _id: string, seq: number, extra: Partial<AgentMessage>,
+  ): AgentMessage => ({
+    _id, sessionId: 's1', seq, role: 'note', createdAt: new Date(0), ...extra,
+  });
+
+  const errorNote = note('n-err', 11, {
+    kind: 'error', error: { error: 'provider unavailable', reason: 'http 503' },
+  });
+  const budgetNote = note('n-bud', 13, {
+    kind: 'budget', budget: 'toolCalls',
+    error: { error: 'budget exhausted', reason: 'tool call limit reached' },
+  });
+  const approvalNote = note('n-app', 15, {
+    kind: 'approval', approved: false, by: null,
+    reason: 'approval timed out', timedOut: true,
+  });
+  const compactionNote = note('n-cmp', 17, {
+    kind: 'compaction', summary: 'Goal: ship. Progress: partial.', upto: 14,
+  });
+  const notes = [errorNote, budgetNote, approvalNote, compactionNote];
+
+  const user = (id: string, seq: number, content: string): AgentMessage => ({
+    _id: id, sessionId: 's1', seq, role: 'user', content, createdAt: new Date(0),
+  });
+
+  it('passes every note kind through with its fields intact', () => {
+    const view = mergeView(notes, []);
+    assert.lengthOf(view, 4);
+    for (const original of notes) {
+      const row: any = view.find((m) => m._id === original._id);
+      assert.isDefined(row, `${original._id} vanished`);
+      // Every field the source note carried survives, unchanged.
+      for (const [k, v] of Object.entries(original)) assert.deepEqual(row[k], v, `${original._id}.${k}`);
+    }
+    const compaction: any = view.find((m) => m._id === 'n-cmp');
+    assert.equal(compaction.summary, 'Goal: ship. Progress: partial.');
+    assert.equal(compaction.upto, 14);
+    const approval: any = view.find((m) => m._id === 'n-app');
+    assert.isFalse(approval.approved);
+    assert.isNull(approval.by, 'a timed-out approval has no decider');
+    assert.isTrue(approval.timedOut);
+    const budget: any = view.find((m) => m._id === 'n-bud');
+    assert.equal(budget.budget, 'toolCalls', 'a UI must be able to name the limit that tripped');
+  });
+
+  it('sorts notes by seq among ordinary messages', () => {
+    // Shuffled input: order must come from `seq`, not from arrival.
+    const view = mergeView(
+      shuffle([user('u1', 10, 'Q'), errorNote, user('u2', 12, 'again'), budgetNote,
+        user('u3', 14, 'ok'), approvalNote, user('u4', 16, 'more'), compactionNote], 3),
+      [],
+    );
+    assert.deepEqual(view.map((m) => m._id),
+      ['u1', 'n-err', 'u2', 'n-bud', 'u3', 'n-app', 'u4', 'n-cmp']);
+    assert.deepEqual(view.map((m) => m.seq), [10, 11, 12, 13, 14, 15, 16, 17]);
+  });
+
+  it('never treats a note as in-flight, even beside a live stream', () => {
+    // A note commonly sits right where a stream is running: the error note that
+    // ends a turn, the compaction note written mid-turn.
+    const view = mergeView([...notes, user('u1', 10, 'Q')], streamOf('m1', 'partial', { msgSeq: 18 }));
+    for (const row of view.filter((m) => m.role === 'note')) {
+      assert.isFalse(row.streaming, `${row._id} was marked streaming`);
+      assert.isUndefined(row.truncatedHead, `${row._id} got delta-reconstruction fields`);
+      assert.isUndefined(row.deltaCount, `${row._id} got delta-reconstruction fields`);
+    }
+    // The in-flight row is still there, still last, still streaming.
+    const live = view[view.length - 1];
+    assert.equal(live._id, 'm1');
+    assert.isTrue(live.streaming);
+    assert.equal(live.content, 'partial');
+  });
+
+  it('lets a committed note supersede stray deltas that share its id', () => {
+    // Defensive: notes are written by allocateSeq with no delta stream of their
+    // own, so this must never happen — but if a delta ever named a note's id,
+    // the commit has to win rather than the note being rebuilt as an
+    // `assistant` row out of chunks.
+    const view = mergeView([compactionNote], streamOf('n-cmp', 'junk', { msgSeq: 17 }));
+    assert.lengthOf(view, 1);
+    assert.equal(view[0].role, 'note');
+    assert.equal((view[0] as any).summary, 'Goal: ship. Progress: partial.');
+    assert.isFalse(view[0].streaming);
+  });
+});

@@ -9,6 +9,12 @@ export interface ProviderMessage {
   content?: string;
   toolCalls?: Array<{ id: string; name: string; args: unknown }>;
   toolCallId?: string;
+  /** `role: 'tool'` only, and set only when true: this result is a FAILURE.
+   *  The content already says so in JSON, but providers carry a first-class
+   *  error flag on a tool result and read it — Anthropic renders it as
+   *  `is_error`, which changes how the model treats the block. Set from the
+   *  transcript row's `error` field by `toProviderMessages`. */
+  isError?: boolean;
 }
 
 export interface ProviderRequest {
@@ -16,6 +22,12 @@ export interface ProviderRequest {
   system: string;
   messages: ProviderMessage[];
   tools: ToolSchema[];
+  /** Aborting this must cancel the underlying HTTP request. Breaking out of
+   *  the consuming loop alone only stops READING — the response keeps
+   *  arriving and the provider keeps billing it. The loop passes a fresh
+   *  per-attempt signal; providers that cannot honor it (the scripted mock,
+   *  whose streams end immediately) may ignore it. */
+  signal?: AbortSignal;
 }
 
 export type ProviderChunk =

@@ -55,10 +55,18 @@ describe('pi-ai loader v2 (no node_modules writes)', () => {
     // Exercise every load path, then assert the M1 shim dir does not exist.
     await loadPiAi();
     await shimLoad(pathToFileURL(resolvePiAiEntry()).href);
+    // Both layouts the loader itself searches (CANDIDATE_DIRS): dev puts app
+    // npm deps in `node_modules`, a production `meteor build` puts them in
+    // `npm/node_modules`. Checking only the dev one would let the M1 bug —
+    // writing a shim package INTO node_modules, fatal on a read-only container
+    // filesystem — come back unnoticed in the layout that actually ships.
+    const candidates = ['node_modules', path.join('npm', 'node_modules')];
     let dir = process.cwd();
     for (let i = 0; i < 8; i += 1) {
-      const candidate = path.join(dir, 'node_modules', '.agent-loader');
-      assert.isFalse(fs.existsSync(candidate), `stale shim dir at ${candidate}`);
+      for (const c of candidates) {
+        const candidate = path.join(dir, c, '.agent-loader');
+        assert.isFalse(fs.existsSync(candidate), `stale shim dir at ${candidate}`);
+      }
       const parent = path.dirname(dir);
       if (parent === dir) break;
       dir = parent;

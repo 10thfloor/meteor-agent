@@ -11,6 +11,16 @@ interface AgentPackageSettings {
   rateLimit?: {
     sends?: RateLimitEntry;
     starts?: RateLimitEntry;
+    /**
+     * `agent.interrupt`. It starts no model call, so it is not the spend
+     * vector `sends` is — but it is an unauthenticated-reachable WRITE
+     * (`phase: 'stopped'` on every call, against any session id the caller
+     * owns) and it is the one method a UI can fire from a button held down.
+     * Left unlimited, a flood of interrupts is a free write amplifier against
+     * Mongo and, aimed at a session with a turn in flight, a way to keep
+     * cancelling work faster than it can start.
+     */
+    interrupts?: RateLimitEntry;
   };
 }
 
@@ -90,8 +100,8 @@ function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): n
  * A missing/empty settings path (no `packages['10thfloor:agent']`, or no
  * `rateLimit` on it) adds nothing and never throws, so a deployment that
  * hasn't configured rate limits still boots. A PRESENT but malformed entry —
- * `sends` or `starts` given with a non-positive-integer `count` or
- * `intervalMs` — throws a plain `Error` naming the offending field, so a typo
+ * `sends`, `starts` or `interrupts` given with a non-positive-integer `count`
+ * or `intervalMs` — throws a plain `Error` naming the offending field, so a typo
  * in settings.json fails startup loudly instead of silently shipping an
  * unenforced (or nonsensical) limit.
  */
@@ -102,5 +112,8 @@ export function applyRateLimits(settings: unknown): number {
   let added = 0;
   if (rateLimit.sends) added += addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
   if (rateLimit.starts) added += addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
+  if (rateLimit.interrupts) {
+    added += addRuleFor(NAMES.mInterrupt, rateLimit.interrupts, 'interrupts');
+  }
   return added;
 }

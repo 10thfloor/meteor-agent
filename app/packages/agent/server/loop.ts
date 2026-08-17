@@ -1,7 +1,7 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import type { AgentMessage, AgentSession } from '../common/types';
-import type { Provider, ProviderMessage } from './providers/types';
+import type { Provider, ProviderMessage, ToolSchema } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
   HEARTBEAT_MS, SERVER_ID,
@@ -22,10 +22,14 @@ export interface RunConfig {
    *  (`phase: 'stopped'`). Tests lower it; the default keeps the cost to a few
    *  indexed reads per response. */
   interruptCheckMs?: number;
-  /** §10: bounded retry with exponential backoff for a provider stream that
-   *  throws mid-iteration. `attempts` counts the initial try (default 3);
-   *  `baseMs` is the base of `baseMs * 2^attemptIndex` (default 500). */
-  retry?: { attempts?: number; baseMs?: number };
+  /** §10: bounded retry with full-jitter exponential backoff for a provider
+   *  stream that throws mid-iteration. `attempts` counts the initial try
+   *  (default 3); the delay is uniform in
+   *  `[0, min(maxDelayMs, baseMs * 2^attemptIndex)]` (defaults 500 / 10_000). */
+  retry?: { attempts?: number; baseMs?: number; maxDelayMs?: number };
+  /** §9 compaction thresholds (defaults 200_000 / 0.8 / 6); absent =
+   *  compaction disabled. */
+  context?: { window?: number; compactAt?: number; keep?: number };
   /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
    *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
    *  `mSend`, not here — by the time a turn runs, the send it would refuse has
@@ -34,6 +38,31 @@ export interface RunConfig {
   /** $ per million tokens. The FALLBACK for a provider that reports no cost of
    *  its own; see `accruedCost`. */
   pricing?: { input: number; output: number };
+  /** §5.2. A tool result enters the transcript AND every later provider
+   *  request; one oversized result inside compaction's kept tail can exceed
+   *  the context window with nothing compaction can do about it. Truncation
+   *  is explicit in the content so the model knows it saw a prefix.
+   *  Default 8000. */
+  maxResultChars?: number;
+  /** §7's backstop: agent-level tool authorization, checked before gates and
+   *  before dispatch. A refusal is a structured result the model reads and
+   *  routes around — never a park, never a throw. */
+  canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
+    => boolean | Promise<boolean>;
+}
+
+/** Threaded into every dispatch path as one bundle so a future path cannot
+ *  forget half of it. */
+interface DispatchLimits {
+  maxResultChars: number;
+  canUse?: RunConfig['canUse'];
+}
+
+/** The transcript row content for a tool result, truncated explicitly. */
+function toolResultContent(result: ToolResult, maxChars: number): string {
+  const raw = JSON.stringify(result.ok ? result.value : result.error) ?? 'null';
+  if (raw.length <= maxChars) return raw;
+  return `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
 }
 
 /**
@@ -64,21 +93,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
-/** §10: 429, 5xx and network-ish errors retry; 4xx auth/request errors do
- *  not. Anything unclassifiable is treated as retryable — a transient blip
- *  should not permanently kill a session, and retries are bounded anyway.
+/** §10: 429, 408 (a request timeout is transient by definition — Anthropic's
+ *  and OpenAI's own client libraries retry it alongside 429 and 5xx), 5xx and
+ *  network-ish errors retry; other 4xx auth/request errors do not. Anything
+ *  unclassifiable is treated as retryable — a transient blip should not
+ *  permanently kill a session, and retries are bounded anyway.
+ *
+ *  'abandon' is the third answer: a cancelled request. Retrying re-issues the
+ *  very request the user stopped, and a failure note blames them for their
+ *  own cancellation — so an abort takes the interrupt path instead. Detected
+ *  by the adapter's hint or by the standard AbortError name a raw aborted
+ *  fetch carries (no status at all, so it would otherwise default to
+ *  retryable).
  *
  *  An explicit `e.retryable` hint (set by an adapter that has better
  *  information than an HTTP status — pi-ai's own transient-error classifier,
- *  for one) short-circuits the status-based classification in either
- *  direction. */
-export function classifyProviderError(e: any): 'retryable' | 'fatal' {
+ *  for one) short-circuits the status-based classification. */
+export function classifyProviderError(e: any): 'retryable' | 'fatal' | 'abandon' {
+  if (e?.retryable === 'abandon' || e?.name === 'AbortError') return 'abandon';
   if (e?.retryable === true) return 'retryable';
   if (e?.retryable === false) return 'fatal';
   const status = e?.status ?? e?.statusCode ?? e?.response?.status;
-  if (status === 429 || (typeof status === 'number' && status >= 500)) return 'retryable';
+  if (status === 429 || status === 408
+    || (typeof status === 'number' && status >= 500)) return 'retryable';
   if (typeof status === 'number' && status >= 400 && status < 500) return 'fatal';
   return 'retryable';
+}
+
+/** Full jitter: uniform in [0, min(maxDelayMs, baseMs * 2^attemptIndex)].
+ *  A deterministic exponential resynchronizes every session that failed
+ *  together — a provider-wide 529 would have the whole fleet retrying in
+ *  lockstep, which is how outages prolong themselves. */
+export function backoffDelay(attemptIndex: number, baseMs: number, maxDelayMs: number): number {
+  return Math.random() * Math.min(maxDelayMs, baseMs * 2 ** attemptIndex);
 }
 
 /**
@@ -150,6 +197,19 @@ async function commitBudgetNote(
  * a double-submitting user reaching `Meteor.defer(() => runTurn(...))` twice.
  */
 const running = new Set<string>();
+
+/**
+ * Is a turn for this session running in THIS process?
+ *
+ * The watcher's read of the same guard `runTurn` enforces internally. It is an
+ * optimization, not a correctness boundary: calling `runTurn` for a session
+ * already running here returns immediately anyway, and a run on ANOTHER server
+ * is invisible to this Set (that is what the lease is for). It exists so a sweep
+ * does not queue wake-ups it knows will be no-ops.
+ */
+export function isRunning(sessionId: string): boolean {
+  return running.has(sessionId);
+}
 
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
@@ -256,15 +316,240 @@ class DeltaWriter {
   }
 }
 
-function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
+/** The newest `kind:'compaction'` note, or null. Only the newest matters:
+ *  each compaction's summary already folds the previous one in. */
+export function latestCompaction(
+  msgs: AgentMessage[],
+): { seq: number; summary: string; upto: number } | null {
+  for (let i = msgs.length - 1; i >= 0; i -= 1) {
+    const m = msgs[i] as any;
+    if (m.role === 'note' && m.kind === 'compaction' && typeof m.upto === 'number') {
+      return { seq: m.seq, summary: m.summary ?? '', upto: m.upto };
+    }
+  }
+  return null;
+}
+
+/**
+ * What the MODEL sees: from the newest compaction note, its summary as a
+ * leading user message, then every non-note message after the note's `upto`.
+ * With no compaction, the whole (note-filtered) transcript. The transcript
+ * itself is never touched — compaction changes this view only.
+ */
+export function assembleContext(msgs: AgentMessage[]): ProviderMessage[] {
+  const c = latestCompaction(msgs);
+  if (!c) return toProviderMessages(msgs);
+  return [
+    { role: 'user', content: `[Earlier conversation, compacted]\n${c.summary}` },
+    ...toProviderMessages(msgs.filter((m) => m.seq > c.upto)),
+  ];
+}
+
+/**
+ * Estimated tokens the next provider call will carry. The last assistant's
+ * provider-reported `usage.input` is ground truth for the context size at
+ * THAT call; chars/4 approximates what has landed since. Take the max — the
+ * estimate feeds a threshold, so erring high compacts a little early, erring
+ * low silently never compacts. `lastReportedInput` must come from an
+ * assistant NEWER than the latest compaction, or it describes a view that no
+ * longer exists (the caller enforces this).
+ */
+export function estimateContext(
+  assembled: ProviderMessage[], lastReportedInput?: number,
+): number {
+  const chars = JSON.stringify(assembled).length;
+  return Math.max(lastReportedInput ?? 0, Math.ceil(chars / 4));
+}
+
+/**
+ * The seq to compact up to (inclusive), keeping the last `keep` non-note
+ * messages — or null when there is nothing worth compacting. The cut NEVER
+ * splits an assistant-with-toolCalls from its tool results: a summarized
+ * `tool_use` whose `tool_result` survives in the tail (or vice versa) is the
+ * same unmatched-pair 400 the repair machinery exists to prevent, introduced
+ * by our own bookkeeping. Tool rows sit directly after their assistant, so
+ * walking the cut backward off any tool row lands it on the owning
+ * assistant, which is then KEPT whole with its results.
+ */
+export function findCompactionCut(msgs: AgentMessage[], keep: number): number | null {
+  const c = latestCompaction(msgs);
+  const eligible = msgs.filter(
+    (m) => m.role !== 'note' && (!c || m.seq > c.upto),
+  );
+  if (eligible.length <= keep) return null;
+  let cut = eligible.length - keep; // index of the first KEPT message
+  // Batch safety cannot rely on row adjacency: a `send` queued while the
+  // session was `awaiting` puts a USER row between an assistant's toolCalls
+  // and its tool results, so walking back off tool rows alone would cut
+  // between them — summarizing the tool_use while its tool_results survive
+  // in the tail, a permanent 400 nothing can repair (the transcript itself
+  // is healthy; only the model's view is broken). Use the same turn-window
+  // machinery repair uses: if any assistant's window spans the cut, move the
+  // cut to before that assistant.
+  const boundarySeq = () => eligible[cut].seq; // first kept seq
+  // Latest window first: moving the cut earlier can only push the boundary
+  // into EARLIER windows, so processing in reverse handles the cascade in one
+  // pass.
+  for (const w of [...turnWindows(eligible)].reverse()) {
+    if (!w.assistant.toolCalls?.length) continue;
+    const lastAnswerSeq = Math.max(
+      w.assistant.seq,
+      ...eligible
+        .filter((t) => t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd)
+        .map((t) => t.seq),
+    );
+    // Window spans the boundary: assistant would be summarized (or kept) while
+    // some of its results land on the other side.
+    while (cut > 0 && w.assistant.seq < boundarySeq() && lastAnswerSeq >= boundarySeq()) {
+      cut -= 1;
+    }
+  }
+  if (cut <= 0) return null;
+  return eligible[cut - 1].seq;
+}
+
+/**
+ * §9. Summarize everything older than the last `keep` messages into a
+ * `kind:'compaction'` note, using the turn's own provider. Failure is
+ * DEGRADED, never fatal: the turn proceeds uncompacted (too-long context is
+ * the provider's error to report, and the next iteration tries again), and no
+ * error note is written — compaction is bookkeeping, not the user's request.
+ * Returns true when a note was committed (the caller re-reads history).
+ */
+async function maybeCompact(
+  sessionId: string, config: RunConfig, history: AgentMessage[],
+  schemas: ToolSchema[] = [], interruptCheckMs = 250,
+): Promise<boolean> {
+  const ctx = config.context;
+  if (!ctx) return false;
+  const window = ctx.window ?? 200_000;
+  const compactAt = ctx.compactAt ?? 0.8;
+  const keep = ctx.keep ?? 6;
+
+  const prior = latestCompaction(history);
+  const assembled = assembleContext(history);
+  const lastAssistant = [...history].reverse()
+    .find((m) => m.role === 'assistant' && typeof m.usage?.input === 'number');
+  // A reported input from BEFORE the latest compaction describes the
+  // pre-compaction view; using it would re-trigger forever.
+  const reported = lastAssistant && (!prior || lastAssistant.seq > prior.seq)
+    ? lastAssistant.usage!.input : undefined;
+  if (estimateContext(assembled, reported) <= window * compactAt) return false;
+
+  const upto = findCompactionCut(history, keep);
+  if (upto === null) return false;
+  // Phase-guarded, not just lease-guarded: `guardedUpdate` filters on the
+  // lease only, so without the $ne a stop landing right before this write
+  // would be silently overwritten — the same interrupt-erasure hole the M2
+  // retry branch had, widened here to a full provider round trip.
+  const entered = await AgentSessions.updateAsync(
+    { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
+    { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
+  );
+  if (entered !== 1) return false;
+
+  const head = history.filter(
+    (m) => m.role !== 'note' && (!prior || m.seq > prior.upto) && m.seq <= upto,
+  );
+  let summary = '';
+  let usage = { input: 0, output: 0 } as { input: number; output: number; cost?: number };
+  // The summarization is a full provider round trip with no consuming-loop
+  // interrupt check of its own — so it polls the phase itself and ABORTS the
+  // request on a stop, instead of leaving the user's interrupt waiting on a
+  // call they cannot see.
+  const abort = new AbortController();
+  const poll = setInterval(() => {
+    void AgentSessions.findOneAsync(sessionId)
+      .then((s) => { if (!s || s.phase === 'stopped') abort.abort(); })
+      .catch(() => { /* best-effort */ });
+  }, interruptCheckMs);
+  try {
+    for await (const chunk of config.provider.stream({
+      model: config.model,
+      system:
+        'You compact conversation history for an agent. Produce a concise brief '
+        + 'the agent can continue from, structured as: Goal, Progress, Decisions, '
+        + 'Open items. Preserve identifiers, numbers, and constraints exactly. '
+        + 'Output only the brief.',
+      messages: [
+        ...(prior ? [{
+          role: 'user' as const,
+          content: `[Earlier conversation, compacted]\n${prior.summary}`,
+        }] : []),
+        ...toProviderMessages(head),
+        { role: 'user' as const, content: 'Compact the conversation above now, as instructed.' },
+      ],
+      // The head keeps its tool_use/tool_result blocks, and Anthropic rejects
+      // a request carrying those with no `tools` parameter — so the agent's
+      // real tool schemas ride along. The summarizer is told to output only
+      // the brief; a tool call in its reply is discarded anyway (only text
+      // chunks accumulate below).
+      tools: schemas,
+      signal: abort.signal,
+    })) {
+      if (chunk.kind === 'text') summary += chunk.chunk;
+      else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
+    }
+  } catch (e) {
+    // An abort is the user's stop arriving mid-summarization — quiet return;
+    // the attempt head's phase-conditional write is what honors it. Anything
+    // else is degraded-not-fatal, per the compaction contract.
+    if (classifyProviderError(e) !== 'abandon') {
+      console.warn(
+        `[10thfloor:agent] compaction failed for session ${sessionId}; proceeding uncompacted:`,
+        (e as Error)?.message,
+      );
+    }
+    return false;
+  } finally {
+    clearInterval(poll);
+  }
+  if (!summary.trim()) return false;
+
+  // The summarization call is a real model call: its usage and cost accrue
+  // exactly as a think's do, in the same atomic write as the note's seq.
+  const noteSeq = await allocateSeq(sessionId, {
+    'usage.input': usage.input,
+    'usage.output': usage.output,
+    'usage.cost': accruedCost(usage, config.pricing),
+  });
+  if (noteSeq === null) return false;
+  await AgentMessages.insertAsync({
+    _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'compaction',
+    summary, upto, usage, createdAt: new Date(),
+  } as any);
+  return true;
+}
+
+/**
+ * The transcript, as the provider sees it — the single boundary between what
+ * is stored and what is sent.
+ *
+ * Notes are dropped: `kind:'error'`, `'budget'`, `'approval'`, `'compaction'`
+ * are the harness's own bookkeeping in a role no provider knows, and
+ * `assembleContext` is what turns a compaction note back into something the
+ * model reads.
+ *
+ * `error` becomes `isError`, and only on the rows that have one. The row's
+ * `content` is already the error's JSON, but a tool result carries a
+ * first-class failure flag on every provider worth the name, and a model told
+ * a result failed treats it differently from one it has to infer failure from.
+ * The error OBJECT stays behind: `isError` is a boolean on the wire, and the
+ * `{error, reason}` detail is already in the content.
+ */
+export function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
   return msgs
     .filter((m) => m.role !== 'note')
-    .map((m) => ({
-      role: m.role as ProviderMessage['role'],
-      content: m.content,
-      toolCalls: m.toolCalls,
-      toolCallId: m.toolCallId,
-    }));
+    .map((m) => {
+      const out: ProviderMessage = {
+        role: m.role as ProviderMessage['role'],
+        content: m.content,
+        toolCalls: m.toolCalls,
+        toolCallId: m.toolCallId,
+      };
+      if (m.error) out.isError = true;
+      return out;
+    });
 }
 
 /**
@@ -476,7 +761,8 @@ async function dispatchCalls(
   calls: Array<{ id: string; name: string; args: unknown }>,
   tools: ResolvedTool[],
   turn: TurnAnchor,
-  budget?: RunConfig['budget'],
+  budget: RunConfig['budget'],
+  limits: DispatchLimits,
 ): Promise<DispatchOutcome> {
   const abandon = async (): Promise<DispatchOutcome> => {
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
@@ -484,6 +770,27 @@ async function dispatchCalls(
   };
 
   for (const call of calls) {
+    // §7's backstop, BEFORE the gate: a tool the agent may not use must never
+    // park either — asking a human to approve a call the config forbids is a
+    // request nothing may grant. Refusal is a result (no toolCalls budget:
+    // nothing dispatched), and the model routes around it.
+    if (limits.canUse
+      && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
+      const denied: ToolResult = {
+        ok: false,
+        error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+      };
+      const deniedSeq = await allocateSeq(sessionId);
+      if (deniedSeq === null) return abandon();
+      await AgentMessages.insertAsync({
+        _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
+        toolCallId: call.id,
+        content: toolResultContent(denied, limits.maxResultChars),
+        error: denied.error,
+        createdAt: new Date(),
+      } as any);
+      continue;
+    }
     // Ownership is checked BEFORE dispatch, not after. Adopted tools are real
     // Meteor methods: running one we no longer own means the recovering server
     // runs it a second time — a second charge, a second email. The window
@@ -574,7 +881,7 @@ async function dispatchCalls(
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
       toolCallId: call.id,
-      content: JSON.stringify(result.ok ? result.value : result.error),
+      content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
       createdAt: new Date(),
     } as any);
@@ -630,7 +937,8 @@ async function resumeParkedTurn(
   pending: NonNullable<AgentSession['pending']>,
   tools: ResolvedTool[],
   userId: string | null,
-  budget?: RunConfig['budget'],
+  budget: RunConfig['budget'],
+  limits: DispatchLimits,
 ): Promise<DispatchOutcome> {
   const msgs = await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
   const batch = locateBatch(msgs, pending.toolCallId);
@@ -709,7 +1017,7 @@ async function resumeParkedTurn(
 
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
-      content: JSON.stringify(result.ok ? result.value : result.error),
+      content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
       createdAt: new Date(),
     } as any);
@@ -729,7 +1037,7 @@ async function resumeParkedTurn(
   // discard the very turn they answered. The remainder goes through the
   // ordinary gate below, so a batch cannot run away past the limit — it can
   // only exceed it by the one call a person signed for.
-  return dispatchCalls(sessionId, remaining, tools, turn, budget);
+  return dispatchCalls(sessionId, remaining, tools, turn, budget, limits);
 }
 
 /**
@@ -750,6 +1058,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   // the provider" quietly calling it once. Floor it instead of trusting it.
   const retryAttempts = Math.max(1, config.retry?.attempts ?? 3);
   const retryBaseMs = config.retry?.baseMs ?? 500;
+  const retryMaxDelayMs = config.retry?.maxDelayMs ?? 10_000;
+  const limits: DispatchLimits = {
+    maxResultChars: config.maxResultChars ?? 8000,
+    canUse: config.canUse,
+  };
   const tools = resolveTools(config.tools);
   const schemas = toolSchemas(tools);
 
@@ -817,7 +1130,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         } else {
           resumed = true;
           const outcome = await resumeParkedTurn(
-            sessionId, entry.pending, tools, entry.userId, config.budget,
+            sessionId, entry.pending, tools, entry.userId, config.budget, limits,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -853,8 +1166,18 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           return;
         }
 
-        const history = await AgentMessages
+        let history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+
+        // §9: compact BEFORE this iteration's provider call, so the call that
+        // would have overflowed is the one that benefits. A committed note
+        // changes the assembled view; re-read so this iteration streams
+        // against it (the note also occupies a seq).
+        if (await maybeCompact(sessionId, config, history, schemas, interruptCheckMs)) {
+          history = await AgentMessages
+            .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+        }
+
         const historyMaxSeq = history.length ? history[history.length - 1].seq : -1;
 
         let messageId = Random.id();
@@ -885,7 +1208,18 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // on 'retrying' for the whole of its own stream tells the client a
           // retry is still pending while tokens are already arriving.
           // 'retrying' must be visible only BETWEEN attempts.
-          if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'streaming' } }))) return;
+          //
+          // Phase-conditional as well as lease-guarded: compaction sits
+          // between the iteration head's stopped-check and this write, a full
+          // provider round trip in which an interrupt can land. A lease-only
+          // write here would erase it — the M2 retry-branch hole, reopened.
+          // Zero matched (stop OR lost lease) → return; the finally preserves
+          // a stop.
+          const streaming = await AgentSessions.updateAsync(
+            { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
+            { $set: { phase: 'streaming', updatedAt: new Date() } } as any,
+          );
+          if (streaming !== 1) return;
 
           const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
           text = '';
@@ -895,12 +1229,18 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           interrupted = false;
           let lastPhaseCheck = Date.now();
           let providerError: unknown = null;
+          // Fresh per attempt: an aborted attempt's signal must not poison its
+          // retry, and a signal is single-shot.
+          const abort = new AbortController();
 
           try {
             try {
               for await (const chunk of config.provider.stream({
                 model: config.model, system: config.system,
-                messages: toProviderMessages(history), tools: schemas,
+                // The COMPACTED view when a compaction note stands; the raw
+                // (note-filtered) transcript otherwise.
+                messages: assembleContext(history), tools: schemas,
+                signal: abort.signal,
               })) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
@@ -916,7 +1256,14 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
                   lastPhaseCheck = Date.now();
                   const s = await AgentSessions.findOneAsync(sessionId);
-                  if (!s || s.phase === 'stopped') { interrupted = true; break; }
+                  if (!s || s.phase === 'stopped') {
+                    // Abort BEFORE breaking: the break only stops consuming;
+                    // the abort is what cancels the HTTP request behind the
+                    // stream, which otherwise keeps arriving and billing.
+                    abort.abort();
+                    interrupted = true;
+                    break;
+                  }
                 }
               }
             } finally {
@@ -955,10 +1302,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             if (interrupted || !live || live.phase === 'stopped') return;
 
             const classification = classifyProviderError(providerError);
+            // An abandoned request is the interrupt path with a different
+            // trigger: deltas are already cleaned above, no note is owed to
+            // the user (nothing failed AT them), and the finally preserves a
+            // stop if one stands. Returning here is the whole handling.
+            if (classification === 'abandon') return;
             const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
             if (classification === 'retryable' && hasMoreAttempts) {
               if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;
-              await sleep(retryBaseMs * 2 ** attemptIndex);
+              await sleep(backoffDelay(attemptIndex, retryBaseMs, retryMaxDelayMs));
               // The interrupt check above only fires WHILE a stream is
               // running; re-check here so an interrupt landing during the
               // backoff sleep itself still stops the turn, instead of being
@@ -1053,7 +1405,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,
-        }, config.budget);
+        }, config.budget, limits);
         // A park exits the turn with the batch deliberately unanswered; an
         // abandonment has already erased it. Only a fully answered batch may
         // go round again and ask the model what to do with the results.
@@ -1099,8 +1451,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     // send clears it: neither is ours to wake.
     if (owned && !resumed) {
       const after = await AgentSessions.findOneAsync(sessionId).catch(() => null);
+      // 'error' belongs in this exclusion list for the same reason it is in
+      // the finally's terminal list: a failed turn is not ours to wake, and
+      // the two lists disagreeing was itself a reviewed defect.
       if (after?.pending?.verdict
-        && after.phase !== 'awaiting' && after.phase !== 'stopped'
+        && after.phase !== 'awaiting' && after.phase !== 'stopped' && after.phase !== 'error'
         && !running.has(sessionId)) {
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
@@ -1110,7 +1465,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // the same load-bearing one `deferTurn` uses: an unhandled rejection is
         // fatal by default on Node >= 15.
         setTimeout(() => {
-          runTurn(sessionId, config).catch((e) => {
+          void (async () => {
+            // Re-read INSIDE the deferred callback, not before it: the
+            // legitimate resume can start AND finish between the check above
+            // and this timer firing. It spends the verdict; a woken run that
+            // then finds no `pending` would fall straight into the think loop
+            // and make a provider call nobody asked for — a charge, and an
+            // assistant row appended to a turn the user considered finished.
+            const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
+            if (!still?.pending?.verdict
+              || still.phase === 'awaiting' || still.phase === 'stopped'
+              || still.phase === 'error' || running.has(sessionId)) return;
+            await runTurn(sessionId, config);
+          })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
           });
         }, 0);

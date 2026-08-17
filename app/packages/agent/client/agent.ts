@@ -19,13 +19,70 @@ export class Agent {
   /** Client-only collection holding the merged view. */
   private view = new Mongo.Collection<ViewMessage>(null);
   private computation: Tracker.Computation | null = null;
+  /** The handle from the LAST `subscribe()`, retained so `stop()` has something
+   *  to stop. `Meteor.subscribe` outside a reactive computation is never
+   *  cleaned up for you — returning the handle and keeping no reference to it
+   *  was the leak. */
+  private handle: Meteor.SubscriptionHandle | null = null;
+  /** Which session `subscribe()` last opened — the identity `stop(sessionId)`
+   *  checks itself against. */
+  private watching: string | null = null;
 
   constructor(public readonly name: string) {}
 
   subscribe(sessionId: string) {
-    const handle = Meteor.subscribe(NAMES.pubSession, this.name, sessionId);
+    // One Agent instance watches one session, so a re-subscribe REPLACES:
+    // stopping the previous handle here is the other half of the leak fix,
+    // since `startMerging` already replaces the computation and the old
+    // subscription would otherwise keep shipping a session nothing renders.
+    if (this.handle) this.handle.stop();
+    this.handle = Meteor.subscribe(NAMES.pubSession, this.name, sessionId);
+    this.watching = sessionId;
     this.startMerging(sessionId);
-    return handle;
+    return this.handle;
+  }
+
+  /**
+   * Tear down everything `subscribe()` started: the merge computation, the
+   * subscription, and the merged view it maintained.
+   *
+   * Call it from a component's unmount — `useEffect(() => () =>
+   * agent.stop(sessionId), [sessionId])`. A `Tracker.autorun` created outside a
+   * parent computation and a `Meteor.subscribe` called outside one both live
+   * until stopped explicitly; without this, navigating away from a chat leaves
+   * an autorun recomputing on every delta of a session nobody is looking at,
+   * and a subscription still shipping them over DDP.
+   *
+   * Idempotent, because unmount paths double-fire (React 18 StrictMode mounts,
+   * unmounts and remounts every effect in development): the second call finds
+   * both handles already null and does nothing.
+   *
+   * `sessionId` is an optional GUARD, not a selector — this instance only ever
+   * holds one session. Pass it and the teardown happens only if that session is
+   * still the one being watched, so a stale unmount cleanup arriving AFTER a
+   * re-subscribe to a newer session (React runs the old effect's cleanup after
+   * the new render in some orderings) cannot tear down the live subscription.
+   *
+   * `subscribe()` afterwards works exactly as the first time: nothing here is
+   * one-way.
+   */
+  stop(sessionId?: string): void {
+    if (sessionId !== undefined && this.watching !== null && sessionId !== this.watching) return;
+
+    if (this.computation) {
+      this.computation.stop();
+      this.computation = null;
+    }
+    if (this.handle) {
+      this.handle.stop();
+      this.handle = null;
+    }
+    this.watching = null;
+    // The view is a client-only mirror of a subscription that no longer
+    // exists. Leaving its rows behind would let `messages()` keep serving a
+    // transcript the component already tore down — and the merge computation
+    // that used to evict them is stopped.
+    this.view.remove({});
   }
 
   /**

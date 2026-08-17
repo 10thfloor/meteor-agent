@@ -32,9 +32,22 @@ interface PiAiToolCallContent {
   type: 'toolCall'; id: string; name: string; arguments: Record<string, any>;
 }
 
+/**
+ * pi-ai's `Usage`. Required on a replayed `AssistantMessage`, not optional —
+ * see `zeroUsage()`.
+ */
+export interface PiAiUsage {
+  input: number; output: number; cacheRead: number; cacheWrite: number;
+  totalTokens: number;
+  cost: { input: number; output: number; cacheRead: number; cacheWrite: number; total: number };
+}
+
 export type PiAiMessage =
   | { role: 'user'; content: string; timestamp: number }
-  | { role: 'assistant'; content: Array<PiAiTextContent | PiAiToolCallContent>; timestamp: number }
+  | {
+      role: 'assistant'; content: Array<PiAiTextContent | PiAiToolCallContent>;
+      usage: PiAiUsage; timestamp: number;
+    }
   | {
       role: 'toolResult'; toolCallId: string; toolName: string;
       content: PiAiTextContent[]; isError: boolean; timestamp: number;
@@ -117,6 +130,35 @@ export function toPiAiRequest(req: ProviderRequest, now: number = Date.now()): P
   };
 }
 
+/**
+ * An all-zero `Usage` for a REPLAYED assistant message.
+ *
+ * pi-ai's `Usage` is not optional on `AssistantMessage`, and its context
+ * estimator dereferences it without a guard: `estimateMessages` ->
+ * `getLastAssistantUsageInfo` -> `calculateContextTokens(assistant.usage)`
+ * reads `usage.totalTokens` (utils/estimate.js:4). That estimator runs on the
+ * way INTO every request — `buildBaseOptions` -> `clampMaxTokensToContext`
+ * (api/simple-options.js:6) — so an assistant row without `usage` threw
+ * `Cannot read properties of undefined (reading 'totalTokens')` before a single
+ * byte reached the provider. Verified against pi-ai 0.84.2: every turn after
+ * the first failed on the real Anthropic path, which the faux-provider tests
+ * never reached because fauxProvider does not build request options.
+ *
+ * Zero rather than the transcript's real figures, deliberately:
+ * `getLastAssistantUsageInfo` only trusts a usage whose token total is > 0, so
+ * zero makes pi-ai fall back to its own character-based estimate over the
+ * assembled messages — an honest estimate — instead of anchoring the context
+ * size to a number this mapping cannot supply. `ProviderMessage` carries no
+ * usage, and inventing one would misreport the window to pi-ai's max-token
+ * clamp.
+ */
+function zeroUsage(): PiAiUsage {
+  return {
+    input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+  };
+}
+
 function toPiAiMessage(
   m: ProviderMessage, toolNames: Map<string, string>, now: number,
 ): PiAiMessage {
@@ -126,10 +168,11 @@ function toPiAiMessage(
       toolCallId: m.toolCallId ?? '',
       toolName: toolNames.get(m.toolCallId ?? '') ?? '',
       content: [{ type: 'text', text: m.content ?? '' }],
-      // ProviderMessage has no error flag; the transcript's `error` field is
-      // dropped by the loop's toProviderMessages. Tool failures reach the model
-      // as their JSON content either way.
-      isError: false,
+      // The transcript's `error` field, carried this far by the loop's
+      // `toProviderMessages` as `ProviderMessage.isError`. pi-ai's
+      // ToolResultMessage requires the flag, so an absent one is `false` —
+      // a successful result — rather than omitted.
+      isError: m.isError === true,
       timestamp: now,
     };
   }
@@ -144,7 +187,7 @@ function toPiAiMessage(
         arguments: (c.args ?? {}) as Record<string, any>,
       });
     }
-    return { role: 'assistant', content, timestamp: now };
+    return { role: 'assistant', content, usage: zeroUsage(), timestamp: now };
   }
   return { role: 'user', content: m.content ?? '', timestamp: now };
 }
@@ -218,8 +261,19 @@ export function translateEvent(ev: any): ProviderChunk[] {
  * The `Provider` seam over an arbitrary pi-ai `Models` collection. Exported so
  * tests can drive the whole stream path through pi-ai's own `fauxProvider()`
  * without a network call or an API key.
+ *
+ * `options` are merged into every `streamSimple` call. The type is pi-ai's
+ * `ModelsSimpleStreamOptions` minus the fields this adapter owns — `apiKey`,
+ * `fetch`, `headers`, `timeoutMs`, … (`ProviderRequestOptions`, types.d.ts:49).
+ * `piAiProvider()` passes nothing, so the shipped behavior is unchanged and
+ * keys keep coming from the environment; the seam exists so a test can inject a
+ * `fetch` and read the request body the real converter produces, which is the
+ * only way to check the wire format without a network call.
  */
-export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Provider {
+export function createPiAiProvider(
+  resolveModels: () => Promise<PiAiModels>,
+  options?: Record<string, unknown>,
+): Provider {
   return {
     async *stream(req: ProviderRequest): AsyncIterable<ProviderChunk> {
       const { provider, modelId, context } = toPiAiRequest(req);
@@ -248,7 +302,13 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
           Object.assign(m, { provider, model: modelId, api: (model as any).api });
         }
       }
-      for await (const ev of models.streamSimple(model, context)) {
+      // The third argument is the only thing that reaches the HTTP request:
+      // `ModelsSimpleStreamOptions` extends `ProviderRequestOptions`, which
+      // declares `signal?: AbortSignal` (types.d.ts:50). Without it, an
+      // interrupt stops only the reading. `signal` is written LAST so the
+      // loop's per-attempt controller can never be displaced by a configured
+      // option — cancellation is the loop's, not the caller's, to own.
+      for await (const ev of models.streamSimple(model, context, { ...options, signal: req.signal })) {
         if (ev?.type === 'error') {
           // pi-ai terminates a failed stream with an event, not a rejection.
           // Throwing turns it back into the failure the turn loop expects: the
@@ -260,11 +320,13 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
             `${ev.error?.errorMessage ?? 'unknown error'}`,
           );
           // §10 retry hint, read by loop.ts's classifyProviderError
-          // (`e.retryable === true/false` short-circuits its status-based
-          // classification). An abort is a deliberate stop, never a transient
-          // failure worth retrying.
+          // (`e.retryable` short-circuits its status-based classification).
+          // An abort is neither transient (retrying re-issues the request the
+          // user just cancelled, at full price) nor a failure to report at
+          // them (they cancelled it) — 'abandon' routes it onto the loop's
+          // interrupt path: deltas cleaned, no error note, stop preserved.
           if (ev.reason === 'aborted') {
-            err.retryable = false;
+            err.retryable = 'abandon';
           } else {
             // Reuse pi-ai's own transient-vs-terminal classifier (rate
             // limits/timeouts/overloaded upstreams vs auth/quota errors)

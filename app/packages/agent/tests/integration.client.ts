@@ -24,6 +24,21 @@ const waitFor = (
  * server function or a pure function; this proves the whole path:
  * method call -> turn loop -> capped-collection deltas -> publication -> DDP ->
  * minimongo -> client-side merge -> reactive cursor.
+ *
+ * BUDGET WARNING — this test runs inside the server's live rate limits.
+ * `capped.test.ts`'s `applyRateLimits` suite registers REAL `DDPRateLimiter`
+ * rules against `agent.start`, `agent.send` and `agent.interrupt`, some with a
+ * count as low as 1 per minute, and DDPRateLimiter offers no supported way to
+ * remove a rule or reset its counters — so those rules are live for the rest of
+ * the process, and this is the only test whose calls actually pass through
+ * them (server-side tests invoke method handlers directly and never touch the
+ * limiter). Every DDP call made from here must therefore stay within the
+ * TIGHTEST count any of those fixtures registers: today that means ONE
+ * `start` and ONE `send` per method name for the whole file, and no
+ * `interrupt` at all. Adding a second call — or a retry loop around one —
+ * fails with `too-many-requests` in a way that looks like a harness flake and
+ * has nothing to do with the code under test. If this file ever needs more
+ * calls, raise the counts in those fixtures rather than adding calls here.
  */
 describe('live DDP round trip', () => {
   it('delivers a streamed reply into the merged cursor', async function () {
@@ -33,6 +48,11 @@ describe('live DDP round trip', () => {
     const support = new Agent(AGENT);
     const sessionId: string = await support.start({ title: 'itest' });
     const handle = support.subscribe(sessionId);
+    // Teardown on EVERY exit (try/finally below): a failed assertion would
+    // otherwise leave this subscription and its merge autorun live for the
+    // rest of the client run. stop() is idempotent, so the success path's own
+    // stop() calls — part of what this test asserts — are unaffected.
+    try {
 
     await waitFor('the subscription to become ready', 20000, () => handle.ready());
 
@@ -76,5 +96,31 @@ describe('live DDP round trip', () => {
       'live streamed reply'.startsWith(streamed.content),
       `in-flight text must be a prefix of the committed text, got "${streamed.content}"`,
     );
+
+    // --- teardown, asserted on the same session rather than in a test of its
+    // own: `stop()` needs a LIVE subscription and a running merge computation
+    // to be worth anything, and a second test would need a second start+send
+    // to get them — which the rate-limit budget above does not have room for.
+    // Subscriptions are not rate limited (the rules are `type: 'method'`), so
+    // re-subscribing below costs nothing against it.
+    support.stop(sessionId);
+    assert.isFalse(handle.ready(), 'stop() must stop the subscription it created');
+    assert.lengthOf(
+      support.messages(sessionId).fetch(), 0,
+      'stop() must clear the merged view it maintained',
+    );
+    support.stop(sessionId);          // idempotent: a double unmount must not throw
+    support.stop();                   // …with or without the guard argument
+
+    // And it is not one-way: subscribing again rebuilds both halves.
+    const second = support.subscribe(sessionId);
+    await waitFor('the re-subscription to become ready', 20000, () => second.ready());
+    await waitFor('the merged view to repopulate', 20000, () =>
+      support.messages(sessionId).fetch()
+        .some((m: any) => m.role === 'assistant' && m.content === 'live streamed reply'));
+    support.stop();
+    } finally {
+      try { support.stop(); } catch { /* already stopped */ }
+    }
   });
 });

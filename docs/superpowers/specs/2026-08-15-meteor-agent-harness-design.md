@@ -296,13 +296,15 @@ interface AgentConfig {
   budget?: {
     turns?: number; toolCalls?: number;
     spend?: string | number;                        // '$1.00' or dollars
-    idle?: string;                                  // '30 m' — parked-run expiry
+    approval?: number;                              // ms — parked-approval expiry
+                                                    // (was sketched as `idle: '30 m'`;
+                                                    // shipped as ms, watcher-enforced)
   };
   context?: { window?: number; compactAt?: number; keep?: number };
   canUse?: (tool: string, ctx: ToolContext) => boolean | Promise<boolean>;
-  runAs?: string | 'session';                       // default 'session'
-  compact?: (msgs: AgentMessage[]) => Promise<string>;
   maxResultChars?: number;                          // default 8000
+  // Sketched but NOT SHIPPED in v1 (v2 candidates): `runAs` (tools always run
+  // as the session's user) and a custom `compact` summarizer hook.
 }
 ```
 
@@ -325,11 +327,12 @@ await Support.send(sessionId, text)
 await Support.interrupt(sessionId)
 await Support.approve(sessionId)
 await Support.deny(sessionId, reason?)
-await Support.compact(sessionId)
+Support.stop(sessionId?)                      // teardown for component unmount
 ```
 
-Everything on the write side is also available on the server, with an explicit
-`{ userId }` where the invocation context can't supply one.
+Manual `Support.compact(sessionId)` was sketched here but NOT shipped in v1 —
+compaction is automatic (§9). On the server, `ask` takes an explicit
+`{ userId }`; the other write methods are DDP methods.
 
 ### 5.4 Server-only surface
 
@@ -337,8 +340,13 @@ Everything on the write side is also available on the server, with an explicit
 Support.define(config)
 await Support.ask(text, { userId })           // headless one-shot → string
 Agent.method(name, def)                       // §6
-Agent.provider(name, impl)                    // §8
+setToolArgsValidator(fn | null)               // §6 — replace the arg checker
+startWatcher(opts?)                           // §4.3 — usually automatic at boot
 ```
+
+`Agent.provider(name, impl)` (a global provider registry) was sketched here but
+NOT shipped in v1: providers are per-agent config objects, and the pi-ai
+default covers the registry's main use.
 
 ### 5.5 Minimal consumer example
 
@@ -437,9 +445,11 @@ second, independent validation rather than the schema source.
 
 ## 7. Permissions, gates, and rate limiting
 
-Per-tool `gate`: `'auto'` (default), `'ask'` (parks per §4.3), or a predicate
-`(ctx) => boolean | 'ask'`. Agent-wide, `canUse(tool, ctx)` is the backstop.
-Tools run as the session's user unless `runAs` says otherwise.
+Per-tool `gate`: `'auto'` (default) or `'ask'` (parks per §4.3). A predicate
+gate (`(ctx) => boolean | 'ask'`) was sketched here but NOT shipped in v1 —
+`canUse(tool, ctx)`, the agent-wide backstop (checked before gates, so a
+forbidden tool never parks), covers the dynamic case; a per-tool predicate is
+a v2 candidate. Tools always run as the session's user (`runAs` not shipped).
 
 **Rate limiting splits in two, and this is a correction.** An earlier draft
 claimed adopted methods keep their `DDPRateLimiter` rules when an agent calls

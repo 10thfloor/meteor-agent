@@ -715,6 +715,45 @@ describe('turn loop', () => {
     assert.equal(doc!.phase, 'stopped', 'the finally must preserve the stop');
   });
 
+  it('an interrupt aborts the provider request, not just the consuming loop', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-abort', 'hello');
+    // Breaking out of the for-await only stops CONSUMING the stream: the HTTP
+    // request behind it keeps arriving and the provider keeps billing the
+    // whole response. The signal is the only thing that reaches the provider,
+    // so the provider is what has to observe it flip.
+    let signal: AbortSignal | undefined;
+    let abortedWhileStreaming: boolean | undefined;
+    const observing: Provider = {
+      async *stream(req) {
+        signal = req.signal;
+        abortedWhileStreaming = req.signal?.aborted;
+        yield { kind: 'text', chunk: 'should ' };
+        await new Promise((r) => setTimeout(r, 30));
+        await AgentSessions.updateAsync('s-abort', { $set: { phase: 'stopped' } } as any);
+        await new Promise((r) => setTimeout(r, 30));
+        yield { kind: 'text', chunk: 'never commit' };
+        yield { kind: 'done', usage: { input: 1, output: 3 } };
+      },
+    };
+
+    await runTurn('s-abort', {
+      model: 'mock', system: '', tools: [], provider: observing, interruptCheckMs: 5,
+    });
+
+    assert.isDefined(signal, 'the loop must hand the provider a signal to honor');
+    assert.isFalse(abortedWhileStreaming, 'the signal starts live');
+    assert.isTrue(signal!.aborted, 'an interrupt must abort the in-flight request');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abort', role: 'assistant' }).countAsync(), 0,
+      'an aborted stream must not commit',
+    );
+    assert.equal((await AgentSessions.findOneAsync('s-abort'))!.phase, 'stopped');
+  });
+
   it('interrupt during tool dispatch discards the turn instead of stranding tool_use', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -873,6 +912,60 @@ describe('turn loop', () => {
     assert.equal(sid, 'auth-s1');
   });
 
+  it('a send clears a stranded error phase and the deferred turn recovers', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('recover', {
+      model: 'mock', instructions: 'x', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    // The state a fatal provider failure leaves behind: a terminal `error`
+    // phase and a note explaining it. §10's position is that the model usually
+    // recovers, so a send is the resume signal — and clearing the phase is what
+    // makes it one.
+    await seed('s-error-clear', 'first message', 'recover');
+    await AgentMessages.insertAsync({
+      _id: 'err-note', sessionId: 's-error-clear', seq: 1, role: 'note', kind: 'error',
+      error: { error: 'provider-failed', reason: 'The model request failed.' },
+      createdAt: new Date(),
+    } as any);
+    await AgentSessions.updateAsync(
+      { _id: 's-error-clear' } as any,
+      { $set: { phase: 'error', nextSeq: 2 } } as any,
+    );
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    await send.call({ userId: 'u1' }, 'recover', 's-error-clear', 'try again');
+
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-error-clear', role: 'assistant' }).countAsync()) === 1,
+      'the deferred turn to answer the send that cleared the error',
+    );
+
+    // The phase is the whole point. The loop's `finally` treats `error` as
+    // terminal and PRESERVES it, so without mSend's conditional clear this
+    // session would answer perfectly while still displaying a failure forever —
+    // and a UI keying its retry affordance off `phase === 'error'` would offer
+    // to retry a turn that already succeeded.
+    const doc = (await AgentSessions.findOneAsync('s-error-clear'))!;
+    assert.equal(doc.phase, 'idle', 'a send must clear the error phase it recovered from');
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-error-clear' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.equal(msgs[msgs.length - 1].content, 'recovered');
+    // Clearing the phase is not rewriting history: the failure note stays in
+    // the transcript, and both user messages are still there.
+    assert.isDefined(await AgentMessages.findOneAsync('err-note'));
+    assert.lengthOf(msgs.filter((m) => m.role === 'user'), 2);
+  });
+
   it('retries a retryable provider failure and then succeeds', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');
@@ -967,7 +1060,73 @@ describe('turn loop', () => {
       'retry must not overwrite the stop with `retrying`/`error`');
   });
 
-  it('shows phase `retrying` between attempts and sleeps a real backoff', async function () {
+  it('treats an aborted stream as abandon: no retry, no error note, no commit', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-abandon', 'hello');
+    let attempts = 0;
+    // The shape an aborted request takes once the signal fires: the stream
+    // rejects with an AbortError rather than an HTTP status. It is a
+    // deliberate stop, so it must NOT retry — a retry re-issues the very
+    // request that was just cancelled, at full price — and must NOT write a
+    // failure note at the user, because nothing failed at them.
+    const aborting: Provider = {
+      async *stream() {
+        attempts += 1;
+        yield { kind: 'text', chunk: 'par' };
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-abandon', {
+      model: 'mock', system: '', tools: [], provider: aborting,
+      retry: { attempts: 3, baseMs: 10 },
+    });
+
+    assert.equal(attempts, 1, 'an abort must never be retried');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon', role: 'note' } as any).countAsync(), 0,
+      'an abort is a cancellation, not a provider failure to report',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon', role: 'assistant' }).countAsync(), 0,
+    );
+    assert.equal(
+      await AgentDeltas.find({ sessionId: 's-abandon' }).countAsync(), 0,
+      'the abandoned attempt must take its deltas with it, exactly as an interrupt does',
+    );
+    assert.notEqual(
+      (await AgentSessions.findOneAsync('s-abandon'))!.phase, 'error',
+      'nothing failed, so the turn must not end in the failure phase',
+    );
+
+    // And when the abort followed the user's own stop, the stop is what
+    // survives — the same terminal state the interrupt path leaves behind.
+    await seed('s-abandon-stop', 'hello');
+    const stoppedAbort: Provider = {
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        await AgentSessions.updateAsync('s-abandon-stop', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-abandon-stop', {
+      model: 'mock', system: '', tools: [], provider: stoppedAbort,
+      retry: { attempts: 3, baseMs: 10 },
+    });
+    assert.equal((await AgentSessions.findOneAsync('s-abandon-stop'))!.phase, 'stopped');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon-stop', role: 'note' } as any).countAsync(), 0,
+    );
+  });
+
+  it('shows phase `retrying` between attempts', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');
     const { runTurn } = await import('../server/loop');
@@ -984,6 +1143,9 @@ describe('turn loop', () => {
 
     // `retrying` is only observable BETWEEN attempts, so poll for it rather
     // than reading the phase after the fact — by then it is `idle` again.
+    // Full jitter draws the backoff from [0, cap], so an unpinned run can put
+    // the whole retrying window under the sampler's period — a 1-in-N flake.
+    // Pin Math.random for the duration so the window is the full cap.
     const seenPhases = new Set<string>();
     const sampler = setInterval(() => {
       void AgentSessions.findOneAsync('s-retry-phase')
@@ -991,21 +1153,24 @@ describe('turn loop', () => {
         .catch(() => { /* sampling is best-effort */ });
     }, 15);
 
-    const startedAt = Date.now();
+    const realRandom = Math.random;
+    Math.random = () => 0.99;
     try {
       await runTurn('s-retry-phase', {
         model: 'mock', system: '', tools: [], provider: flaky,
         retry: { attempts: 2, baseMs: 120 },
       });
-    } finally { clearInterval(sampler); }
-    const elapsed = Date.now() - startedAt;
+    } finally {
+      Math.random = realRandom;
+      clearInterval(sampler);
+    }
 
     assert.equal(attempts, 2);
     assert.isTrue(seenPhases.has('retrying'),
       `the retry must be visible to the client, saw [${[...seenPhases].join(', ')}]`);
-    // Floor only. CI is slow and the sleep is bounded from below by design;
-    // asserting an upper bound would just be a flake generator.
-    assert.isAtLeast(elapsed, 120, 'the backoff must be a real sleep, not a no-op');
+    // No duration assertion: full jitter draws the delay from [0, cap], so a
+    // legitimate backoff can be ~0ms and any floor here is a flake generator.
+    // The delay itself is pinned by `backoffDelay()`'s own test below.
     const committed = await AgentMessages.findOneAsync({ sessionId: 's-retry-phase', role: 'assistant' });
     assert.equal(committed!.content, 'back up');
   });
@@ -1655,6 +1820,88 @@ describe('approval gates', () => {
     assert.isUndefined((await AgentSessions.findOneAsync('s-wake'))!.pending);
   });
 
+  it('a wake whose verdict was already spent does not run an unrequested turn', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // The mirror image of the test above. The wake-check reads the session,
+    // sees a standing verdict, and defers a re-run — but the legitimate resume
+    // can START AND FINISH inside that window, spending the verdict. The woken
+    // run then finds no `pending` at all, falls straight into the think loop,
+    // and makes a provider call nobody asked for: a charge, and an assistant
+    // message appended to a turn the user considered finished.
+    //
+    // The window is forced through the wake-check's own read: the session is
+    // stripped of its verdict the instant a read returns it with the lease
+    // already released, which is exactly the wind-down snapshot the deferred
+    // re-run is scheduled from.
+    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    let spent = false;
+    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
+      const doc = await original(...args);
+      if (!spent && doc?._id === 's-wake-stale' && doc.pending?.verdict && !doc.lease) {
+        spent = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-stale' } as any, { $unset: { pending: 1 } } as any,
+        );
+      }
+      return doc;
+    };
+
+    // Same verdict injection as the test above: written on the park write, with
+    // no defer of its own, so the winding-down run's self-check is the only
+    // thing that can act on it.
+    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      const n = await originalUpdate(sel, mod, ...rest);
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-stale' } as any,
+          { $set: { 'pending.verdict': 'approved', 'pending.by': 'u1', phase: 'idle' } } as any,
+        );
+      }
+      return n;
+    };
+
+    let state: { ran: string[]; providerCalls: number } | null = null;
+    try {
+      state = await buildFixture('s-wake-stale', 'gate-wake-stale', [
+        { id: 'g1', name: 'refund', gate: 'ask' },
+      ]);
+    } finally {
+      if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
+      else delete (AgentSessions as any).updateAsync;
+      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
+      else delete (AgentSessions as any).findOneAsync;
+    }
+    assert.isTrue(injected, 'the verdict must have landed on the park write');
+    assert.isTrue(spent, 'the verdict must have been spent inside the wake window');
+
+    // The deferred re-run fires on a zero timer; give it room to misbehave.
+    await new Promise((r) => { setTimeout(r, 400); });
+
+    assert.equal(
+      state!.providerCalls, 1,
+      'a stale wake must not call the provider — the verdict it woke for is gone',
+    );
+    const assistants = await AgentMessages
+      .find({ sessionId: 's-wake-stale', role: 'assistant' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(assistants, 1, 'no extra assistant row may appear');
+    // Identity matters, not just the count: a woken run repairs on entry, so it
+    // would DISCARD this parked turn (its `tool_use` is unanswered by design)
+    // and commit its own reply in its place — one row either way, a different
+    // transcript entirely.
+    assert.deepEqual(
+      (assistants[0].toolCalls ?? []).map((c) => c.id), ['g1'],
+      'the parked turn must survive a wake that had nothing to do',
+    );
+    assert.deepEqual(state!.ran, [], 'nothing was approved any more, so nothing runs');
+  });
+
   it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -1698,6 +1945,15 @@ describe('approval gates', () => {
       msgs.filter((m) => m.role === 'assistant'), 1,
       'the parked assistant must survive a refusal to run',
     );
+
+    // Re-assert after a beat. The wind-down wake-check schedules its re-run on
+    // a timer, so a stop that only LOOKS honored synchronously would be undone
+    // a tick later by a woken run that runs the tool anyway.
+    await new Promise((r) => { setTimeout(r, 250); });
+    assert.deepEqual(state.ran, [], 'no deferred wake may run the cancelled tool');
+    doc = (await AgentSessions.findOneAsync('s-stop-verdict'))!;
+    assert.equal(doc.phase, 'stopped', 'and no woken run may idle the stop away');
+    assert.deepInclude(doc.pending as any, { toolCallId: 'g1', verdict: 'approved' });
 
     // The send clears the stop; the verdict is still standing, so the batch
     // resumes rather than stranding its tool_use.
@@ -2102,10 +2358,476 @@ describe('classifyProviderError()', () => {
     // taxonomy) knows more than the status line, in BOTH directions.
     assert.equal(classifyProviderError({ retryable: false, status: 503 }), 'fatal');
     assert.equal(classifyProviderError({ retryable: true, status: 401 }), 'retryable');
-    // 408 is a timeout, but the current table treats the whole 4xx range as
-    // fatal. Pinned deliberately: change the table, change this line.
-    assert.equal(classifyProviderError({ status: 408 }), 'fatal');
+    // 408 is a request timeout — the server never got a complete request, so
+    // re-issuing it is exactly what every provider's own client library does
+    // (Anthropic and OpenAI both retry 408 alongside 429 and 5xx). It is the
+    // one 4xx that is transient by definition.
+    assert.equal(classifyProviderError({ status: 408 }), 'retryable');
     // Unclassifiable (a socket hang-up, a DNS blip) retries — bounded anyway.
     assert.equal(classifyProviderError({}), 'retryable');
+  });
+
+  it('classifies an abort as abandon, by hint or by error name', async () => {
+    const { classifyProviderError } = await import('../server/loop');
+    // The adapter's own mapping (pi-ai's `reason: 'aborted'` error event).
+    assert.equal(classifyProviderError({ retryable: 'abandon' }), 'abandon');
+    // A raw aborted fetch, which carries no status at all and would otherwise
+    // fall through to the retryable default — re-issuing the request the user
+    // just cancelled.
+    assert.equal(classifyProviderError({ name: 'AbortError' }), 'abandon');
+    // The hint outranks a status that would otherwise read as retryable.
+    assert.equal(classifyProviderError({ retryable: 'abandon', status: 503 }), 'abandon');
+  });
+});
+
+describe('backoffDelay()', () => {
+  it('is full jitter: every sample lands in [0, cap] and the cap is maxDelayMs', async () => {
+    const { backoffDelay } = await import('../server/loop');
+    // cap = min(maxDelayMs 10, baseMs 4 * 2^3 = 32) = 10.
+    const capped = Array.from({ length: 20 }, () => backoffDelay(3, 4, 10));
+    capped.forEach((d) => {
+      assert.isAtLeast(d, 0, 'a negative delay is not a delay');
+      assert.isAtMost(d, 10, 'maxDelayMs caps the exponential, always');
+    });
+    assert.isAbove(
+      new Set(capped).size, 1,
+      'full jitter must actually vary — a fixed delay resynchronizes every '
+      + 'client that failed together, which is what jitter exists to prevent',
+    );
+    // Below the cap the exponent still governs: 2 * 2^2 = 8.
+    Array.from({ length: 20 }, () => backoffDelay(2, 2, 100))
+      .forEach((d) => assert.isAtMost(d, 8));
+  });
+});
+
+describe('compaction (§9)', () => {
+  const seedLong = async (sessionId: string) => {
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 5, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    const pad = 'x'.repeat(80);
+    const rows: Array<[number, string, string]> = [
+      [0, 'user', `OLD-1 ${pad}`], [1, 'assistant', `OLD-2 ${pad}`],
+      [2, 'user', `OLD-3 ${pad}`], [3, 'assistant', `OLD-4 ${pad}`],
+      [4, 'user', 'ask now'],
+    ];
+    for (const [seq, role, content] of rows) {
+      await AgentMessages.insertAsync({
+        _id: `m${seq}`, sessionId, seq, role, content, createdAt: new Date(),
+      } as any);
+    }
+  };
+
+  it('compacts before the call that would overflow, and the model sees the summary', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seedLong('s-compact');
+    const requests: any[] = [];
+    const scripted: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        const isCompaction = req.system.includes('compact');
+        for (const ch of (isCompaction ? 'SUMMARY-BRIEF' : 'final answer')) {
+          yield { kind: 'text', chunk: ch };
+        }
+        yield { kind: 'done', usage: { input: 7, output: 3 } };
+      },
+    };
+    await runTurn('s-compact', {
+      model: 'mock', system: 'be helpful', tools: [], provider: scripted,
+      context: { window: 100, compactAt: 0.5, keep: 2 },
+    });
+
+    const note = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact', role: 'note', kind: 'compaction' } as any,
+    );
+    assert.isDefined(note, 'a compaction note must be committed');
+    assert.equal((note as any).summary, 'SUMMARY-BRIEF');
+    assert.equal((note as any).upto, 2, 'keep=2 keeps OLD-4 and "ask now"');
+
+    // Two provider calls: the compaction, then the think against the view.
+    assert.lengthOf(requests, 2);
+    const think = requests[1];
+    assert.include(think.messages[0].content, '[Earlier conversation, compacted]');
+    assert.include(think.messages[0].content, 'SUMMARY-BRIEF');
+    const flat = JSON.stringify(think.messages);
+    assert.notInclude(flat, 'OLD-2', 'compacted messages must not reach the model');
+    assert.include(flat, 'OLD-4', 'kept messages must');
+
+    // The TRANSCRIPT keeps everything: 5 seeded + note + assistant reply.
+    assert.equal(await AgentMessages.find({ sessionId: 's-compact' }).countAsync(), 7);
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact', role: 'assistant', content: 'final answer' } as any,
+    );
+    assert.isDefined(reply, 'the turn must complete after compacting');
+  });
+
+  it('a failed compaction degrades to an uncompacted turn, never an error', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seedLong('s-compact-fail');
+    const failing: Provider = {
+      async *stream(req) {
+        if (req.system.includes('compact')) {
+          const e: any = new Error('summarizer down'); e.status = 503; throw e;
+        }
+        yield { kind: 'text', chunk: 'answered anyway' };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+    await runTurn('s-compact-fail', {
+      model: 'mock', system: '', tools: [], provider: failing,
+      context: { window: 100, compactAt: 0.5, keep: 2 },
+    });
+
+    assert.equal(
+      await AgentMessages.find(
+        { sessionId: 's-compact-fail', role: 'note' } as any,
+      ).countAsync(),
+      0, 'no compaction note and no error note — compaction failure is silent degradation',
+    );
+    // The seeded transcript already contains assistants; the reply is the
+    // NEWEST assistant row, not the first match.
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 's-compact-fail', role: 'assistant' } as any,
+      { sort: { seq: -1 } } as any,
+    );
+    assert.equal((reply as any).content, 'answered anyway');
+    assert.equal((await AgentSessions.findOneAsync('s-compact-fail'))!.phase, 'idle');
+  });
+
+  it('repair still works with a compaction note standing', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: 's-compact-repair', agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 3, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'r0', sessionId: 's-compact-repair', seq: 0, role: 'user',
+      content: 'hello', createdAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'r1', sessionId: 's-compact-repair', seq: 1, role: 'note', kind: 'compaction',
+      summary: 'earlier stuff', upto: 0, createdAt: new Date(),
+    } as any);
+    // A crash-stranded assistant AFTER the note: unanswered tool_use.
+    await AgentMessages.insertAsync({
+      _id: 'r2', sessionId: 's-compact-repair', seq: 2, role: 'assistant',
+      content: '', toolCalls: [{ id: 'dead1', name: 'gone', args: {} }],
+      createdAt: new Date(),
+    } as any);
+
+    await runTurn('s-compact-repair', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-compact-repair' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the stranded turn must be repaired');
+    assert.isDefined(msgs.find((m) => m.role === 'assistant' && m.content === 'recovered'));
+    const note = msgs.find((m) => (m as any).kind === 'compaction');
+    assert.isDefined(note, 'the compaction note is history and must survive repair');
+  });
+});
+
+describe('compaction pure functions', () => {
+  const msg = (seq: number, role: string, extra: any = {}) => ({
+    _id: `p${seq}`, sessionId: 's', seq, role, createdAt: new Date(0), ...extra,
+  });
+
+  it('findCompactionCut keeps the last `keep` and never splits a batch', async () => {
+    const { findCompactionCut } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'a' }),
+      msg(1, 'assistant', { toolCalls: [{ id: 't1', name: 'x', args: {} }] }),
+      msg(2, 'tool', { toolCallId: 't1', content: '{}' }),
+      msg(3, 'user', { content: 'b' }),
+      msg(4, 'assistant', { content: 'c' }),
+      msg(5, 'user', { content: 'd' }),
+    ];
+    // keep=3: cut lands on a non-tool row — plain boundary.
+    assert.equal(findCompactionCut(msgs, 3), 2);
+    // keep=4: the naive cut lands ON the tool row; walking back keeps the
+    // whole batch (assistant AND its result) in the tail.
+    assert.equal(findCompactionCut(msgs, 4), 0);
+    // keep >= eligible: nothing to compact.
+    assert.isNull(findCompactionCut(msgs, 6));
+    // Walking back to the start: nothing summarizable without splitting.
+    assert.isNull(findCompactionCut([
+      msg(0, 'assistant', { toolCalls: [{ id: 't1', name: 'x', args: {} }] }),
+      msg(1, 'tool', { toolCallId: 't1', content: '{}' }),
+    ] as any, 1));
+  });
+
+  it('findCompactionCut starts after the previous compaction', async () => {
+    const { findCompactionCut } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'old' }),
+      msg(1, 'note', { kind: 'compaction', summary: 's', upto: 0 }),
+      msg(2, 'user', { content: 'a' }), msg(3, 'assistant', { content: 'b' }),
+      msg(4, 'user', { content: 'c' }),
+    ];
+    // eligible = seqs 2,3,4; keep=1 -> cut before seq 4 -> upto 3.
+    assert.equal(findCompactionCut(msgs, 1), 3);
+  });
+
+  it('assembleContext swaps compacted history for the summary', async () => {
+    const { assembleContext } = await import('../server/loop');
+    const msgs: any[] = [
+      msg(0, 'user', { content: 'old question' }),
+      msg(1, 'assistant', { content: 'old answer' }),
+      msg(2, 'note', { kind: 'compaction', summary: 'THE-BRIEF', upto: 1 }),
+      msg(3, 'user', { content: 'new question' }),
+    ];
+    const out = assembleContext(msgs);
+    assert.lengthOf(out, 2);
+    assert.include(out[0].content, 'THE-BRIEF');
+    assert.equal(out[1].content, 'new question');
+  });
+
+  it('estimateContext takes the max of reported input and chars/4', async () => {
+    const { estimateContext } = await import('../server/loop');
+    const small = [{ role: 'user' as const, content: 'hi' }];
+    assert.equal(estimateContext(small, 999), 999);
+    const noReport = estimateContext(small);
+    assert.isAbove(noReport, 0);
+    assert.isBelow(noReport, 50);
+  });
+});
+
+describe('compaction hardening (final-review fixes)', () => {
+  const seedRows = async (sessionId: string, rows: Array<Record<string, any>>, nextSeq: number) => {
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    for (const r of rows) {
+      await AgentMessages.insertAsync({
+        _id: `x${r.seq}`, sessionId, createdAt: new Date(), ...r,
+      } as any);
+    }
+  };
+
+  it('the cut never splits a batch even when a user message interjects inside it', async () => {
+    // A send queued while the session was `awaiting` lands BETWEEN an
+    // assistant's toolCalls and its tool results. Row-adjacency walking would
+    // cut inside the batch; the window-based cut must not.
+    const { findCompactionCut } = await import('../server/loop');
+    const pad = 'x'.repeat(40);
+    const msgs: any[] = [
+      { seq: 0, role: 'user', content: `u0 ${pad}` },
+      { seq: 1, role: 'assistant', toolCalls: [{ id: 't1', name: 'a', args: {} }, { id: 't2', name: 'b', args: {} }] },
+      { seq: 2, role: 'user', content: `interjected ${pad}` },
+      { seq: 3, role: 'tool', toolCallId: 't1', content: '{}' },
+      { seq: 4, role: 'tool', toolCallId: 't2', content: '{}' },
+      { seq: 5, role: 'user', content: `u5 ${pad}` },
+      { seq: 6, role: 'assistant', content: 'a6' },
+      { seq: 7, role: 'user', content: `u7 ${pad}` },
+    ].map((r, i) => ({ _id: `p${i}`, sessionId: 's', createdAt: new Date(0), ...r }));
+    // keep=4: the naive boundary lands between t3 and t4 — inside the batch.
+    // The window walk must pull the cut back to before the assistant.
+    assert.equal(findCompactionCut(msgs, 4), 0, 'the whole batch must stay in the tail');
+    // keep=2: boundary after the batch — everything up to u5 summarizes fine.
+    assert.equal(findCompactionCut(msgs, 2), 5);
+  });
+
+  it('the compaction request carries the agent tool schemas', async function () {
+    this.timeout(30000);
+    const { runTurn } = await import('../server/loop');
+    const { AgentMessages } = await import('../common/collections');
+    // The head keeps tool_use/tool_result blocks; Anthropic rejects those
+    // with no `tools` parameter — so the schemas must ride along.
+    const pad = 'x'.repeat(80);
+    await seedRows('s-comp-tools', [
+      { seq: 0, role: 'user', content: `q ${pad}` },
+      { seq: 1, role: 'assistant', toolCalls: [{ id: 't1', name: 'look', args: {} }] },
+      { seq: 2, role: 'tool', toolCallId: 't1', content: `{"r":"${pad}"}` },
+      { seq: 3, role: 'assistant', content: `a ${pad}` },
+      { seq: 4, role: 'user', content: 'now' },
+    ], 5);
+
+    const requests: any[] = [];
+    const scripted: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        const isCompaction = req.system.includes('compact');
+        for (const ch of (isCompaction ? 'BRIEF' : 'done')) yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    await runTurn('s-comp-tools', {
+      model: 'mock', system: 'help', provider: scripted,
+      tools: [{
+        name: 'look', description: 'looks', args: { type: 'object', properties: {} },
+        run: async () => 'ok',
+      }],
+      context: { window: 60, compactAt: 0.5, keep: 2 },
+    });
+
+    assert.isAbove(requests.length, 1);
+    const compactionReq = requests[0];
+    assert.include(compactionReq.system, 'compact');
+    assert.lengthOf(compactionReq.tools, 1, 'tool schemas must ride along with tool blocks');
+    assert.equal(compactionReq.tools[0].name, 'look');
+    const note = await AgentMessages.findOneAsync(
+      { sessionId: 's-comp-tools', role: 'note', kind: 'compaction' } as any,
+    );
+    assert.isDefined(note);
+  });
+
+  it('an interrupt during compaction stops the turn instead of being erased', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const pad = 'x'.repeat(120);
+    await seedRows('s-comp-int', [
+      { seq: 0, role: 'user', content: `q1 ${pad}` },
+      { seq: 1, role: 'assistant', content: `a1 ${pad}` },
+      { seq: 2, role: 'user', content: `q2 ${pad}` },
+      { seq: 3, role: 'assistant', content: `a2 ${pad}` },
+      { seq: 4, role: 'user', content: 'now' },
+    ], 5);
+
+    const requests: any[] = [];
+    const stallingCompaction: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        // Only ever called for the compaction: the interrupt must prevent the
+        // think call entirely.
+        yield { kind: 'text', chunk: 'S' };
+        await AgentSessions.updateAsync('s-comp-int', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        // Wait for the compaction's own poll to notice and abort the signal,
+        // then do what a real transport does: reject with AbortError.
+        const deadline = Date.now() + 5000;
+        while (!req.signal?.aborted && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-comp-int', {
+      model: 'mock', system: 'help', tools: [], provider: stallingCompaction,
+      context: { window: 60, compactAt: 0.5, keep: 2 },
+      interruptCheckMs: 10,
+    });
+
+    assert.lengthOf(requests, 1, 'the think call must never fire after the stop');
+    assert.isTrue(requests[0].signal?.aborted === true || requests[0].signal === undefined
+      ? requests[0].signal?.aborted === true : false,
+    'the compaction request must actually be aborted');
+    assert.equal((await AgentSessions.findOneAsync('s-comp-int'))!.phase, 'stopped');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-comp-int', role: 'note' } as any).countAsync(), 0,
+      'no compaction note and no error note',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-comp-int', role: 'assistant', content: 'done' } as any).countAsync(), 0,
+    );
+  });
+});
+
+describe('canUse backstop and maxResultChars (§5.2/§7)', () => {
+  it('a forbidden tool never runs, never parks, and the model sees not-allowed', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+    await seed('s-canuse', 'do both');
+    let allowedRan = false;
+    let forbiddenRan = false;
+    let call = 0;
+    await runTurn('s-canuse', {
+      model: 'mock', system: '',
+      tools: [
+        { name: 'allowed', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { allowedRan = true; return 'ok'; } },
+        { name: 'forbidden', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { forbiddenRan = true; return 'never'; } },
+      ],
+      canUse: async (tool) => tool !== 'forbidden',
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [
+              { id: 'c1', name: 'forbidden', args: {} },
+              { id: 'c2', name: 'allowed', args: {} },
+            ] }
+          : { text: 'finished' };
+      }),
+    });
+
+    assert.isFalse(forbiddenRan);
+    assert.isTrue(allowedRan);
+    const doc = (await AgentSessions.findOneAsync('s-canuse'))!;
+    assert.notEqual(doc.phase, 'awaiting', 'a forbidden ask-gated tool must NOT park');
+    const rows = await AgentMessages
+      .find({ sessionId: 's-canuse', role: 'tool' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(rows, 2);
+    const forbiddenRow = rows.find((m) => m.toolCallId === 'c1')!;
+    assert.equal(forbiddenRow.error!.error, 'not-allowed');
+    const final = await AgentMessages.findOneAsync(
+      { sessionId: 's-canuse', role: 'assistant', content: 'finished' } as any,
+    );
+    assert.isDefined(final, 'the turn completes; the model routes around the refusal');
+  });
+
+  it('oversized tool results are truncated with an explicit marker', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+    await seed('s-trunc', 'fetch it');
+    let call = 0;
+    await runTurn('s-trunc', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'big', description: 'x', args: { type: 'object', properties: {} },
+        run: async () => 'y'.repeat(500),
+      }],
+      maxResultChars: 40,
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [{ id: 'b1', name: 'big', args: {} }] }
+          : { text: 'ok' };
+      }),
+    });
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-trunc', role: 'tool' } as any,
+    ))!;
+    assert.isBelow(row.content!.length, 120, 'content must be truncated');
+    assert.include(row.content!, 'truncated');
   });
 });
