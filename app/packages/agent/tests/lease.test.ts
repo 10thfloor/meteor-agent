@@ -1,4 +1,5 @@
 import { assert } from 'chai';
+import type { Provider } from '../server/providers/types';
 
 const base = {
   agent: 'support', userId: 'u1', phase: 'idle' as const, model: 'mock', nextSeq: 0,
@@ -65,5 +66,67 @@ describe('lease', () => {
     await claimLease('r1', 'A');
     await releaseLease('r1', 'A');
     assert.isTrue(await claimLease('r1', 'B'));
+  });
+
+  it('renews the lease via heartbeat during a turn that outlives one lease period', async function () {
+    this.timeout(15000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { _setLeaseTimings } = await import('../server/lease');
+    const { runTurn } = await import('../server/loop');
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentSessions.insertAsync({ ...base, _id: 'hb1' } as any);
+
+    // Shrunk well below the ~1s paced turn below: the turn survives past one
+    // lease period, and `lease.until` advances past its initial grant, ONLY
+    // if `runTurn`'s heartbeat interval is actually firing and renewing it.
+    // `LEASE_MS`/`HEARTBEAT_MS` are read at call time by `claimLease` and
+    // `heartbeat` (both already do), so setting this BEFORE the turn starts
+    // is enough — no loop.ts change needed.
+    const previous = _setLeaseTimings({ leaseMs: 300, heartbeatMs: 80 });
+    try {
+      const paced: Provider = {
+        async *stream() {
+          for (const ch of 'paced response over one second!!') {
+            yield { kind: 'text', chunk: ch };
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 30); });
+          }
+          yield { kind: 'done', usage: { input: 1, output: 32 } };
+        },
+      };
+
+      // Sample `lease.until` throughout the turn rather than only at the end:
+      // by the time the turn returns, the interesting mid-turn renewals are
+      // long past and only the final value would be left to inspect.
+      const samples: Date[] = [];
+      const sampler = setInterval(() => {
+        void AgentSessions.findOneAsync('hb1')
+          .then((s) => { if (s?.lease?.until) samples.push(s.lease.until); })
+          .catch(() => { /* sampling is best-effort */ });
+      }, 20);
+
+      try {
+        await runTurn('hb1', { model: 'mock', system: '', tools: [], provider: paced });
+      } finally {
+        clearInterval(sampler);
+      }
+
+      assert.isAtLeast(samples.length, 2, 'must have sampled the lease while the turn was running');
+      const first = samples[0].getTime();
+      const last = Math.max(...samples.map((d) => d.getTime()));
+      assert.isAbove(
+        last, first,
+        'lease.until must advance past its initial grant during the turn — nothing but the '
+        + 'heartbeat renews it mid-turn, and the turn is paced to outlast one lease period',
+      );
+
+      const committed = await AgentMessages.findOneAsync({ sessionId: 'hb1', role: 'assistant' });
+      assert.isDefined(committed, 'the turn must still commit normally');
+      assert.equal(committed!.content, 'paced response over one second!!');
+    } finally {
+      _setLeaseTimings(previous);
+    }
   });
 });

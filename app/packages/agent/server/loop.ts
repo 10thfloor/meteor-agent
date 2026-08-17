@@ -210,17 +210,34 @@ class DeltaWriter {
       while (this.buf.length > 0) {
         const batch = this.buf;
         this.buf = [];
-        for (const item of batch) {
-          await AgentDeltas.insertAsync({
-            _id: Random.id(),
-            sessionId: this.sessionId,
-            messageId: this.messageId,
-            msgSeq: this.msgSeq,
-            seq: item.seq,
-            kind: item.kind as any,
-            chunk: item.chunk,
-            at: new Date(),
-          } as any);
+        for (let i = 0; i < batch.length; i += 1) {
+          const item = batch[i];
+          try {
+            await AgentDeltas.insertAsync({
+              _id: Random.id(),
+              sessionId: this.sessionId,
+              messageId: this.messageId,
+              msgSeq: this.msgSeq,
+              seq: item.seq,
+              kind: item.kind as any,
+              chunk: item.chunk,
+              at: new Date(),
+            } as any);
+          } catch (e) {
+            // A throw here must not drop the UNWRITTEN remainder: `batch` was
+            // already detached from `this.buf` above, so items after `i` —
+            // never inserted — would otherwise vanish, opening a permanent
+            // gap in `seq` that mergeView's backward walk (which stops the
+            // instant `seq` fails to decrement by exactly 1) silently
+            // truncates the render at. Splice the remainder (order
+            // preserved, failed item included since it never landed) back
+            // onto the FRONT of `this.buf` — ahead of anything pushed since —
+            // so the next flush picks up exactly where this one broke off,
+            // then rethrow to the caller, which already swallows this
+            // rejection (the interval's `.catch`, or `stop()`'s).
+            this.buf = [...batch.slice(i), ...this.buf];
+            throw e;
+          }
         }
       }
     } finally {

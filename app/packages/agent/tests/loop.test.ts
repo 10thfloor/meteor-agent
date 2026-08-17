@@ -103,6 +103,88 @@ describe('turn loop', () => {
     assert.equal(fromDeltas, committed!.content);
   });
 
+  it('recovers the unwritten remainder when a delta insert throws mid-batch', async function () {
+    this.timeout(30000);
+    const { AgentDeltas, AgentMessages } = await import('../common/collections');
+    const { mergeView } = await import('../common/merge');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-delta-remainder', 'hello');
+
+    // Alternate kinds so consecutive chunks do NOT coalesce — `DeltaWriter.push`
+    // only merges a chunk into the previous buffered item when the kind
+    // matches — giving the flush batch several distinct items to fail partway
+    // through, per the brief's "same-kind chunks coalesce" note.
+    const script: Array<{ kind: 'text' | 'thinking'; chunk: string }> = [
+      { kind: 'thinking', chunk: 'a' },
+      { kind: 'text', chunk: '1' },
+      { kind: 'thinking', chunk: 'b' },
+      { kind: 'text', chunk: '2' },
+      { kind: 'thinking', chunk: 'c' },
+      { kind: 'text', chunk: '3' },
+    ];
+    let captured: any[] = [];
+    const staggered: Provider = {
+      async *stream() {
+        for (const c of script) yield c as any;
+        // Same idiom as the 'reconstructs' test above: > flushMs, and long
+        // enough for the interval's own retry (the injected failure below
+        // fires only once, on the first flush attempt) to have landed before
+        // we snapshot.
+        await new Promise((r) => { setTimeout(r, 400); });
+        captured = await AgentDeltas.find({ sessionId: 's-delta-remainder' }).fetchAsync();
+        yield { kind: 'done', usage: { input: 1, output: 6 } };
+      },
+    };
+
+    // Fail the SECOND insertAsync call exactly once — mid-batch, since all 6
+    // chunks land in `this.buf` well before the first flush tick fires, so
+    // the first flush's batch holds all of them.
+    const original = (AgentDeltas as any).insertAsync.bind(AgentDeltas);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentDeltas, 'insertAsync');
+    let calls = 0;
+    let injected = false;
+    (AgentDeltas as any).insertAsync = async (doc: any, ...rest: any[]) => {
+      calls += 1;
+      if (!injected && calls === 2) {
+        injected = true;
+        throw new Error('injected mid-batch delta failure');
+      }
+      return original(doc, ...rest);
+    };
+
+    try {
+      await runTurn('s-delta-remainder', {
+        model: 'mock', system: '', tools: [], provider: staggered,
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(AgentDeltas, 'insertAsync', descriptor);
+      else delete (AgentDeltas as any).insertAsync;
+    }
+
+    assert.isTrue(injected, 'the injected mid-batch failure must actually have fired');
+
+    const committed = await AgentMessages
+      .findOneAsync({ sessionId: 's-delta-remainder', role: 'assistant' });
+    assert.equal(committed!.content, '123', 'the commit is built from in-memory text, unaffected');
+    assert.equal(committed!.thinking, 'abc');
+
+    assert.isAbove(
+      captured.length, 1,
+      'the flush batch must have had more than one item for a mid-batch failure to be meaningful',
+    );
+    const seqs = captured.map((d) => d.seq).sort((a, b) => a - b);
+    seqs.forEach((s, i) => assert.equal(
+      s, i, 'delta seqs must be complete and contiguous — a gap is where the failed insert '
+      + 'would have been dropped without the remainder-recovery fix',
+    ));
+
+    const fromDeltas = mergeView([], captured);
+    assert.lengthOf(fromDeltas, 1, 'all deltas belong to the one in-flight message');
+    assert.equal(fromDeltas[0].content, '123');
+    assert.equal(fromDeltas[0].thinking, 'abc');
+  });
+
   it('sweeps crash-orphaned deltas on the next turn (repair-on-entry)', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentDeltas } = await import('../common/collections');
@@ -241,6 +323,132 @@ describe('turn loop', () => {
       await AgentDeltas.find({ sessionId: 's6' }).countAsync(), 0,
       'the abandoned turn must take its deltas with it',
     );
+  });
+
+  it('discardTurn fails toward the repairable state when the LAST removal (the '
+    + 'assistant row) throws', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // Two calls in the batch, not one: 'first' dispatches and its `tool` row
+    // actually lands in Mongo BEFORE the steal, so this test can tell whether
+    // discardTurn reached the tool-row removal step (which targets the WHOLE
+    // batch, landed results included — see discardTurn's docstring) before it
+    // failed. A single-call batch never writes a real tool row here, so it
+    // cannot distinguish "cleanup ran, then the last step failed" from
+    // "nothing ran because a failure hit fast" — the two states this test
+    // exists to tell apart.
+    await seed('s-discard-order', 'look it up');
+    let call = 0;
+
+    // The assistant-row removal (`AgentMessages.removeAsync({ _id: messageId })`)
+    // is the LAST of discardTurn's three removals, and the only one selected
+    // by `_id` — the tool-row removal selects on toolCallId/seq, the delta
+    // removal is a different collection entirely. Throw exactly once, on
+    // that specific selector.
+    const original = (AgentMessages as any).removeAsync.bind(AgentMessages);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentMessages, 'removeAsync');
+    let injected = false;
+    (AgentMessages as any).removeAsync = async (sel: any, ...rest: any[]) => {
+      if (!injected && sel && typeof sel === 'object' && '_id' in sel) {
+        injected = true;
+        throw new Error('injected assistant-row removal failure');
+      }
+      return original(sel, ...rest);
+    };
+
+    try {
+      await runTurn('s-discard-order', {
+        model: 'mock', system: '',
+        tools: [
+          {
+            name: 'first', description: 'x', args: { type: 'object', properties: {} },
+            run: async () => ({ found: 1 }),
+          },
+          {
+            name: 'second', description: 'x', args: { type: 'object', properties: {} },
+            // The steal lands inside the SECOND call's own `run`, after the
+            // first call's `tool` row already committed and after
+            // assistant(toolCalls) itself is committed — the window that
+            // drives `dispatchCalls` into `discardTurn`'s abandon() path.
+            // Test-only failure injection: no production ordering changes.
+            run: async () => {
+              await AgentSessions.updateAsync('s-discard-order', {
+                $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
+              } as any);
+              return { found: 2 };
+            },
+          },
+        ],
+        provider: mockProvider(() => {
+          call += 1;
+          return call === 1
+            ? {
+              toolCalls: [
+                { id: 't1', name: 'first', args: {} },
+                { id: 't2', name: 'second', args: {} },
+              ],
+            }
+            : { text: 'never reached' };
+        }),
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(AgentMessages, 'removeAsync', descriptor);
+      else delete (AgentMessages as any).removeAsync;
+    }
+
+    assert.isTrue(injected, 'the injected assistant-row removal failure must actually have fired');
+
+    // REPAIRABLE state: cleanup is best-effort and swallows its own failure
+    // (discardTurn's catch), so nothing here surfaces as a runTurn error. What
+    // distinguishes "fail toward repairable" from "fail toward broken" is
+    // BOTH of the following holding at once:
+    //   - the assistant row still stands (it is removed LAST, so a failure
+    //     there never reaches the removal at all) — the anchor
+    //     `repairUnansweredToolUse` looks for;
+    //   - the batch's already-landed `t1` result is GONE — discardTurn erases
+    //     the tool rows for the WHOLE batch before ever attempting the
+    //     assistant, so by the time the injected failure fires that cleanup
+    //     has already happened. A reordering that removes the assistant
+    //     FIRST would abort before ever reaching that removal, leaving `t1`'s
+    //     answered row stranded next to a surviving assistant — silent
+    //     double-cleanup debt a later repair does not re-check for.
+    const afterFailure = await AgentMessages
+      .find({ sessionId: 's-discard-order' }, { sort: { seq: 1 } }).fetchAsync();
+    const strandedAssistant = afterFailure.find((m) => m.role === 'assistant');
+    assert.isDefined(
+      strandedAssistant, 'discardTurn must fail BEFORE the assistant row is removed — that is '
+      + 'the whole point of removing it last',
+    );
+    assert.deepEqual(
+      unansweredToolUses(afterFailure).sort(), ['t1', 't2'],
+      'the assistant survives with the whole batch unanswered — the repairable shape',
+    );
+    assert.isUndefined(
+      afterFailure.find((m) => m.role === 'tool' && m.toolCallId === 't1'),
+      "the batch's already-landed t1 result must be erased along with the rest of the "
+      + 'abandoned turn — cleanup must have run BEFORE the injected failure, which only '
+      + 'holds if the assistant row is removed last',
+    );
+
+    // A subsequent recovery turn must repair it. Free the lease the tool's
+    // `run` handed to 'other' first — that steal is what drove THIS run's
+    // abandonment, not a claim this test means to keep contesting.
+    await AgentSessions.updateAsync('s-discard-order', { $unset: { lease: 1 } } as any);
+    await runTurn('s-discard-order', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'recovered' })),
+    });
+
+    const final = await AgentMessages
+      .find({ sessionId: 's-discard-order' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(final), [],
+      'the recovery turn must repair the stranded assistant away — no unanswered tool_use left',
+    );
+    assert.equal(final[final.length - 1].content, 'recovered', 'the recovery turn must complete');
   });
 
   it('repairs an unanswered tool_use left behind by a previous run', async function () {
