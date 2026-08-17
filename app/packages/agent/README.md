@@ -267,14 +267,19 @@ JSON into that first message (declare a `prompt` string property to keep the
 plain-prose form). `name` defaults to the agent's name; `gate: 'ask'` works
 exactly as on any other tool, and gates the *opening* of the child session.
 
-**The child persists, and streams.** The parent's tool row carries
-`childSessionId`, which is the handle:
+**The child persists, and streams.** WHILE the child runs, the parent
+session's `activeChild` field carries `{ sessionId, toolCallId }` — that is
+the live handle, present exactly as long as the dispatch is in flight. Once
+the call resolves, the parent's tool row carries `childSessionId` durably:
 
 ```ts
-const rows = Writer.messages(sessionId);
-const call = rows.find((m) => m.role === 'tool' && m.childSessionId);
-const child = new Agent('researcher');          // the CHILD's agent name
-child.subscribe(call.childSessionId);           // …and watch it live
+// Live, while the parent is `calling`:
+const active = Writer.session(sessionId)?.activeChild;
+if (active) new Agent('researcher').subscribe(active.sessionId);
+
+// Afterwards, from the transcript:
+const call = Writer.messages(sessionId).fetch()
+  .find((m) => m.role === 'tool' && m.childSessionId);
 ```
 
 Nothing in the client API changes for a child. `agent.session` authorizes by
@@ -300,20 +305,33 @@ approve or deny it through the ordinary `agent.approve` / `agent.deny` path
 (using the *child's* agent name and session id) and the child completes on its
 own. The parent has already moved on. Give subagents no ask-gates if you want
 the delegation to be self-contained, or build a UI that surfaces the parked
-child.
+child — and note that the *child agent's* own `budget.approval` applies, so an
+unattended parked child may deny itself on that clock.
 
-The depth guard is a fork-bomb bound: an agent that lists itself, or two that
-list each other, would otherwise recurse until the process gave out. Sessions
-carry `depth` (absent = 0, `parent.depth + 1` on a child), and the fourth hop is
-refused before any document is written.
+The depth guard bounds NESTING, not fan-out: an agent that lists itself, or two
+that list each other, cannot recurse past three hops (sessions carry `depth`,
+and the fourth hop is refused before any document is written). Breadth is a
+different animal — each level can still make `maxIterations × batch` calls, so
+**`budget.toolCalls` on every agent in a subagent graph is effectively
+required**; without it one `send` can legally fan out into hundreds of child
+turns, run inline while the parent holds its lease.
 
 **Budgets compose, they do not merge.** The parent spends exactly one
-`budgetSpent.toolCalls` per subagent call, like any other tool; everything the
-child spends — turns, tool calls, dollars — accrues to the *child's* session
-under the *child agent's* registry config. So you bound a subagent-heavy parent
-from two directions: the parent's `toolCalls` caps how many consultations
-happen, and each child agent's own `budget.spend` caps what one consultation may
+`budgetSpent.toolCalls` per subagent call, like any other tool; what the child
+spends accrues to the *child's* session under the *child agent's* registry
+config. The two limits that bite for a child are `toolCalls` and `spend` —
+`turns` counts sends, and a child receives exactly one — so you bound a
+subagent-heavy parent from two directions: the parent's `toolCalls` caps how
+many consultations happen, and each child agent's `spend` caps what one may
 cost.
+
+Three operational truths to design around: **interrupting the parent does not
+interrupt a running child** — the child streams to completion on its own budget
+and the parent picks up afterwards; **delivery is at-least-once at the
+subagent granularity** — a parent turn abandoned mid-batch (lease steal, crash)
+is re-dispatched by recovery, and a subagent call in that batch runs a whole
+second child; and an abandoned batch's discarded tool rows can leave a
+completed child session with no durable pointer to it from any transcript.
 
 ## Headless one-shots
 

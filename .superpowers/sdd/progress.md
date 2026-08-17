@@ -220,3 +220,13 @@ M4 Task 1: complete (aacc34d..HEAD, review Approved-with-issues, all fixed inlin
   discovery — Task 1's report re-described it. My interim summary misattributed it.
   Carry: no compiled-schema cache (typebox/compile) — note for hot loops; tool_args deltas add capped-
   store pressure; DeltaWriter.push could assert kind for contentIndex.
+M4 Task 2: complete (22a089b..HEAD, review 3 Medium + 4 Low, fixed/documented inline, 218+1 passing)
+  Code fix: activeChild live handle on the parent session (set guarded before the child runs, cleared
+  in a finally) — the documented "watch the child live" path previously had no door. +2 tests (child's
+  own toolCalls budget enforced; activeChild visible mid-stream and cleared after).
+  Documented honestly instead of fixed: at-least-once includes whole subagent runs on abandoned
+  batches (orphaned children possible); depth bounds nesting not fan-out (budget.toolCalls effectively
+  required across a subagent graph); parent interrupt does not stop a running child; child's own
+  budget.approval can auto-deny a parked child; turns is inert for children.
+  Carry to v3 ledger: idempotency keys for subagent dispatch (the at-least-once double-child);
+  re-linking orphaned children; parent-interrupt propagation to children.

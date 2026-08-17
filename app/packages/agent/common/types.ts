@@ -49,6 +49,16 @@ export interface AgentSession {
    */
   parent?: { sessionId: string; toolCallId: string };
   /**
+   * PARENT sessions only, and only WHILE a subagent dispatch is in flight: the
+   * child currently running behind a tool call. This is the live handle — the
+   * tool row that carries `childSessionId` durably is only written after the
+   * child resolves, so without this field a streaming child is unreachable
+   * from any client. Cleared (guarded) when the dispatch returns; a lease
+   * steal mid-dispatch can leave it stale until the recovering server's turn
+   * writes, which is why readers should treat it as a hint, not a contract.
+   */
+  activeChild?: { sessionId: string; toolCallId: string };
+  /**
    * How many subagent hops deep this session is. Absent (read as 0) on a root
    * session; `parent.depth + 1` on a child. The guard that keeps agents
    * composing agents from fork-bombing: past `MAX_SUBAGENT_DEPTH` the tool call

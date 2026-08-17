@@ -542,3 +542,134 @@ describe('subagents', () => {
     assert.equal(subagentPrompt(undefined), 'null');
   });
 });
+
+describe('subagents: budgets and the live handle', () => {
+  it('a child enforces its OWN toolCalls budget, independent of the parent', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+
+    // The child wants to call its tool twice; its budget allows one.
+    let childToolRuns = 0;
+    new Agent('sub-budgeted', {
+      model: 'mock',
+      instructions: '',
+      budget: { toolCalls: 1 },
+      tools: [{
+        name: 'dig', description: 'x', args: { type: 'object', properties: {} },
+        run: async () => { childToolRuns += 1; return 'dug'; },
+      }],
+      provider: mockProvider((req) => {
+        const digs = req.messages.filter((m) => m.role === 'tool').length;
+        if (digs < 2) return { toolCalls: [{ id: `dig-${digs + 1}`, name: 'dig', args: {} }] };
+        return { text: 'done digging' };
+      }),
+    });
+
+    await AgentSessions.insertAsync({
+      _id: 's-parent-budget', agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'pb-msg', sessionId: 's-parent-budget', seq: 0, role: 'user',
+      content: 'delegate', createdAt: new Date(),
+    } as any);
+
+    const { mockProvider: mp } = await import('../server/providers/mock');
+    await runTurn('s-parent-budget', {
+      model: 'mock', system: '',
+      tools: [{ subagent: 'sub-budgeted', description: 'delegate digging' }],
+      provider: mp((req) => (
+        req.messages.some((m) => m.role === 'tool')
+          ? { text: 'delegated' }
+          : { toolCalls: [{ id: 'd1', name: 'sub-budgeted', args: { prompt: 'dig twice' } }] }
+      )),
+    });
+
+    // The child ran ONE dig, then its own budget note stopped it — the parent's
+    // (absent) budget had nothing to do with it, and the parent turn completed.
+    assert.equal(childToolRuns, 1, "the child's second tool call must be refused by ITS budget");
+    const child = await AgentSessions.findOneAsync({ 'parent.sessionId': 's-parent-budget' } as any);
+    assert.isDefined(child, 'the child session persists');
+    const budgetNote = await AgentMessages.findOneAsync(
+      { sessionId: child!._id, role: 'note', kind: 'budget' } as any,
+    );
+    assert.isDefined(budgetNote, "the stop is recorded in the CHILD's transcript");
+    const parentRow = await AgentMessages.findOneAsync(
+      { sessionId: 's-parent-budget', role: 'tool' } as any,
+    );
+    assert.isDefined(parentRow, 'the parent still gets a tool result');
+  });
+
+  it('announces a running child on the parent session, and clears it after', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+
+    // The child pauses mid-stream, long enough for the test to observe the
+    // parent's activeChild marker WHILE the dispatch is in flight — the only
+    // client-reachable route to a child that is still streaming.
+    let seenDuring: any = 'unread';
+    new Agent('sub-slow', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: {
+        async *stream() {
+          yield { kind: 'text', chunk: 'thinking ' };
+          seenDuring = (await AgentSessions.findOneAsync('s-parent-live'))?.activeChild ?? null;
+          yield { kind: 'text', chunk: 'done' };
+          yield { kind: 'done', usage: { input: 1, output: 2 } };
+        },
+      },
+    });
+
+    await AgentSessions.insertAsync({
+      _id: 's-parent-live', agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'pl-msg', sessionId: 's-parent-live', seq: 0, role: 'user',
+      content: 'go', createdAt: new Date(),
+    } as any);
+
+    await runTurn('s-parent-live', {
+      model: 'mock', system: '',
+      tools: [{ subagent: 'sub-slow', description: 'slow child' }],
+      provider: mockProvider((req) => (
+        req.messages.some((m) => m.role === 'tool')
+          ? { text: 'ok' }
+          : { toolCalls: [{ id: 'sc1', name: 'sub-slow', args: { prompt: 'think' } }] }
+      )),
+    });
+
+    assert.isObject(seenDuring, 'activeChild must be visible WHILE the child streams');
+    assert.equal(seenDuring.toolCallId, 'sc1');
+    const parentAfter = await AgentSessions.findOneAsync('s-parent-live');
+    assert.isUndefined(
+      (parentAfter as any).activeChild,
+      'the marker must not outlive the dispatch',
+    );
+    const row = await AgentMessages.findOneAsync(
+      { sessionId: 's-parent-live', role: 'tool' } as any,
+    );
+    assert.equal((row as any).childSessionId, seenDuring.sessionId,
+      'the durable handle and the live handle must name the same child');
+  });
+});

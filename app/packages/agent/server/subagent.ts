@@ -1,6 +1,7 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { buildRunConfig, getAgent } from './registry';
+import { guardedUpdate, SERVER_ID } from './lease';
 import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
 // TYPE-only, so no runtime edge is created: `runTurn` is passed IN by the loop
 // (see `runSubagent`), which is what keeps loop -> subagent a one-way import.
@@ -201,6 +202,18 @@ export async function runSubagent(
     updatedAt: new Date(),
   } as any);
 
+  // Announce the child on the PARENT session BEFORE it runs — this is the only
+  // client-reachable route to a child that is still streaming. The tool row
+  // that carries `childSessionId` durably is only inserted after the child
+  // resolves, so without this marker "watch the child live" is a documented
+  // path with no door. Lease-guarded: the parent holds its lease for the whole
+  // inline dispatch, and losing it means another server owns the turn and this
+  // child's result will be discarded anyway.
+  await guardedUpdate(ctx.sessionId, SERVER_ID, {
+    $set: { activeChild: { sessionId: childSessionId, toolCallId: ctx.toolCallId ?? '' } },
+  });
+
+  try { // outer: the finally at the end clears activeChild on every exit
   try {
     // Atomic seq allocation, exactly as `agent.send` does it. Nothing else can
     // be writing to a session id that has not left this function yet, but the
@@ -268,4 +281,11 @@ export async function runSubagent(
     result: failure('subagent-failed', `The subagent "${name}" did not answer: ${outcome.reason}`),
     childSessionId,
   };
+  } finally {
+    // The live-child marker is only meaningful while the dispatch is inside
+    // this function; a stale one would point clients at a finished child and
+    // shadow the NEXT call's marker. Guarded like the set: if the lease is
+    // gone, the recovering server owns the parent doc now.
+    await guardedUpdate(ctx.sessionId, SERVER_ID, { $unset: { activeChild: 1 } });
+  }
 }
