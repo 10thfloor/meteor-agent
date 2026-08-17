@@ -6,6 +6,13 @@ import os from 'os';
 
 const PKG = '@earendil-works/pi-ai';
 
+/** typebox — pi-ai's own dependency, and the full JSON-Schema checker behind
+ *  `validateToolArgs`. It is `type: module`, has NO `main`, and reaches its
+ *  `Value` module only through the `./value` key of its `exports` map, which
+ *  is exactly the shape Meteor's resolver cannot follow. Same seam, same
+ *  hedge. */
+const TYPEBOX = 'typebox';
+
 /**
  * Meteor cannot resolve pi-ai's transitive dep `typebox` (no `main`, exports
  * map only). We reach Node's own resolver through a one-line ESM shim: a real
@@ -17,14 +24,33 @@ const PKG = '@earendil-works/pi-ai';
  */
 const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
 
-/** One namespace per export key ('.', './providers/all', …). */
+/** One namespace per package + export key (`@earendil-works/pi-ai|./providers/all`,
+ *  `typebox|./value`, …). The `|` is a separator no package name contains. */
 const cache = new Map<string, unknown>();
 
-function findNodeModulesBase(): string | null {
+/**
+ * The directory a package's own nested `node_modules` would live in, tried
+ * after the hoisted layout. npm hoists `typebox` to the app's top level in
+ * every install we have seen, but a version conflict with another dependency
+ * would nest it under pi-ai instead — and a checker that vanishes because of
+ * someone else's dependency tree is exactly the kind of silent degrade this
+ * package refuses.
+ */
+const NESTED_BASES: Record<string, string[]> = {
+  [TYPEBOX]: [path.join(...PKG.split('/'), 'node_modules')],
+};
+
+function findNodeModulesBase(pkg: string): string | null {
+  const nested = NESTED_BASES[pkg] ?? [];
   let dir = process.cwd();
   for (let i = 0; i < 8; i += 1) {
     for (const c of CANDIDATE_DIRS) {
-      if (fs.existsSync(path.join(dir, c, ...PKG.split('/')))) return path.join(dir, c);
+      const root = path.join(dir, c);
+      if (fs.existsSync(path.join(root, ...pkg.split('/')))) return root;
+      for (const n of nested) {
+        const base = path.join(root, n);
+        if (fs.existsSync(path.join(base, ...pkg.split('/')))) return base;
+      }
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -88,23 +114,34 @@ function resolveExportKey(exportsMap: unknown, key: string): string | undefined 
  * `subpath` selects a deep export, e.g. `'providers/all'`. Exported as a test
  * seam.
  */
-export function resolvePiAiEntry(subpath?: string): string {
-  const base = findNodeModulesBase();
+export function resolvePackageEntry(pkg: string, subpath?: string): string {
+  const base = findNodeModulesBase(pkg);
   if (!base) {
     throw new Error(
-      `[10thfloor:agent] ${PKG} not found. Install it in your app: ` +
-      `meteor npm install --save ${PKG}`,
+      `[10thfloor:agent] ${pkg} not found. Install it in your app: ` +
+      `meteor npm install --save ${pkg}`,
     );
   }
-  const pkgDir = path.join(base, ...PKG.split('/'));
+  const pkgDir = path.join(base, ...pkg.split('/'));
   const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
   const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
   let rel = resolveExportKey(pkgJson.exports, key);
   if (!rel && key === '.') rel = pkgJson.main ?? 'index.js';
   if (!rel) {
-    throw new Error(`[10thfloor:agent] ${PKG} does not export "${key}"`);
+    throw new Error(`[10thfloor:agent] ${pkg} does not export "${key}"`);
   }
   return path.join(pkgDir, rel);
+}
+
+/** pi-ai's entry. Kept as its own export: it is the name the M1/M2 tests and
+ *  every comment in this package already use. */
+export function resolvePiAiEntry(subpath?: string): string {
+  return resolvePackageEntry(PKG, subpath);
+}
+
+/** typebox's entry — `resolveTypeboxEntry('value')` for the `Value` module. */
+export function resolveTypeboxEntry(subpath?: string): string {
+  return resolvePackageEntry(TYPEBOX, subpath);
 }
 
 /**
@@ -140,16 +177,17 @@ export async function shimLoad(urlHref: string): Promise<unknown> {
  * `subpath` loads a deep export instead of the root one — `'providers/all'`
  * for the built-in model catalog. Each key is cached separately.
  */
-export async function loadPiAi(subpath?: string): Promise<unknown> {
-  const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
+export async function loadPackage(pkg: string, subpath?: string): Promise<unknown> {
+  const rel = subpath ? subpath.replace(/^\.?\//, '') : '';
+  const key = `${pkg}|${rel ? `./${rel}` : '.'}`;
   const hit = cache.get(key);
   if (hit) return hit;
-  const specifier = subpath ? `${PKG}/${subpath.replace(/^\.?\//, '')}` : PKG;
+  const specifier = rel ? `${pkg}/${rel}` : pkg;
   let ns: unknown;
   try {
     ns = await import(specifier);
   } catch {
-    const href = pathToFileURL(resolvePiAiEntry(subpath)).href;
+    const href = pathToFileURL(resolvePackageEntry(pkg, subpath)).href;
     try {
       ns = await import(href);
     } catch {
@@ -158,4 +196,40 @@ export async function loadPiAi(subpath?: string): Promise<unknown> {
   }
   cache.set(key, ns);
   return ns;
+}
+
+export function loadPiAi(subpath?: string): Promise<unknown> {
+  return loadPackage(PKG, subpath);
+}
+
+/**
+ * typebox through the same three-step hedge. `loadTypebox('value')` yields the
+ * namespace whose `Value.Check` is the full JSON-Schema checker behind
+ * `validateToolArgs` — see `server/tools.ts` for the probe that established
+ * this is the ONLY route (pi-ai re-exports `Type`, never `Value`).
+ */
+export function loadTypebox(subpath?: string): Promise<unknown> {
+  return loadPackage(TYPEBOX, subpath);
+}
+
+/**
+ * SYNCHRONOUS: is typebox's `value` export present on disk?
+ *
+ * `Agent.method` registers methods synchronously and its fail-closed check
+ * cannot await a dynamic import, so it asks this instead — pure `fs`, the same
+ * resolution the async loader would perform, cached after the first answer.
+ * A `true` here is a well-founded expectation, not a guarantee: if the import
+ * itself later fails, `validateToolArgs` degrades to the structural checker
+ * with one warning (which is exactly what that warning is for).
+ */
+let typeboxOnDisk: boolean | null = null;
+export function typeboxValueResolvable(): boolean {
+  if (typeboxOnDisk === null) {
+    try {
+      typeboxOnDisk = fs.existsSync(resolveTypeboxEntry('value'));
+    } catch {
+      typeboxOnDisk = false;
+    }
+  }
+  return typeboxOnDisk;
 }

@@ -12,8 +12,10 @@ export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
+  fullValidationAvailable, setTypeboxValueLoader,
   type ToolSpec, type InlineTool, type AdoptedTool, type ToolContext,
   type AgentMethodOptions, type ValidationResult, type ArgsValidator,
+  type TypeboxValue,
 } from './tools';
 export { mockProvider } from './providers/mock';
 export { piAiProvider } from './providers/piai';

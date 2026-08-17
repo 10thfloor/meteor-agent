@@ -230,8 +230,11 @@ export function isRunning(sessionId: string): boolean {
 
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
-class DeltaWriter {
-  private buf: Array<{ kind: string; chunk: string; seq: number }> = [];
+/** Exported as a TEST SEAM. The loop is its only production caller; the
+ *  attribution tests drive it directly because a committed turn deletes its
+ *  own deltas, so nothing survives a full run to assert on. */
+export class DeltaWriter {
+  private buf: Array<{ kind: string; chunk: string; seq: number; contentIndex?: number }> = [];
   private seq = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Non-reentrancy: the interval fires on a wall clock regardless of whether
@@ -265,11 +268,20 @@ class DeltaWriter {
    * Coalescing at push time is also what keeps `seq` contiguous: one run, one
    * seq, one document. `mergeView` walks back only while `seq` decrements by
    * exactly 1, so any gap would silently truncate the rendered message.
+   *
+   * `contentIndex` (tool_args only) is part of the coalescing key, not just a
+   * field along for the ride: two PARALLEL tool calls stream interleaved, so
+   * merging their fragments because both are `tool_args` would concatenate one
+   * call's JSON into the other's and lose the boundary permanently — the
+   * delta document is the only place the attribution can still be recorded.
    */
-  push(kind: string, chunk: string) {
+  push(kind: string, chunk: string, contentIndex?: number) {
     const last = this.buf[this.buf.length - 1];
-    if (last && last.kind === kind) { last.chunk += chunk; return; }
-    this.buf.push({ kind, chunk, seq: this.seq++ });
+    if (last && last.kind === kind && last.contentIndex === contentIndex) {
+      last.chunk += chunk;
+      return;
+    }
+    this.buf.push({ kind, chunk, seq: this.seq++, ...(contentIndex === undefined ? {} : { contentIndex }) });
   }
 
   flush(): Promise<void> {
@@ -298,6 +310,7 @@ class DeltaWriter {
               seq: item.seq,
               kind: item.kind as any,
               chunk: item.chunk,
+              ...(item.contentIndex === undefined ? {} : { contentIndex: item.contentIndex }),
               at: new Date(),
             } as any);
           } catch (e) {
@@ -1262,6 +1275,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
                   thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
+                } else if (chunk.kind === 'tool_args') {
+                  // Streamed for FIDELITY, not for dispatch: the tool calls the
+                  // loop actually runs come off the terminal `done` chunk,
+                  // already parsed. These deltas exist so a client can show a
+                  // tool call forming, and they carry `contentIndex` so two
+                  // calls forming at once stay apart. Nothing accumulates them
+                  // in memory here — a partial-JSON buffer the commit never
+                  // reads would be dead weight on every turn.
+                  writer.push('tool_args', chunk.chunk, chunk.contentIndex);
                 } else if (chunk.kind === 'done') {
                   toolCalls = chunk.toolCalls;
                   usage = chunk.usage ?? usage;

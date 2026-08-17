@@ -27,6 +27,46 @@ describe('pi-ai loader', () => {
   });
 });
 
+describe('typebox loader (M4: the full-validation route)', () => {
+  // PROBE, recorded as an assertion: pi-ai re-exports typebox's `Type` and
+  // NOTHING else from it — no `Value`, no `Compile`. So the full JSON-Schema
+  // checker is reachable only through typebox's own `./value` export key,
+  // which is why the loader learned a second package.
+  it('confirms pi-ai does NOT re-export typebox Value', async function () {
+    this.timeout(20000);
+    const piai: any = await loadPiAi();
+    assert.isFunction(piai.Type?.Object, 'Type is re-exported');
+    assert.isUndefined(piai.Value, 'Value is not — the probe finding this task rests on');
+  });
+
+  it('loads typebox/value through the exports map Meteor cannot follow', async function () {
+    this.timeout(20000);
+    const { loadTypebox, resolveTypeboxEntry, typeboxValueResolvable } =
+      await import('../server/providers/loader');
+    const entry = resolveTypeboxEntry('value');
+    assert.isTrue(entry.startsWith('/'), `expected absolute path, got ${entry}`);
+    assert.include(entry, 'typebox');
+    assert.isTrue(typeboxValueResolvable());
+
+    const ns: any = await loadTypebox('value');
+    const V = ns.Value ?? ns;
+    assert.isFunction(V.Check);
+    assert.isFunction(V.Errors);
+    // Plain JSON Schema, not a TSchema: the compatibility the upgrade needs.
+    assert.isTrue(V.Check({ type: 'object', properties: { n: { type: 'integer', maximum: 3 } } }, { n: 1 }));
+    assert.isFalse(V.Check({ type: 'object', properties: { n: { type: 'integer', maximum: 3 } } }, { n: 9 }));
+  });
+
+  it('caches typebox per subpath, separately from pi-ai', async function () {
+    this.timeout(20000);
+    const { loadTypebox } = await import('../server/providers/loader');
+    const a = await loadTypebox('value');
+    const b = await loadTypebox('value');
+    assert.strictEqual(a, b);
+    assert.notStrictEqual(a, await loadPiAi());
+  });
+});
+
 describe('pi-ai loader v2 (no node_modules writes)', () => {
   it('resolves the pi-ai entry to an absolute file path', async function () {
     this.timeout(20000);

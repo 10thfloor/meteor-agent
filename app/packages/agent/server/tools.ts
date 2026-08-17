@@ -3,6 +3,7 @@ import { check, Match } from 'meteor/check';
 import { DDP } from 'meteor/ddp';
 import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
+import { loadTypebox, typeboxValueResolvable } from './providers/loader';
 
 export interface ToolContext { userId: string | null; sessionId: string }
 
@@ -53,22 +54,40 @@ export type ArgsValidator =
  * Argument validation
  *
  * PROBE (pi-ai 0.84.2, typebox 1.3.7, both read off the installed files):
- * pi-ai's root namespace re-exports from typebox only `Type` (value) and
- * `Static`/`TSchema` (types) — `dist/index.d.ts` line 1-2. Neither `Value` nor
- * `Compile` is re-exported at the root or on any subpath. What IS reachable is
- * `validateToolArguments(tool, toolCall)` (`dist/utils/validation.js`, exported
- * via `export * from "./utils/validation.ts"`), which imports `Compile` from
- * `typebox/compile` and `Value` from `typebox/value` internally. It is not
- * usable here for two reasons: it COERCES and mutates the arguments rather than
- * only checking them, and its thrown message ends with
- * `Received arguments:\n${JSON.stringify(toolCall.arguments)}` — the raw
- * user/model data this package must never put into a published transcript.
- * Reaching `typebox/value` directly would mean importing a transitive
- * dependency of pi-ai, which the loader deliberately does not do.
  *
- * So the shipped default is the minimal structural checker below, and the
- * validator is a SEAM: a host that wants full JSON Schema hands its own
- * validator to `setToolArgsValidator`.
+ *  - pi-ai's root namespace re-exports from typebox only `Type` (value) and
+ *    `Static`/`TSchema` (types) — `dist/index.d.ts` lines 1-2. `Value` is NOT
+ *    re-exported at the root or on any subpath (46 root exports, none named
+ *    `Value`). So there is no pi-ai route to a `Check`-style API.
+ *  - pi-ai DOES export `validateToolArguments(tool, toolCall)`
+ *    (`dist/utils/validation.js`), which imports `Compile` from
+ *    `typebox/compile` and `Value` from `typebox/value` internally. Still not
+ *    usable here: it COERCES and mutates the arguments rather than only
+ *    checking them, and its thrown message ends with
+ *    `Received arguments:\n${JSON.stringify(toolCall.arguments)}` — the raw
+ *    model data this package must never put into a published transcript.
+ *  - typebox's OWN package exposes it: `package.json` `exports["./value"]` →
+ *    `./build/value/index.mjs`, whose namespace includes `Check` and `Errors`
+ *    both directly and under a `Value` object. That is the route taken, via
+ *    `loadTypebox('value')` — the same loader seam pi-ai goes through, for the
+ *    same reason (typebox is `type: module`, has NO `main`, and is reachable
+ *    only through its exports map, which Meteor cannot follow).
+ *
+ * typebox 1.x's `Value.Check` accepts PLAIN JSON Schema, not just `TSchema`.
+ * Verified against a `$ref`-free rich schema: `enum`, `const`, `minimum`/
+ * `maximum`, `minLength`/`maxLength`, `pattern`, `minItems`/`maxItems`,
+ * `oneOf`, `anyOf`, `format`, `additionalProperties: false`, `integer` and
+ * nested `properties`/`items`/`required` all REJECT bad values and ACCEPT good
+ * ones; internal `$ref`/`$defs` resolve too; unknown keywords are tolerated.
+ * `Value.Errors` returns ajv-shaped
+ * `{ keyword, schemaPath, instancePath, params, message }` records whose
+ * messages are derived from the SCHEMA and never echo the instance value —
+ * which is what makes them safe to put in a published `reason`.
+ *
+ * So the shipped default is now full JSON-Schema checking when typebox is
+ * reachable, and the minimal structural checker below when it is not. The
+ * validator remains a SEAM on top of both: `setToolArgsValidator` wins over
+ * either.
  * ------------------------------------------------------------------ */
 
 type Schema = Record<string, any>;
@@ -114,10 +133,12 @@ const describeTypes = (types: string[]) =>
  *
  * The bias is one-directional on purpose: anything it does not understand it
  * accepts. It can therefore reject only arguments that are structurally wrong —
- * never arguments a fuller validator would have allowed. A tool whose schema
- * needs more than this should keep its own `check()` (adopt it as a Meteor
- * method) or the app should inject a real validator via
- * `setToolArgsValidator`.
+ * never arguments a fuller validator would have allowed.
+ *
+ * As of M4 this is the FALLBACK, not the default: `defaultValidator` uses
+ * typebox's `Value.Check` when it is reachable and drops to this only when it
+ * is not. It still stands alone in a tree without typebox, and an app can
+ * always inject its own validator via `setToolArgsValidator`.
  *
  * Returns a reason, or null when nothing is wrong. The reason names the field
  * and NEVER the value.
@@ -168,13 +189,198 @@ const structuralValidator: ArgsValidator = (schema, args) => {
   return reason === null ? { ok: true } : { ok: false, reason };
 };
 
-let validator: ArgsValidator | null = structuralValidator;
+/* ---------------- the full checker (typebox `Value`) ---------------- */
+
+/** The slice of typebox's `value` namespace this package uses. */
+export interface TypeboxValue {
+  Check(schema: unknown, value: unknown): boolean;
+  Errors(schema: unknown, value: unknown): Iterable<TypeboxError>;
+}
+
+interface TypeboxError {
+  keyword?: string;
+  instancePath?: string;
+  params?: Record<string, any>;
+  message?: string;
+}
+
+/** `/customer/id` -> `customer.id`; `/ids/1` -> `ids[1]`; `` -> ``. The dotted
+ *  form the structural checker already reports, so one reason vocabulary
+ *  serves both checkers. */
+function dottedPath(instancePath: string | undefined): string {
+  if (!instancePath) return '';
+  let out = '';
+  for (const raw of instancePath.split('/')) {
+    if (raw === '') continue;
+    // JSON Pointer escapes; `~1` is `/` and `~0` is `~`, in that order.
+    const seg = raw.replace(/~1/g, '/').replace(/~0/g, '~');
+    if (/^\d+$/.test(seg)) out += `[${seg}]`;
+    else out += out ? `.${seg}` : seg;
+  }
+  return out;
+}
+
+/**
+ * One typebox error -> the package's reason vocabulary. Names the offending
+ * FIELD and never the value: typebox's own `message` describes the schema
+ * constraint ("must be string", "must be <= 10"), and the only data-derived
+ * strings in `params` are property NAMES, which the structural checker already
+ * reports.
+ */
+function reasonFor(err: TypeboxError): string {
+  const path = dottedPath(err.instancePath);
+  if (err.keyword === 'required') {
+    const missing = (err.params?.requiredProperties ?? [])[0];
+    if (typeof missing === 'string') {
+      return `missing required field "${join(path, missing)}"`;
+    }
+  }
+  if (err.keyword === 'additionalProperties') {
+    const extra = (err.params?.additionalProperties ?? [])[0];
+    if (typeof extra === 'string') {
+      return `unexpected field "${join(path, extra)}" is not allowed by the schema`;
+    }
+  }
+  return `${label(path)} ${err.message ?? 'does not match the schema'}`;
+}
+
+function fullCheck(V: TypeboxValue, schema: unknown, args: unknown): ValidationResult {
+  // `Value.Check` throws on a non-object schema (`Cannot use 'in' operator`).
+  // Nothing to enforce there anyway — the structural checker accepts it too.
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { ok: true };
+  if (V.Check(schema, args)) return { ok: true };
+  for (const err of V.Errors(schema, args)) return { ok: false, reason: reasonFor(err) };
+  // Check said no and Errors said nothing — report the disagreement rather
+  // than silently passing arguments the checker just rejected.
+  return { ok: false, reason: 'arguments do not match the tool schema' };
+}
+
+/** Default: typebox's `Value` through the loader seam. Replaceable so a test
+ *  can force the degrade path without uninstalling a package. */
+async function defaultValueLoader(): Promise<TypeboxValue> {
+  const ns: any = await loadTypebox('value');
+  // 1.3.7 exposes `Check`/`Errors` both at the top level and under `Value`.
+  // Prefer the namespaced object: it is the documented surface, and a future
+  // release that stops spreading the members keeps working.
+  const V = (ns?.Value && typeof ns.Value.Check === 'function') ? ns.Value : ns;
+  if (typeof V?.Check !== 'function' || typeof V?.Errors !== 'function') {
+    throw new Error('typebox/value exposes no Check/Errors');
+  }
+  return V as TypeboxValue;
+}
+
+type ValueLoader = () => Promise<TypeboxValue>;
+
+let valueLoader: ValueLoader | null = defaultValueLoader;
+let valueModule: TypeboxValue | null = null;
+let valuePromise: Promise<TypeboxValue | null> | null = null;
+/** The full checker was tried and failed; the structural one stands in. */
+let degraded = false;
+
+/**
+ * Replace (or, with `null`, remove) the route to the full checker.
+ *
+ * The escape hatch for a host that must pin validation to the structural
+ * checker, and the seam the degrade-path test uses — forcing a rejecting
+ * loader is the only way to exercise "typebox went missing at runtime" without
+ * uninstalling a package. Returns a restore function; the cached module, the
+ * degrade latch and the warn-once latch all reset on every call so a test can
+ * observe the warning it expects.
+ */
+export function setTypeboxValueLoader(next: ValueLoader | null): () => void {
+  const previous = valueLoader;
+  const previousModule = valueModule;
+  const previousDegraded = degraded;
+  const previouslyWarned = warnedUnavailable;
+  valueLoader = next;
+  valueModule = null;
+  valuePromise = null;
+  degraded = false;
+  warnedUnavailable = false;
+  return () => {
+    valueLoader = previous;
+    valueModule = previousModule;
+    valuePromise = null;
+    degraded = previousDegraded;
+    warnedUnavailable = previouslyWarned;
+  };
+}
+
+/** The full checker, or null once it is known to be unreachable. Lazy (nothing
+ *  loads until the first tool call) and cached (one import per process). */
+async function fullChecker(): Promise<TypeboxValue | null> {
+  if (valueModule) return valueModule;
+  if (degraded || !valueLoader) return null;
+  if (!valuePromise) {
+    const loader = valueLoader;
+    valuePromise = loader()
+      .then((V) => { valueModule = V; return V; })
+      .catch((e) => {
+        degraded = true;
+        warnUnavailable(
+          'the full JSON-Schema checker (typebox) could not be loaded; falling back to the '
+          + `minimal structural checker, which does not enforce enum/bounds/oneOf/…: ${(e as Error)?.message}`,
+        );
+        return null;
+      })
+      // Never leave a settled promise that could re-warn: the result is cached
+      // in `valueModule`/`degraded` above.
+      .finally(() => { valuePromise = null; });
+  }
+  return valuePromise;
+}
+
+/**
+ * SYNCHRONOUS: is a full JSON-Schema validator available to this process?
+ *
+ * True when the app installed one with `setToolArgsValidator`, when the full
+ * checker is already loaded, or when typebox's `value` export resolves on
+ * disk. `Agent.method` asks this at registration time, where awaiting an
+ * import is not an option — see the fail-closed guard there.
+ */
+export function fullValidationAvailable(): boolean {
+  if (validator !== defaultValidator) return validator !== null;
+  if (valueModule) return true;
+  if (degraded || !valueLoader) return false;
+  // An injected loader is trusted; only the built-in one is probed on disk.
+  if (valueLoader !== defaultValueLoader) return true;
+  try {
+    return typeboxValueResolvable() === true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The shipped default: full JSON Schema when typebox is reachable, the minimal
+ * structural check when it is not. Falling back rather than throwing is the
+ * whole point — a checker that cannot load must narrow what is enforced, never
+ * take every tool call down with it.
+ */
+const defaultValidator: ArgsValidator = async (schema, args) => {
+  const V = await fullChecker();
+  if (!V) return structuralValidator(schema, args);
+  try {
+    return fullCheck(V, schema, args);
+  } catch (e) {
+    // A schema typebox itself chokes on. Degrade THIS call rather than the
+    // process: the structural checker still catches the shape errors.
+    warnUnavailable(
+      `the full JSON-Schema checker threw on a tool schema; falling back to the minimal `
+      + `structural checker for it: ${(e as Error)?.message}`,
+    );
+    return structuralValidator(schema, args);
+  }
+};
+
+let validator: ArgsValidator | null = defaultValidator;
 let warnedUnavailable = false;
 
 /**
  * Replace the argument checker for the whole package — both the loop's inline
  * dispatch and every method `Agent.method` registers, so one schema keeps
- * meaning one thing to both callers.
+ * meaning one thing to both callers. An installed validator wins over the
+ * built-in default, typebox-backed or not.
  *
  * Pass `null` to DISABLE validation: arguments then pass through unchecked and
  * a single warning is logged (repeating it once per tool call would drown the
@@ -377,15 +583,24 @@ export function defineAgentMethod(name: string, options: AgentMethodOptions): Ad
   // DDP client — the classic selector-injection surface, reintroduced by the
   // feature that promised to close it. Skipped when the app installed its
   // own validator (do that BEFORE registering methods).
-  if (validator === structuralValidator) {
+  //
+  // M4: the guard now fires only when NO full validator is available — neither
+  // the built-in typebox route nor one the app installed. A rich schema is
+  // perfectly safe once something actually enforces it, and refusing it then
+  // would be the fail-closed reflex outliving its reason.
+  if (!fullValidationAvailable()) {
     const kw = unenforceableKeyword(options.args);
     if (kw) {
       throw new Error(
         `[10thfloor:agent] Agent.method('${name}') uses schema keyword "${kw}", `
-        + 'which the built-in minimal checker does not enforce — on a DDP '
-        + 'endpoint that means an unguarded argument. Simplify the schema to '
-        + 'type/properties/required/items, or install a full validator with '
-        + 'setToolArgsValidator() before registering methods.',
+        + 'which the built-in structural checker does not enforce, and no full '
+        + 'validator is available — on a DDP endpoint that means an unguarded '
+        + 'argument. Fix it one of three ways: install typebox in your app '
+        + '(`meteor npm install --save typebox`, already a dependency of '
+        + '@earendil-works/pi-ai) so the harness can enforce the whole schema; '
+        + 'install your own validator with setToolArgsValidator() BEFORE '
+        + 'registering methods; or simplify the schema to '
+        + 'type/properties/required/items.',
       );
     }
   }

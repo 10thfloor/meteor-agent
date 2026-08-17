@@ -89,6 +89,11 @@ export interface AgentDelta {
   seq: number;
   kind: DeltaKind;
   chunk: string;
+  /** `kind: 'tool_args'` only. The provider's content-block index for the tool
+   *  call this fragment belongs to — the attribution that lets a consumer
+   *  reassemble PARALLEL tool calls instead of splicing their JSON together.
+   *  Absent for text/thinking, and for a provider that reports no index. */
+  contentIndex?: number;
   at: Date;
 }
 
@@ -97,5 +102,21 @@ export interface ViewMessage extends Omit<AgentMessage, 'createdAt'> {
   streaming: boolean;
   truncatedHead?: boolean;
   deltaCount?: number;
-  createdAt?: Date;
+  /**
+   * IN-FLIGHT rows only, and present only when tool-argument fragments have
+   * arrived: the partial arguments JSON of each tool call the assistant is
+   * still streaming, KEYED BY the provider's content-block index.
+   *
+   * One entry per concurrent tool call, so two calls streaming at once stay
+   * two strings rather than one interleaved mess. The values are PARTIAL JSON
+   * — a consumer that wants to render them mid-stream needs a tolerant parser,
+   * and one that does not can ignore the field entirely. The committed message
+   * supersedes it with the real `toolCalls` array, on which `args` is a parsed
+   * object; nothing here is ever the source of truth for dispatch.
+   *
+   * Runtime keys are strings (they are object keys); the `number` in the type
+   * says what they mean. Fragments from a provider that reports no index
+   * collect under `0`.
+   */
+  toolArgs?: Record<number, string>;
 }

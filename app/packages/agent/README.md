@@ -103,11 +103,20 @@ checked before it runs either way: a DDP caller gets
 tool result naming the field it got wrong — which it usually corrects on the
 next call, since a bad argument answers the call rather than failing the turn.
 
-Inline tools are checked the same way. The shipped checker is deliberately
-minimal — `type`, object `required`/`properties`, and array `items` — and
-accepts anything it cannot model, so it only ever rejects arguments that are
-structurally wrong. A tool that needs more should adopt a real method and keep
-its own `check()`, or the app can install a full JSON Schema validator:
+Inline tools are checked the same way, against the **whole** JSON Schema —
+`enum`, `const`, numeric and length bounds, `pattern`, `format`, `minItems`,
+`oneOf`/`anyOf`, `additionalProperties: false`, internal `$ref`, and nested
+`properties`/`items` are all enforced. The checker is typebox's `Value.Check`,
+loaded lazily through the same seam the pi-ai provider uses; typebox already
+ships as a dependency of `@earendil-works/pi-ai`, so nothing new to install.
+
+If typebox cannot be loaded, the package logs **one** warning and falls back to
+a minimal structural checker — `type`, object `required`/`properties`, array
+`items`, accepting anything it cannot model. Validation narrows; it never
+disappears and never takes a turn down with it. `fullValidationAvailable()`
+reports which of the two is in force.
+
+An app can install its own validator instead, and it wins over both:
 
 ```ts
 import { setToolArgsValidator } from 'meteor/10thfloor:agent';
@@ -116,7 +125,15 @@ setToolArgsValidator((schema, args) => (myCheck(schema, args)
 ```
 
 A `reason` is fed back to the model and stored in the published transcript, so
-name the offending field — never echo its value.
+name the offending field — never echo its value. That is why the built-in
+reasons quote paths (`field "customer.id" must be string`,
+`missing required field "q"`, `unexpected field "sneak" is not allowed by the
+schema`) and never the data.
+
+`Agent.method` still fails closed at registration for a schema nothing can
+enforce: if neither typebox nor an installed validator is available, a schema
+using `enum`/bounds/`oneOf`/… throws at define time rather than shipping an
+unguarded argument to a public DDP endpoint.
 
 **Budgets** are the only brake on loop-initiated work. `turns` refuses the
 (N+1)th `send` with `budget-exhausted`; `spend` and `toolCalls` stop a running
@@ -176,6 +193,15 @@ await Support.send(sessionId, 'where is my order?');
 Support.messages(sessionId).fetch();   // reactive, includes in-flight tokens
 Support.status(sessionId);             // 'idle' | 'streaming' | 'calling' | …
 ```
+
+An in-flight row also carries `toolArgs` when the model is streaming tool
+calls: a `Record<number, string>` of the partial arguments JSON, **keyed by the
+provider's content-block index**, so two tool calls streaming at once stay two
+strings rather than one interleaved ruin. The values are partial JSON — render
+them with a tolerant parser or ignore the field. Once the message commits, the
+real `toolCalls` array supersedes it with parsed `args`; `toolArgs` is never a
+source of truth for dispatch. Fragments from a provider that reports no index
+collect under `0`.
 
 A tool declared `gate: 'ask'` parks the turn instead of running: the status goes
 to `'awaiting'` and `pending(sessionId)` returns the call the agent wants to
@@ -289,7 +315,7 @@ callers). Two consequences to design for: an anonymous session **stays**
 anonymous after the user logs in — it is not adopted by the account, and
 remains reachable by anyone holding the id — and every tool runs with
 `this.userId === null`, so an ownership check written as "belongs to the
-caller" matches nothing. Model-supplied arguments are structurally checked
+caller" matches nothing. Model-supplied arguments are checked
 against the tool's schema before dispatch (see **Tools**), but a check is not
 an authorization: a tool reachable by an anonymous session should decide what
 it will do for a caller with no user at all.
@@ -301,13 +327,17 @@ and error surfacing, approval gates, budgets and cost accounting, and DDP rate
 limits. Milestone 3 completed the working surface: compaction, an interrupt
 that cancels the provider request, the orphan-claim watcher with approval
 timeouts, the finished tool surface — `Agent.method()` co-registration and
-validated tool arguments (a minimal structural checker: a co-registered schema
-leaning on `$ref`/`oneOf`/`enum`/bounds is REJECTED at registration unless a
-full validator is installed via `setToolArgsValidator`) — plus `Agent.ask()`
+validated tool arguments — plus `Agent.ask()`
 for headless one-shots and agent composition, the `canUse` tool backstop,
 `maxResultChars` truncation, client teardown via `stop()`, rate limiting for
 `agent.interrupt`, and the production-bundle verification sweep
 (see **Verifying a production build**).
+
+Milestone 4 is closing out the remaining tiers. Shipped so far: full
+JSON-Schema validation of tool arguments through typebox when it is reachable
+(with a structural fallback and one warning when it is not), and per-tool-call
+attribution of streamed arguments so parallel tool calls arrive as separate
+streams (`toolArgs` on an in-flight row).
 
 Sketched in the original design but deliberately NOT implemented (v2
 candidates): a global `Agent.provider()` registry, a manual `compact()` call,

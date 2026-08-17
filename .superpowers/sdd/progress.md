@@ -198,3 +198,16 @@ Tier 1 progress: GitHub repo created (10thfloor/meteor-agent, private) + CI gree
   exports map rejects Meteor's .js-suffixed helper imports); .approval[hidden] CSS specificity bug;
   demo script answeredTool must check the LAST message, not .some().
 BLOCKED on user: live smoke (no ANTHROPIC_API_KEY in env), Atmosphere publish (meteor not logged in).
+
+== MILESTONE 4 (branch milestone-4-v2, plan 2026-08-17-agent-harness-milestone-4.md) ==
+Task 1 DONE: full-schema validation via typebox + parallel tool-arg attribution. Suite 204 server
+  (+1 pending) + 1 client, from 185. Probe: pi-ai re-exports typebox's `Type` ONLY (index.d.ts:1-2,
+  46 root exports, no `Value`); the route is typebox's own `exports["./value"]` through a
+  generalized loader seam (loadPackage/loadTypebox/typeboxValueResolvable). Value.Check takes plain
+  JSON Schema and enforces enum/bounds/pattern/format/oneOf/anyOf/const/minItems/additionalProperties/
+  $ref both directions. Degrades to the structural checker with ONE warn; setToolArgsValidator still
+  wins. Agent.method's fail-closed guard now fires only when NO full validator is available.
+  Attribution: ProviderChunk tool_args + AgentDelta gained contentIndex?; DeltaWriter coalesces per
+  index; mergeView exposes `toolArgs?: Record<number, string>` on in-flight rows. verify-build.sh
+  now proves the typebox chain in a real production bundle (URL-import branch wins). Full report:
+  .superpowers/sdd/task-1-report.md

@@ -104,9 +104,11 @@ describe('pi-ai adapter mapping', () => {
       translateEvent({ type: 'thinking_delta', contentIndex: 0, delta: 'hm' }),
       [{ kind: 'thinking', chunk: 'hm' }],
     );
+    // tool_args alone carries the attribution: text and thinking are one
+    // stream each, tool calls are not.
     assert.deepEqual(
       translateEvent({ type: 'toolcall_delta', contentIndex: 0, delta: '{"q":' }),
-      [{ kind: 'tool_args', chunk: '{"q":' }],
+      [{ kind: 'tool_args', chunk: '{"q":', contentIndex: 0 }],
     );
   });
 
@@ -165,6 +167,26 @@ describe('pi-ai adapter mapping', () => {
       'thinking_end', 'toolcall_start', 'toolcall_end', 'error', 'not_a_type']) {
       assert.lengthOf(translateEvent({ type: t } as any), 0, t);
     }
+  });
+
+  it('threads toolcall_delta contentIndex through, and omits it when absent', () => {
+    // pi-ai's types.d.ts:426-429 declares contentIndex on every toolcall_*
+    // event. It is the only attribution parallel calls have.
+    assert.deepEqual(
+      translateEvent({ type: 'toolcall_delta', delta: '{"a":1}', contentIndex: 2 }),
+      [{ kind: 'tool_args', chunk: '{"a":1}', contentIndex: 2 }],
+    );
+    assert.deepEqual(
+      translateEvent({ type: 'toolcall_delta', delta: '{"a":1}', contentIndex: 0 }),
+      [{ kind: 'tool_args', chunk: '{"a":1}', contentIndex: 0 }],
+      'index 0 is a real index, not a missing one',
+    );
+    // A release that drops the field must yield NO index rather than a made-up
+    // 0, which would merge parallel calls back together downstream.
+    assert.deepEqual(
+      translateEvent({ type: 'toolcall_delta', delta: 'x' }),
+      [{ kind: 'tool_args', chunk: 'x' }],
+    );
   });
 });
 
@@ -536,5 +558,128 @@ describe('piAiProvider()', () => {
     })) chunks.push(c);
     assert.isAbove(chunks.filter((c) => c.kind === 'text').length, 0);
     assert.equal(chunks[chunks.length - 1].kind, 'done');
+  });
+});
+
+describe('parallel tool-call attribution, end to end (faux provider, no network)', () => {
+  // M4 Task 1, the half the validator work does not touch: two tool calls
+  // streaming at once must reach a consumer as two argument strings, not one
+  // interleaved ruin. The chain under test is adapter -> ProviderChunk ->
+  // DeltaWriter -> delta document -> mergeView, driven by pi-ai's own faux
+  // provider so the contentIndex values are pi-ai's, not the test's.
+
+  async function streamTwoCalls(): Promise<ProviderChunk[]> {
+    const piai: any = await loadPiAi();
+    // Faux defaults: how many deltas each call's arguments are cut into is the
+    // provider's business and varies run to run, which is precisely why the
+    // assertions below key on contentIndex rather than on fragment counts.
+    const faux = piai.fauxProvider({
+      provider: 'faux', api: 'faux-api', models: [{ id: 'm1' }],
+    });
+    const models = piai.createModels();
+    models.setProvider(faux.provider);
+    faux.setResponses([piai.fauxAssistantMessage([
+      piai.fauxToolCall('weather', { city: 'Paris' }, { id: 't1' }),
+      piai.fauxToolCall('quote', { stock: 'ACME' }, { id: 't2' }),
+    ], { stopReason: 'toolUse' })]);
+    const provider = createPiAiProvider(async () => models as any);
+    const chunks: ProviderChunk[] = [];
+    for await (const c of provider.stream({
+      model: 'faux/m1', system: 'be terse',
+      messages: [{ role: 'user', content: 'both please' }], tools: [],
+    })) chunks.push(c);
+    return chunks;
+  }
+
+  it('tags each tool_args chunk with the calls\'s own contentIndex', async function () {
+    this.timeout(20000);
+    const chunks = await streamTwoCalls();
+    const args = chunks.filter((c) => c.kind === 'tool_args') as any[];
+    assert.isAtLeast(args.length, 2, 'both calls must have streamed their arguments');
+    const indexes = new Set(args.map((c) => c.contentIndex));
+    assert.deepEqual([...indexes].sort(), [0, 1], 'two calls, two indexes');
+    // Reassembling by index recovers both calls' arguments verbatim.
+    const byIndex: Record<number, string> = {};
+    for (const c of args) byIndex[c.contentIndex] = (byIndex[c.contentIndex] ?? '') + c.chunk;
+    assert.deepEqual(JSON.parse(byIndex[0]), { city: 'Paris' });
+    assert.deepEqual(JSON.parse(byIndex[1]), { stock: 'ACME' });
+    // And the terminal done chunk still carries both parsed calls.
+    const done: any = chunks[chunks.length - 1];
+    assert.deepEqual(done.toolCalls.map((t: any) => t.id), ['t1', 't2']);
+  });
+
+  it('survives DeltaWriter and mergeView as two separate argument streams', async function () {
+    this.timeout(20000);
+    const { DeltaWriter } = await import('../server/loop');
+    const { AgentDeltas } = await import('../common/collections');
+    const { mergeView } = await import('../common/merge');
+    const sessionId = 's-attribution';
+    const messageId = 'm-attribution';
+    await AgentDeltas.removeAsync({ sessionId } as any);
+
+    const chunks = await streamTwoCalls();
+    const writer = new DeltaWriter(sessionId, messageId, 3, 10_000);
+    // INTERLEAVED on purpose: a real provider alternates between the two
+    // blocks, and the faux one emits them in order. Feeding them alternately
+    // is what proves the coalescing key includes contentIndex rather than
+    // relying on arrival order.
+    const args = chunks.filter((c) => c.kind === 'tool_args') as any[];
+    const first = args.filter((c) => c.contentIndex === 0);
+    const second = args.filter((c) => c.contentIndex === 1);
+    for (let i = 0; i < Math.max(first.length, second.length); i += 1) {
+      if (first[i]) writer.push('tool_args', first[i].chunk, first[i].contentIndex);
+      if (second[i]) writer.push('tool_args', second[i].chunk, second[i].contentIndex);
+    }
+    await writer.stop();
+
+    const docs = await AgentDeltas.find({ sessionId } as any).fetchAsync();
+    assert.isAtLeast(docs.length, 2, 'the two calls must occupy at least one run each');
+    for (const d of docs) assert.isNumber((d as any).contentIndex, 'the doc must record the index');
+    // No document may mix the two calls: that is the corruption this whole
+    // chain exists to prevent, and it survives every fragment layout the faux
+    // provider happens to choose.
+    assert.deepEqual(
+      [...new Set(docs.map((d: any) => d.contentIndex))].sort(), [0, 1],
+    );
+    // Contiguous seq from 0 — mergeView's backward walk depends on it.
+    const seqs = docs.map((d) => d.seq).sort((a, b) => a - b);
+    assert.deepEqual(seqs, seqs.map((_, i) => i));
+
+    const view = mergeView([], docs as any);
+    assert.lengthOf(view, 1);
+    assert.deepEqual(JSON.parse(view[0].toolArgs![0]), { city: 'Paris' });
+    assert.deepEqual(JSON.parse(view[0].toolArgs![1]), { stock: 'ACME' });
+    await AgentDeltas.removeAsync({ sessionId } as any);
+  });
+
+  it('coalesces a tool_args run only within one contentIndex', async function () {
+    this.timeout(20000);
+    const { DeltaWriter } = await import('../server/loop');
+    const { AgentDeltas } = await import('../common/collections');
+    const sessionId = 's-coalesce';
+    await AgentDeltas.removeAsync({ sessionId } as any);
+
+    const writer = new DeltaWriter(sessionId, 'm-coalesce', 0, 10_000);
+    writer.push('tool_args', '{"a":', 0);
+    writer.push('tool_args', '1}', 0);       // same index: coalesces
+    writer.push('tool_args', '{"b":', 1);    // different index: new run
+    writer.push('tool_args', '2}', 1);
+    writer.push('tool_args', '{"c":', 0);    // back to 0: new run, not a merge
+    writer.push('text', 'and', 0);           // a different kind never coalesces
+    await writer.stop();
+
+    const docs = (await AgentDeltas.find({ sessionId } as any).fetchAsync())
+      .sort((a, b) => a.seq - b.seq) as any[];
+    assert.deepEqual(
+      docs.map((d) => [d.kind, d.contentIndex, d.chunk]),
+      [
+        ['tool_args', 0, '{"a":1}'],
+        ['tool_args', 1, '{"b":2}'],
+        ['tool_args', 0, '{"c":'],
+        ['text', 0, 'and'],
+      ],
+    );
+    assert.deepEqual(docs.map((d) => d.seq), [0, 1, 2, 3], 'seq stays contiguous');
+    await AgentDeltas.removeAsync({ sessionId } as any);
   });
 });
