@@ -62,6 +62,11 @@ export interface AgentMessage {
   approved?: boolean;
   by?: string | null;
   reason?: string;
+  /** `kind: 'approval'` notes only, and only when true: the watcher denied this
+   *  request because `budget.approval` elapsed with nobody answering (§4.3).
+   *  `by` is null on those rows — nobody decided — and a UI must be able to say
+   *  "timed out" rather than implying a person refused. */
+  timedOut?: boolean;
   /** `kind: 'compaction'` notes only. `summary` is what the MODEL sees in
    *  place of everything at-or-before seq `upto`; the transcript itself keeps
    *  every message — compaction changes the model's view, never history. */

@@ -32,13 +32,16 @@ async function requireSession(agent: string, sessionId: string, userId: string |
  *
  * Every method that starts work goes through this, so a send and an approval
  * resume a session on identical terms — same registry config, same pi-ai
- * fallback, same error containment.
+ * fallback, same error containment. Exported for the watcher (§4.3), which wakes
+ * an orphan through this same shape rather than assembling a `RunConfig` of its
+ * own: a recovered turn must run with exactly the config a user-initiated one
+ * would.
  *
  * The `.catch` is load-bearing, not decoration: an unhandled rejection is
  * fatal by default on Node >= 15, so a bare `void runTurn(...)` would let one
  * bad provider call take down the whole app server.
  */
-function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
+export function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
   Meteor.defer(() => {
     runTurn(sessionId, {
       model: config.model,
@@ -62,6 +65,124 @@ function deferTurn(sessionId: string, config: AgentConfig, userId: string | null
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
   });
+}
+
+/**
+ * The single-winner verdict write, and the audit row that records it.
+ *
+ * The ONE place that decides a parked approval, shared by `agent.approve` /
+ * `agent.deny` (a human answering) and by the watcher's approval timeout (§4.3,
+ * nobody answering). Both need the identical conditional write — `phase:
+ * 'awaiting'` and no verdict yet, matched atomically — so two approvers
+ * clicking at once, or two servers' sweeps timing out the same request at once,
+ * produce exactly one winner and exactly one side effect. Duplicating that
+ * selector for the timeout path would be duplicating the thing that makes it
+ * correct.
+ *
+ * Returns whether THIS caller won. It deliberately does not throw: a human
+ * caller is owed a `no-pending` error, a sweep is owed a quiet false.
+ *
+ * Authorization is NOT here. It belongs to the caller that has one
+ * (`recordVerdict`), and a timeout has none to check — see
+ * `recordTimeoutVerdict`.
+ */
+async function writeVerdict(
+  sessionId: string,
+  verdict: 'approved' | 'denied',
+  by: string | null,
+  reason: string | undefined,
+  timedOut = false,
+): Promise<boolean> {
+  const $set: Record<string, unknown> = {
+    'pending.verdict': verdict,
+    'pending.by': by,
+    phase: 'idle',
+    updatedAt: new Date(),
+  };
+  // Only when given: `$set` with an undefined value is not a field write.
+  if (reason !== undefined) $set['pending.reason'] = reason;
+
+  const won = await AgentSessions.updateAsync(
+    {
+      _id: sessionId,
+      phase: 'awaiting',
+      'pending.verdict': { $exists: false },
+    } as any,
+    { $set } as any,
+  );
+  // Zero matched means someone else answered between our read and our write.
+  if (won !== 1) return false;
+
+  // The verdict is history: who decided, which way, and why. Structured
+  // fields, never prose — a UI renders it and an audit reads it.
+  //
+  // The seq comes from a direct atomic allocation rather than the loop's
+  // `allocateSeq`, which guards on the lease: a parked run holds no lease (it
+  // exited), so this is the same shape `agent.send` uses to interleave safely
+  // with a running turn.
+  const before = await AgentSessions.rawCollection().findOneAndUpdate(
+    { _id: sessionId },
+    { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
+    { returnDocument: 'before' },
+  );
+  if (before) {
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq: (before as any).nextSeq,
+      role: 'note', kind: 'approval',
+      approved: verdict === 'approved', by, reason,
+      // `undefined` is not a field write, so a human verdict carries no
+      // `timedOut` key at all rather than an explicit false. A UI that
+      // distinguishes "denied by someone" from "nobody answered in time" must
+      // be able to tell them apart from the row alone.
+      timedOut: timedOut || undefined,
+      createdAt: new Date(),
+    } as any);
+  } else {
+    // No seq means the session vanished between the verdict write and here.
+    // The verdict itself is already durable and the tool may well execute, so
+    // the missing row is an audit gap, not a cosmetic one: say so rather than
+    // letting an approved side effect leave no trace of who authorized it.
+    console.warn(
+      `[10thfloor:agent] session ${sessionId} vanished before its ${verdict} `
+      + 'note could be written; the approval has no audit row',
+    );
+  }
+  return true;
+}
+
+/**
+ * §4.3. Deny a parked approval that nobody answered in time, and wake the run.
+ *
+ * The watcher's sweep decides WHEN (it owns `budget.approval` and the clock);
+ * this owns WHAT a timeout is: a denial, recorded through the same single-winner
+ * core a human verdict goes through, with `by: null` because no one decided, and
+ * `timedOut: true` on the audit row so the distinction survives in history. The
+ * loop then answers the parked call with `{ error: 'denied', reason: 'approval
+ * timed out' }` — the model sees the refusal and routes around it, exactly as it
+ * does for a human denial.
+ *
+ * No `config.approve` check: that predicate says who may ANSWER, and nobody is
+ * answering. No ownership check either — there is no caller to authorize.
+ *
+ * Returns false when the session or its agent is gone, or when another server's
+ * sweep won the race. Never throws: a sweep is not a caller.
+ */
+export async function recordTimeoutVerdict(sessionId: string): Promise<boolean> {
+  const session = await AgentSessions.findOneAsync(sessionId);
+  if (!session) return false;
+  // The watcher has already warned about an unregistered agent (it needs the
+  // config to read `budget.approval` at all); this is the second line of
+  // defense for a direct caller, and the reason a missing config is not fatal:
+  // a verdict we could not resume would strand the session worse than the
+  // timeout it was fixing.
+  const config = getAgent(session.agent);
+  if (!config) return false;
+
+  if (!(await writeVerdict(sessionId, 'denied', null, 'approval timed out', true))) {
+    return false;
+  }
+  deferTurn(sessionId, config, session.userId);
+  return true;
 }
 
 /**
@@ -100,54 +221,11 @@ async function recordVerdict(
     throw new Meteor.Error('not-allowed', 'You may not answer this approval');
   }
 
-  const $set: Record<string, unknown> = {
-    'pending.verdict': verdict,
-    'pending.by': ctx.userId,
-    phase: 'idle',
-    updatedAt: new Date(),
-  };
-  // Only when given: `$set` with an undefined value is not a field write.
-  if (reason !== undefined) $set['pending.reason'] = reason;
-
-  const won = await AgentSessions.updateAsync(
-    {
-      _id: sessionId,
-      phase: 'awaiting',
-      'pending.verdict': { $exists: false },
-    } as any,
-    { $set } as any,
-  );
-  // Zero matched means someone else answered between our read and our write.
-  if (won !== 1) throw new Meteor.Error('no-pending', 'Nothing is waiting for approval');
-
-  // The verdict is history: who decided, which way, and why. Structured
-  // fields, never prose — a UI renders it and an audit reads it.
-  //
-  // The seq comes from a direct atomic allocation rather than the loop's
-  // `allocateSeq`, which guards on the lease: a parked run holds no lease (it
-  // exited), so this is the same shape `agent.send` uses to interleave safely
-  // with a running turn.
-  const before = await AgentSessions.rawCollection().findOneAndUpdate(
-    { _id: sessionId },
-    { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
-    { returnDocument: 'before' },
-  );
-  if (before) {
-    await AgentMessages.insertAsync({
-      _id: Random.id(), sessionId, seq: (before as any).nextSeq,
-      role: 'note', kind: 'approval',
-      approved: verdict === 'approved', by: ctx.userId, reason,
-      createdAt: new Date(),
-    } as any);
-  } else {
-    // No seq means the session vanished between the verdict write and here.
-    // The verdict itself is already durable and the tool may well execute, so
-    // the missing row is an audit gap, not a cosmetic one: say so rather than
-    // letting an approved side effect leave no trace of who authorized it.
-    console.warn(
-      `[10thfloor:agent] session ${sessionId} vanished before its ${verdict} `
-      + 'note could be written; the approval has no audit row',
-    );
+  // Losing the conditional write means someone else answered between our read
+  // and our write: tell the loser rather than handing them a silent success for
+  // a tool they never authorized.
+  if (!(await writeVerdict(sessionId, verdict, ctx.userId, reason))) {
+    throw new Meteor.Error('no-pending', 'Nothing is waiting for approval');
   }
 
   deferTurn(sessionId, config, ctx.userId);

@@ -32,6 +32,17 @@ export interface AgentConfig {
     toolCalls?: number;
     /** Dollars, as a number or a `'$1.50'` string. Parsed at define() time. */
     spend?: number | string;
+    /**
+     * §4.3. Milliseconds a `gate: 'ask'` request may sit unanswered before the
+     * watcher records a DENIED verdict for it (`reason: 'approval timed out'`)
+     * and lets the turn continue. Omit it and a parked request waits forever —
+     * which is the right default for a request a human is expected to see, and
+     * the wrong one for an unattended run.
+     *
+     * Enforced by the WATCHER's sweep, not by the loop: a park holds no process
+     * and runs no timer, so there is nothing in-turn left to enforce it.
+     */
+    approval?: number;
   };
   maxIterations?: number;
   /** §9 compaction. When the estimated context exceeds `window * compactAt`
@@ -60,6 +71,9 @@ export interface ResolvedBudget {
   turns?: number;
   toolCalls?: number;
   spend?: number;
+  /** Passed through unchanged (already a plain ms count). The loop ignores it;
+   *  the watcher's sweep is what enforces it. */
+  approval?: number;
 }
 
 /** `'$1.50'` / `'1.50'` / `1.5`, and nothing else. A bare `Number(...)` would
@@ -114,10 +128,16 @@ export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | 
   if (!budget) return undefined;
   assertCountLimit(budget.turns, 'turns');
   assertCountLimit(budget.toolCalls, 'toolCalls');
+  // Milliseconds rather than a count, but the same rigor for the same reason: a
+  // string `'60000'` compares as a string against a Date arithmetic result and
+  // an approval would silently never time out — the one failure mode this
+  // setting exists to prevent.
+  assertCountLimit(budget.approval, 'approval');
   return {
     turns: budget.turns,
     toolCalls: budget.toolCalls,
     spend: budget.spend === undefined ? undefined : parseSpend(budget.spend),
+    approval: budget.approval,
   };
 }
 

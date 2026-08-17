@@ -173,6 +173,19 @@ async function commitBudgetNote(
  */
 const running = new Set<string>();
 
+/**
+ * Is a turn for this session running in THIS process?
+ *
+ * The watcher's read of the same guard `runTurn` enforces internally. It is an
+ * optimization, not a correctness boundary: calling `runTurn` for a session
+ * already running here returns immediately anyway, and a run on ANOTHER server
+ * is invisible to this Set (that is what the lease is for). It exists so a sweep
+ * does not queue wake-ups it knows will be no-ops.
+ */
+export function isRunning(sessionId: string): boolean {
+  return running.has(sessionId);
+}
+
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
 class DeltaWriter {

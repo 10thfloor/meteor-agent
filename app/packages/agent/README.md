@@ -39,7 +39,8 @@ Support.define({
   model: 'anthropic/claude-sonnet-5',
   instructions: [...],                       // string | fn(ctx) | array
   tools: ['orders.lookup', { name, description, args, run, gate: 'ask' }],
-  budget: { turns: 20, toolCalls: 40, spend: '$1.00' },  // each optional; see below
+  budget: { turns: 20, toolCalls: 40, spend: '$1.00',
+            approval: 3600000 },             // each optional; see below
   pricing: { input: 3, output: 15 },         // $/Mtok fallback when the provider
                                              // does not report its own cost
   retry: { attempts: 3, baseMs: 500 },       // provider retry with backoff
@@ -53,6 +54,9 @@ Support.define({
 turn with a `role:'note', kind:'budget'` row in the transcript and
 `phase:'stopped'`. Cost prefers the provider's own reported figure (pi-ai
 prices cache reads/writes correctly) and falls back to your `pricing` table.
+`approval` (ms) is the one the watcher enforces: a `gate: 'ask'` request nobody
+answers within it is DENIED with `reason: 'approval timed out'` and the turn
+continues. Omit it and a parked request waits forever.
 
 **Provider failures** retry with exponential backoff under `phase:'retrying'`;
 auth/request errors fail immediately. Either terminal failure writes a
@@ -72,6 +76,17 @@ tries again. Your transcript UI should render three note kinds: `error`,
 Each entry registers two DDP rules: per-(user, connection) so an anonymous
 flood only burns its own connection's quota, and per-user for authenticated
 callers so opening more connections does not multiply the allowance.
+
+**Recovery runs itself.** Every server starts a watcher at boot: it observes
+sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
+mid-turn) and re-runs the turn, which repairs its own transcript on entry. A
+15s sweep backs the observer up, because a lease can expire without any document
+change to observe, and the same sweep enforces `budget.approval` and picks up a
+verdict whose resume died before consuming it. Two servers racing on one session
+resolve through the lease and the verdict's conditional write — one winner, no
+new coordination. Turn it off with
+`{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
+`startWatcher({ sweepMs })` yourself.
 
 ## Use it from the client
 
@@ -96,7 +111,9 @@ await Support.deny(sessionId, 'too large');
 ```
 
 Nothing waits server-side while a session is parked — no process, no timer — so
-the request survives a deploy, and the verdict is what resumes the turn. A
+the request survives a deploy, and the verdict is what resumes the turn (give
+the agent a `budget.approval` in ms if an unanswered request should deny itself
+rather than wait forever). A
 denial is answered, not dropped: the model sees the refusal and routes around
 it. Who may answer is the session's owner by default; give the agent an
 `approve(ctx)` predicate to narrow that further.
@@ -128,9 +145,9 @@ lands in Milestone 3).
 
 Milestone 2 shipped the production core: the pi-ai provider (default), retry
 and error surfacing, approval gates, budgets and cost accounting, and DDP rate
-limits. Still deferred to Milestone 3: compaction, an automatic orphan-claim
-watcher (a turn abandoned by a server restart is recovered on the next `send`,
-not automatically), TypeBox validation of inline tool args, `Agent.method()`
-co-registration, and `Agent.ask()`.
+limits. Milestone 3 is in progress and has added compaction, an interrupt that
+cancels the provider request, and the orphan-claim watcher with approval
+timeouts. Still to come in it: TypeBox validation of inline tool args,
+`Agent.method()` co-registration, and `Agent.ask()`.
 
 See `docs/superpowers/specs/` for the full design.

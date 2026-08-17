@@ -6,4 +6,5 @@ import './capped.test';
 import './tools.test';
 import './lease.test';
 import './loop.test';
+import './watcher.test';
 import './integration.server';
