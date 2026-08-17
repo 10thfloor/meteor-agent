@@ -144,3 +144,18 @@ M3 Task 4: complete (c4dabf1, 159+1). Minimal structural validator (probe: pi-ai
   FINAL-REVIEW DECISION NEEDED: minimal checker accepts $ref/oneOf/unions unconditionally — "validated"
   != "JSON Schema validated"; documented, escape hatch via setToolArgsValidator.
   Controller fixed inline: retrying-phase sampler flake (Math.random pinned for the window).
+M3 Task 5: complete (b13d927, 170+1). ask() with finally-cleanup; client stop() asserted inside the
+  live round trip (rate-limit budget documented in integration.client.ts); rateLimit.interrupts.
+  Noted: ask has no wall-clock timeout (maxIterations+budgets are the brake); a crash mid-ask leaves
+  a throwaway session the watcher sweeps once — single path where a throwaway outlives its call.
+M3 Task 6: complete (177+1 server, 1 client). verify-build.sh: production bundle proves branch 1
+  (bare import) FAILS with ERR_MODULE_NOT_FOUND and branch 2 (file:// URL) wins; branch 3 (temp shim)
+  also verified live. FINDING: app never had `10thfloor:agent` in .meteor/packages, so every prior
+  `meteor build` shipped zero agent code — added, script now fails early without it.
+  FINDING (real bug): pi-ai's Usage is required on a replayed AssistantMessage and its context
+  estimator derefs it unguarded (utils/estimate.js:4 via api/simple-options.js:6) — every turn after
+  the first threw before the HTTP call on the real Anthropic path; toPiAiRequest now stamps a zero
+  usage (zero so pi-ai falls back to its char estimate rather than a fabricated window).
+  createPiAiProvider gained an options seam (signal written last, loop keeps cancellation).
+  FINAL-REVIEW DECISION NEEDED: the probe is a hand-kept PORT of loader.ts, guarded only by a marker
+  grep — logic drift in loader.ts would not be caught.

@@ -232,6 +232,31 @@ import { mockProvider } from 'meteor/10thfloor:agent';
 Support.define({ model: 'mock', instructions: '…', provider: mockProvider(() => ({ text: 'hi' })) });
 ```
 
+## Verifying a production build
+
+`meteor build` relocates your app's npm dependencies to
+`programs/server/npm/node_modules`, which is not on Node's bare-specifier
+resolution path — the reason this package resolves pi-ai through its own loader
+rather than a plain `import`. That path is not exercised by the test suite,
+which runs against a dev tree, so there is a script for it:
+
+```bash
+./scripts/verify-build.sh
+```
+
+It builds the app server-only into a temp directory, runs `npm install` inside
+the bundle, and re-runs the loader's resolution chain against the real bundle
+layout — reporting which of its three branches (bare import, absolute-file-URL
+import, temp-dir shim) wins there and asserting pi-ai's namespace, `Type` and
+`builtinModels()` all load. It needs no Mongo, no API key and no port, exits
+non-zero on any failure, and cleans up after itself. Budget ~3-5 minutes;
+`meteor build` is nearly all of it. Run it in CI and before a release, not as
+part of `meteor test-packages`.
+
+Your app must `meteor add 10thfloor:agent` for this to verify anything — a
+bundle built without it contains no agent code, and the script fails early
+saying so.
+
 ## Anonymous sessions
 
 Sessions started without a login carry `userId: null` and behave as
@@ -254,8 +279,8 @@ limits. Milestone 3 is in progress and has added compaction, an interrupt that
 cancels the provider request, the orphan-claim watcher with approval timeouts,
 the finished tool surface — `Agent.method()` co-registration and validated
 tool arguments — plus `Agent.ask()` for headless one-shots and agent
-composition, client teardown via `stop()`, and rate limiting for
-`agent.interrupt`. Still to come in it: the production-bundle verification
-sweep.
+composition, client teardown via `stop()`, rate limiting for
+`agent.interrupt`, and the production-bundle verification sweep
+(see **Verifying a production build**).
 
 See `docs/superpowers/specs/` for the full design.

@@ -22,3 +22,5 @@ ddp-common
 check
 random
 meteortesting:mocha
+
+10thfloor:agent

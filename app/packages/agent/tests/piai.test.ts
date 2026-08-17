@@ -257,12 +257,19 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
       },
     };
     const controller = new AbortController();
-    const provider = createPiAiProvider(async () => fakeModels as any);
+    const stale = new AbortController();
+    // The options seam merges UNDER the signal: cancellation belongs to the
+    // loop's per-attempt controller and no configured option may displace it.
+    const provider = createPiAiProvider(
+      async () => fakeModels as any,
+      { apiKey: 'k', signal: stale.signal },
+    );
     for await (const _c of provider.stream({ ...streamReq, signal: controller.signal })) {
       /* drain */
     }
     assert.strictEqual(seen[0]?.signal, controller.signal,
       'the loop\'s per-attempt signal must reach pi-ai, or an abort stops only the reading');
+    assert.equal(seen[0]?.apiKey, 'k', 'configured options must reach streamSimple');
   });
 
   it('maps pi-ai\'s `aborted` stream error to the abandon hint, not a fatal', async function () {
@@ -300,6 +307,163 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
     } catch (e) { threw = e; }
     assert.instanceOf(threw, Error);
     assert.strictEqual(threw.retryable, true, 'a 503 should carry an explicit retryable hint');
+  });
+});
+
+describe('Anthropic converter request body (injected fetch, no network)', () => {
+  // The mapping tests above stop at pi-ai's `Context`. Everything after that —
+  // `tool_result` blocks, `is_error`, `input_schema`, the system block — is
+  // pi-ai's own Anthropic converter, and a mistake there is invisible until a
+  // real request is rejected. `ProviderRequestOptions` (dist/types.d.ts:49-59)
+  // makes that reachable offline:
+  //
+  //     export interface ProviderRequestOptions<TModel = Model<Api>> {
+  //         signal?: AbortSignal;
+  //         ...
+  //         apiKey?: string;
+  //         /**
+  //          * Optional fetch implementation for provider HTTP requests.
+  //          * Defaults to `globalThis.fetch`. ...
+  //          */
+  //         fetch?: FetchFunction;
+  //
+  // `ModelsSimpleStreamOptions` extends it (models.d.ts:46), and the Anthropic
+  // adapter hands the option straight to the SDK client it constructs
+  // (api/anthropic-messages.js:371 -> createClient(..., options?.fetch, ...)),
+  // so the injected fetch sees the finished HTTP request. `createPiAiProvider`
+  // grew a second `options` argument for exactly this — the loop still passes
+  // none.
+  //
+  // RESPONSE SHAPE: the fake fetch replies 400 with Anthropic's own error JSON.
+  // The stream therefore terminates immediately with an `error` event, which
+  // the adapter turns into a throw — by design. The assertions are about the
+  // captured REQUEST; a hand-rolled SSE success body would add a second thing
+  // to get wrong and prove nothing extra. 400 (not 429/5xx) so the SDK's own
+  // retry policy does not re-issue the request.
+
+  async function captureBody(request: ProviderRequest) {
+    const all: any = await loadPiAi('providers/all');
+    const models = all.builtinModels();
+    const bodies: any[] = [];
+    const fakeFetch = async (_url: any, init: any) => {
+      bodies.push(JSON.parse(String(init.body)));
+      return new Response(
+        JSON.stringify({
+          type: 'error',
+          error: { type: 'invalid_request_error', message: 'captured by test fetch' },
+        }),
+        { status: 400, headers: { 'content-type': 'application/json' } },
+      );
+    };
+    const provider = createPiAiProvider(
+      async () => models as any,
+      { apiKey: 'test-key', fetch: fakeFetch },
+    );
+    let threw: any = null;
+    try {
+      for await (const _c of provider.stream(request)) { /* drain */ }
+    } catch (e) { threw = e; }
+    return { body: bodies[0], calls: bodies.length, threw };
+  }
+
+  const errorTurn: ProviderRequest = {
+    model: 'anthropic/claude-sonnet-5',
+    system: 'be terse',
+    messages: [
+      { role: 'user', content: 'hi' },
+      { role: 'assistant', content: 'checking', toolCalls: [{ id: 't1', name: 'look', args: { q: 1 } }] },
+      { role: 'tool', toolCallId: 't1', content: '{"error":"denied"}', isError: true },
+    ],
+    tools: [{
+      name: 'look',
+      description: 'Look something up',
+      parameters: { type: 'object', properties: { q: { type: 'number' } }, required: ['q'] },
+    }],
+  };
+
+  it('sends system, an is_error tool_result, and input_schema-shaped tools', async function () {
+    this.timeout(30000);
+    const { body, calls, threw } = await captureBody(errorTurn);
+    assert.equal(calls, 1, 'exactly one HTTP request, not a retry storm');
+    assert.instanceOf(threw, Error, 'the 400 terminates the stream as a throw');
+    assert.isObject(body, 'no request body was captured');
+
+    assert.equal(body.model, 'claude-sonnet-5');
+    assert.isTrue(body.stream);
+
+    // `system` is present and carries the prompt. Anthropic accepts either a
+    // string or a block array; pi-ai sends blocks (so it can cache-control it),
+    // so assert on the text rather than the container.
+    assert.isDefined(body.system, 'system prompt dropped on the floor');
+    const systemText = typeof body.system === 'string'
+      ? body.system
+      : body.system.map((b: any) => b.text).join('');
+    assert.equal(systemText, 'be terse');
+
+    // The assistant's tool call becomes a tool_use block...
+    assert.deepEqual(body.messages.map((m: any) => m.role), ['user', 'assistant', 'user']);
+    const toolUse = body.messages[1].content.find((b: any) => b.type === 'tool_use');
+    assert.deepEqual(
+      { id: toolUse.id, name: toolUse.name, input: toolUse.input },
+      { id: 't1', name: 'look', input: { q: 1 } },
+    );
+
+    // ...and the failed result comes back as a USER-role tool_result block with
+    // is_error: true. This is the whole point of threading `isError` through
+    // the loop: without it Anthropic is told the tool succeeded and the model
+    // has to infer failure from the payload's prose.
+    const toolResult = body.messages[2].content.find((b: any) => b.type === 'tool_result');
+    assert.isDefined(toolResult, 'no tool_result block in the request');
+    assert.equal(toolResult.tool_use_id, 't1');
+    assert.isTrue(toolResult.is_error, 'a failed tool result must be flagged is_error');
+    assert.include(JSON.stringify(toolResult.content), 'denied');
+
+    // Tools use Anthropic's `name` / `input_schema` spelling, not pi-ai's
+    // `name` / `parameters`.
+    assert.lengthOf(body.tools, 1);
+    assert.equal(body.tools[0].name, 'look');
+    assert.equal(body.tools[0].description, 'Look something up');
+    assert.isUndefined(body.tools[0].parameters, 'pi-ai\'s spelling must not leak to the wire');
+    assert.deepEqual(body.tools[0].input_schema, {
+      type: 'object', properties: { q: { type: 'number' } }, required: ['q'],
+    });
+  });
+
+  it('marks a successful tool result WITHOUT is_error', async function () {
+    this.timeout(30000);
+    const { body } = await captureBody({
+      ...errorTurn,
+      messages: [
+        ...errorTurn.messages.slice(0, 2),
+        { role: 'tool', toolCallId: 't1', content: '{"found":true}' },
+      ],
+    });
+    const toolResult = body.messages[2].content.find((b: any) => b.type === 'tool_result');
+    assert.notEqual(toolResult.is_error, true, 'a successful result must not claim failure');
+  });
+
+  it('builds a request at all when history contains a replayed assistant message', async function () {
+    this.timeout(30000);
+    // Regression. pi-ai's `Usage` is REQUIRED on an AssistantMessage and its
+    // context estimator dereferences it unguarded (utils/estimate.js:4, reached
+    // from api/simple-options.js:6 on the way into every request). A replayed
+    // assistant row without one threw
+    // "Cannot read properties of undefined (reading 'totalTokens')" before any
+    // HTTP call — so every turn after the first died on the real Anthropic
+    // path, while the faux-provider tests, which never build request options,
+    // stayed green. `toPiAiRequest` now stamps a zero usage.
+    const { body, threw } = await captureBody(errorTurn);
+    assert.isObject(body, `no request was built: ${threw && threw.message}`);
+    assert.notInclude(String(threw && threw.message), 'totalTokens');
+    // Zero rather than fabricated: pi-ai ignores a zero-token usage and falls
+    // back to its own character estimate, so max_tokens is clamped against an
+    // estimate, not against a number this adapter invented.
+    const replayed = toPiAiRequest(errorTurn, 0).context.messages[1] as any;
+    assert.deepEqual(replayed.usage, {
+      input: 0, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0,
+      cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+    });
+    assert.isAbove(body.max_tokens, 0);
   });
 });
 
