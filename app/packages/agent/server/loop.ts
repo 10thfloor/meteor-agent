@@ -577,11 +577,27 @@ async function compactNow(
   const upto = findCompactionCut(history, keep);
   if (upto === null) return false;
   // Phase-guarded, not just lease-guarded: `guardedUpdate` filters on the
-  // lease only, so without the $ne a stop landing right before this write
+  // lease only, so without the $nin a stop landing right before this write
   // would be silently overwritten — the same interrupt-erasure hole the M2
   // retry branch had, widened here to a full provider round trip.
+  //
+  // `awaiting` and `error` join `stopped` as defence in depth behind
+  // `compactSession`'s own refusals: all three are DECISIONS, and overwriting
+  // one with `compacting` would leave the finally to "restore" a phase that
+  // no longer describes the session (an unanswerable pending verdict, a
+  // laundered failure). It is inert on the automatic path, which is the point
+  // of a backstop — `maybeCompact`'s only call site is inside `runTurn`'s
+  // iteration loop, after the head's `phase === 'stopped'` return and after
+  // the pending-gate that returns on `awaiting`, with `error` terminal (the
+  // loop returns on it, and only a send clears it). The phase there is `idle`
+  // on the first iteration and `streaming`/`calling` on later ones — never
+  // one of these three.
   const entered = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
+    {
+      _id: sessionId,
+      'lease.serverId': SERVER_ID,
+      phase: { $nin: ['stopped', 'awaiting', 'error'] },
+    } as any,
     { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
   );
   if (entered !== 1) return false;
@@ -668,10 +684,30 @@ async function compactNow(
 /**
  * What a manual compaction did. A plain union rather than a throw, because this
  * module is deliberately free of the Meteor namespace — `Agent.compact` turns
- * `busy` into `Meteor.Error('busy')` and `gone` into `no-session`, and the
- * client sees those.
+ * every REFUSING outcome into `Meteor.Error('busy')` and `gone` into
+ * `no-session`, and the client sees those.
  */
-export type CompactOutcome = 'compacted' | 'nothing' | 'busy' | 'gone';
+export type CompactOutcome =
+  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone';
+
+/**
+ * The refusing outcomes, and the `reason` each one carries.
+ *
+ * One error CODE (`busy`) across all three, because that is the contract
+ * `Agent.compact` and `agent.compact` already published and every client
+ * branches on — but three distinct reasons, because "a turn is running",
+ * "answer the approval first" and "this session failed" are three different
+ * things for a person to do next, and a UI that only ever sees `busy` would
+ * tell all three of them to wait a moment.
+ *
+ * Here rather than duplicated at the two call sites, which is exactly how the
+ * two would drift.
+ */
+export const COMPACT_REFUSALS: Partial<Record<CompactOutcome, string>> = {
+  busy: 'This session is running a turn; compact it when it is idle.',
+  awaiting: 'This session is waiting on an approval; answer it before compacting.',
+  errored: 'This session has failed; send to it again before compacting.',
+};
 
 /**
  * §9's compaction step, run ON DEMAND against an idle session — the whole point
@@ -699,6 +735,15 @@ export type CompactOutcome = 'compacted' | 'nothing' | 'busy' | 'gone';
  * `runTurn`'s exact rule — `stopped`, `error` and `awaiting` are decisions and
  * are left alone; anything else returns to `idle`, which is what an idle
  * session that was compacted goes back to being.
+ *
+ * `awaiting` and `error` are refused on the way IN for the same reason the
+ * finally leaves them alone on the way out. Neither is leased — a parked run
+ * releases its lease, and a failed one is long gone — so the lease check below
+ * cannot see them, and without their own guard a compaction would overwrite
+ * the phase with `compacting` and the finally would then "restore" `idle`: an
+ * approval nobody can answer any more (`recordVerdict` and the watcher sweep
+ * both require `awaiting`, and the next send's overtaken-park branch DELETES
+ * the parked turn), or a failure laundered into a healthy-looking session.
  */
 export async function compactSession(
   sessionId: string, config: RunConfig,
@@ -707,6 +752,12 @@ export async function compactSession(
 
   const session = await AgentSessions.findOneAsync(sessionId);
   if (!session) return 'gone';
+  // An approval is a DECISION, not a state to tidy: a human is being asked
+  // something, and the only two answers are approve and deny.
+  if (session.phase === 'awaiting') return 'awaiting';
+  // A terminal failure is STATUS a UI gates on — a banner, a retry button, an
+  // alert. Compaction is bookkeeping; it must not launder one into `idle`.
+  if (session.phase === 'error') return 'errored';
   // A live lease is another server's turn (or ours, mid-wind-down). An EXPIRED
   // one is an orphan the watcher will re-run: `claimLease` would take it, and
   // compacting an abandoned turn's half-written transcript is not this call's
@@ -1030,7 +1081,11 @@ async function dispatchCalls(
         _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
         toolCallId: call.id,
         content: toolResultContent(denied, limits.maxResultChars),
-        error: denied.error,
+        // Guarded like the other two row writes: a hook may turn this refusal
+        // into a SUCCESS, and an unguarded write would then stamp `error` onto
+        // a row whose `ok` says otherwise (`ToolResult` carries `error` only on
+        // the failing arm, but a hook is app code and hands back what it likes).
+        error: denied.ok ? undefined : denied.error,
         createdAt: new Date(),
       } as any);
       continue;

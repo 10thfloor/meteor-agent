@@ -47,6 +47,20 @@ const seedLong = async (sessionId: string, agent: string) => {
   }
 };
 
+/** The resume an approval schedules is deferred and exposes no promise to
+ *  await, so the wait is bounded by a deadline and fails loudly rather than
+ *  hanging the suite. */
+const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await cond()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => { setTimeout(r, 25); });
+  }
+};
+
 const SKILLS = [
   { name: 'refunds', description: 'How to process a refund.', content: 'REFUND-BODY-MARKER' },
   { name: 'shipping', description: 'When parcels arrive.', content: 'SHIPPING-BODY-MARKER' },
@@ -511,6 +525,175 @@ describe('hooks', () => {
     );
     assert.isDefined(reply, 'a broken extension must not kill the turn');
     assert.equal((await AgentSessions.findOneAsync('hk-throw'))!.phase, 'idle');
+  });
+
+  /**
+   * The seam's contract is "nothing reaches a row unseen", and a turn writes
+   * tool rows from THREE places: the streaming dispatch (covered above), the
+   * `canUse` refusal that never dispatched at all, and the resume an approval
+   * wakes. The two below are those other two — a redaction hook that covered
+   * only the first would be a footgun rather than a guarantee, and a hook that
+   * could be dodged by parking a call is no gate at all.
+   */
+  it('afterToolResult sees a canUse refusal, and its rewrite is what the row carries', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    const observed: any[] = [];
+    let ran = false;
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'd1', name: 'forbidden', args: { amt: 1 } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        for (const ch of 'moved on') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+
+    await seed('hk-denied', 'do the forbidden thing', 'support');
+    try {
+      // A rewrite that flips the arm as well as the text: an app turning the
+      // harness's blunt `not-allowed` into a house-style answer is the obvious
+      // use, and it is also what proves the row's `error` is written from the
+      // POST-hook result — an unguarded write would stamp `not-allowed` onto a
+      // row whose content now says it succeeded.
+      Agent.hook('afterToolResult', (result, call, ctx) => {
+        observed.push({ result, call, ctx });
+        return { ok: true, value: 'REWRITTEN-BY-HOOK' };
+      });
+      await runTurn('hk-denied', {
+        model: 'mock',
+        system: '',
+        tools: [{
+          name: 'forbidden',
+          description: 'x',
+          // Gated as well as forbidden: §7's backstop must refuse BEFORE the
+          // gate, so this call reaches the hook rather than parking.
+          gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { ran = true; return 'never'; },
+        }],
+        canUse: async (tool) => tool !== 'forbidden',
+        provider: scripted,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    assert.isFalse(ran, 'a forbidden tool must not run');
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 'hk-denied', role: 'tool' } as any,
+    ))!;
+    assert.include((row as any).content, 'REWRITTEN-BY-HOOK', 'the ROW must carry the rewrite');
+    assert.notInclude((row as any).content, 'may not use');
+    assert.isUndefined(
+      (row as any).error,
+      'the rewritten result says ok — the row must not still claim not-allowed',
+    );
+
+    // And the hook was handed the harness's own refusal, unabridged.
+    assert.lengthOf(observed, 1);
+    assert.isFalse(observed[0].result.ok);
+    assert.equal(observed[0].result.error.error, 'not-allowed');
+    assert.include(observed[0].result.error.reason, 'forbidden');
+    assert.deepEqual(observed[0].call, { id: 'd1', name: 'forbidden', args: { amt: 1 } });
+    assert.deepEqual(observed[0].ctx, {
+      agent: 'support', sessionId: 'hk-denied', userId: 'u1',
+    });
+  });
+
+  it('afterToolResult runs on the resume an approval wakes, so parking cannot dodge it', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent, buildRunConfig } = await import('../server/registry');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const observed: any[] = [];
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'p1', name: 'lookup', args: { id: 7 } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        for (const ch of 'finished') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+
+    // Registered, because approve resumes through the REGISTRY config: the
+    // tools and provider the method finds must be the ones that parked.
+    new Agent('hk-gate').define({
+      model: 'mock',
+      instructions: '',
+      provider: scripted,
+      tools: [{
+        name: 'lookup',
+        description: 'x',
+        gate: 'ask',
+        args: { type: 'object', properties: {} },
+        run: async () => ({ card: '4111111111111111' }),
+      }],
+    });
+    await seed('hk-gate-session', 'look it up', 'hk-gate');
+    await runTurn('hk-gate-session', buildRunConfig(getAgent('hk-gate')!, 'u1'));
+    assert.equal(
+      (await AgentSessions.findOneAsync('hk-gate-session'))!.phase, 'awaiting',
+      'the fixture must actually park',
+    );
+
+    try {
+      Agent.hook('afterToolResult', (result, call, ctx) => {
+        observed.push({ result, call, ctx });
+        return {
+          ok: true,
+          value: JSON.stringify(result.value).replace(/4111\d+/, '[REDACTED]'),
+        };
+      });
+      const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+      await approve.call({ userId: 'u1', unblock() {} }, 'hk-gate', 'hk-gate-session');
+      await waitFor(
+        async () => !!(await AgentMessages.findOneAsync(
+          { sessionId: 'hk-gate-session', role: 'tool', toolCallId: 'p1' } as any,
+        )),
+        'the approved call to be answered',
+      );
+    } finally {
+      Agent.clearHooks();
+    }
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 'hk-gate-session', role: 'tool', toolCallId: 'p1' } as any,
+    ))!;
+    assert.include((row as any).content, '[REDACTED]', 'the resumed row must carry the rewrite');
+    assert.notInclude(
+      (row as any).content, '4111111111111111',
+      'a redaction hook must not be dodgeable by parking the call',
+    );
+    assert.lengthOf(observed, 1);
+    assert.deepEqual(observed[0].result, { ok: true, value: { card: '4111111111111111' } });
+    assert.deepEqual(observed[0].call, { id: 'p1', name: 'lookup', args: { id: 7 } });
+    assert.deepEqual(observed[0].ctx, {
+      agent: 'hk-gate', sessionId: 'hk-gate-session', userId: 'u1',
+    });
   });
 
 });

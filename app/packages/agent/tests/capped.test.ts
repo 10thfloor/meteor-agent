@@ -383,6 +383,65 @@ describe('applyRateLimits', () => {
     );
   });
 
+  it('adds fourteen rules when compacts joins the other four entries', async () => {
+    // `compacts` governs ONE method, so it adds the plain two — 12 + 2. It gets
+    // an entry of its own rather than sharing `sends` because both buy a
+    // provider round trip but an operator tunes them apart: a compaction is
+    // bookkeeping a UI fires rarely, a send is the product.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
+        approvals: { count: HEADROOM, intervalMs: 10000 },
+        compacts: { count: HEADROOM, intervalMs: 10000 },
+      },
+    });
+    assert.equal(added, 14);
+  });
+
+  it('a compacts entry registers rules scoped to agent.compact', async () => {
+    // The limit exists because `agent.compact` is the one method besides
+    // `agent.send` whose every accepted call buys a provider round trip, with
+    // no turn budget in front of it — so it must be its own rule, not a
+    // side effect of some other entry.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mCompact,
+      userId: 'rl-user-comp', connectionId: 'rl-conn-comp', clientAddress: '127.0.0.1',
+    };
+    const sendInput = { ...input, name: NAMES.mSend };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    const sendBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
+
+    applyRateLimits({ rateLimit: { compacts: { count: HEADROOM, intervalMs: 60000 } } });
+
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(input)).length,
+      before.length,
+      'the entry must match a real agent.compact invocation',
+    );
+    assert.equal(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput)).length,
+      sendBefore.length,
+      'a compacts entry must not add rules to agent.send',
+    );
+  });
+
+  it('throws naming the field for a malformed compacts entry', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { compacts: { count: 3, intervalMs: -1 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a negative intervalMs must throw');
+    assert.include(threw.message, 'compacts.intervalMs');
+  });
+
   it('throws naming the field for a malformed approvals entry', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     let threw: any;

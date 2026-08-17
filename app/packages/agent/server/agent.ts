@@ -5,7 +5,7 @@ import {
   defineAgent, getAgent, buildRunConfig, registerProvider, type AgentConfig,
 } from './registry';
 import type { Provider } from './providers/types';
-import { compactSession, runTurn } from './loop';
+import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
@@ -184,7 +184,11 @@ export class Agent {
    *
    * `Meteor.Error('busy')` when a turn is running or the session is leased: a
    * compaction writes to the transcript exactly as a turn does, so the two must
-   * not overlap. Wait for `status()` to be `idle` and call again.
+   * not overlap. Wait for `status()` to be `idle` and call again. The same
+   * `busy` — with its own `reason` — refuses a session that is `awaiting` an
+   * approval or sitting in `error`: both are decisions a person makes, and
+   * compaction is bookkeeping that must not overwrite either (see
+   * `compactSession`).
    *
    * The threshold is the only thing skipped. Everything else is the automatic
    * path: the same batch-safe cut, the same summarizer prompt through the same
@@ -211,11 +215,8 @@ export class Agent {
     const outcome = await compactSession(
       sessionId, buildRunConfig(config, session.userId),
     );
-    if (outcome === 'busy') {
-      throw new Meteor.Error(
-        'busy', 'This session is running a turn; compact it when it is idle.',
-      );
-    }
+    const refusal = COMPACT_REFUSALS[outcome];
+    if (refusal) throw new Meteor.Error('busy', refusal);
     if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
     return outcome === 'compacted';
   }

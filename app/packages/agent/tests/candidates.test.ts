@@ -28,6 +28,20 @@ const recorder = (answer: (req: ProviderRequest) => string) => {
   return { provider, requests };
 };
 
+/** Deferred work (the resume an approval schedules) exposes no promise to
+ *  await, so every wait here is bounded by a deadline and fails loudly rather
+ *  than hanging the suite. */
+const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await cond()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => { setTimeout(r, 25); });
+  }
+};
+
 /** Capture `console.warn` for the duration of `fn`. Restored in a `finally`, so
  *  a failing assertion cannot leave the suite without a working warn. */
 const captureWarn = async (fn: () => Promise<void> | void): Promise<string[]> => {
@@ -116,13 +130,13 @@ describe('manual compaction (Agent.compact)', () => {
   /** Five padded messages under a threshold so high the automatic path can
    *  never fire — the only thing that can compact this session is a manual
    *  call, which is exactly what these tests are about. */
-  const seed = async (sessionId: string) => {
+  const seed = async (sessionId: string, agent = 'compact-test') => {
     const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
     await AgentSessions.removeAsync({ _id: sessionId } as any);
     await AgentMessages.removeAsync({ sessionId });
     await AgentDeltas.removeAsync({ sessionId });
     await AgentSessions.insertAsync({
-      _id: sessionId, agent: 'compact-test', userId: 'u1', phase: 'idle', model: 'mock',
+      _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
       nextSeq: 5, usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
       createdAt: new Date(), updatedAt: new Date(),
@@ -238,6 +252,137 @@ describe('manual compaction (Agent.compact)', () => {
       await AgentMessages.find({ sessionId: 's-manual-busy', role: 'note' } as any).countAsync(),
       0,
       'a refused compaction writes nothing at all',
+    );
+  });
+
+  it('refuses a session parked on an approval, and the verdict still resolves it', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+    const { NAMES } = await import('../common/names');
+
+    // A parked run holds NO lease — it releases it when it parks — so the
+    // `busy` check above cannot see this session. Without a phase guard the
+    // compaction would write `compacting` over `awaiting` and its finally would
+    // restore `idle`: `recordVerdict` requires `awaiting`, so the pending
+    // approval would become unanswerable, and the next send's overtaken-park
+    // branch would DELETE the parked turn.
+    await seed('s-compact-park', 'compact-park');
+    const requests: ProviderRequest[] = [];
+    let toolRan = 0;
+    let calls = 0;
+    const provider: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        calls += 1;
+        if (calls === 1) {
+          yield {
+            kind: 'done',
+            toolCalls: [{ id: 'gp1', name: 'refund', args: { amt: 5 } }],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        for (const ch of 'all done') yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+    const parking = new Agent('compact-park').define({
+      model: 'mock',
+      instructions: 'be helpful',
+      provider,
+      tools: [{
+        name: 'refund',
+        description: 'x',
+        gate: 'ask',
+        args: { type: 'object', properties: {} },
+        run: async () => { toolRan += 1; return { did: 'refund' }; },
+      }],
+      // keep=2 against a six-message transcript: there IS a legal cut here, so
+      // the refusal below is a refusal and not a disguised `nothing`.
+      context: { window: 1_000_000, compactAt: 0.99, keep: 2 },
+    });
+
+    await runTurn('s-compact-park', buildRunConfig(getAgent('compact-park')!, 'u1'));
+    const parked = (await AgentSessions.findOneAsync('s-compact-park'))!;
+    assert.equal(parked.phase, 'awaiting', 'the fixture must actually park');
+    assert.isNotOk(parked.lease, 'and a parked run holds no lease — hence the phase guard');
+
+    let threw: any;
+    try {
+      await parking.compact('s-compact-park');
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'compacting a parked session must refuse, not proceed');
+    assert.equal(threw.error, 'busy', 'the published error code is unchanged');
+    assert.include(
+      threw.reason, 'approval',
+      'and its reason must say WHICH kind of busy — a person has an answer to give',
+    );
+
+    const after = (await AgentSessions.findOneAsync('s-compact-park'))!;
+    assert.equal(after.phase, 'awaiting', 'the phase a UI gates its approval bar on must stand');
+    assert.deepInclude(
+      after.pending as any, { toolCallId: 'gp1', name: 'refund' },
+      'the pending request must survive untouched',
+    );
+    assert.lengthOf(requests, 1, 'a refused compaction spends no model call');
+    assert.equal(
+      await AgentMessages.find(
+        { sessionId: 's-compact-park', role: 'note' } as any,
+      ).countAsync(),
+      0, 'and writes nothing',
+    );
+
+    // The whole point of refusing: the approval is still answerable, end to end.
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1', unblock() {} }, 'compact-park', 's-compact-park');
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync(
+        { sessionId: 's-compact-park', role: 'assistant', content: 'all done' } as any,
+      )),
+      'the approved turn to resume and finish',
+    );
+    assert.equal(toolRan, 1, 'the approved tool must run exactly once');
+    const done = (await AgentSessions.findOneAsync('s-compact-park'))!;
+    assert.isUndefined(done.pending, 'the verdict is spent');
+    assert.equal(done.phase, 'idle');
+  });
+
+  it('refuses an errored session rather than laundering it back to idle', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // `error` is terminal STATUS — a banner, a retry button, an alert someone
+    // is paged by — and it is unleased exactly like a parked session. Compaction
+    // is bookkeeping; the finally that restores `idle` would silently clear it.
+    await seed('s-compact-errored');
+    await AgentSessions.updateAsync('s-compact-errored', {
+      $set: { phase: 'error', updatedAt: new Date() },
+    } as any);
+
+    const { provider, requests } = recorder(() => 'BRIEF');
+    let threw: any;
+    try {
+      await define(provider).compact('s-compact-errored');
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'an errored session must refuse');
+    assert.equal(threw.error, 'busy');
+    assert.include(threw.reason, 'failed', 'the reason must name the terminal state');
+
+    const after = (await AgentSessions.findOneAsync('s-compact-errored'))!;
+    assert.equal(after.phase, 'error', 'the failure must still be visible to a UI');
+    assert.isNotOk(after.lease, 'and no lease may be left behind by a refusal');
+    assert.lengthOf(requests, 0, 'no model call is spent on a refusal');
+    assert.equal(
+      await AgentMessages.find(
+        { sessionId: 's-compact-errored', role: 'note' } as any,
+      ).countAsync(),
+      0,
     );
   });
 

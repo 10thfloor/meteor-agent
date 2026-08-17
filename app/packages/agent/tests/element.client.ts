@@ -242,4 +242,41 @@ describe('<agent-chat>', () => {
       committed(again, 'assistant').includes('live streamed reply'));
     assert.include(committed(again, 'user'), 'hello');
   });
+
+  it('renders message text as TEXT — markup in a transcript is never parsed', async function () {
+    this.timeout(60000);
+    // Reuses the streaming test's session rather than starting a new one, per
+    // the budget note at the top of this file: this costs the shared
+    // rate-limit counter one `agent.send` and no `agent.start`.
+    assert.isString(streamedSession, 'this test replays the streaming test\'s session');
+
+    // Every transcript string reaches the DOM through `textContent`
+    // (client/element.ts), and this is the assertion that keeps it that way: a
+    // single `innerHTML =` anywhere in `renderRow` turns a chat bubble into an
+    // XSS sink, and the content is attacker-influenced by definition — it is
+    // whatever a user typed or a model (or a tool result) echoed back.
+    const PAYLOAD = '<img src=x onerror="window.__xss=1"><script>window.__xss=1</script>';
+    const el = mount({ agent: 'itest', 'session-id': streamedSession! });
+    await waitFor('the transcript to arrive over DDP', 30000, () =>
+      committed(el, 'assistant').includes('live streamed reply'));
+
+    say(el, PAYLOAD);
+    await waitFor('the payload to render as a user bubble', 30000, () =>
+      committed(el, 'user').includes(PAYLOAD));
+
+    // Verbatim, in the row's TEXT: nothing was stripped or escaped away
+    // either — an element that silently ate the markup would be a different
+    // bug, and just as wrong.
+    const row = partsAll(el, 'user').find((n) => n.textContent === PAYLOAD);
+    assert.isDefined(row, 'the raw text must survive verbatim in the row');
+
+    assert.lengthOf(
+      el.shadowRoot!.querySelectorAll('img, script'), 0,
+      'markup in a message must never become nodes in the shadow tree',
+    );
+    assert.isUndefined(
+      (window as any).__xss,
+      'and nothing in it may execute — no onerror, no inline script',
+    );
+  });
 });

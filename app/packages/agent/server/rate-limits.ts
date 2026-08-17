@@ -39,6 +39,22 @@ interface AgentPackageSettings {
      * refuses.
      */
     approvals?: RateLimitEntry;
+    /**
+     * `agent.compact`. The one method besides `send` whose every ACCEPTED call
+     * buys a provider round trip — a summarization over the whole compactable
+     * head, which on a long transcript is a bigger request than most turns —
+     * and it is reachable by exactly the same unauthenticated capability-URL
+     * caller. Left unlimited it is a cheaper `send`: no turn budget applies to
+     * it (a compaction is not a turn), so `budget.spend` is the only backstop
+     * behind it, and a flood aimed at an idle session bills a model call per
+     * call until that cap trips.
+     *
+     * Refusing while busy is not a substitute for a limit: a refusal is cheap
+     * for the ATTACKER too, and it still costs a session read — and between
+     * two turns a session is idle, which is exactly when the expensive branch
+     * is the one that runs.
+     */
+    compacts?: RateLimitEntry;
   };
 }
 
@@ -120,9 +136,9 @@ function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): n
  * A missing/empty settings path (no `packages['10thfloor:agent']`, or no
  * `rateLimit` on it) adds nothing and never throws, so a deployment that
  * hasn't configured rate limits still boots. A PRESENT but malformed entry —
- * any of `sends`, `starts`, `interrupts` or `approvals` given with a
- * non-positive-integer `count` or `intervalMs` — throws a plain `Error` naming
- * the offending field, so a typo
+ * any of `sends`, `starts`, `interrupts`, `approvals` or `compacts` given with
+ * a non-positive-integer `count` or `intervalMs` — throws a plain `Error`
+ * naming the offending field, so a typo
  * in settings.json fails startup loudly instead of silently shipping an
  * unenforced (or nonsensical) limit.
  */
@@ -155,6 +171,13 @@ export function applyRateLimits(settings: unknown): number {
     // `starts` has for start and fork.
     added += addRuleFor(NAMES.mApprove, rateLimit.approvals, 'approvals');
     added += addRuleFor(NAMES.mDeny, rateLimit.approvals, 'approvals');
+  }
+  if (rateLimit.compacts) {
+    // One method, one entry — the plain shape. `agent.compact` shares no
+    // budget with `sends` deliberately: they buy the same thing (a provider
+    // round trip) but an operator wants to tune them apart, since a compaction
+    // is bookkeeping a UI fires rarely and a send is the product.
+    added += addRuleFor(NAMES.mCompact, rateLimit.compacts, 'compacts');
   }
   return added;
 }

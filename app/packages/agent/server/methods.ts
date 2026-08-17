@@ -4,7 +4,7 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
-import { compactSession, runTurn } from './loop';
+import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
 
 /**
@@ -368,9 +368,9 @@ export function registerMethods(): void {
      *
      * The turn budget is untouched: a compaction is not a turn. Its
      * summarization call still accrues usage and cost like any other model
-     * call, so `budget.spend` remains the backstop — and `rateLimit` has no
-     * entry of its own for this yet (v3): it is authenticated-or-capability
-     * scoped, refuses while busy, and costs one model call.
+     * call, so `budget.spend` remains the backstop — and `rateLimit.compacts`
+     * is the front one: this is the second method (after `send`) whose every
+     * accepted call buys a provider round trip, so it gets a knob of its own.
      */
     async [NAMES.mCompact](this: any, agent: string, sessionId: string) {
       check(agent, String);
@@ -385,11 +385,10 @@ export function registerMethods(): void {
       const outcome = await compactSession(
         sessionId, buildRunConfig(config, session.userId),
       );
-      if (outcome === 'busy') {
-        throw new Meteor.Error(
-          'busy', 'This session is running a turn; compact it when it is idle.',
-        );
-      }
+      // One code, three reasons — `busy` also covers a session parked on an
+      // approval and one sitting in `error`. See `COMPACT_REFUSALS`.
+      const refusal = COMPACT_REFUSALS[outcome];
+      if (refusal) throw new Meteor.Error('busy', refusal);
       if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
       return outcome === 'compacted';
     },

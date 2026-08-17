@@ -82,6 +82,9 @@ nothing worth compacting (fewer than `keep` messages past the last note). It
 rejects with `busy` while a turn is running — a compaction writes to the
 transcript exactly as a turn does, so it takes the session's lease for the
 operation and the two never overlap; gate the button on `status(id) === 'idle'`.
+The same `busy` (with its own `reason`) refuses a session that is `awaiting` an
+approval or sitting in `error`: both are decisions — one a person still owes an
+answer to, one a UI gates on — and bookkeeping must not overwrite either.
 Everything except the threshold is the automatic path: same cut, same summarizer
 prompt through the same `beforeProviderRequest` hook, same usage and cost
 accrual, same silent degrade on failure. The transcript keeps every message, so
@@ -187,7 +190,8 @@ tries again. Your transcript UI should render three note kinds: `error`,
   "sends":      { "count": 10, "intervalMs": 60000 },
   "starts":     { "count": 5,  "intervalMs": 60000 },
   "interrupts": { "count": 30, "intervalMs": 60000 },
-  "approvals":  { "count": 30, "intervalMs": 60000 }
+  "approvals":  { "count": 30, "intervalMs": 60000 },
+  "compacts":   { "count": 5,  "intervalMs": 60000 }
 } } } }
 ```
 
@@ -199,7 +203,10 @@ multiply the allowance. Two entries govern two methods each: `starts` covers
 session, and `approvals` covers `agent.approve` and `agent.deny` — the same
 decision made two ways, and the one unauthenticated-reachable method that
 *resumes* a turn. Given separate knobs, `deny` would be the cheap way to hammer
-the path `approve` limits.
+the path `approve` limits. `compacts` covers `agent.compact`: besides `send` it
+is the only method whose every accepted call buys a provider round trip, and no
+turn budget applies to it, so an unlimited one is a cheaper `send` with
+`budget.spend` as its only backstop.
 
 **Recovery runs itself.** Every server starts a watcher at boot: it observes
 sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
