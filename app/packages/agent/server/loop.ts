@@ -415,14 +415,75 @@ export function estimateContext(
 }
 
 /**
+ * Walk a proposed transcript boundary BACKWARD until it is batch-safe, and
+ * return the adjusted boundary.
+ *
+ * `eligible` is a seq-sorted, NOTE-FREE message list; `boundary` is the index
+ * of the first message that will NOT be in the head (so `boundary ===
+ * eligible.length` means the head is everything). The head is what one side of
+ * the operation keeps: for compaction it is what gets summarized away, for a
+ * FORK it is what gets copied. Both need the same guarantee — the head must
+ * never contain an assistant's `tool_use` whose `tool_result` is on the other
+ * side of the boundary — so both call this, and the rule cannot drift between
+ * them.
+ *
+ * Batch safety cannot rely on row adjacency: a `send` queued while the session
+ * was `awaiting` puts a USER row between an assistant's toolCalls and its tool
+ * results, so walking back off tool rows alone would cut between them — a
+ * permanent 400 nothing can repair (the transcript itself is healthy; only the
+ * model's view of it is broken). So this uses the same turn-window machinery
+ * repair uses: if any assistant's window spans the boundary, the boundary moves
+ * to before that assistant.
+ */
+export function batchSafeBoundary(eligible: AgentMessage[], boundary: number): number {
+  let cut = Math.max(0, Math.min(boundary, eligible.length));
+  // The first seq NOT in the head — Infinity when the head is the whole list.
+  // That arm is reachable only from a fork (compaction always keeps a tail),
+  // and it is what makes an UNANSWERED batch fall out of the same rule: see
+  // `lastAnswerSeq` below.
+  const boundarySeq = () => (cut < eligible.length ? eligible[cut].seq : Infinity);
+  // Latest window first: moving the boundary earlier can only push it into
+  // EARLIER windows, so processing in reverse handles the cascade in one pass.
+  for (const w of [...turnWindows(eligible)].reverse()) {
+    const calls = w.assistant.toolCalls ?? [];
+    if (calls.length === 0) continue;
+    // A call with NO `tool_result` anywhere in its window has its answer
+    // "after everything" — Infinity — so a head that ends on such an assistant
+    // strands a `tool_use` exactly as a mid-batch cut would, and the same
+    // comparison pushes the boundary back past it. This is what makes forking
+    // an AWAITING session cut before the parked batch with no special case:
+    // the parked assistant is unanswered by construction.
+    //
+    // Compaction is unaffected in practice. Its boundary is never the end of
+    // the list (`keep >= 1` keeps a tail), and repair-on-entry deletes stranded
+    // assistants before a turn ever reaches `maybeCompact`, so the only
+    // unanswered assistant a live transcript can hold is a parked one at the
+    // tail — which is on the KEPT side, where this loop does not look.
+    const lastAnswerSeq = calls.every((c) => w.answered.has(c.id))
+      ? Math.max(
+        w.assistant.seq,
+        ...eligible
+          .filter((t) => t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd)
+          .map((t) => t.seq),
+      )
+      : Infinity;
+    // Window spans the boundary: the assistant is in the head while some of
+    // its results are (or would be) on the other side.
+    while (cut > 0 && w.assistant.seq < boundarySeq() && lastAnswerSeq >= boundarySeq()) {
+      cut -= 1;
+    }
+  }
+  return cut;
+}
+
+/**
  * The seq to compact up to (inclusive), keeping the last `keep` non-note
  * messages — or null when there is nothing worth compacting. The cut NEVER
  * splits an assistant-with-toolCalls from its tool results: a summarized
  * `tool_use` whose `tool_result` survives in the tail (or vice versa) is the
  * same unmatched-pair 400 the repair machinery exists to prevent, introduced
- * by our own bookkeeping. Tool rows sit directly after their assistant, so
- * walking the cut backward off any tool row lands it on the owning
- * assistant, which is then KEPT whole with its results.
+ * by our own bookkeeping. `batchSafeBoundary` is the walk that guarantees it —
+ * shared verbatim with session forking.
  */
 export function findCompactionCut(msgs: AgentMessage[], keep: number): number | null {
   const c = latestCompaction(msgs);
@@ -430,33 +491,8 @@ export function findCompactionCut(msgs: AgentMessage[], keep: number): number | 
     (m) => m.role !== 'note' && (!c || m.seq > c.upto),
   );
   if (eligible.length <= keep) return null;
-  let cut = eligible.length - keep; // index of the first KEPT message
-  // Batch safety cannot rely on row adjacency: a `send` queued while the
-  // session was `awaiting` puts a USER row between an assistant's toolCalls
-  // and its tool results, so walking back off tool rows alone would cut
-  // between them — summarizing the tool_use while its tool_results survive
-  // in the tail, a permanent 400 nothing can repair (the transcript itself
-  // is healthy; only the model's view is broken). Use the same turn-window
-  // machinery repair uses: if any assistant's window spans the cut, move the
-  // cut to before that assistant.
-  const boundarySeq = () => eligible[cut].seq; // first kept seq
-  // Latest window first: moving the cut earlier can only push the boundary
-  // into EARLIER windows, so processing in reverse handles the cascade in one
-  // pass.
-  for (const w of [...turnWindows(eligible)].reverse()) {
-    if (!w.assistant.toolCalls?.length) continue;
-    const lastAnswerSeq = Math.max(
-      w.assistant.seq,
-      ...eligible
-        .filter((t) => t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd)
-        .map((t) => t.seq),
-    );
-    // Window spans the boundary: assistant would be summarized (or kept) while
-    // some of its results land on the other side.
-    while (cut > 0 && w.assistant.seq < boundarySeq() && lastAnswerSeq >= boundarySeq()) {
-      cut -= 1;
-    }
-  }
+  // `eligible.length - keep` is the index of the first KEPT message.
+  const cut = batchSafeBoundary(eligible, eligible.length - keep);
   if (cut <= 0) return null;
   return eligible[cut - 1].seq;
 }

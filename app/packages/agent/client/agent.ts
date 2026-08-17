@@ -160,6 +160,22 @@ export class Agent {
   }
 
   /**
+   * Branch this session into a new one sharing its history up to `atSeq`, and
+   * resolve with the NEW session id — `subscribe()` it and carry on from there.
+   *
+   * `atSeq` defaults to the whole conversation and is clamped DOWN to the
+   * nearest batch-safe cut point server-side, so passing the seq of the row a
+   * user clicked is always safe even when that row sits inside a tool batch.
+   * The fork shows up in `sessions()` like any other conversation.
+   */
+  fork(sessionId: string, opts?: { atSeq?: number; title?: string }): Promise<string> {
+    return Meteor.callAsync(
+      NAMES.mFork, this.name, sessionId, opts?.atSeq,
+      opts?.title === undefined ? undefined : { title: opts.title },
+    );
+  }
+
+  /**
    * The tool call waiting on a human answer, or undefined when nothing is
    * parked. Reactive, like `status()` — render it beside `status(id) ===
    * 'awaiting'` to show what is being asked, then call `approve`/`deny`.

@@ -240,7 +240,11 @@ describe('applyRateLimits', () => {
     assert.equal(added, 2);
   });
 
-  it('adds four rules when both sends and starts are configured', async () => {
+  it('adds six rules when both sends and starts are configured', async () => {
+    // Two per method, and `starts` governs TWO methods: `agent.start` and
+    // `agent.fork`. A fork creates a session exactly as a start does (and
+    // copies a transcript on top), so it shares the session-creation budget
+    // rather than getting a cheaper knob of its own.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
@@ -248,10 +252,29 @@ describe('applyRateLimits', () => {
         starts: { count: 3, intervalMs: 30000 },
       },
     });
-    assert.equal(added, 4);
+    assert.equal(added, 6);
   });
 
-  it('adds six rules when interrupts is configured alongside sends and starts', async () => {
+  it('a starts entry registers rules for agent.fork as well as agent.start', async () => {
+    // The pairing is load-bearing, not incidental: forks are session creation,
+    // and an unlimited `agent.fork` would be the cheap way to do the thing a
+    // `starts` limit refuses — one call per copy of an entire transcript.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mFork,
+      userId: 'rl-user-fork', connectionId: 'rl-conn-fork', clientAddress: '127.0.0.1',
+    };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    applyRateLimits({ rateLimit: { starts: { count: 2, intervalMs: 60000 } } });
+    const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    assert.isAbove(
+      after.length, before.length,
+      'a starts entry must register rules matching a real agent.fork invocation',
+    );
+  });
+
+  it('adds eight rules when interrupts is configured alongside sends and starts', async () => {
     // `interrupts` gets the identical two-rule treatment, not a cheaper one:
     // it is an unauthenticated-reachable write, so the anonymous-isolation
     // pair rule and the per-user cap on multi-connection multiplication both
@@ -264,7 +287,7 @@ describe('applyRateLimits', () => {
         interrupts: { count: 10, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 6);
+    assert.equal(added, 8);
   });
 
   it('registers a rule that actually matches an agent.interrupt invocation', async () => {

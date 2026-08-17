@@ -5,6 +5,7 @@ import {
   defineAgent, getAgent, buildRunConfig, type AgentConfig,
 } from './registry';
 import { runTurn } from './loop';
+import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
 
@@ -143,6 +144,32 @@ export class Agent {
         );
       }
     }
+  }
+
+  /**
+   * Branch a session into a new one that shares its history up to a point, and
+   * diverges from there. Returns the NEW session's id.
+   *
+   * `atSeq` is clamped DOWN to the nearest batch-safe cut point, so a caller
+   * can pass the seq of any row — including a tool row in the middle of a
+   * batch — without producing a transcript that strands a `tool_use`. It
+   * defaults to the last message: fork the whole conversation.
+   *
+   * The fork is a new ROOT conversation owned by the source's owner, listed by
+   * `agent.sessions` like any other, with zeroed usage and budgets and no
+   * lease. It remembers where it came from in `forkedFrom` and nothing else —
+   * see `forkSession` for the field-by-field reasoning.
+   *
+   * `userId` scopes the lookup for a server-side caller acting on behalf of
+   * someone (a method, a job): give it and a session belonging to anyone else
+   * is `no-session`. Omit it and the source's own owner is used, which is what
+   * a direct server call wants.
+   */
+  fork(
+    sessionId: string,
+    opts?: { atSeq?: number; title?: string; userId?: string | null },
+  ): Promise<string> {
+    return forkSessionById(this.name, sessionId, opts);
   }
 
   /**

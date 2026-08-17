@@ -59,6 +59,25 @@ export interface AgentSession {
    */
   activeChild?: { sessionId: string; toolCallId: string };
   /**
+   * FORKED sessions only: which session this one was branched from, and at
+   * which `seq` the copy stopped (inclusive — every message with `seq <= seq`
+   * was copied, keeping its original seq and a fresh `_id`).
+   *
+   * A DIFFERENT relationship from `parent`, deliberately. `parent` says "this
+   * session is one turn's internal work inside another session", which is why
+   * `agent.sessions` excludes it. A fork is a new ROOT conversation that merely
+   * remembers where it came from: it is listed, it is driven by the user, and
+   * nothing about it is subordinate to the source. So a fork copies neither
+   * `parent` nor `depth` — copying `parent` would hide a user's own fork from
+   * their session list, and copying `depth` would charge a root conversation
+   * for hops it never took.
+   *
+   * The seq is the source's cut point, which is always a batch-safe boundary
+   * (see `findForkCut`): the fork can never begin life holding a `tool_use`
+   * with no `tool_result`.
+   */
+  forkedFrom?: { sessionId: string; seq: number };
+  /**
    * How many subagent hops deep this session is. Absent (read as 0) on a root
    * session; `parent.depth + 1` on a child. The guard that keeps agents
    * composing agents from fork-bombing: past `MAX_SUBAGENT_DEPTH` the tool call

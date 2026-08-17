@@ -7,6 +7,7 @@ export const NAMES = {
   mStart: 'agent.start',
   mSend: 'agent.send',
   mInterrupt: 'agent.interrupt',
+  mFork: 'agent.fork',
   mApprove: 'agent.approve',
   mDeny: 'agent.deny',
 } as const;

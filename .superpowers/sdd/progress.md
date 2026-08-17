@@ -230,3 +230,21 @@ M4 Task 2: complete (22a089b..HEAD, review 3 Medium + 4 Low, fixed/documented in
   budget.approval can auto-deny a parked child; turns is inert for children.
   Carry to v3 ledger: idempotency keys for subagent dispatch (the at-least-once double-child);
   re-linking orphaned children; parent-interrupt propagation to children.
+M4 Task 3: complete (session forking, 228+1 passing + 1 client, from 218). agent.fork method +
+  Agent.fork server/client APIs; new server/fork.ts. The compaction batch-safety walk is factored
+  out as loop.ts `batchSafeBoundary(eligible, boundary)` and shared verbatim — findCompactionCut is
+  behavior-identical (its 4 pre-existing assertions unchanged). Two generalizations inside it,
+  inert for compaction and load-bearing for fork: boundarySeq() is Infinity when the head is the
+  whole list, and lastAnswerSeq is Infinity for an UNANSWERED batch — which is what makes forking an
+  awaiting session cut before the parked assistant with no special case.
+  Lineage decisions implemented + commented: parent/depth/activeChild/pending NOT copied (a fork is
+  a new ROOT conversation; forkedFrom is a different relationship), lease/phase fresh, usage and
+  budgetSpent ZEROED, nextSeq = cut+1, compaction notes at-or-before the cut ARE copied (verified by
+  capturing the fork's first provider request), copied tool rows keep childSessionId.
+  Copy is rawCollection().insertMany in chunks of 500 (no hooks exist here); session document is
+  written LAST so a half-copied transcript is unreachable rather than visibly corrupt.
+  Rate limits: mFork rides the existing `starts` entry (session creation), so a starts entry now
+  adds 4 rules — two existing applyRateLimits count assertions updated (4->6, 6->8) plus a new test
+  asserting a real agent.fork invocation matches. Full report: .superpowers/sdd/task-3-report.md
+  Carry: fork of a huge transcript is O(n) docs in one method call (only rateLimit.starts bounds it);
+  the copy is not transactional, so a crash mid-copy leaks inert orphan message rows nothing reaps.

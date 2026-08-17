@@ -165,9 +165,11 @@ tries again. Your transcript UI should render three note kinds: `error`,
 } } } }
 ```
 
-Each entry registers two DDP rules: per-(user, connection) so an anonymous
-flood only burns its own connection's quota, and per-user for authenticated
-callers so opening more connections does not multiply the allowance.
+Each entry registers two DDP rules per method it governs: per-(user,
+connection) so an anonymous flood only burns its own connection's quota, and
+per-user for authenticated callers so opening more connections does not
+multiply the allowance. `starts` governs two methods — `agent.start` and
+`agent.fork` (see **Forking**), both of which create a session.
 
 **Recovery runs itself.** Every server starts a watcher at boot: it observes
 sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
@@ -333,6 +335,66 @@ is re-dispatched by recovery, and a subagent call in that batch runs a whole
 second child; and an abandoned batch's discarded tool rows can leave a
 completed child session with no durable pointer to it from any transcript.
 
+## Forking
+
+A fork branches a conversation: it copies a session's transcript up to a point
+and hands you a **new session** that continues from there, leaving the original
+exactly as it was. It is how you ask "what if we'd answered differently three
+messages ago" without losing the answer you already have.
+
+```ts
+const branch = await Support.fork(sessionId);                     // the whole conversation
+const earlier = await Support.fork(sessionId, { atSeq: 12 });     // up to message 12
+Support.subscribe(branch);
+await Support.send(branch, 'try it the other way instead');
+```
+
+Server-side it is the same call with an owner:
+
+```ts
+const branch = await Support.fork(sessionId, { atSeq, title, userId });
+```
+
+**`atSeq` is a request, not a command.** It is clamped DOWN to the nearest
+batch-safe cut point, so a UI can pass the seq of whatever row the user clicked
+without knowing anything about tool batches. Point it at a tool result — or at
+the assistant that asked for one — and the fork begins *before* that assistant
+instead: a transcript holding a `tool_use` with no matching `tool_result` is a
+400 from every provider, on every retry, forever, and a fork born that way has
+no repair path. This is the identical walk compaction uses to decide what it
+may summarize away, so "a legal place to divide a transcript" has one
+definition in this package rather than two.
+
+The same rule decides what happens when you fork a session that is **awaiting
+an approval**: the parked assistant's tool call is unanswered by construction,
+so the cut lands before it. The fork gets the conversation up to the last
+completed exchange, is `idle` rather than `awaiting`, and carries no pending
+request — the approval belongs to the turn that parked it, and that turn is not
+in the fork. The source stays parked and answerable.
+
+What a fork carries, and what it does not:
+
+| Carried | Not carried |
+| --- | --- |
+| the transcript up to the cut — new `_id`s, original `seq`s, every other field verbatim | `usage` and `budgetSpent` — **zeroed**; a fork costs nothing until it runs |
+| compaction notes at or before the cut, so the model view stays compacted | `pending` — see above |
+| the agent, the owner, and the model the source was running | `phase` and `lease` — a fork is idle and owned by no server |
+| `forkedFrom: { sessionId, seq }` | `parent`, `depth`, `activeChild` |
+
+A fork is a new **root** conversation, not a child: `agent.sessions` lists it
+like any other, and `agent.session` serves it with no special case. That is why
+it copies neither `parent` (which marks a subagent's internal work and is
+excluded from listings) nor `depth` (subagent hops it never took). `forkedFrom`
+is the only lineage it keeps, and it is a different relationship. Fork a fork
+as often as you like — a fork is an ordinary session.
+
+Two things to know about the copy. A copied tool row keeps its
+`childSessionId`, so both transcripts point at the same finished subagent
+session rather than re-running it. And forking is rate-limited by the
+`starts` entry (the settings block is under **Define an agent**), not by an
+entry of its own: a fork creates a session exactly as a start does, and copies a
+whole transcript on top of it.
+
 ## Headless one-shots
 
 `ask` is the whole conversation in one call — no session to start, subscribe to
@@ -420,9 +482,10 @@ Milestone 4 is closing out the remaining tiers. Shipped so far: full
 JSON-Schema validation of tool arguments through typebox when it is reachable
 (with a structural fallback and one warning when it is not), per-tool-call
 attribution of streamed arguments so parallel tool calls arrive as separate
-streams (`toolArgs` on an in-flight row), and **subagents** — a named agent
+streams (`toolArgs` on an in-flight row), **subagents** — a named agent
 behind a tool call, running a child session with a live, persistent transcript
-(see **Subagents**).
+(see **Subagents**) — and **session forking** at batch-safe cut points (see
+**Forking**).
 
 Sketched in the original design but deliberately NOT implemented (v2
 candidates): a global `Agent.provider()` registry, a manual `compact()` call,

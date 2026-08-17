@@ -5,6 +5,7 @@ import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
 import { runTurn } from './loop';
+import { forkSession } from './fork';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -322,6 +323,36 @@ export function registerMethods(): void {
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
       } as any);
+    },
+
+    /**
+     * Branch a session at a batch-safe cut point; returns the NEW session id.
+     *
+     * `atSeq` is a REQUEST, not a command: it is clamped down to the nearest
+     * legal cut (see `findForkCut`), so a UI can hand this the seq of the row a
+     * user clicked without knowing anything about tool batches. Defaults to the
+     * last message — "fork the whole thing".
+     *
+     * Authorization is on the SOURCE only: the fork is created for the source's
+     * owner, so a caller who may drive the source may fork it, and no one else
+     * can name a session id they cannot already read.
+     */
+    async [NAMES.mFork](
+      this: any, agent: string, sessionId: string, atSeq?: number,
+      opts?: { title?: string },
+    ) {
+      check(agent, String);
+      check(sessionId, String);
+      check(atSeq, Match.Maybe(Match.Integer));
+      check(opts, Match.Maybe({ title: Match.Maybe(String) }));
+      // The registry check mirrors mStart/mSend: forking into an agent this
+      // server does not define would produce a session nothing can ever run.
+      if (!getAgent(agent)) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const source = await requireSession(agent, sessionId, this.userId ?? null);
+      // `Match.Maybe` accepts null as well as undefined, and DDP turns a
+      // trailing `undefined` argument into null on the wire — so normalize
+      // rather than letting a null `atSeq` reach the arithmetic downstream.
+      return forkSession(source, { atSeq: atSeq ?? undefined, title: opts?.title });
     },
 
     async [NAMES.mApprove](this: any, agent: string, sessionId: string) {
