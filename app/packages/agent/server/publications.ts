@@ -25,7 +25,11 @@ export function registerPublications(): void {
     });
     if (!session) return []; // publishes nothing and marks the sub ready
     return [
-      AgentSessions.find({ _id: sessionId }),
+      // `lease` is server-internal (which app process currently owns the
+      // run, see server/lease.ts) — never wire hygiene the client needs, and
+      // not something any client code reads (status()/usage()/pending() in
+      // client/agent.ts only touch phase/usage/pending).
+      AgentSessions.find({ _id: sessionId }, { fields: { lease: 0 } }),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
     ];
@@ -43,7 +47,8 @@ export function registerPublications(): void {
     if (this.userId == null) return [];
     return AgentSessions.find(
       { agent, userId: this.userId },
-      { sort: { updatedAt: -1 }, limit: 100 },
+      // `lease` omitted here too — see the matching comment on `pubSession`.
+      { sort: { updatedAt: -1 }, limit: 100, fields: { lease: 0 } },
     );
   });
 }

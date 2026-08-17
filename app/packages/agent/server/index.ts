@@ -2,6 +2,7 @@ import { Meteor } from 'meteor/meteor';
 import { ensureCapped } from './capped';
 import { registerPublications } from './publications';
 import { registerMethods } from './methods';
+import { applyRateLimits } from './rate-limits';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
@@ -16,4 +17,9 @@ Meteor.startup(async () => {
   await ensureCapped();
   registerPublications();
   registerMethods();
+  // `Meteor.settings.packages` is undefined whenever no `--settings` file was
+  // passed at all; `applyRateLimits` treats that (and a settings file with no
+  // `rateLimit` block) the same way — zero rules, no throw — so an
+  // unconfigured deployment still boots.
+  applyRateLimits((Meteor.settings as any)?.packages?.['10thfloor:agent']);
 });
