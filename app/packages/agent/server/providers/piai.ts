@@ -248,7 +248,11 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
           Object.assign(m, { provider, model: modelId, api: (model as any).api });
         }
       }
-      for await (const ev of models.streamSimple(model, context)) {
+      // The third argument is the only thing that reaches the HTTP request:
+      // `ModelsSimpleStreamOptions` extends `ProviderRequestOptions`, which
+      // declares `signal?: AbortSignal` (types.d.ts:50). Without it, an
+      // interrupt stops only the reading.
+      for await (const ev of models.streamSimple(model, context, { signal: req.signal })) {
         if (ev?.type === 'error') {
           // pi-ai terminates a failed stream with an event, not a rejection.
           // Throwing turns it back into the failure the turn loop expects: the
@@ -260,11 +264,13 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
             `${ev.error?.errorMessage ?? 'unknown error'}`,
           );
           // §10 retry hint, read by loop.ts's classifyProviderError
-          // (`e.retryable === true/false` short-circuits its status-based
-          // classification). An abort is a deliberate stop, never a transient
-          // failure worth retrying.
+          // (`e.retryable` short-circuits its status-based classification).
+          // An abort is neither transient (retrying re-issues the request the
+          // user just cancelled, at full price) nor a failure to report at
+          // them (they cancelled it) — 'abandon' routes it onto the loop's
+          // interrupt path: deltas cleaned, no error note, stop preserved.
           if (ev.reason === 'aborted') {
-            err.retryable = false;
+            err.retryable = 'abandon';
           } else {
             // Reuse pi-ai's own transient-vs-terminal classifier (rate
             // limits/timeouts/overloaded upstreams vs auth/quota errors)

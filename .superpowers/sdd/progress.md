@@ -121,3 +121,5 @@ M3 backlog additions from final review: spurious extra turn from the wake self-c
   proven to register, never to throttle; drain-remainder comment assumes failed insert never landed
   (lost-ack duplicate seq truncates in-flight render transiently).
 Suite at M2 close: 122 server (+1 pending live-smoke) + 1 client, 0 failures.
+
+== MILESTONE 3 (branch milestone-3-spec-v1, plan 2026-08-16-agent-harness-milestone-3.md) ==

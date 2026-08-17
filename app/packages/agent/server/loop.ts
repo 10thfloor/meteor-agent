@@ -22,10 +22,11 @@ export interface RunConfig {
    *  (`phase: 'stopped'`). Tests lower it; the default keeps the cost to a few
    *  indexed reads per response. */
   interruptCheckMs?: number;
-  /** §10: bounded retry with exponential backoff for a provider stream that
-   *  throws mid-iteration. `attempts` counts the initial try (default 3);
-   *  `baseMs` is the base of `baseMs * 2^attemptIndex` (default 500). */
-  retry?: { attempts?: number; baseMs?: number };
+  /** §10: bounded retry with full-jitter exponential backoff for a provider
+   *  stream that throws mid-iteration. `attempts` counts the initial try
+   *  (default 3); the delay is uniform in
+   *  `[0, min(maxDelayMs, baseMs * 2^attemptIndex)]` (defaults 500 / 10_000). */
+  retry?: { attempts?: number; baseMs?: number; maxDelayMs?: number };
   /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
    *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
    *  `mSend`, not here — by the time a turn runs, the send it would refuse has
@@ -64,21 +65,39 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
-/** §10: 429, 5xx and network-ish errors retry; 4xx auth/request errors do
- *  not. Anything unclassifiable is treated as retryable — a transient blip
- *  should not permanently kill a session, and retries are bounded anyway.
+/** §10: 429, 408 (a request timeout is transient by definition — Anthropic's
+ *  and OpenAI's own client libraries retry it alongside 429 and 5xx), 5xx and
+ *  network-ish errors retry; other 4xx auth/request errors do not. Anything
+ *  unclassifiable is treated as retryable — a transient blip should not
+ *  permanently kill a session, and retries are bounded anyway.
+ *
+ *  'abandon' is the third answer: a cancelled request. Retrying re-issues the
+ *  very request the user stopped, and a failure note blames them for their
+ *  own cancellation — so an abort takes the interrupt path instead. Detected
+ *  by the adapter's hint or by the standard AbortError name a raw aborted
+ *  fetch carries (no status at all, so it would otherwise default to
+ *  retryable).
  *
  *  An explicit `e.retryable` hint (set by an adapter that has better
  *  information than an HTTP status — pi-ai's own transient-error classifier,
- *  for one) short-circuits the status-based classification in either
- *  direction. */
-export function classifyProviderError(e: any): 'retryable' | 'fatal' {
+ *  for one) short-circuits the status-based classification. */
+export function classifyProviderError(e: any): 'retryable' | 'fatal' | 'abandon' {
+  if (e?.retryable === 'abandon' || e?.name === 'AbortError') return 'abandon';
   if (e?.retryable === true) return 'retryable';
   if (e?.retryable === false) return 'fatal';
   const status = e?.status ?? e?.statusCode ?? e?.response?.status;
-  if (status === 429 || (typeof status === 'number' && status >= 500)) return 'retryable';
+  if (status === 429 || status === 408
+    || (typeof status === 'number' && status >= 500)) return 'retryable';
   if (typeof status === 'number' && status >= 400 && status < 500) return 'fatal';
   return 'retryable';
+}
+
+/** Full jitter: uniform in [0, min(maxDelayMs, baseMs * 2^attemptIndex)].
+ *  A deterministic exponential resynchronizes every session that failed
+ *  together — a provider-wide 529 would have the whole fleet retrying in
+ *  lockstep, which is how outages prolong themselves. */
+export function backoffDelay(attemptIndex: number, baseMs: number, maxDelayMs: number): number {
+  return Math.random() * Math.min(maxDelayMs, baseMs * 2 ** attemptIndex);
 }
 
 /**
@@ -750,6 +769,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   // the provider" quietly calling it once. Floor it instead of trusting it.
   const retryAttempts = Math.max(1, config.retry?.attempts ?? 3);
   const retryBaseMs = config.retry?.baseMs ?? 500;
+  const retryMaxDelayMs = config.retry?.maxDelayMs ?? 10_000;
   const tools = resolveTools(config.tools);
   const schemas = toolSchemas(tools);
 
@@ -895,12 +915,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           interrupted = false;
           let lastPhaseCheck = Date.now();
           let providerError: unknown = null;
+          // Fresh per attempt: an aborted attempt's signal must not poison its
+          // retry, and a signal is single-shot.
+          const abort = new AbortController();
 
           try {
             try {
               for await (const chunk of config.provider.stream({
                 model: config.model, system: config.system,
                 messages: toProviderMessages(history), tools: schemas,
+                signal: abort.signal,
               })) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
@@ -916,7 +940,14 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
                   lastPhaseCheck = Date.now();
                   const s = await AgentSessions.findOneAsync(sessionId);
-                  if (!s || s.phase === 'stopped') { interrupted = true; break; }
+                  if (!s || s.phase === 'stopped') {
+                    // Abort BEFORE breaking: the break only stops consuming;
+                    // the abort is what cancels the HTTP request behind the
+                    // stream, which otherwise keeps arriving and billing.
+                    abort.abort();
+                    interrupted = true;
+                    break;
+                  }
                 }
               }
             } finally {
@@ -955,10 +986,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             if (interrupted || !live || live.phase === 'stopped') return;
 
             const classification = classifyProviderError(providerError);
+            // An abandoned request is the interrupt path with a different
+            // trigger: deltas are already cleaned above, no note is owed to
+            // the user (nothing failed AT them), and the finally preserves a
+            // stop if one stands. Returning here is the whole handling.
+            if (classification === 'abandon') return;
             const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
             if (classification === 'retryable' && hasMoreAttempts) {
               if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;
-              await sleep(retryBaseMs * 2 ** attemptIndex);
+              await sleep(backoffDelay(attemptIndex, retryBaseMs, retryMaxDelayMs));
               // The interrupt check above only fires WHILE a stream is
               // running; re-check here so an interrupt landing during the
               // backoff sleep itself still stops the turn, instead of being
@@ -1099,8 +1135,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     // send clears it: neither is ours to wake.
     if (owned && !resumed) {
       const after = await AgentSessions.findOneAsync(sessionId).catch(() => null);
+      // 'error' belongs in this exclusion list for the same reason it is in
+      // the finally's terminal list: a failed turn is not ours to wake, and
+      // the two lists disagreeing was itself a reviewed defect.
       if (after?.pending?.verdict
-        && after.phase !== 'awaiting' && after.phase !== 'stopped'
+        && after.phase !== 'awaiting' && after.phase !== 'stopped' && after.phase !== 'error'
         && !running.has(sessionId)) {
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
@@ -1110,7 +1149,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // the same load-bearing one `deferTurn` uses: an unhandled rejection is
         // fatal by default on Node >= 15.
         setTimeout(() => {
-          runTurn(sessionId, config).catch((e) => {
+          void (async () => {
+            // Re-read INSIDE the deferred callback, not before it: the
+            // legitimate resume can start AND finish between the check above
+            // and this timer firing. It spends the verdict; a woken run that
+            // then finds no `pending` would fall straight into the think loop
+            // and make a provider call nobody asked for — a charge, and an
+            // assistant row appended to a turn the user considered finished.
+            const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
+            if (!still?.pending?.verdict
+              || still.phase === 'awaiting' || still.phase === 'stopped'
+              || still.phase === 'error' || running.has(sessionId)) return;
+            await runTurn(sessionId, config);
+          })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
           });
         }, 0);

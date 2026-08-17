@@ -715,6 +715,45 @@ describe('turn loop', () => {
     assert.equal(doc!.phase, 'stopped', 'the finally must preserve the stop');
   });
 
+  it('an interrupt aborts the provider request, not just the consuming loop', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-abort', 'hello');
+    // Breaking out of the for-await only stops CONSUMING the stream: the HTTP
+    // request behind it keeps arriving and the provider keeps billing the
+    // whole response. The signal is the only thing that reaches the provider,
+    // so the provider is what has to observe it flip.
+    let signal: AbortSignal | undefined;
+    let abortedWhileStreaming: boolean | undefined;
+    const observing: Provider = {
+      async *stream(req) {
+        signal = req.signal;
+        abortedWhileStreaming = req.signal?.aborted;
+        yield { kind: 'text', chunk: 'should ' };
+        await new Promise((r) => setTimeout(r, 30));
+        await AgentSessions.updateAsync('s-abort', { $set: { phase: 'stopped' } } as any);
+        await new Promise((r) => setTimeout(r, 30));
+        yield { kind: 'text', chunk: 'never commit' };
+        yield { kind: 'done', usage: { input: 1, output: 3 } };
+      },
+    };
+
+    await runTurn('s-abort', {
+      model: 'mock', system: '', tools: [], provider: observing, interruptCheckMs: 5,
+    });
+
+    assert.isDefined(signal, 'the loop must hand the provider a signal to honor');
+    assert.isFalse(abortedWhileStreaming, 'the signal starts live');
+    assert.isTrue(signal!.aborted, 'an interrupt must abort the in-flight request');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abort', role: 'assistant' }).countAsync(), 0,
+      'an aborted stream must not commit',
+    );
+    assert.equal((await AgentSessions.findOneAsync('s-abort'))!.phase, 'stopped');
+  });
+
   it('interrupt during tool dispatch discards the turn instead of stranding tool_use', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -967,7 +1006,73 @@ describe('turn loop', () => {
       'retry must not overwrite the stop with `retrying`/`error`');
   });
 
-  it('shows phase `retrying` between attempts and sleeps a real backoff', async function () {
+  it('treats an aborted stream as abandon: no retry, no error note, no commit', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    await seed('s-abandon', 'hello');
+    let attempts = 0;
+    // The shape an aborted request takes once the signal fires: the stream
+    // rejects with an AbortError rather than an HTTP status. It is a
+    // deliberate stop, so it must NOT retry — a retry re-issues the very
+    // request that was just cancelled, at full price — and must NOT write a
+    // failure note at the user, because nothing failed at them.
+    const aborting: Provider = {
+      async *stream() {
+        attempts += 1;
+        yield { kind: 'text', chunk: 'par' };
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-abandon', {
+      model: 'mock', system: '', tools: [], provider: aborting,
+      retry: { attempts: 3, baseMs: 10 },
+    });
+
+    assert.equal(attempts, 1, 'an abort must never be retried');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon', role: 'note' } as any).countAsync(), 0,
+      'an abort is a cancellation, not a provider failure to report',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon', role: 'assistant' }).countAsync(), 0,
+    );
+    assert.equal(
+      await AgentDeltas.find({ sessionId: 's-abandon' }).countAsync(), 0,
+      'the abandoned attempt must take its deltas with it, exactly as an interrupt does',
+    );
+    assert.notEqual(
+      (await AgentSessions.findOneAsync('s-abandon'))!.phase, 'error',
+      'nothing failed, so the turn must not end in the failure phase',
+    );
+
+    // And when the abort followed the user's own stop, the stop is what
+    // survives — the same terminal state the interrupt path leaves behind.
+    await seed('s-abandon-stop', 'hello');
+    const stoppedAbort: Provider = {
+      // eslint-disable-next-line require-yield
+      async *stream() {
+        await AgentSessions.updateAsync('s-abandon-stop', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-abandon-stop', {
+      model: 'mock', system: '', tools: [], provider: stoppedAbort,
+      retry: { attempts: 3, baseMs: 10 },
+    });
+    assert.equal((await AgentSessions.findOneAsync('s-abandon-stop'))!.phase, 'stopped');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abandon-stop', role: 'note' } as any).countAsync(), 0,
+    );
+  });
+
+  it('shows phase `retrying` between attempts', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');
     const { runTurn } = await import('../server/loop');
@@ -991,21 +1096,19 @@ describe('turn loop', () => {
         .catch(() => { /* sampling is best-effort */ });
     }, 15);
 
-    const startedAt = Date.now();
     try {
       await runTurn('s-retry-phase', {
         model: 'mock', system: '', tools: [], provider: flaky,
         retry: { attempts: 2, baseMs: 120 },
       });
     } finally { clearInterval(sampler); }
-    const elapsed = Date.now() - startedAt;
 
     assert.equal(attempts, 2);
     assert.isTrue(seenPhases.has('retrying'),
       `the retry must be visible to the client, saw [${[...seenPhases].join(', ')}]`);
-    // Floor only. CI is slow and the sleep is bounded from below by design;
-    // asserting an upper bound would just be a flake generator.
-    assert.isAtLeast(elapsed, 120, 'the backoff must be a real sleep, not a no-op');
+    // No duration assertion: full jitter draws the delay from [0, cap], so a
+    // legitimate backoff can be ~0ms and any floor here is a flake generator.
+    // The delay itself is pinned by `backoffDelay()`'s own test below.
     const committed = await AgentMessages.findOneAsync({ sessionId: 's-retry-phase', role: 'assistant' });
     assert.equal(committed!.content, 'back up');
   });
@@ -1655,6 +1758,88 @@ describe('approval gates', () => {
     assert.isUndefined((await AgentSessions.findOneAsync('s-wake'))!.pending);
   });
 
+  it('a wake whose verdict was already spent does not run an unrequested turn', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // The mirror image of the test above. The wake-check reads the session,
+    // sees a standing verdict, and defers a re-run — but the legitimate resume
+    // can START AND FINISH inside that window, spending the verdict. The woken
+    // run then finds no `pending` at all, falls straight into the think loop,
+    // and makes a provider call nobody asked for: a charge, and an assistant
+    // message appended to a turn the user considered finished.
+    //
+    // The window is forced through the wake-check's own read: the session is
+    // stripped of its verdict the instant a read returns it with the lease
+    // already released, which is exactly the wind-down snapshot the deferred
+    // re-run is scheduled from.
+    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    let spent = false;
+    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
+      const doc = await original(...args);
+      if (!spent && doc?._id === 's-wake-stale' && doc.pending?.verdict && !doc.lease) {
+        spent = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-stale' } as any, { $unset: { pending: 1 } } as any,
+        );
+      }
+      return doc;
+    };
+
+    // Same verdict injection as the test above: written on the park write, with
+    // no defer of its own, so the winding-down run's self-check is the only
+    // thing that can act on it.
+    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      const n = await originalUpdate(sel, mod, ...rest);
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-stale' } as any,
+          { $set: { 'pending.verdict': 'approved', 'pending.by': 'u1', phase: 'idle' } } as any,
+        );
+      }
+      return n;
+    };
+
+    let state: { ran: string[]; providerCalls: number } | null = null;
+    try {
+      state = await buildFixture('s-wake-stale', 'gate-wake-stale', [
+        { id: 'g1', name: 'refund', gate: 'ask' },
+      ]);
+    } finally {
+      if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
+      else delete (AgentSessions as any).updateAsync;
+      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
+      else delete (AgentSessions as any).findOneAsync;
+    }
+    assert.isTrue(injected, 'the verdict must have landed on the park write');
+    assert.isTrue(spent, 'the verdict must have been spent inside the wake window');
+
+    // The deferred re-run fires on a zero timer; give it room to misbehave.
+    await new Promise((r) => { setTimeout(r, 400); });
+
+    assert.equal(
+      state!.providerCalls, 1,
+      'a stale wake must not call the provider — the verdict it woke for is gone',
+    );
+    const assistants = await AgentMessages
+      .find({ sessionId: 's-wake-stale', role: 'assistant' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(assistants, 1, 'no extra assistant row may appear');
+    // Identity matters, not just the count: a woken run repairs on entry, so it
+    // would DISCARD this parked turn (its `tool_use` is unanswered by design)
+    // and commit its own reply in its place — one row either way, a different
+    // transcript entirely.
+    assert.deepEqual(
+      (assistants[0].toolCalls ?? []).map((c) => c.id), ['g1'],
+      'the parked turn must survive a wake that had nothing to do',
+    );
+    assert.deepEqual(state!.ran, [], 'nothing was approved any more, so nothing runs');
+  });
+
   it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -1698,6 +1883,15 @@ describe('approval gates', () => {
       msgs.filter((m) => m.role === 'assistant'), 1,
       'the parked assistant must survive a refusal to run',
     );
+
+    // Re-assert after a beat. The wind-down wake-check schedules its re-run on
+    // a timer, so a stop that only LOOKS honored synchronously would be undone
+    // a tick later by a woken run that runs the tool anyway.
+    await new Promise((r) => { setTimeout(r, 250); });
+    assert.deepEqual(state.ran, [], 'no deferred wake may run the cancelled tool');
+    doc = (await AgentSessions.findOneAsync('s-stop-verdict'))!;
+    assert.equal(doc.phase, 'stopped', 'and no woken run may idle the stop away');
+    assert.deepInclude(doc.pending as any, { toolCallId: 'g1', verdict: 'approved' });
 
     // The send clears the stop; the verdict is still standing, so the batch
     // resumes rather than stranding its tool_use.
@@ -2102,10 +2296,44 @@ describe('classifyProviderError()', () => {
     // taxonomy) knows more than the status line, in BOTH directions.
     assert.equal(classifyProviderError({ retryable: false, status: 503 }), 'fatal');
     assert.equal(classifyProviderError({ retryable: true, status: 401 }), 'retryable');
-    // 408 is a timeout, but the current table treats the whole 4xx range as
-    // fatal. Pinned deliberately: change the table, change this line.
-    assert.equal(classifyProviderError({ status: 408 }), 'fatal');
+    // 408 is a request timeout — the server never got a complete request, so
+    // re-issuing it is exactly what every provider's own client library does
+    // (Anthropic and OpenAI both retry 408 alongside 429 and 5xx). It is the
+    // one 4xx that is transient by definition.
+    assert.equal(classifyProviderError({ status: 408 }), 'retryable');
     // Unclassifiable (a socket hang-up, a DNS blip) retries — bounded anyway.
     assert.equal(classifyProviderError({}), 'retryable');
+  });
+
+  it('classifies an abort as abandon, by hint or by error name', async () => {
+    const { classifyProviderError } = await import('../server/loop');
+    // The adapter's own mapping (pi-ai's `reason: 'aborted'` error event).
+    assert.equal(classifyProviderError({ retryable: 'abandon' }), 'abandon');
+    // A raw aborted fetch, which carries no status at all and would otherwise
+    // fall through to the retryable default — re-issuing the request the user
+    // just cancelled.
+    assert.equal(classifyProviderError({ name: 'AbortError' }), 'abandon');
+    // The hint outranks a status that would otherwise read as retryable.
+    assert.equal(classifyProviderError({ retryable: 'abandon', status: 503 }), 'abandon');
+  });
+});
+
+describe('backoffDelay()', () => {
+  it('is full jitter: every sample lands in [0, cap] and the cap is maxDelayMs', async () => {
+    const { backoffDelay } = await import('../server/loop');
+    // cap = min(maxDelayMs 10, baseMs 4 * 2^3 = 32) = 10.
+    const capped = Array.from({ length: 20 }, () => backoffDelay(3, 4, 10));
+    capped.forEach((d) => {
+      assert.isAtLeast(d, 0, 'a negative delay is not a delay');
+      assert.isAtMost(d, 10, 'maxDelayMs caps the exponential, always');
+    });
+    assert.isAbove(
+      new Set(capped).size, 1,
+      'full jitter must actually vary — a fixed delay resynchronizes every '
+      + 'client that failed together, which is what jitter exists to prevent',
+    );
+    // Below the cap the exponent still governs: 2 * 2^2 = 8.
+    Array.from({ length: 20 }, () => backoffDelay(2, 2, 100))
+      .forEach((d) => assert.isAtMost(d, 8));
   });
 });

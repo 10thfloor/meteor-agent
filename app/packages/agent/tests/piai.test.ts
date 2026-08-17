@@ -222,6 +222,54 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
     assert.include(String(threw.message), 'boom');
   });
 
+  it('passes the request signal through to streamSimple\'s options', async function () {
+    this.timeout(20000);
+    // Probe finding (pi-ai 0.84.2): `Models.streamSimple(model, context,
+    // options?: ModelsSimpleStreamOptions)`, and
+    // `ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsRequestTransforms`
+    // -> `SimpleStreamOptions extends StreamOptions`
+    // -> `StreamOptions extends ProviderRequestOptions<Model<Api>>`, which
+    // declares `signal?: AbortSignal`. That third argument is the ONLY thing
+    // that reaches the HTTP request, so an interrupt that does not arrive here
+    // cancels nothing.
+    const seen: any[] = [];
+    const fakeModels = {
+      getModel: () => ({ id: 'm1', provider: 'faux', api: 'faux-api' }),
+      async *streamSimple(_model: any, _context: any, options: any) {
+        seen.push(options);
+        yield { type: 'done', reason: 'stop', message: { content: [], usage: { input: 1, output: 1 } } };
+      },
+    };
+    const controller = new AbortController();
+    const provider = createPiAiProvider(async () => fakeModels as any);
+    for await (const _c of provider.stream({ ...streamReq, signal: controller.signal })) {
+      /* drain */
+    }
+    assert.strictEqual(seen[0]?.signal, controller.signal,
+      'the loop\'s per-attempt signal must reach pi-ai, or an abort stops only the reading');
+  });
+
+  it('maps pi-ai\'s `aborted` stream error to the abandon hint, not a fatal', async function () {
+    this.timeout(20000);
+    // An abort is neither transient (retrying re-issues the cancelled request)
+    // nor a failure to report at the user (they cancelled it). The loop's
+    // 'abandon' classification is the interrupt path, and this hint is what
+    // routes an adapter-level abort onto it.
+    const fakeModels = {
+      getModel: () => ({ id: 'm1', provider: 'faux', api: 'faux-api' }),
+      async *streamSimple() {
+        yield { type: 'error', reason: 'aborted', error: { errorMessage: 'request aborted' } };
+      },
+    };
+    const provider = createPiAiProvider(async () => fakeModels as any);
+    let threw: any = null;
+    try {
+      for await (const _c of provider.stream(streamReq)) { /* drain */ }
+    } catch (e) { threw = e; }
+    assert.instanceOf(threw, Error);
+    assert.strictEqual(threw.retryable, 'abandon');
+  });
+
   it('marks a transient provider error event retryable via isRetryableAssistantError', async function () {
     this.timeout(20000);
     // '503 Service Unavailable' matches pi-ai's own RETRYABLE_PROVIDER_ERROR_PATTERN
