@@ -40,15 +40,18 @@ function assertPositiveInteger(value: unknown, field: string): asserts value is 
  * `connectionId` to the same matcher splits that shared bucket per
  * connection, so an anonymous flood only ever burns its own quota.
  *
- * The cost: an authenticated user with N simultaneous connections (tabs,
- * devices) gets N independent buckets instead of one bucket shared by
- * `userId`. That is strictly more generous than pure per-user scoping, never
- * less safe — every (user, connection) pair is still isolated from every
- * other — and it keeps registration to the single `addRule` call promised
- * per configured entry, rather than needing a second rule just to special-
- * case `userId === null`.
+ * The cost of per-connection bucketing is real and must be capped, not
+ * hand-waved: an AUTHENTICATED attacker can open N DDP connections under one
+ * login with a few lines of WebSocket scripting and get N independent
+ * buckets — a rate-limit bypass in front of paid model calls. So each entry
+ * registers a SECOND, per-user rule for authenticated callers only
+ * (`userId: (id) => id != null` — no `connectionId`, so it buckets on userId
+ * alone). The pair-rule handles anonymous isolation; the user-rule caps the
+ * multi-connection multiplication. Legitimate multi-tab users share one
+ * per-user allowance, which is the semantics a per-user limit promises
+ * anyway. Session budgets (§9) remain the spend backstop behind both.
  */
-function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): void {
+function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): number {
   assertPositiveInteger(entry.count, `${label}.count`);
   assertPositiveInteger(entry.intervalMs, `${label}.intervalMs`);
 
@@ -62,6 +65,20 @@ function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): v
     entry.count,
     entry.intervalMs,
   );
+  DDPRateLimiter.addRule(
+    {
+      type: 'method',
+      name: methodName,
+      // Authenticated callers only: anonymous (null) stays governed by the
+      // per-connection rule above — a userId-only rule would put every
+      // anonymous visitor in one shared bucket, the exact DoS the pair rule
+      // exists to prevent.
+      userId: (id: string | null) => id != null,
+    },
+    entry.count,
+    entry.intervalMs,
+  );
+  return 2;
 }
 
 /**
@@ -83,13 +100,7 @@ export function applyRateLimits(settings: unknown): number {
   if (!rateLimit) return 0;
 
   let added = 0;
-  if (rateLimit.sends) {
-    addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
-    added += 1;
-  }
-  if (rateLimit.starts) {
-    addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
-    added += 1;
-  }
+  if (rateLimit.sends) added += addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
+  if (rateLimit.starts) added += addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
   return added;
 }

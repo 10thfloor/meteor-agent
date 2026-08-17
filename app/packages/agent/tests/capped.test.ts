@@ -228,15 +228,19 @@ describe('applyRateLimits', () => {
     assert.equal(applyRateLimits({ packages: {} }), 0);
   });
 
-  it('adds one rule for one configured entry', async () => {
+  it('adds a per-connection-pair rule AND a per-user rule per configured entry', async () => {
+    // Two rules per entry is the design, not an accident: the (userId,
+    // connectionId) pair rule isolates anonymous floods per connection, and
+    // the authenticated-only per-user rule caps the multiply-your-limit-by-
+    // opening-N-connections bypass the pair rule alone would allow.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: { sends: { count: 5, intervalMs: 60000 } },
     });
-    assert.equal(added, 1);
+    assert.equal(added, 2);
   });
 
-  it('adds two rules when both sends and starts are configured', async () => {
+  it('adds four rules when both sends and starts are configured', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
@@ -244,7 +248,7 @@ describe('applyRateLimits', () => {
         starts: { count: 3, intervalMs: 30000 },
       },
     });
-    assert.equal(added, 2);
+    assert.equal(added, 4);
   });
 
   it('throws naming the field for a non-positive count', async () => {

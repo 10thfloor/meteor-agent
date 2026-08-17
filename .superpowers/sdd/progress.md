@@ -84,3 +84,29 @@ M2 Task 2: complete (5429bbc..HEAD, review Approved-with-issues, 81+1 passing, 1
     plumbing and prefer provider-reported cost over pricing math.
   M3 ledger: AbortSignal so interrupt cancels the HTTP request; toolcall_delta contentIndex correlator;
     ProviderMessage isError flag for tool results; converter-level request-body test via injectable fetch.
+M2 Task 3: complete (26c462e..74235ba, 1 HIGH + 2 MEDIUM fixed, re-review clean, 89+1 passing)
+  HIGH was interrupt-erasure: retry branch overwrote phase:'stopped' with 'retrying' (guardedUpdate
+    filters on lease only, never phase) and committed a cancelled message. Now: a stop outranks retry.
+  MEDIUM: writer.stop() rejection classified as provider failure -> double provider charge on a Mongo
+    blip. MEDIUM: behaviors 2/6 untested -> 4 tests added.
+  Notes for M3: no jitter/cap on backoff (thundering herd); 408 pinned fatal (arguably retryable);
+    'abandon' as a third error classification once AbortSignal lands; note-row client rendering untested.
+M2 Task 4: complete (cc599f8..faea374, work spanned 3 sleep-interrupted implementers + controller
+  assembly + 2 High/3 Medium/4 Low fix pass, re-review Approved, 106+1 passing)
+  The predicted cross-agent-seam bug was real: locateBatch first-match vs repair's windows (H1).
+  M3 ledger: resumed-flag reopens H2 for a SECOND gate in one run (wake bound should be verdict
+    identity, not a boolean); locateBatch unanswered-first can pick an older stranded turn (prefer
+    newest-carrying); turnWindows skips nothing (O(assistants x messages) per entry); s-stop-verdict
+    second half doesn't re-assert single execution after settle.
+M2 Task 5: complete (faea374..HEAD, review found 1 Medium TOCTOU on turn budget — fixed inline as
+  atomic $lt filter, 113+1 passing)
+  Documented trade-offs kept: zero-reported-cost treated as unpriced (pricing fallback may charge a
+  genuinely-free call — overcharge, trips EARLIER, not a brake erosion); resume path's human-approved
+  call exceeds toolCalls budget by at most one.
+M2 Task 6: complete (dd6b264..de01c85 + controller fix, review 1 Medium fixed inline, 122+1 passing)
+  Medium: per-(userId,connectionId) bucketing let an authenticated attacker multiply the limit by
+    opening N connections -> added a second authenticated-only per-user rule per entry (2 rules/entry).
+  Low kept: `sends: null` silently skipped; findAllMatchingRulesAsync is young/undocumented API.
+M2 Task 7: complete (43b484d, 122+1 passing; delete-order falsified against reordered code and
+  restored; heartbeat + drain-remainder now enforced by tests). NOT separately reviewed — the final
+  whole-branch review is instructed to give its diff per-task scrutiny.
