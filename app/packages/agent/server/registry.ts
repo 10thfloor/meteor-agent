@@ -19,10 +19,18 @@ export interface AgentConfig {
    * needed, and its full body only in the turn that needs it.
    */
   skills?: Skill[];
-  /** Optional. Defaults to `piAiProvider()`, which resolves `model` against
-   *  pi-ai's built-in catalog and reads API keys from the environment. Supply
-   *  one explicitly for a mock (see `mockProvider`) or a custom backend. */
-  provider?: Provider;
+  /**
+   * Optional. Defaults to `piAiProvider()`, which resolves `model` against
+   * pi-ai's built-in catalog and reads API keys from the environment. Supply
+   * one explicitly for a mock (see `mockProvider`) or a custom backend.
+   *
+   * A STRING names a provider registered with `Agent.provider(name, impl)` and
+   * is resolved at run time — see `registerProvider` and `buildRunConfig`. It
+   * exists so an isomorphic config file can say `provider: 'mock'` without
+   * importing a server-only implementation, and so a deployment can swap the
+   * backend behind one registration.
+   */
+  provider?: Provider | string;
   /** $ per million tokens, for cost accounting. Used only as the FALLBACK when
    *  a provider reports no cost of its own: pi-ai prices each call itself,
    *  including the cacheRead/cacheWrite tokens this two-rate table cannot
@@ -167,6 +175,77 @@ export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | 
 
 const registry = new Map<string, AgentConfig>();
 
+/**
+ * Named provider implementations, for configs that say `provider: 'name'`.
+ *
+ * GLOBAL, like `Agent.method` and `Agent.hook`: a provider belongs to the
+ * process, and any number of agents may name the same one.
+ */
+const providers = new Map<string, Provider>();
+
+/**
+ * Register a provider under a name. See `Agent.provider` for the contract.
+ *
+ * Additive, and re-registering OVERWRITES with one warning rather than
+ * throwing. Meteor's dev server re-runs server files on every hot reload, so a
+ * throw here would turn an ordinary edit into a startup failure; a silent
+ * overwrite, on the other hand, is how two different implementations end up
+ * fighting over one name in production and nobody finds out. Warn and take the
+ * newest — the reload case is exactly a re-registration of the same impl.
+ */
+export function registerProvider(name: string, impl: Provider): void {
+  if (typeof name !== 'string' || name === '') {
+    throw new Error('[10thfloor:agent] Agent.provider(name, impl) needs a non-empty name');
+  }
+  if (!impl || typeof (impl as any).stream !== 'function') {
+    throw new Error(
+      `[10thfloor:agent] Agent.provider("${name}", impl): impl must have a `
+      + 'stream(request) method returning an async iterable of chunks',
+    );
+  }
+  if (providers.has(name)) {
+    console.warn(
+      `[10thfloor:agent] provider "${name}" was already registered; overwriting `
+      + '(expected on a dev hot reload, a real conflict otherwise)',
+    );
+  }
+  providers.set(name, impl);
+}
+
+/** The registered impl, or undefined. Exported for tests and for a host that
+ *  wants to reuse an app-registered provider directly. */
+export function getProvider(name: string): Provider | undefined {
+  return providers.get(name);
+}
+
+/**
+ * A config's `provider` reduced to an implementation.
+ *
+ * A STRING is resolved HERE — at `buildRunConfig` time, once per turn — and
+ * NOT at `defineAgent` time, deliberately. Agents and providers register in
+ * whatever order their server files load, and an agent that names a provider
+ * registered in a later file is ordinary code, not a mistake; validating at
+ * define() would make correctness depend on file order (the same reasoning
+ * `resolveTools` gives for not resolving a subagent name). An unknown name is
+ * therefore an error at the first turn, naming what was asked for and what is
+ * available, rather than a silent fallback to pi-ai — which would bill a real
+ * provider for a config that asked for a mock.
+ */
+function resolveProvider(provider: AgentConfig['provider']): Provider {
+  if (provider === undefined) return piAiProvider();
+  if (typeof provider !== 'string') return provider;
+  const impl = providers.get(provider);
+  if (!impl) {
+    const known = [...providers.keys()];
+    throw new Error(
+      `[10thfloor:agent] Unknown provider "${provider}". Register it with `
+      + `Agent.provider("${provider}", impl) before a turn runs. `
+      + `Registered: ${known.length ? known.join(', ') : '(none)'}`,
+    );
+  }
+  return impl;
+}
+
 /** Numeric config keys are validated with `assertCountLimit`'s rigor and for
  *  its reason: a non-numeric `context.window` makes the compaction trigger
  *  compare against NaN — false forever — so compaction silently never runs,
@@ -213,7 +292,9 @@ export function getAgent(name: string): AgentConfig | undefined {
  * that ran under different terms depending on how it was started would make
  * every one of them untestable as a proxy for the others. `provider` is
  * resolved HERE rather than at define() time so `defineAgent` stays a pure
- * registration and pi-ai is loaded only when a turn actually runs; `spend` is
+ * registration, pi-ai is loaded only when a turn actually runs, and a
+ * `provider: 'name'` string can be registered after the agent that names it
+ * (see `resolveProvider`, which is also where an unknown name throws); `spend` is
  * reduced to dollars here so the loop compares numbers (it cannot throw at this
  * point — `defineAgent` already parsed the same value at startup and refused a
  * bad one).
@@ -226,7 +307,7 @@ export function buildRunConfig(config: AgentConfig, userId: string | null): RunC
     model: config.model,
     system: buildSystemPrompt(config, { userId }),
     tools: config.tools ?? [],
-    provider: config.provider ?? piAiProvider(),
+    provider: resolveProvider(config.provider),
     maxIterations: config.maxIterations,
     budget: resolveBudget(config.budget),
     pricing: config.pricing,

@@ -21,8 +21,9 @@ TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 \
 ```
 
 Budget 2–4 minutes. The client half needs Playwright's Chromium
-(`npx playwright install chromium`). The one `pending` test is the live smoke;
-it un-skips itself when `ANTHROPIC_API_KEY` is set.
+(`npx playwright install chromium`). The two `pending` tests are the live
+smokes: the pi-ai one un-skips itself when `ANTHROPIC_API_KEY` is set, the MCP
+one when `MCP_LIVE_TEST=1` is.
 
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
@@ -66,6 +67,19 @@ weekly. The package survives both because of three rules — keep them:
 
 The app pins `^0.84.2` and `^1.30.0`. Do not widen either range in a commit that
 changes anything else.
+
+**Both peers are genuinely optional, and that is a property to preserve.** An
+app that installs neither still runs agents: the MCP SDK is reached only by a
+`{ mcp: … }` tool spec, and pi-ai only by the DEFAULT provider. There are three
+ways to skip pi-ai entirely — `mockProvider`, an inline `provider:`
+implementation, and `Agent.provider(name, impl)` with a config that names it as
+a string. Resolution (`resolveProvider` in `server/registry.ts`) is the gate:
+`piAiProvider()` is constructed only when a config names no provider at all,
+and even then it loads nothing until its first stream. If you change provider
+resolution, keep both halves — a named or supplied provider must never route
+through the pi-ai default, and the default must stay lazy. Either regression
+puts an app-level npm peer back on the critical path for every agent, which is
+exactly what the loader seam exists to avoid.
 
 ## Invariants that reviews keep re-proving
 

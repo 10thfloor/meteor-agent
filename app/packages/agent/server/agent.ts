@@ -2,9 +2,10 @@ import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import {
-  defineAgent, getAgent, buildRunConfig, type AgentConfig,
+  defineAgent, getAgent, buildRunConfig, registerProvider, type AgentConfig,
 } from './registry';
-import { runTurn } from './loop';
+import type { Provider } from './providers/types';
+import { compactSession, runTurn } from './loop';
 import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
@@ -175,6 +176,51 @@ export class Agent {
   }
 
   /**
+   * §9's compaction, run NOW — regardless of the `context.compactAt` threshold,
+   * which is the entire point of a manual call. Resolves true when a
+   * `kind:'compaction'` note was committed, false when there was nothing worth
+   * compacting (fewer than `context.keep` messages past the last note, or no
+   * legal cut point).
+   *
+   * `Meteor.Error('busy')` when a turn is running or the session is leased: a
+   * compaction writes to the transcript exactly as a turn does, so the two must
+   * not overlap. Wait for `status()` to be `idle` and call again.
+   *
+   * The threshold is the only thing skipped. Everything else is the automatic
+   * path: the same batch-safe cut, the same summarizer prompt through the same
+   * `beforeProviderRequest` hook (`ctx.purpose === 'compaction'`), the same
+   * usage and cost accrual — and the same silent degrade when the summarization
+   * fails, which surfaces here as `false`.
+   *
+   * `userId` scopes the lookup for a server-side caller acting on someone's
+   * behalf, exactly as `fork`'s does.
+   */
+  async compact(
+    sessionId: string, opts?: { userId?: string | null },
+  ): Promise<boolean> {
+    const config = getAgent(this.name);
+    if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${this.name}`);
+    const selector: Record<string, unknown> = { _id: sessionId, agent: this.name };
+    if (opts && 'userId' in opts) selector.userId = opts.userId ?? null;
+    const session = await AgentSessions.findOneAsync(selector as any);
+    if (!session) throw new Meteor.Error('no-session', 'Session not found');
+
+    // The session's OWN owner, not the caller's scope: a compaction runs the
+    // agent's `instructions` and resolves its tools, and both must see the
+    // identity every other entry into this session sees.
+    const outcome = await compactSession(
+      sessionId, buildRunConfig(config, session.userId),
+    );
+    if (outcome === 'busy') {
+      throw new Meteor.Error(
+        'busy', 'This session is running a turn; compact it when it is idle.',
+      );
+    }
+    if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
+    return outcome === 'compacted';
+  }
+
+  /**
    * §6. Register a Meteor method and get a tool handle for it in one
    * definition — see `defineAgentMethod`. STATIC because a co-registered method
    * belongs to the app, not to one agent: any number of agents may list the
@@ -186,6 +232,35 @@ export class Agent {
    */
   static method(name: string, options: AgentMethodOptions): AdoptedTool {
     return defineAgentMethod(name, options);
+  }
+
+  /**
+   * Register a provider implementation under a NAME, so a config can say
+   * `provider: 'name'` instead of holding the implementation.
+   *
+   *   Agent.provider('mock', mockProvider(() => ({ text: 'hi' })));
+   *   Support.define({ model: 'mock', instructions: '…', provider: 'mock' });
+   *
+   * STATIC and GLOBAL, like `Agent.method`, `Agent.mcpServer` and `Agent.hook`:
+   * a provider belongs to the process, and any number of agents may name one.
+   *
+   * Two things it buys. An agent config can live in an ISOMORPHIC file — the
+   * string names a server-only implementation without importing it into the
+   * client bundle. And a deployment swaps its backend behind one registration
+   * rather than editing every agent: a custom provider is also the third way to
+   * avoid pi-ai entirely (the other two being `mockProvider` and passing an
+   * implementation inline), which is what makes the npm peer genuinely
+   * optional.
+   *
+   * Resolution happens on the first TURN, not at `define()`: agents and
+   * providers register in whatever order their server files load, so an unknown
+   * name throws when a turn needs it, naming what was asked for and what is
+   * registered. Re-registering a name overwrites it with one warning — that is
+   * a dev hot reload, and refusing it would turn an ordinary edit into a
+   * startup failure.
+   */
+  static provider(name: string, impl: Provider): void {
+    registerProvider(name, impl);
   }
 
   /**

@@ -307,12 +307,19 @@ export class DeltaWriter {
    * delta document is the only place the attribution can still be recorded.
    */
   push(kind: string, chunk: string, contentIndex?: number) {
+    // `contentIndex` is meaningful for `tool_args` and nothing else — `mergeView`
+    // only accumulates per index there. A stray one (a third-party Provider
+    // stamping it on a text chunk) is DROPPED rather than thrown: deltas are
+    // ephemeral by design and a provider's mistake must not abandon a turn, but
+    // carried through it would split one text run into two coalescing buckets
+    // and reorder nothing visibly — the worst kind of bug to find later.
+    const index = kind === 'tool_args' ? contentIndex : undefined;
     const last = this.buf[this.buf.length - 1];
-    if (last && last.kind === kind && last.contentIndex === contentIndex) {
+    if (last && last.kind === kind && last.contentIndex === index) {
       last.chunk += chunk;
       return;
     }
-    this.buf.push({ kind, chunk, seq: this.seq++, ...(contentIndex === undefined ? {} : { contentIndex }) });
+    this.buf.push({ kind, chunk, seq: this.seq++, ...(index === undefined ? {} : { contentIndex: index }) });
   }
 
   flush(): Promise<void> {
@@ -520,6 +527,9 @@ export function findCompactionCut(msgs: AgentMessage[], keep: number): number | 
  * the provider's error to report, and the next iteration tries again), and no
  * error note is written — compaction is bookkeeping, not the user's request.
  * Returns true when a note was committed (the caller re-reads history).
+ *
+ * This is the THRESHOLD half only. The step itself is `compactNow`, which the
+ * manual `Agent.compact` calls directly — see there.
  */
 async function maybeCompact(
   sessionId: string, agent: string, config: RunConfig, history: AgentMessage[],
@@ -529,7 +539,6 @@ async function maybeCompact(
   if (!ctx) return false;
   const window = ctx.window ?? 200_000;
   const compactAt = ctx.compactAt ?? 0.8;
-  const keep = ctx.keep ?? 6;
 
   const prior = latestCompaction(history);
   const assembled = assembleContext(history);
@@ -540,6 +549,30 @@ async function maybeCompact(
   const reported = lastAssistant && (!prior || lastAssistant.seq > prior.seq)
     ? lastAssistant.usage!.input : undefined;
   if (estimateContext(assembled, reported) <= window * compactAt) return false;
+
+  return compactNow(sessionId, agent, config, history, schemas, interruptCheckMs);
+}
+
+/**
+ * The §9 compaction STEP, with no threshold in it.
+ *
+ * Factored out of `maybeCompact` so the manual `Agent.compact` runs exactly the
+ * automatic path — same cut, same summarizer prompt, same hook seam, same
+ * usage accounting, same degrade-never-fail contract — instead of a second
+ * implementation that would drift. `maybeCompact` is now the estimate and the
+ * `window * compactAt` comparison, and nothing else; everything from the cut
+ * down is here, unchanged.
+ *
+ * `context.keep` still applies (the manual call is "compact now", not "throw
+ * the tail away"), and `config.context` may be absent entirely: a caller that
+ * asked for this explicitly gets the defaults rather than a silent no-op.
+ */
+async function compactNow(
+  sessionId: string, agent: string, config: RunConfig, history: AgentMessage[],
+  schemas: ToolSchema[] = [], interruptCheckMs = 250,
+): Promise<boolean> {
+  const keep = config.context?.keep ?? 6;
+  const prior = latestCompaction(history);
 
   const upto = findCompactionCut(history, keep);
   if (upto === null) return false;
@@ -630,6 +663,96 @@ async function maybeCompact(
     summary, upto, usage, createdAt: new Date(),
   } as any);
   return true;
+}
+
+/**
+ * What a manual compaction did. A plain union rather than a throw, because this
+ * module is deliberately free of the Meteor namespace — `Agent.compact` turns
+ * `busy` into `Meteor.Error('busy')` and `gone` into `no-session`, and the
+ * client sees those.
+ */
+export type CompactOutcome = 'compacted' | 'nothing' | 'busy' | 'gone';
+
+/**
+ * §9's compaction step, run ON DEMAND against an idle session — the whole point
+ * being that the threshold does NOT apply. A UI's "compact now" button, a job
+ * trimming a long-running session before it gets expensive.
+ *
+ * It takes the LEASE for the operation (claim, compact, release) rather than
+ * writing under whatever the session's state happens to be. A compaction is a
+ * full provider round trip that commits a note at an allocated seq, which is
+ * precisely what a turn does — running one beside a live turn would interleave
+ * two writers over one transcript. So a session with a live lease, or a turn in
+ * flight in this process, is refused as `busy` instead of queued: the caller is
+ * a human clicking a button, and "try again in a moment" is an answer they can
+ * act on. The in-process `running` Set is held too, for the same reason
+ * `runTurn` holds it — `claimLease` succeeds on its "already ours" branch, so
+ * the lease alone would not stop a `Meteor.defer`red turn in THIS process from
+ * writing straight through the compaction.
+ *
+ * The heartbeat mirrors `runTurn`'s: LEASE_MS is 30s and a summarization of a
+ * long transcript can exceed it, and losing the lease mid-call would make the
+ * note's own lease-guarded write fail silently.
+ *
+ * The watcher is not fought: it recovers sessions whose lease EXPIRED, and this
+ * one is heartbeaten and released. The phase is restored on the way out with
+ * `runTurn`'s exact rule — `stopped`, `error` and `awaiting` are decisions and
+ * are left alone; anything else returns to `idle`, which is what an idle
+ * session that was compacted goes back to being.
+ */
+export async function compactSession(
+  sessionId: string, config: RunConfig,
+): Promise<CompactOutcome> {
+  if (running.has(sessionId)) return 'busy';
+
+  const session = await AgentSessions.findOneAsync(sessionId);
+  if (!session) return 'gone';
+  // A live lease is another server's turn (or ours, mid-wind-down). An EXPIRED
+  // one is an orphan the watcher will re-run: `claimLease` would take it, and
+  // compacting an abandoned turn's half-written transcript is not this call's
+  // job — leave it to the recovery that knows how to repair it.
+  if (session.lease) return 'busy';
+
+  running.add(sessionId);
+  try {
+    if (!(await claimLease(sessionId))) return 'busy';
+    const beat = setInterval(() => {
+      void heartbeat(sessionId).catch(() => { /* the guards catch a lost lease */ });
+    }, HEARTBEAT_MS);
+    try {
+      // The same assembly a turn makes, and for the same reason `maybeCompact`
+      // is given `schemas` at all: the compacted head keeps its
+      // tool_use/tool_result blocks, and Anthropic rejects a request carrying
+      // those with no `tools` parameter.
+      const tools = withSkillTool(
+        await expandMcpTools(resolveTools(config.tools)), config.skills,
+      );
+      const history = await AgentMessages
+        .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+      const did = await compactNow(
+        sessionId, session.agent, config, history, toolSchemas(tools),
+        config.interruptCheckMs ?? 250,
+      );
+      return did ? 'compacted' : 'nothing';
+    } finally {
+      clearInterval(beat);
+      // `compactNow` leaves `phase: 'compacting'` behind on success — inside a
+      // turn the next iteration's `streaming` write clears it, and here there
+      // is no next iteration. Same terminal list as `runTurn`'s finally, for
+      // the same reasons: a stop that landed mid-summarization (the abort poll
+      // honors it) and an approval nobody has answered are decisions, not
+      // states to tidy up.
+      const current = await AgentSessions.findOneAsync(sessionId);
+      if (current && !['stopped', 'error', 'awaiting'].includes(current.phase)) {
+        await guardedUpdate(sessionId, SERVER_ID, {
+          $set: { phase: 'idle', updatedAt: new Date() },
+        });
+      }
+      await releaseLease(sessionId);
+    }
+  } finally {
+    running.delete(sessionId);
+  }
 }
 
 /**

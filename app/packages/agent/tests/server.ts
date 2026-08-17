@@ -11,5 +11,6 @@ import './subagent.test';
 import './mcp.test';
 import './skills.test';
 import './fork.test';
+import './candidates.test';
 import './watcher.test';
 import './integration.server';

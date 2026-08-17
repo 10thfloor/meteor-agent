@@ -10,6 +10,7 @@ export const NAMES = {
   mFork: 'agent.fork',
   mApprove: 'agent.approve',
   mDeny: 'agent.deny',
+  mCompact: 'agent.compact',
 } as const;
 
 /** Capped collection size in bytes. Sized for ~200 concurrent streaming turns. */

@@ -278,3 +278,36 @@ M4 Task 5 (skills + hooks): complete (5d95cac, 260+2 passing + 1 client, from 24
   cannot disable the interrupt. Full report: .superpowers/sdd/task-5-report.md
   Carry: skill bodies obey maxResultChars (no special case); canUse can deny `skill` while the
   prompt listing stands.
+M4 Task 7 (small candidates + docs close-out): complete. Suite 275 server (+2 pending) + 5 client,
+  from 260 — +15 (12 in a new tests/candidates.test.ts, 3 approvals rate-limit tests in capped).
+  Agent.provider(name, impl): AgentConfig.provider is Provider|string, resolved in buildRunConfig
+  (NOT define — file load order would decide correctness, same reasoning resolveTools gives for
+  subagent names); unknown name THROWS naming it + listing the registered (no silent pi-ai fallback:
+  that bills a real provider for a config that asked for a mock); shape checked eagerly; re-register
+  overwrites with one warn (hot reload). Third documented way to avoid the pi-ai peer entirely.
+  Manual compact: maybeCompact split at the threshold seam -> compactNow(sessionId, agent, config,
+  history, schemas, interruptCheckMs) holds everything from findCompactionCut down, unchanged (the
+  4 existing compaction tests pass untouched). compactSession() takes the LEASE + the in-process
+  running Set (claimLease succeeds on "already ours", so the lease alone would not stop a deferred
+  turn in this process), heartbeats, and restores the phase with runTurn's exact terminal rule ->
+  an idle session ends idle+unleased, nothing for the watcher to claim. Refuses 'busy' when leased
+  (incl. EXPIRED — that is the watcher's orphan) or running, before spending a model call. loop.ts
+  stays Meteor-free: returns 'compacted'|'nothing'|'busy'|'gone'; agent.compact method + Agent.compact
+  + client compact() map it. Works with context absent (defaults) — the caller asked explicitly.
+  runAs: inline+adopted only; withInvocation userId AND ctx.userId move together; presence-not-
+  truthiness everywhere (null = anonymous service context; a present-but-undefined value resolves to
+  null, the fail-safe direction); ToolContext.callerUserId carries the session's real owner in, which
+  is what "check ctx inside the tool" means; authorization (canUse/gate/ownership) does NOT move.
+  Subagent + MCP specs rejected at resolveTools with the reason.
+  rateLimit.approvals: one entry, agent.approve + agent.deny, 4 rules (starts' shape).
+  Docs: README Scope rewritten as "what v2 means now" (bulleted M4 inventory) + RPC/print RETIRED in
+  writing (RPC mode IS DDP, print mode IS Agent.ask()); new ## Providers section; ### runAs section
+  with the escalation warning + a cross-referenced paragraph in Anonymous sessions; compact-on-demand
+  block; approvals in the rate-limit example. CONTRIBUTING: both peers genuinely optional, the three
+  pi-ai escapes with Agent.provider as the third, the two resolveProvider properties to preserve;
+  stale "one pending test" line corrected to two live smokes.
+  Ledger closed: DeltaWriter.push now scopes contentIndex to tool_args — DROPPED not thrown (the
+  value comes off a ProviderChunk; a third-party provider must not abandon turns), one piai.test
+  assertion re-pinned from the incidental old behavior. Standalone-Mongo README line: already there.
+  v3 backlog consolidated (14 items) in .superpowers/sdd/task-7-report.md — new one from this task:
+  no rateLimit entry for agent.compact.

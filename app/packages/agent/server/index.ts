@@ -9,6 +9,9 @@ export * from '../common/types';
 export { NAMES } from '../common/names';
 export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 export { mergeView } from '../common/merge';
+// `Agent.provider` / `Agent.compact` are the doors to the provider registry and
+// to manual compaction; the underlying `registerProvider` / `compactSession`
+// stay internal, exactly as `runTurn` and `resolveTools` do.
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,

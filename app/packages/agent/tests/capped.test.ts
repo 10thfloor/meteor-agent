@@ -341,6 +341,60 @@ describe('applyRateLimits', () => {
     );
   });
 
+  it('adds twelve rules when approvals joins sends, starts and interrupts', async () => {
+    // `approvals` is the second entry governing TWO methods: `agent.approve`
+    // and `agent.deny` are the same decision made two ways, and separate knobs
+    // would make `deny` the cheap way to hammer the path `approve` limits.
+    // Two rules per method, so the entry adds four — 8 + 4.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
+        approvals: { count: HEADROOM, intervalMs: 10000 },
+      },
+    });
+    assert.equal(added, 12);
+  });
+
+  it('an approvals entry registers rules for BOTH agent.approve and agent.deny', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const approveInput = {
+      type: 'method', name: NAMES.mApprove,
+      userId: 'rl-user-appr', connectionId: 'rl-conn-appr', clientAddress: '127.0.0.1',
+    };
+    const denyInput = { ...approveInput, name: NAMES.mDeny };
+    const approveBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(approveInput);
+    const denyBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(denyInput);
+
+    applyRateLimits({ rateLimit: { approvals: { count: HEADROOM, intervalMs: 60000 } } });
+
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(approveInput)).length,
+      approveBefore.length,
+      'the entry must match a real agent.approve invocation',
+    );
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(denyInput)).length,
+      denyBefore.length,
+      'and a real agent.deny one — one entry, both methods',
+    );
+  });
+
+  it('throws naming the field for a malformed approvals entry', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { approvals: { count: -1, intervalMs: 60000 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a negative count must throw');
+    assert.include(threw.message, 'approvals.count');
+  });
+
   it('throws naming the field for a malformed interrupts entry', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     let threw: any;

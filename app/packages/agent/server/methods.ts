@@ -4,7 +4,7 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
-import { runTurn } from './loop';
+import { compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
 
 /**
@@ -353,6 +353,45 @@ export function registerMethods(): void {
       // trailing `undefined` argument into null on the wire — so normalize
       // rather than letting a null `atSeq` reach the arithmetic downstream.
       return forkSession(source, { atSeq: atSeq ?? undefined, title: opts?.title });
+    },
+
+    /**
+     * §9's compaction on demand, ignoring the threshold. Resolves true when a
+     * note was committed, false when there was nothing to compact.
+     *
+     * Authorized exactly as every other session method is, then handed to
+     * `compactSession`, which owns the lease for the operation — so this cannot
+     * race a turn, and a session that is running one is refused with `busy`
+     * rather than queued. It is deliberately NOT `deferTurn`-shaped: the caller
+     * asked for a specific piece of bookkeeping and is owed its result, and a
+     * compaction commits at most one note.
+     *
+     * The turn budget is untouched: a compaction is not a turn. Its
+     * summarization call still accrues usage and cost like any other model
+     * call, so `budget.spend` remains the backstop — and `rateLimit` has no
+     * entry of its own for this yet (v3): it is authenticated-or-capability
+     * scoped, refuses while busy, and costs one model call.
+     */
+    async [NAMES.mCompact](this: any, agent: string, sessionId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const session = await requireSession(agent, sessionId, this.userId ?? null);
+
+      // The SESSION's owner, not `this.userId`: an anonymous capability-URL
+      // session compacts under the same null identity its turns run under, and
+      // the two are the same value anyway after `requireSession` matched on it.
+      const outcome = await compactSession(
+        sessionId, buildRunConfig(config, session.userId),
+      );
+      if (outcome === 'busy') {
+        throw new Meteor.Error(
+          'busy', 'This session is running a turn; compact it when it is idle.',
+        );
+      }
+      if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
+      return outcome === 'compacted';
     },
 
     async [NAMES.mApprove](this: any, agent: string, sessionId: string) {

@@ -9,6 +9,8 @@ import {
 } from './mcp/client';
 
 export interface ToolContext {
+  /** Who this tool runs AS. Normally the session's owner; a spec with `runAs`
+   *  replaces it for that one tool — see `RUNAS_NOTE` and `runTool`. */
   userId: string | null;
   sessionId: string;
   /** The id of the tool call currently being dispatched. Set by every loop
@@ -16,7 +18,34 @@ export interface ToolContext {
    *  a host driving one tool) has no call to name. A subagent needs it: it is
    *  half of the child's `parent` lineage. */
   toolCallId?: string;
+  /** The SESSION's owner, present only when `runAs` replaced `userId` for this
+   *  call. It is what a `runAs` tool checks to decide what it will do on whose
+   *  behalf: the escalation gives the tool an identity, and this is the only
+   *  remaining record of who actually asked. */
+  callerUserId?: string | null;
 }
+
+/* ---------------------------------------------------------------------------
+ * THE `runAs` NOTE — the contract both spec types below point at.
+ *
+ * A tool with `runAs` runs under a userId the CALLER did not authenticate as.
+ * That is privilege escalation by construction, and it is per-LISTING, not
+ * per-session: every session of every agent that lists the spec gets the same
+ * fixed identity, including anonymous capability-URL sessions, where the human
+ * on the other end is "whoever holds the id". Gate such a tool (`gate: 'ask'`),
+ * fence it with `canUse`, or check `ctx.callerUserId` inside it — and prefer a
+ * narrow service tool over a broad one running as an admin.
+ *
+ * `null` is not "unset": it is the ANONYMOUS service context (`this.userId ===
+ * null`), which is what a tool wants when it should never act on anyone's
+ * behalf. Omitting `runAs` is what inherits the session's user.
+ *
+ * Only INLINE and ADOPTED specs take it. A subagent owns its identity (the
+ * child session inherits the parent's owner and its own tools decide from
+ * there), and an MCP call has no Meteor invocation to carry a userId at all —
+ * so `runAs` on either is refused in `resolveTools` rather than accepted and
+ * ignored.
+ * ------------------------------------------------------------------------ */
 
 export type InlineTool = {
   name: string;
@@ -24,6 +53,10 @@ export type InlineTool = {
   args: unknown;
   run: (args: any, ctx: ToolContext) => Promise<unknown>;
   gate?: 'auto' | 'ask';
+  /** Run this tool as a FIXED user instead of the session's owner (`null` =
+   *  anonymous service context). Privilege escalation by construction —
+   *  read THE `runAs` NOTE above before using it. */
+  runAs?: string | null;
 };
 
 export type AdoptedTool = {
@@ -32,6 +65,10 @@ export type AdoptedTool = {
   args: unknown;
   name?: string;
   gate?: 'auto' | 'ask';
+  /** The method's `this.userId` for calls the MODEL makes through this listing
+   *  (your UI's own `Meteor.callAsync` is unaffected). Privilege escalation by
+   *  construction — read `RUNAS_NOTE` above before using it. */
+  runAs?: string | null;
 };
 
 /**
@@ -110,6 +147,10 @@ export interface ResolvedTool {
   /** `kind: 'mcp'` only: which metadata the SPEC set, so discovery fills in
    *  only the rest. */
   mcpExplicit?: { description: boolean; args: boolean };
+  /** `inline` and `adopted` only. PRESENT means "run as this user instead of
+   *  the session's owner" — and `null` is a real value (anonymous service
+   *  context), so every check on it is `!== undefined`, never truthiness. */
+  runAs?: string | null;
 }
 
 export interface ToolResult {
@@ -570,6 +611,11 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
     const hasRun = 'run' in spec && spec.run !== undefined;
     const hasSubagent = 'subagent' in spec && (spec as any).subagent !== undefined;
     const hasMcp = 'mcp' in spec && (spec as any).mcp !== undefined;
+    // `in`, not a truthiness or `!== undefined` test: `runAs: null` is the
+    // ANONYMOUS service context, a deliberate value, and reading it as "unset"
+    // would silently run the tool as the session's user instead — the opposite
+    // of what was asked for, in the direction that grants MORE access.
+    const hasRunAs = 'runAs' in spec;
     const chosen = [hasMethod, hasRun, hasSubagent, hasMcp].filter(Boolean).length;
     if (chosen > 1) {
       const label = (spec as any).name ?? (spec as any).method
@@ -584,6 +630,15 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       throw new Error(
         `[10thfloor:agent] Tool spec has none of "method", "run", "subagent" and `
         + `"mcp" — pick one: ${label}`,
+      );
+    }
+    if (hasRunAs && (hasSubagent || hasMcp)) {
+      throw new Error(
+        `[10thfloor:agent] "runAs" is not supported on ${hasSubagent ? 'subagent' : 'MCP'} `
+        + "tool specs: a subagent's child session owns its identity (it inherits the "
+        + "session's user and its own tools decide from there), and an MCP call runs in "
+        + 'another process with no Meteor invocation to carry a userId. Put "runAs" on the '
+        + `inline or adopted tool that needs it: ${JSON.stringify(spec)}`,
       );
     }
     if (hasMcp) {
@@ -667,6 +722,16 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         gate: adopted.gate ?? 'auto',
         kind: 'adopted' as const,
         method: adopted.method,
+        // Spread rather than `runAs: adopted.runAs`, so a spec WITHOUT the key
+        // leaves the field ABSENT rather than present-and-undefined: `runTool`
+        // reads presence, and `null` is a real value there.
+        //
+        // A key that IS present with an undefined value (`runAs: maybeUser`
+        // where the variable is undefined) resolves to `null` — anonymous. It
+        // is the fail-safe direction: the alternative, treating it as unset,
+        // silently runs the tool as the SESSION's user, which is the reading
+        // that grants more access than was written.
+        ...(hasRunAs ? { runAs: adopted.runAs ?? null } : {}),
       };
     }
     const inline = spec as InlineTool;
@@ -682,6 +747,9 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       gate: inline.gate ?? 'auto',
       kind: 'inline' as const,
       run: inline.run,
+      // See the adopted branch above for why this is a spread and why an
+      // undefined value resolves to `null`.
+      ...(hasRunAs ? { runAs: inline.runAs ?? null } : {}),
     };
   });
 }
@@ -1182,14 +1250,29 @@ export async function runTool(
       return { ok: false, error: { error: 'invalid-args', reason: verdict.reason } };
     }
   }
+  // `runAs` REPLACES the identity for this one tool: the ambient invocation's
+  // userId (so an adopted method's `this.userId` is it) and `ctx.userId` (so an
+  // inline body sees the same thing through its own argument) move together —
+  // a tool whose `this` and whose `ctx` disagreed about who it is would be a
+  // trap, and which of the two an author reaches for is a matter of style.
+  //
+  // AUTHORIZATION does not move. `canUse`, the gate and the session's ownership
+  // check all ran BEFORE dispatch, against the session's real owner, so `runAs`
+  // widens what the tool may do and never who may invoke it. `callerUserId`
+  // carries that real owner in for a tool that wants to decide for itself.
+  const escalated = tool.runAs !== undefined;
+  const effectiveUserId: string | null = escalated ? (tool.runAs ?? null) : ctx.userId;
+  const toolCtx: ToolContext = escalated
+    ? { ...ctx, userId: effectiveUserId, callerUserId: ctx.userId }
+    : ctx;
   try {
-    const value = await withInvocation(ctx.userId, async () => {
+    const value = await withInvocation(effectiveUserId, async () => {
       if (tool.kind === 'adopted') {
         // Meteor derives its own MethodInvocation here, inheriting userId from
         // the ambient one, and the method's own check() calls run as written.
         return Meteor.callAsync(tool.method!, args);
       }
-      return tool.run!(args, ctx);
+      return tool.run!(args, toolCtx);
     });
     return { ok: true, value };
   } catch (e: any) {

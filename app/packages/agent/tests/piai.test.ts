@@ -665,7 +665,12 @@ describe('parallel tool-call attribution, end to end (faux provider, no network)
     writer.push('tool_args', '{"b":', 1);    // different index: new run
     writer.push('tool_args', '2}', 1);
     writer.push('tool_args', '{"c":', 0);    // back to 0: new run, not a merge
-    writer.push('text', 'and', 0);           // a different kind never coalesces
+    // A different kind never coalesces — and a contentIndex on a non-tool_args
+    // chunk is DROPPED: the field is meaningful only where `mergeView`
+    // accumulates per index, and a stray one (a third-party provider stamping
+    // it on text) would split one text run into two coalescing buckets for no
+    // reader's benefit.
+    writer.push('text', 'and', 0);
     await writer.stop();
 
     const docs = (await AgentDeltas.find({ sessionId } as any).fetchAsync())
@@ -676,7 +681,7 @@ describe('parallel tool-call attribution, end to end (faux provider, no network)
         ['tool_args', 0, '{"a":1}'],
         ['tool_args', 1, '{"b":2}'],
         ['tool_args', 0, '{"c":'],
-        ['text', 0, 'and'],
+        ['text', undefined, 'and'],
       ],
     );
     assert.deepEqual(docs.map((d) => d.seq), [0, 1, 2, 3], 'seq stays contiguous');

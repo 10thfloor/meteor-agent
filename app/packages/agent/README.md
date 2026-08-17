@@ -38,7 +38,9 @@ The full config surface:
 Support.define({
   model: 'anthropic/claude-sonnet-5',
   instructions: [...],                       // string | fn(ctx) | array
-  tools: ['orders.lookup', { name, description, args, run, gate: 'ask' }],
+  tools: ['orders.lookup', { name, description, args, run, gate: 'ask' },
+          { method: 'billing.credit', description, args,
+            runAs: 'service-account' }],  // see runAs — privilege escalation
   skills: [{ name: 'refunds', description, content }],   // see Skills
   budget: { turns: 20, toolCalls: 40, spend: '$1.00',
             approval: 3600000 },             // each optional; see below
@@ -52,7 +54,8 @@ Support.define({
   maxResultChars: 8000,                      // tool results truncated past this
   canUse: (tool, { userId }) => true,        // agent-level tool backstop
   approve: ({ userId }) => userId !== null,  // who may answer ask-gates
-  provider: mockProvider(...),               // omit for pi-ai
+  provider: mockProvider(...),               // an impl, or 'name' registered
+                                             // with Agent.provider; omit for pi-ai
 });
 ```
 
@@ -64,6 +67,26 @@ every message and your UI keeps rendering all of it. The cut never separates a
 tool call from its result, a failed summarization silently degrades to an
 uncompacted turn, and the summarization call is billed like any other model
 call.
+
+**Compacting on demand.** `compact()` runs that same step immediately,
+*whatever the threshold says* — that is the point of a manual call. It is a
+"compact now" button, or a job trimming a long-lived session before it gets
+expensive.
+
+```ts
+const compacted: boolean = await Support.compact(sessionId);   // client or server
+```
+
+It resolves true when a summary note was committed and false when there was
+nothing worth compacting (fewer than `keep` messages past the last note). It
+rejects with `busy` while a turn is running — a compaction writes to the
+transcript exactly as a turn does, so it takes the session's lease for the
+operation and the two never overlap; gate the button on `status(id) === 'idle'`.
+Everything except the threshold is the automatic path: same cut, same summarizer
+prompt through the same `beforeProviderRequest` hook, same usage and cost
+accrual, same silent degrade on failure. The transcript keeps every message, so
+nothing vanishes from your UI. It works even for an agent with no `context`
+block (compaction otherwise disabled): you asked for it explicitly.
 
 ## Tools
 
@@ -163,15 +186,20 @@ tries again. Your transcript UI should render three note kinds: `error`,
 { "packages": { "10thfloor:agent": { "rateLimit": {
   "sends":      { "count": 10, "intervalMs": 60000 },
   "starts":     { "count": 5,  "intervalMs": 60000 },
-  "interrupts": { "count": 30, "intervalMs": 60000 }
+  "interrupts": { "count": 30, "intervalMs": 60000 },
+  "approvals":  { "count": 30, "intervalMs": 60000 }
 } } } }
 ```
 
 Each entry registers two DDP rules per method it governs: per-(user,
 connection) so an anonymous flood only burns its own connection's quota, and
 per-user for authenticated callers so opening more connections does not
-multiply the allowance. `starts` governs two methods — `agent.start` and
-`agent.fork` (see **Forking**), both of which create a session.
+multiply the allowance. Two entries govern two methods each: `starts` covers
+`agent.start` and `agent.fork` (see **Forking**), both of which create a
+session, and `approvals` covers `agent.approve` and `agent.deny` — the same
+decision made two ways, and the one unauthenticated-reachable method that
+*resumes* a turn. Given separate knobs, `deny` would be the cheap way to hammer
+the path `approve` limits.
 
 **Recovery runs itself.** Every server starts a watcher at boot: it observes
 sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
@@ -191,6 +219,59 @@ streaming, and `usage()`/`status()` reactivity all degrade to that polling
 cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
 Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
 Meteor's constraint, not this package's.
+
+### `runAs` — a tool with a fixed identity
+
+A tool normally runs as the session's owner: an adopted method's `this.userId`
+and an inline tool's `ctx.userId` are whoever is on the other end of the chat.
+`runAs` replaces that for **one listing of one tool**.
+
+```ts
+tools: [
+  { method: 'billing.credit', description, args, runAs: 'service-account' },
+  { name: 'rates', description, args, run, runAs: null },   // anonymous
+]
+```
+
+`null` is not "unset" — it is the anonymous service context (`this.userId ===
+null`), for a tool that should never act on anyone's behalf. Omitting `runAs`
+is what inherits the session's user.
+
+> **`runAs` is privilege escalation by construction.** The tool runs under a
+> userId the caller never authenticated as, and it is per-LISTING, not
+> per-session: **every session of every agent that lists the spec gets the same
+> fixed identity** — including anonymous capability-URL sessions, where "the
+> user" is whoever holds the id (see **Anonymous sessions**). A tool running as
+> an admin, listed by an agent anyone can chat to, is an admin API with a
+> language model in front of it.
+
+So: keep such a tool narrow (one operation, not a query surface), gate it
+(`gate: 'ask'`), fence it with `canUse`, or check inside it. Authorization does
+**not** move with the identity — `canUse`, the gate and the session's ownership
+check all run against the session's real owner, before dispatch — so `runAs`
+widens what a tool may do and never who may invoke it. That real owner is
+handed to the tool as `ctx.callerUserId`, which is what an inline tool checks
+when it needs to decide for itself:
+
+```ts
+{ name: 'credit', description, args, runAs: 'service-account',
+  async run(args, ctx) {
+    if (!ctx.callerUserId) throw new Meteor.Error('not-allowed', 'sign in first');
+    return Billing.creditAsync(ctx.callerUserId, args.amount);
+  } }
+```
+
+An `Agent.method` handle takes it by spreading —
+`{ ...lookup, runAs: 'service-account' }` — so the same co-registered method can
+be listed with a service identity by one agent and with the session's own by
+another. Your UI's direct `Meteor.callAsync` is never affected: `runAs` applies
+only to calls the model makes through that listing.
+
+**Subagent and MCP specs refuse it**, at `resolveTools`, rather than accepting
+it and quietly doing nothing: a subagent's child session owns its identity (it
+inherits the session's user, and the child's own tools decide from there), and
+an MCP call runs in another process with no Meteor invocation to carry a userId
+at all.
 
 ### MCP servers
 
@@ -729,6 +810,44 @@ session, so the work streams live, stays readable afterwards, and can still be
 approved if it parks. `ask` is for the case with nothing to watch and nothing
 to keep: a cron job, a webhook, a Meteor method.
 
+## Providers
+
+A `Provider` is one method — `stream(request)` returning an async iterable of
+chunks — and it is the only thing standing between this package and a model
+API. Three ways to give an agent one:
+
+```ts
+Support.define({ ..., provider: myProvider });      // an implementation
+Support.define({ ..., provider: 'anthropic-eu' });  // a registered name
+Support.define({ ... });                            // omit it: pi-ai
+```
+
+`Agent.provider(name, impl)` registers a name, globally, like `Agent.method`
+and `Agent.hook`:
+
+```ts
+// server/providers.ts
+import { Agent, mockProvider } from 'meteor/10thfloor:agent';
+Agent.provider('canned', mockProvider(() => ({ text: 'hi' })));
+```
+
+It buys two things. An agent config can live in an **isomorphic** file — the
+string names a server-only implementation without dragging it into the client
+bundle. And a deployment swaps its backend behind one registration instead of
+editing every agent.
+
+Names resolve on the first **turn**, not at `define()`: agents and providers
+register in whatever order their server files load, so an agent may name a
+provider registered afterwards. An unknown name throws when a turn needs it,
+saying what was asked for and what is registered — never a silent fallback to
+pi-ai, which would bill a real provider for a config that asked for a mock.
+Re-registering a name overwrites it with one warning (that is a dev hot reload,
+and refusing it would turn an ordinary edit into a startup failure).
+
+A custom provider is also the **third way to avoid pi-ai entirely**: with
+`mockProvider`, an inline implementation, or a registered name, the npm peer is
+never loaded and never needs installing.
+
 ## Testing without an API key
 
 ```ts
@@ -775,29 +894,47 @@ against the tool's schema before dispatch (see **Tools**), but a check is not
 an authorization: a tool reachable by an anonymous session should decide what
 it will do for a caller with no user at all.
 
+**And `runAs` is the sharp edge here.** `this.userId === null` at least fails
+closed — an ownership check matches nothing. A tool listed with
+`runAs: 'admin'` does the opposite: it hands every anonymous holder of a
+session id the identity you named, on every call, because the identity belongs
+to the *listing* and not to the session (see **`runAs` — a tool with a fixed
+identity**). If an agent can be reached without a login, either keep `runAs`
+off its tools, or gate them and check `ctx.callerUserId` — which is `null` for
+exactly these sessions.
+
 ## Scope
 
-Milestone 2 shipped the production core: the pi-ai provider (default), retry
-and error surfacing, approval gates, budgets and cost accounting, and DDP rate
-limits. Milestone 3 completed the working surface: compaction, an interrupt
-that cancels the provider request, the orphan-claim watcher with approval
-timeouts, the finished tool surface — `Agent.method()` co-registration and
-validated tool arguments — plus `Agent.ask()`
-for headless one-shots and agent composition, the `canUse` tool backstop,
-`maxResultChars` truncation, client teardown via `stop()`, rate limiting for
-`agent.interrupt`, and the production-bundle verification sweep
-(see **Verifying a production build**).
+**This is what v2 means now: the whole list, shipped.**
 
-Milestone 4 is closing out the remaining tiers. Shipped so far: full
-JSON-Schema validation of tool arguments through typebox when it is reachable
-(with a structural fallback and one warning when it is not), per-tool-call
-attribution of streamed arguments so parallel tool calls arrive as separate
-streams (`toolArgs` on an in-flight row), **subagents** — a named agent
-behind a tool call, running a child session with a live, persistent transcript
-(see **Subagents**), **session forking** at batch-safe cut points (see
-**Forking**), **MCP servers** as tool sources (see **MCP servers**), **skills**
-— on-demand prompt fragments listed in the prompt and loaded through a built-in
-tool (see **Skills**) — and the **hook surface** (see **Hooks**).
+The production core (milestone 2): the pi-ai provider by default, retry with
+backoff and error surfacing, approval gates, budgets and cost accounting, DDP
+rate limits. The working surface (milestone 3): compaction, an interrupt that
+cancels the provider request, the orphan-claim watcher with approval timeouts,
+`Agent.method()` co-registration with validated tool arguments, `Agent.ask()`
+for headless one-shots, the `canUse` backstop, `maxResultChars` truncation,
+client teardown via `stop()`, and the production-bundle verification sweep (see
+**Verifying a production build**).
+
+Milestone 4 finished the v2 list:
+
+- **Full JSON-Schema validation** of tool arguments through typebox when it is
+  reachable, degrading to a structural checker with one warning when it is not.
+- **Per-tool-call attribution** of streamed arguments, so parallel tool calls
+  arrive as separate streams (`toolArgs` on an in-flight row).
+- **Subagents** — a named agent behind a tool call, running a child session with
+  a live, persistent transcript (see **Subagents**).
+- **Session forking** at batch-safe cut points (see **Forking**).
+- **MCP servers** as tool sources (see **MCP servers**).
+- **Skills** — on-demand prompt fragments, listed in the prompt and loaded
+  through a built-in tool (see **Skills**).
+- **Hooks** — the two-seam extension surface (see **Hooks**).
+- **`<agent-chat>`** — the packaged UI, one tag, no framework (see **The
+  packaged UI**).
+- The small candidates the reviews had been carrying: **`Agent.provider()`**
+  name registry (see **Providers**), **manual `compact()`** (see **Define an
+  agent**), **`runAs`** on tool specs (see **`runAs` — a tool with a fixed
+  identity**), and a **rate-limit entry for approvals**.
 
 **The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
 `afterToolResult` are the two seams this package offers an app for changing what
@@ -806,8 +943,13 @@ it: an extension there is a module a host process installs, and here the host
 process is your Meteor server. A custom summarizer needs no option of its own —
 it is `beforeProviderRequest` with `ctx.purpose === 'compaction'`.
 
-Sketched in the original design but deliberately NOT implemented (v2
-candidates): a global `Agent.provider()` registry, a manual `compact()` call,
-and `runAs`.
+**Two items from the original design are retired, not pending.** Pi's **RPC
+mode** and **print mode** describe a standalone process that needs a way to be
+driven and a way to answer once. Here the RPC layer *is* DDP — `agent.start` /
+`agent.send` / `agent.approve` are the RPC surface, published transcripts are
+the streaming half, and adding a second protocol beside them would be inventing
+a worse one. Print mode *is* `Agent.ask()`: one question in, one string out, no
+session left behind. They are satisfied by the architecture rather than by code,
+which is why you will not find them on a backlog.
 
 See `docs/superpowers/specs/` for the full design.
