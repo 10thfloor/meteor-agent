@@ -102,13 +102,26 @@ function isOrphan(session: AgentSession, now: Date): boolean {
  * or retired agent is an ordinary consequence of shipping — and one such session
  * must not take down the sweep that would have recovered all the others.
  */
+/** Warned-once session ids: an orphan naming a retired agent matches EVERY
+ *  sweep forever (nothing can ever clear it), and a warn per sweep per
+ *  session is a log flood that buries real problems. One warning per session
+ *  per process is the signal; the set is process-lifetime and bounded by the
+ *  number of such sessions. */
+const warnedUnregistered = new Set<string>();
+
+function warnUnregisteredOnce(session: AgentSession, why: string): void {
+  if (warnedUnregistered.has(session._id)) return;
+  warnedUnregistered.add(session._id);
+  console.warn(
+    `[10thfloor:agent] watcher: session ${session._id} names unregistered agent `
+    + `"${session.agent}"; skipping ${why} (warned once per process)`,
+  );
+}
+
 function wake(session: AgentSession, why: string): void {
   const config = getAgent(session.agent);
   if (!config) {
-    console.warn(
-      `[10thfloor:agent] watcher: session ${session._id} names unregistered agent `
-      + `"${session.agent}"; skipping ${why}`,
-    );
+    warnUnregisteredOnce(session, why);
     return;
   }
   deferTurn(session._id, config, session.userId);
@@ -180,10 +193,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       if (stopped) return;
       const config = getAgent(session.agent);
       if (!config) {
-        console.warn(
-          `[10thfloor:agent] watcher: session ${session._id} names unregistered agent `
-          + `"${session.agent}"; skipping approval timeout`,
-        );
+        warnUnregisteredOnce(session, 'approval timeout');
         continue;
       }
       const limit = config.budget?.approval;

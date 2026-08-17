@@ -120,6 +120,8 @@ export class Agent {
         pricing: config.pricing,
         retry: config.retry,
         context: config.context,
+        maxResultChars: config.maxResultChars,
+        canUse: config.canUse,
       });
 
       // `runTurn` never throws for a turn that merely ended badly — it records

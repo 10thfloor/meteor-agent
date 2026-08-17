@@ -275,12 +275,19 @@ it will do for a caller with no user at all.
 
 Milestone 2 shipped the production core: the pi-ai provider (default), retry
 and error surfacing, approval gates, budgets and cost accounting, and DDP rate
-limits. Milestone 3 is in progress and has added compaction, an interrupt that
-cancels the provider request, the orphan-claim watcher with approval timeouts,
-the finished tool surface — `Agent.method()` co-registration and validated
-tool arguments — plus `Agent.ask()` for headless one-shots and agent
-composition, client teardown via `stop()`, rate limiting for
+limits. Milestone 3 completed the working surface: compaction, an interrupt
+that cancels the provider request, the orphan-claim watcher with approval
+timeouts, the finished tool surface — `Agent.method()` co-registration and
+validated tool arguments (a minimal structural checker: a co-registered schema
+leaning on `$ref`/`oneOf`/`enum`/bounds is REJECTED at registration unless a
+full validator is installed via `setToolArgsValidator`) — plus `Agent.ask()`
+for headless one-shots and agent composition, the `canUse` tool backstop,
+`maxResultChars` truncation, client teardown via `stop()`, rate limiting for
 `agent.interrupt`, and the production-bundle verification sweep
 (see **Verifying a production build**).
+
+Sketched in the original design but deliberately NOT implemented (v2
+candidates): a global `Agent.provider()` registry, a manual `compact()` call,
+`runAs`, and a custom summarizer hook.
 
 See `docs/superpowers/specs/` for the full design.

@@ -16,9 +16,18 @@ const leftovers = async () => {
 
 const clean = async () => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
-  await AgentSessions.removeAsync({});
-  await AgentMessages.removeAsync({});
-  await AgentDeltas.removeAsync({});
+  // Purge until QUIESCENT, not just once: earlier test files (the gate suite
+  // in loop.test.ts) deliberately schedule deferred wakes on 250-400ms
+  // timers, and one straggler landing between a single purge and this file's
+  // global-zero assertions would fail an ask test with a message pointing at
+  // the wrong file. Repeat-until-nothing-removed makes stragglers harmless.
+  for (let i = 0; i < 6; i += 1) {
+    const removed = (await AgentSessions.removeAsync({}))
+      + (await AgentMessages.removeAsync({}))
+      + (await AgentDeltas.removeAsync({}));
+    if (removed === 0 && i > 0) return;
+    await new Promise((r) => { setTimeout(r, 150); });
+  }
 };
 
 /** Assert `fn` rejects with a specific `Meteor.Error` code, and hand the error

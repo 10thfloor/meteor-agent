@@ -501,3 +501,51 @@ describe('toProviderMessages', () => {
     assert.notProperty(out[1], 'thinking');
   });
 });
+
+describe('Agent.method fail-closed registration (final-review ruling)', () => {
+  it('unenforceableKeyword finds keywords the minimal checker ignores', async () => {
+    const { unenforceableKeyword } = await import('../server/tools');
+    assert.isNull(unenforceableKeyword({
+      type: 'object', properties: { q: { type: 'string' } }, required: ['q'],
+    }));
+    assert.equal(unenforceableKeyword({ type: 'object', properties: {}, enum: [1] }), 'enum');
+    assert.equal(unenforceableKeyword({
+      type: 'object', properties: { q: { type: 'string', pattern: '^x' } },
+    }), 'pattern');
+    assert.equal(unenforceableKeyword({
+      type: 'array', items: { oneOf: [{ type: 'string' }] },
+    }), 'oneOf');
+  });
+
+  it('Agent.method throws at define time for a schema the checker cannot enforce', async () => {
+    const { Agent } = await import('../server/agent');
+    // "Accept what I can't check" is the right bias for the MODEL (it
+    // retries); on a public DDP endpoint it is an unguarded argument — the
+    // selector-injection surface reintroduced by the feature that promised to
+    // close it. So an unenforceable schema is a startup error, not a silent gap.
+    let threw: any;
+    try {
+      Agent.method('failclosed.enum', {
+        description: 'x',
+        args: { type: 'object', properties: { k: { enum: ['a', 'b'] } } },
+        run: async () => 'never',
+      });
+    } catch (e) { threw = e; }
+    assert.isDefined(threw, 'registration must fail closed');
+    assert.include(threw.message, 'enum');
+    assert.include(threw.message, 'failclosed.enum');
+    // And the method must NOT have been registered.
+    assert.isUndefined((Meteor as any).server.method_handlers['failclosed.enum']);
+  });
+
+  it('a plain structural schema still registers fine', async () => {
+    const { Agent } = await import('../server/agent');
+    const spec = Agent.method('failclosed.plain', {
+      description: 'x',
+      args: { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] },
+      run: async (args: any) => `got ${args.q}`,
+    });
+    assert.equal(spec.method, 'failclosed.plain');
+    assert.isFunction((Meteor as any).server.method_handlers['failclosed.plain']);
+  });
+});

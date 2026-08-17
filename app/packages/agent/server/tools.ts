@@ -343,7 +343,52 @@ export interface AgentMethodOptions {
  * Registration is global and permanent, exactly as `Meteor.methods` is —
  * calling this twice for one name throws Meteor's own duplicate-method error.
  */
+const UNENFORCED_KEYWORDS = [
+  '$ref', 'oneOf', 'anyOf', 'allOf', 'not', 'enum', 'const', 'pattern',
+  'format', 'additionalProperties', 'patternProperties',
+  'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum',
+  'minLength', 'maxLength', 'minItems', 'maxItems', 'uniqueItems',
+  'multipleOf', 'if', 'then', 'else', 'dependencies', 'dependentRequired',
+  'dependentSchemas',
+] as const;
+
+/** First keyword in `schema` (walking properties/items) that the built-in
+ *  minimal checker silently does NOT enforce, or null. */
+export function unenforceableKeyword(schema: unknown): string | null {
+  if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return null;
+  const s = schema as Record<string, unknown>;
+  for (const k of UNENFORCED_KEYWORDS) if (k in s) return k;
+  if (s.properties && typeof s.properties === 'object') {
+    for (const sub of Object.values(s.properties as Record<string, unknown>)) {
+      const found = unenforceableKeyword(sub);
+      if (found) return found;
+    }
+  }
+  if (s.items) return unenforceableKeyword(s.items);
+  return null;
+}
+
 export function defineAgentMethod(name: string, options: AgentMethodOptions): AdoptedTool {
+  // FAIL CLOSED at registration, not silently at call time. "Accept what I
+  // cannot check" is the right bias for the MODEL path (the model retries);
+  // it is the wrong bias for a public DDP endpoint whose selling point is
+  // that you no longer write check() yourself. A schema leaning on keywords
+  // the minimal checker ignores would ship an unguarded argument to every
+  // DDP client — the classic selector-injection surface, reintroduced by the
+  // feature that promised to close it. Skipped when the app installed its
+  // own validator (do that BEFORE registering methods).
+  if (validator === structuralValidator) {
+    const kw = unenforceableKeyword(options.args);
+    if (kw) {
+      throw new Error(
+        `[10thfloor:agent] Agent.method('${name}') uses schema keyword "${kw}", `
+        + 'which the built-in minimal checker does not enforce — on a DDP '
+        + 'endpoint that means an unguarded argument. Simplify the schema to '
+        + 'type/properties/required/items, or install a full validator with '
+        + 'setToolArgsValidator() before registering methods.',
+      );
+    }
+  }
   Meteor.methods({
     async [name](this: any, args: unknown) {
       // The schema below is the real guard. This satisfies

@@ -61,6 +61,8 @@ export function deferTurn(sessionId: string, config: AgentConfig, userId: string
       pricing: config.pricing,
       retry: config.retry,
       context: config.context,
+      maxResultChars: config.maxResultChars,
+      canUse: config.canUse,
     }).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });

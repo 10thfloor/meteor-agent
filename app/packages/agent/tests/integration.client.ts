@@ -48,6 +48,11 @@ describe('live DDP round trip', () => {
     const support = new Agent(AGENT);
     const sessionId: string = await support.start({ title: 'itest' });
     const handle = support.subscribe(sessionId);
+    // Teardown on EVERY exit (try/finally below): a failed assertion would
+    // otherwise leave this subscription and its merge autorun live for the
+    // rest of the client run. stop() is idempotent, so the success path's own
+    // stop() calls — part of what this test asserts — are unaffected.
+    try {
 
     await waitFor('the subscription to become ready', 20000, () => handle.ready());
 
@@ -114,5 +119,8 @@ describe('live DDP round trip', () => {
       support.messages(sessionId).fetch()
         .some((m: any) => m.role === 'assistant' && m.content === 'live streamed reply'));
     support.stop();
+    } finally {
+      try { support.stop(); } catch { /* already stopped */ }
+    }
   });
 });

@@ -2615,3 +2615,219 @@ describe('compaction pure functions', () => {
     assert.isBelow(noReport, 50);
   });
 });
+
+describe('compaction hardening (final-review fixes)', () => {
+  const seedRows = async (sessionId: string, rows: Array<Record<string, any>>, nextSeq: number) => {
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    for (const r of rows) {
+      await AgentMessages.insertAsync({
+        _id: `x${r.seq}`, sessionId, createdAt: new Date(), ...r,
+      } as any);
+    }
+  };
+
+  it('the cut never splits a batch even when a user message interjects inside it', async () => {
+    // A send queued while the session was `awaiting` lands BETWEEN an
+    // assistant's toolCalls and its tool results. Row-adjacency walking would
+    // cut inside the batch; the window-based cut must not.
+    const { findCompactionCut } = await import('../server/loop');
+    const pad = 'x'.repeat(40);
+    const msgs: any[] = [
+      { seq: 0, role: 'user', content: `u0 ${pad}` },
+      { seq: 1, role: 'assistant', toolCalls: [{ id: 't1', name: 'a', args: {} }, { id: 't2', name: 'b', args: {} }] },
+      { seq: 2, role: 'user', content: `interjected ${pad}` },
+      { seq: 3, role: 'tool', toolCallId: 't1', content: '{}' },
+      { seq: 4, role: 'tool', toolCallId: 't2', content: '{}' },
+      { seq: 5, role: 'user', content: `u5 ${pad}` },
+      { seq: 6, role: 'assistant', content: 'a6' },
+      { seq: 7, role: 'user', content: `u7 ${pad}` },
+    ].map((r, i) => ({ _id: `p${i}`, sessionId: 's', createdAt: new Date(0), ...r }));
+    // keep=4: the naive boundary lands between t3 and t4 — inside the batch.
+    // The window walk must pull the cut back to before the assistant.
+    assert.equal(findCompactionCut(msgs, 4), 0, 'the whole batch must stay in the tail');
+    // keep=2: boundary after the batch — everything up to u5 summarizes fine.
+    assert.equal(findCompactionCut(msgs, 2), 5);
+  });
+
+  it('the compaction request carries the agent tool schemas', async function () {
+    this.timeout(30000);
+    const { runTurn } = await import('../server/loop');
+    const { AgentMessages } = await import('../common/collections');
+    // The head keeps tool_use/tool_result blocks; Anthropic rejects those
+    // with no `tools` parameter — so the schemas must ride along.
+    const pad = 'x'.repeat(80);
+    await seedRows('s-comp-tools', [
+      { seq: 0, role: 'user', content: `q ${pad}` },
+      { seq: 1, role: 'assistant', toolCalls: [{ id: 't1', name: 'look', args: {} }] },
+      { seq: 2, role: 'tool', toolCallId: 't1', content: `{"r":"${pad}"}` },
+      { seq: 3, role: 'assistant', content: `a ${pad}` },
+      { seq: 4, role: 'user', content: 'now' },
+    ], 5);
+
+    const requests: any[] = [];
+    const scripted: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        const isCompaction = req.system.includes('compact');
+        for (const ch of (isCompaction ? 'BRIEF' : 'done')) yield { kind: 'text', chunk: ch };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    await runTurn('s-comp-tools', {
+      model: 'mock', system: 'help', provider: scripted,
+      tools: [{
+        name: 'look', description: 'looks', args: { type: 'object', properties: {} },
+        run: async () => 'ok',
+      }],
+      context: { window: 60, compactAt: 0.5, keep: 2 },
+    });
+
+    assert.isAbove(requests.length, 1);
+    const compactionReq = requests[0];
+    assert.include(compactionReq.system, 'compact');
+    assert.lengthOf(compactionReq.tools, 1, 'tool schemas must ride along with tool blocks');
+    assert.equal(compactionReq.tools[0].name, 'look');
+    const note = await AgentMessages.findOneAsync(
+      { sessionId: 's-comp-tools', role: 'note', kind: 'compaction' } as any,
+    );
+    assert.isDefined(note);
+  });
+
+  it('an interrupt during compaction stops the turn instead of being erased', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const pad = 'x'.repeat(120);
+    await seedRows('s-comp-int', [
+      { seq: 0, role: 'user', content: `q1 ${pad}` },
+      { seq: 1, role: 'assistant', content: `a1 ${pad}` },
+      { seq: 2, role: 'user', content: `q2 ${pad}` },
+      { seq: 3, role: 'assistant', content: `a2 ${pad}` },
+      { seq: 4, role: 'user', content: 'now' },
+    ], 5);
+
+    const requests: any[] = [];
+    const stallingCompaction: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        // Only ever called for the compaction: the interrupt must prevent the
+        // think call entirely.
+        yield { kind: 'text', chunk: 'S' };
+        await AgentSessions.updateAsync('s-comp-int', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        // Wait for the compaction's own poll to notice and abort the signal,
+        // then do what a real transport does: reject with AbortError.
+        const deadline = Date.now() + 5000;
+        while (!req.signal?.aborted && Date.now() < deadline) {
+          await new Promise((r) => setTimeout(r, 10));
+        }
+        const e: any = new Error('The operation was aborted');
+        e.name = 'AbortError';
+        throw e;
+      },
+    };
+    await runTurn('s-comp-int', {
+      model: 'mock', system: 'help', tools: [], provider: stallingCompaction,
+      context: { window: 60, compactAt: 0.5, keep: 2 },
+      interruptCheckMs: 10,
+    });
+
+    assert.lengthOf(requests, 1, 'the think call must never fire after the stop');
+    assert.isTrue(requests[0].signal?.aborted === true || requests[0].signal === undefined
+      ? requests[0].signal?.aborted === true : false,
+    'the compaction request must actually be aborted');
+    assert.equal((await AgentSessions.findOneAsync('s-comp-int'))!.phase, 'stopped');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-comp-int', role: 'note' } as any).countAsync(), 0,
+      'no compaction note and no error note',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-comp-int', role: 'assistant', content: 'done' } as any).countAsync(), 0,
+    );
+  });
+});
+
+describe('canUse backstop and maxResultChars (§5.2/§7)', () => {
+  it('a forbidden tool never runs, never parks, and the model sees not-allowed', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+    await seed('s-canuse', 'do both');
+    let allowedRan = false;
+    let forbiddenRan = false;
+    let call = 0;
+    await runTurn('s-canuse', {
+      model: 'mock', system: '',
+      tools: [
+        { name: 'allowed', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { allowedRan = true; return 'ok'; } },
+        { name: 'forbidden', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { forbiddenRan = true; return 'never'; } },
+      ],
+      canUse: async (tool) => tool !== 'forbidden',
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [
+              { id: 'c1', name: 'forbidden', args: {} },
+              { id: 'c2', name: 'allowed', args: {} },
+            ] }
+          : { text: 'finished' };
+      }),
+    });
+
+    assert.isFalse(forbiddenRan);
+    assert.isTrue(allowedRan);
+    const doc = (await AgentSessions.findOneAsync('s-canuse'))!;
+    assert.notEqual(doc.phase, 'awaiting', 'a forbidden ask-gated tool must NOT park');
+    const rows = await AgentMessages
+      .find({ sessionId: 's-canuse', role: 'tool' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(rows, 2);
+    const forbiddenRow = rows.find((m) => m.toolCallId === 'c1')!;
+    assert.equal(forbiddenRow.error!.error, 'not-allowed');
+    const final = await AgentMessages.findOneAsync(
+      { sessionId: 's-canuse', role: 'assistant', content: 'finished' } as any,
+    );
+    assert.isDefined(final, 'the turn completes; the model routes around the refusal');
+  });
+
+  it('oversized tool results are truncated with an explicit marker', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+    await seed('s-trunc', 'fetch it');
+    let call = 0;
+    await runTurn('s-trunc', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'big', description: 'x', args: { type: 'object', properties: {} },
+        run: async () => 'y'.repeat(500),
+      }],
+      maxResultChars: 40,
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [{ id: 'b1', name: 'big', args: {} }] }
+          : { text: 'ok' };
+      }),
+    });
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-trunc', role: 'tool' } as any,
+    ))!;
+    assert.isBelow(row.content!.length, 120, 'content must be truncated');
+    assert.include(row.content!, 'truncated');
+  });
+});
