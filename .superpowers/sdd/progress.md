@@ -188,3 +188,13 @@ Post-M3 flake chip: retrying-phase test. Chip predated the Math.random pin (f9e6
   deterministic full-cap delay for this one test, global Math.random patch removed. 3/3 green.
   NOTE for ops docs: on standalone Mongo (no replica set) the watcher's observer path degrades to
   ~10s polling too — the sweep interval is what carries it. Worth a README line in v2.
+
+== POST-M3: TIER COMPLETION (goal: complete the remaining tiers) ==
+Tier 1 progress: GitHub repo created (10thfloor/meteor-agent, private) + CI green on first run
+  (suite job + verify-build job, ubuntu). CONTRIBUTING.md with the pi-ai upgrade policy. Demo chat
+  UI (vanilla JS + Tracker over the reactive cursor) live-verified in the browser: streaming chat,
+  clock tool round trip, refund approval gate (park -> approve -> tool ran -> resumed), all against
+  the real app on :3400. Fixed during verification: @swc/helpers pinned back to 0.5.17 (0.5.23's
+  exports map rejects Meteor's .js-suffixed helper imports); .approval[hidden] CSS specificity bug;
+  demo script answeredTool must check the LAST message, not .some().
+BLOCKED on user: live smoke (no ANTHROPIC_API_KEY in env), Atmosphere publish (meteor not logged in).

@@ -158,6 +158,14 @@ new coordination. Turn it off with
 `{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
 `startWatcher({ sweepMs })` yourself.
 
+One operations note: on a **standalone MongoDB** (no replica set — no oplog, no
+change streams) Meteor's observers fall back to ~10s polling. Recovery still
+works — the sweep is what carries it — but the watcher's observer path, token
+streaming, and `usage()`/`status()` reactivity all degrade to that polling
+cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
+Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
+Meteor's constraint, not this package's.
+
 ## Use it from the client
 
 ```ts
