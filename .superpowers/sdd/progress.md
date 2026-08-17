@@ -181,3 +181,10 @@ M3 final whole-branch review: MERGE AFTER MUST-FIXES -> all applied inline (185+
     two console.warn patches installed pre-try; assert.throws without matchers x3; observer projection
     includes lease (extra findOne per heartbeat); post-compaction consecutive user rows unverified
     against live Anthropic; wake residual (verdict consumed while approve-defer queued) -> v2 token.
+Post-M3 flake chip: retrying-phase test. Chip predated the Math.random pin (f9e6a8c) but its
+  preferred observer approach was tested and REJECTED empirically: test-env mongod is standalone ->
+  Meteor observer falls back to the POLLING driver, which coalesces transient phases (saw [idle],
+  3/3 failures). Shipped instead: _setBackoff test seam in loop.ts (mirrors _setLeaseTimings),
+  deterministic full-cap delay for this one test, global Math.random patch removed. 3/3 green.
+  NOTE for ops docs: on standalone Mongo (no replica set) the watcher's observer path degrades to
+  ~10s polling too — the sweep interval is what carries it. Worth a README line in v2.

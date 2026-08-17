@@ -128,6 +128,23 @@ export function backoffDelay(attemptIndex: number, baseMs: number, maxDelayMs: n
   return Math.random() * Math.min(maxDelayMs, baseMs * 2 ** attemptIndex);
 }
 
+let backoff: typeof backoffDelay = backoffDelay;
+
+/**
+ * TEST SEAM, not public API — the same shape as lease.ts's `_setLeaseTimings`.
+ * Full jitter draws a delay that can legitimately be ~0ms, which makes the
+ * between-attempts `retrying` phase unobservable by any sampler (and the
+ * test-environment Mongo observer runs on the polling driver, which coalesces
+ * transient states away entirely). A test that must SEE the phase pins the
+ * delay deterministic here and restores in `finally`. Pass null to restore
+ * the jittered default. Not re-exported from server/index.ts.
+ */
+export function _setBackoff(fn: typeof backoffDelay | null): () => void {
+  const previous = backoff;
+  backoff = fn ?? backoffDelay;
+  return () => { backoff = previous; };
+}
+
 /**
  * Atomically allocate the next message `seq` under the lease guard: one
  * `findOneAndUpdate`, so no interleaving with `agent.send`'s own atomic
@@ -1310,7 +1327,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
             if (classification === 'retryable' && hasMoreAttempts) {
               if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;
-              await sleep(backoffDelay(attemptIndex, retryBaseMs, retryMaxDelayMs));
+              await sleep(backoff(attemptIndex, retryBaseMs, retryMaxDelayMs));
               // The interrupt check above only fires WHILE a stream is
               // running; re-check here so an interrupt landing during the
               // backoff sleep itself still stops the turn, instead of being
