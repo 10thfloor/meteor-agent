@@ -459,6 +459,14 @@ export function batchSafeBoundary(eligible: AgentMessage[], boundary: number): n
     // assistants before a turn ever reaches `maybeCompact`, so the only
     // unanswered assistant a live transcript can hold is a parked one at the
     // tail — which is on the KEPT side, where this loop does not look.
+    //
+    // If that arm ever DID fire for compaction, the failure direction is: the
+    // boundary walks back past the unanswered assistant, which therefore stays
+    // in the KEPT tail instead of being summarized away — so the assembled view
+    // carries a `tool_use` with no `tool_result` and every provider call 400s
+    // until repair-on-entry deletes the stranded turn. Degraded and
+    // self-healing, not silent corruption; but it is why the invariant above is
+    // stated rather than assumed.
     const lastAnswerSeq = calls.every((c) => w.answered.has(c.id))
       ? Math.max(
         w.assistant.seq,
@@ -944,6 +952,13 @@ async function dispatchCalls(
             phase: 'awaiting',
             pending: {
               toolCallId: call.id, name: call.name, args: call.args, requestedAt: new Date(),
+              // MCP only, and only when there is a server to name. The resume
+              // needs this to tell "the tool was renamed away" from "its server
+              // is down" — see the field's comment in common/types.ts. Spread
+              // rather than a plain `undefined` value so a non-MCP park writes
+              // no key at all.
+              ...(tool?.kind === 'mcp' && tool.mcp?.server
+                ? { mcpServer: tool.mcp.server } : {}),
             },
             updatedAt: new Date(),
           },
@@ -1104,11 +1119,32 @@ async function resumeParkedTurn(
       // call and a silent success would be a lie.
       result = { ok: false, error: { error: 'denied', reason: pending.reason } };
     } else if (!tool) {
-      // Approved, but the tool is no longer in the config — a rename or a
-      // removal deployed while the request sat on someone's screen. Same
-      // answer the streaming path gives an unknown call, so the batch closes
-      // cleanly instead of wedging on a name that no longer exists.
-      result = { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+      // Approved, but the tool is no longer in the expanded list. Either way
+      // the batch closes cleanly rather than wedging on a name that is not
+      // there — but WHICH answer it closes with is a question of honesty.
+      //
+      // `pending.mcpServer` is the discriminator, recorded when the call
+      // parked. A whole-server MCP spec contributes no tools at all while its
+      // server is unreachable, so a perfectly healthy config produces exactly
+      // the same "no such name" here as a rename does. Reporting `unknown-tool`
+      // for it sends an operator hunting a config change that never happened,
+      // and tells the model the tool does not exist when it merely cannot be
+      // reached right now. `mcp-unavailable` is what the streaming path would
+      // have said, so this is the two paths agreeing rather than a special
+      // case.
+      result = pending.mcpServer
+        ? {
+          ok: false,
+          error: {
+            error: 'mcp-unavailable',
+            reason: `The MCP server "${pending.mcpServer}" is unavailable: its tool `
+              + `"${call.name}" could not be resolved when the approval resumed.`,
+          },
+        }
+        : {
+          ok: false,
+          error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
+        };
     } else {
       if (!(await holdsLease(sessionId))) return abandon();
       // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
@@ -1174,18 +1210,6 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     maxResultChars: config.maxResultChars ?? 8000,
     canUse: config.canUse,
   };
-  // The ONE async step in tool assembly, and the only concession the loop makes
-  // to MCP: a `{ mcp: … }` spec carries a server name, and its description, its
-  // schema and (for a whole-server spec) its very existence come from that
-  // server's `tools/list`. Resolution stays synchronous; discovery is awaited
-  // here, once per turn, before anything is shown to the model. Connections and
-  // catalogs are cached per process, so this is a Map lookup from the second
-  // turn on, and a no-op array pass-through for an agent with no MCP tools.
-  // A server that is down costs one failed connect and never fails the turn —
-  // see `expandMcpTools`.
-  const tools = await expandMcpTools(resolveTools(config.tools));
-  const schemas = toolSchemas(tools);
-
   // Both feed the durable-wake check in the outer `finally` — see there.
   let owned = false;
   let resumed = false;
@@ -1203,6 +1227,28 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     }, HEARTBEAT_MS);
 
     try {
+      // The ONE async step in tool assembly, and the only concession the loop
+      // makes to MCP: a `{ mcp: … }` spec carries a server name, and its
+      // description, its schema and (for a whole-server spec) its very
+      // existence come from that server's `tools/list`. Resolution stays
+      // synchronous; discovery is awaited here, once per turn, before anything
+      // is shown to the model. Connections and catalogs are cached per process,
+      // so this is a Map lookup from the second turn on, and a no-op array
+      // pass-through for an agent with no MCP tools. A server that is down
+      // costs one failed connect and never fails the turn — see
+      // `expandMcpTools`.
+      //
+      // AFTER `claimLease`, and after the heartbeat is running, deliberately.
+      // Discovery spawns subprocesses and can burn a full
+      // `MCP_DISCOVERY_TIMEOUT_MS` per server; doing it before the lease meant
+      // a run that another server already owns paid the whole bill before
+      // finding out it had nothing to do — every duplicate wake-up spawning its
+      // own copy of every MCP server. Under the heartbeat, a slow discovery
+      // cannot cost us the lease either. Nothing above reads `tools` or
+      // `schemas`, so there is nothing to reorder around.
+      const tools = await expandMcpTools(resolveTools(config.tools));
+      const schemas = toolSchemas(tools);
+
       if (!(await repairUnansweredToolUse(sessionId))) return;
 
       // An approval gate is resolved BEFORE the think loop, because the

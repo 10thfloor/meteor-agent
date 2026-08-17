@@ -355,6 +355,57 @@ describe('session forking', () => {
       assert.equal(seen[seen.length - 1].content, 'and now?');
     });
 
+  it('a walk-moved cut DROPS the trailing notes, and the fork re-compacts rather than lying',
+    async function () {
+      this.timeout(30000);
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await defineForker();
+
+      // `atSeq: 4` is illegal — it would copy the assistant at seq 1 without the
+      // `tool_result` at seq 5 — so the walk moves the cut back to seq 0. The
+      // compaction note at seq 3 sits between the moved cut and the requested
+      // atSeq, so it is NOT copied.
+      //
+      // This is the documented tradeoff in `findForkCut`'s header, pinned. The
+      // note's `upto: 2` covers rows the fork does not hold, so copying it would
+      // make `assembleContext` start the view AFTER everything the fork owns and
+      // render the summary alone — a view describing an exchange the transcript
+      // underneath it does not contain. Dropping it costs at most one
+      // re-compaction and can only ever WIDEN the view to rows that are really
+      // there.
+      await seedSource('f-note-drop', [
+        { seq: 0, role: 'user', content: 'q0' },
+        { seq: 1, role: 'assistant', toolCalls: [{ id: 't1', name: 'a', args: {} }] },
+        { seq: 2, role: 'user', content: 'interjected' },
+        { seq: 3, role: 'note', kind: 'compaction', summary: 'THE-BRIEF', upto: 2 },
+        { seq: 4, role: 'note', kind: 'error', reason: 'transient' },
+        { seq: 5, role: 'tool', toolCallId: 't1', content: '{"ok":1}' },
+      ]);
+
+      const fork = await forkHandler();
+      const forkId: string = await fork.call({ userId: 'u1' }, 'forker', 'f-note-drop', 4);
+
+      const doc = (await AgentSessions.findOneAsync(forkId))! as any;
+      assert.deepEqual(doc.forkedFrom, { sessionId: 'f-note-drop', seq: 0 },
+        'the cut moves back past the unanswered assistant');
+      assert.equal(doc.nextSeq, 1);
+
+      const msgs = await AgentMessages
+        .find({ sessionId: forkId }, { sort: { seq: 1 } }).fetchAsync();
+      assert.deepEqual(msgs.map((m) => m.seq), [0],
+        'every row after the moved cut is dropped, notes included');
+      assert.isEmpty(msgs.filter((m) => m.role === 'note'),
+        'a note between the moved cut and atSeq is not copied');
+
+      // The contrast, in one assertion: when the walk does NOT move, the very
+      // same note IS copied — the drop is a consequence of moving, not a rule
+      // about notes.
+      const kept: string = await fork.call({ userId: 'u1' }, 'forker', 'f-note-drop', 5);
+      const keptMsgs = await AgentMessages
+        .find({ sessionId: kept }, { sort: { seq: 1 } }).fetchAsync();
+      assert.deepEqual(keptMsgs.map((m) => m.seq), [0, 1, 2, 3, 4, 5]);
+    });
+
   it('agent.sessions lists a fork: it is a root conversation, not a child', async function () {
     this.timeout(30000);
     const { NAMES } = await import('../common/names');

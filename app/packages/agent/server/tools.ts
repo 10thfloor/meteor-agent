@@ -4,7 +4,9 @@ import { DDP } from 'meteor/ddp';
 import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
-import { callMcpTool, discoverMcpTools, type McpToolInfo } from './mcp/client';
+import {
+  callMcpTool, discoverMcpTools, warnMcp, type McpToolInfo,
+} from './mcp/client';
 
 export interface ToolContext {
   userId: string | null;
@@ -736,6 +738,14 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
  * Name collisions: first definition wins and the loser is dropped with one
  * warning. Providers reject a tool list with duplicate names outright, so
  * shipping the collision would break the whole turn rather than one tool.
+ *
+ * Servers are discovered CONCURRENTLY. Every discovery has its own deadline
+ * (`MCP_DISCOVERY_TIMEOUT_MS`), and awaiting them one after another made the
+ * worst case the SUM of those deadlines — four dead servers meant a minute of
+ * silence before the model was called. `Promise.all` makes it the MAX. Ordering
+ * is unaffected: the results are collected first and the tool list is assembled
+ * from them in spec order afterwards, so the model sees the same list either
+ * way.
  */
 export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedTool[]> {
   if (!tools.some((t) => t.kind === 'mcp')) return tools;
@@ -744,7 +754,7 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
   const taken = new Set<string>();
   const push = (tool: ResolvedTool): void => {
     if (taken.has(tool.name)) {
-      warnUnavailable(
+      warnMcp(
         `two tools are named "${tool.name}"; the first definition wins and the other is `
         + 'dropped (a provider rejects a duplicate tool name outright). Give the MCP tool '
         + 'an explicit "name".',
@@ -755,24 +765,47 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
     out.push(tool);
   };
 
+  // One connect per SERVER per process even when several specs name the same
+  // one: dedupe first, then discover every distinct server at once.
+  const names = [...new Set(
+    tools.filter((t) => t.kind === 'mcp').map((t) => t.mcp!.server),
+  )];
+  const discovered = new Map(await Promise.all(
+    names.map(async (server) => [server, await discoverMcpTools(server)] as const),
+  ));
+
   for (const tool of tools) {
     if (tool.kind !== 'mcp') { push(tool); continue; }
     const { server, tool: named } = tool.mcp!;
-    // One connect per server per process; `discoverMcpTools` caches the
-    // successful catalog and caches nothing at all about a failure.
-    const found = await discoverMcpTools(server);
+    const found = discovered.get(server)!;
     if (!found.ok) {
       if (named) push(withMcpMetadata(tool, undefined));
       else {
-        warnUnavailable(
+        warnMcp(
           `the MCP server "${server}" could not be listed, so none of its tools are `
-          + `available this turn (it is retried on the next one): ${found.reason}`,
+          + `available this turn (it is retried once its cooldown expires): ${found.reason}`,
         );
       }
       continue;
     }
     if (named) {
-      push(withMcpMetadata(tool, found.tools.find((t) => t.name === named)));
+      const info = found.tools.find((t) => t.name === named);
+      if (!info) {
+        // The server ANSWERED and this tool is not in its catalog — a rename or
+        // a removal on the server's side, not an outage. The entry is still
+        // offered (with the fallback description) because refusing to expose it
+        // would silently shrink the model's tool list; but a call will fail, so
+        // say which server and which tool rather than leaving an operator to
+        // work it out from an `mcp-tool-failed` in a transcript. Server and tool
+        // lead the message so `warnMcp`'s 40-character latch key distinguishes
+        // one pair from another.
+        warnMcp(
+          `MCP server "${server}" has no tool named "${named}" in its catalog; the tool is `
+          + 'still offered to the model, but calling it will fail. Check the spec\'s '
+          + '"mcp.tool" against the server\'s tools/list.',
+        );
+      }
+      push(withMcpMetadata(tool, info));
       continue;
     }
     for (const info of found.tools) {

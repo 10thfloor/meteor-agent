@@ -82,14 +82,28 @@ async function build(specs: any[]) {
   return expandMcpTools(resolveTools(specs));
 }
 
+/** Deferred work (the resume a verdict schedules) exposes no promise to await,
+ *  so every wait here is bounded and fails loudly rather than hanging. Same
+ *  helper the loop and fork suites use. */
+const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await cond()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => { setTimeout(r, 25); });
+  }
+};
+
 /** A session `runTurn` can start from, scoped to its own id. */
-const seed = async (sessionId: string, text: string) => {
+const seed = async (sessionId: string, text: string, agent = 'mcp-test') => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
   await AgentSessions.removeAsync({ _id: sessionId } as any);
   await AgentMessages.removeAsync({ sessionId });
   await AgentDeltas.removeAsync({ sessionId });
   await AgentSessions.insertAsync({
-    _id: sessionId, agent: 'mcp-test', userId: 'u1', phase: 'idle', model: 'mock',
+    _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
     nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
     budgetSpent: { turns: 0, toolCalls: 0 },
     createdAt: new Date(), updatedAt: new Date(),
@@ -282,7 +296,11 @@ describe('MCP tool specs', () => {
   it('answers mcp-unavailable when the server is down, and RETRIES on the next use', async () => {
     const { _setMcpClientFactory } = await import('../server/mcp/client');
     const { runTool } = await import('../server/tools');
-    Agent.mcpServer('t-flaky', { command: 'never-spawned' });
+    // `cooldownMs: 0` disables the failure cooldown for this server, which is
+    // what makes this the pin for "a failure is never cached as a VERDICT": with
+    // no cooldown in the way, every single use reconnects and recovery is
+    // instant. The cooldown's own behaviour is pinned by the two tests below.
+    Agent.mcpServer('t-flaky', { command: 'never-spawned', cooldownMs: 0 });
     let up = false;
     const fake = fakeServer({
       tools: [SEARCH],
@@ -390,6 +408,214 @@ describe('MCP tool specs', () => {
       assert.isUndefined((toolRow as any)?.error);
       assert.equal(session?.budgetSpent?.toolCalls, 1);
     } finally { restore(); }
+  });
+
+  it('a failed open starts a COOLDOWN: the next use does not re-spawn until it expires', async () => {
+    const { _setMcpClientFactory, discoverMcpTools } = await import('../server/mcp/client');
+    // A tiny window rather than a clock seam: the behaviour under test is
+    // "suppressed, then it expires on its own", and 60ms exercises both halves
+    // without a fake timer that would have to be trusted separately.
+    Agent.mcpServer('t-cooldown', { command: 'never-spawned', cooldownMs: 60 });
+    let up = false;
+    const fake = fakeServer({
+      tools: [SEARCH],
+      onList: () => { if (!up) throw new Error('spawn ENOENT'); },
+    });
+    const restore = _setMcpClientFactory(fake.factory);
+    try {
+      const first = await discoverMcpTools('t-cooldown');
+      assert.isFalse(first.ok);
+      assert.equal(fake.connects.length, 1);
+
+      // WITHIN the window: the same structured answer, and no second spawn.
+      // This is the whole point — a dead server must not cost a subprocess and
+      // a deadline on every tool call.
+      const second = await discoverMcpTools('t-cooldown');
+      assert.isFalse(second.ok);
+      assert.equal((second as any).reason, (first as any).reason);
+      assert.equal(fake.connects.length, 1, 'the factory must not be invoked during the cooldown');
+
+      // AFTER it: the cooldown expires by itself, with no successful connect
+      // needed to clear it. That is the difference from a poisoned cache.
+      await new Promise((r) => { setTimeout(r, 80); });
+      up = true;
+      const third = await discoverMcpTools('t-cooldown');
+      assert.isTrue(third.ok, (third as any).reason);
+      assert.equal(fake.connects.length, 2);
+
+      // A success clears the cooldown outright, so the catalog is live again.
+      assert.deepEqual((third as any).tools.map((t: McpToolInfo) => t.name), ['search']);
+    } finally { restore(); }
+  });
+
+  it('deadlines a connect that never answers instead of waiting on the SDK default', async () => {
+    const { _setMcpClientFactory, discoverMcpTools } = await import('../server/mcp/client');
+    // 80ms stands in for the 15s default. The assertion is that the budget is
+    // OBSERVED at all — an unbounded await here would hang the suite, which is
+    // exactly the production failure (the SDK's own default is 60s per request,
+    // paid per server, on a turn a user is watching).
+    Agent.mcpServer('t-hang', { command: 'never-spawned', timeoutMs: 80, cooldownMs: 0 });
+    // Never resolves and never rejects: the connect that hangs forever.
+    const hangs: McpClientFactory = () => new Promise<McpClient>(() => {});
+    const restore = _setMcpClientFactory(hangs);
+    try {
+      const started = Date.now();
+      const found = await discoverMcpTools('t-hang');
+      const elapsed = Date.now() - started;
+      assert.isFalse(found.ok);
+      assert.include((found as any).reason, 't-hang');
+      assert.include((found as any).reason, 'did not connect');
+      assert.isBelow(elapsed, 5000, 'the deadline must fire, not the SDK default');
+    } finally { restore(); }
+  });
+
+  it('resumes an approved WHOLE-SERVER MCP tool and records its result', async function () {
+    this.timeout(30000);
+    const { _setMcpClientFactory } = await import('../server/mcp/client');
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    Agent.mcpServer('t-resume', { command: 'never-spawned' });
+    const fake = fakeServer({
+      tools: [SEARCH],
+      onCall: () => ({ content: [{ type: 'text', text: 'RESUMED-ANSWER' }] }),
+    });
+    const restore = _setMcpClientFactory(fake.factory);
+    try {
+      // The whole-server form specifically: its tool NAMES come from discovery,
+      // so it is the shape whose resume has nothing to match against if the
+      // server is unreachable. The registry config is load-bearing — approve
+      // resumes through `getAgent`, not through the config this test passed to
+      // `runTurn`.
+      const specs = [{ mcp: { server: 't-resume' }, gate: 'ask' }];
+      let n = 0;
+      const provider = mockProvider(() => {
+        n += 1;
+        return n === 1
+          ? { toolCalls: [{ id: 'g1', name: 'search', args: { q: 'leases' } }] }
+          : { text: 'all done' };
+      });
+      new Agent('mcp-resume', {
+        model: 'mock', instructions: '', tools: specs, provider,
+      } as any);
+      await seed('s-mcp-resume', 'go', 'mcp-resume');
+      await runTurn('s-mcp-resume', {
+        model: 'mock', system: '', tools: specs as any, provider,
+      });
+
+      const parked = (await AgentSessions.findOneAsync('s-mcp-resume'))!;
+      assert.equal(parked.phase, 'awaiting');
+      assert.equal(parked.pending?.name, 'search');
+      assert.equal((parked.pending as any)?.mcpServer, 't-resume',
+        'the park records which MCP server the call came from');
+      assert.lengthOf(fake.calls, 0, 'a parked call has not run');
+
+      const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+      await approve.call({ userId: 'u1' }, 'mcp-resume', 's-mcp-resume');
+
+      await waitFor(
+        async () => (await AgentMessages
+          .find({ sessionId: 's-mcp-resume', role: 'assistant' }).countAsync()) === 2,
+        'the resumed turn to close the batch and reply',
+      );
+
+      assert.deepEqual(fake.calls, [{ name: 'search', arguments: { q: 'leases' } }],
+        'an approved MCP call reaches the server exactly once');
+      const msgs = await AgentMessages
+        .find({ sessionId: 's-mcp-resume' }, { sort: { seq: 1 } }).fetchAsync();
+      const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+      assert.include(row.content ?? '', 'RESUMED-ANSWER');
+      assert.isUndefined((row as any).error);
+      assert.isUndefined((await AgentSessions.findOneAsync('s-mcp-resume'))!.pending);
+    } finally { restore(); }
+  });
+
+  it('reports mcp-unavailable, not unknown-tool, when the server is down at resume', async function () {
+    this.timeout(30000);
+    const { _setMcpClientFactory, stopMcp } = await import('../server/mcp/client');
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    Agent.mcpServer('t-resume-down', { command: 'never-spawned', cooldownMs: 0 });
+    let up = true;
+    const fake = fakeServer({
+      tools: [SEARCH],
+      onList: () => { if (!up) throw new Error('spawn ENOENT'); },
+    });
+    const restore = _setMcpClientFactory(fake.factory);
+    try {
+      const specs = [{ mcp: { server: 't-resume-down' }, gate: 'ask' }];
+      let n = 0;
+      const provider = mockProvider(() => {
+        n += 1;
+        return n === 1
+          ? { toolCalls: [{ id: 'g1', name: 'search', args: { q: 'x' } }] }
+          : { text: 'all done' };
+      });
+      new Agent('mcp-resume-down', {
+        model: 'mock', instructions: '', tools: specs, provider,
+      } as any);
+      await seed('s-mcp-down', 'go', 'mcp-resume-down');
+      await runTurn('s-mcp-down', {
+        model: 'mock', system: '', tools: specs as any, provider,
+      });
+      assert.equal((await AgentSessions.findOneAsync('s-mcp-down'))!.phase, 'awaiting');
+
+      // The server goes down WHILE the request sits on someone's screen, and
+      // the cached connection goes with it. The resume re-expands, the
+      // whole-server spec contributes nothing, and `search` is a name the tool
+      // list no longer contains — the exact shape that used to be misreported
+      // as `unknown-tool`, sending an operator to hunt a rename that never
+      // happened.
+      up = false;
+      await stopMcp();
+
+      const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+      await approve.call({ userId: 'u1' }, 'mcp-resume-down', 's-mcp-down');
+
+      await waitFor(
+        async () => (await AgentMessages
+          .find({ sessionId: 's-mcp-down', role: 'tool' }).countAsync()) === 1,
+        'the resume to answer the parked call',
+      );
+
+      const row = (await AgentMessages
+        .findOneAsync({ sessionId: 's-mcp-down', role: 'tool', toolCallId: 'g1' } as any))!;
+      assert.equal((row as any).error?.error, 'mcp-unavailable');
+      assert.include((row as any).error?.reason, 't-resume-down');
+      assert.lengthOf(fake.calls, 0, 'a down server ran nothing');
+    } finally { restore(); }
+  });
+
+  it('warns when a NAMED tool is missing from a healthy server\'s catalog', async () => {
+    const { _setMcpClientFactory } = await import('../server/mcp/client');
+    Agent.mcpServer('t-missing', { command: 'never-spawned' });
+    const fake = fakeServer({ tools: [SEARCH] });
+    const restore = _setMcpClientFactory(fake.factory);
+    const warned: string[] = [];
+    const realWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warned.push(a.map(String).join(' ')); };
+    try {
+      // The server ANSWERED and simply does not offer `fetch`: not an outage,
+      // a spec that no longer matches the catalog. The entry is still exposed
+      // (shrinking the tool list silently would be worse), so the only signal
+      // an operator gets is this warning — it must name both server and tool.
+      const [tool] = await build([{ mcp: { server: 't-missing', tool: 'fetch' } }]);
+      assert.equal(tool.name, 'fetch');
+      assert.include(tool.description, 'could not be loaded');
+      const hit = warned.find((w) => w.includes('t-missing'));
+      assert.isDefined(hit, `expected a warning naming the server; got ${JSON.stringify(warned)}`);
+      assert.include(hit!, 'fetch');
+    } finally {
+      console.warn = realWarn;
+      restore();
+    }
   });
 });
 

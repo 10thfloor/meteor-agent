@@ -30,6 +30,24 @@ const COPY_CHUNK = 500;
  * expands back to the full uncompacted history. Hence the boundary walk runs
  * over the note-free list, while the returned cut is the requested `atSeq`
  * itself whenever the walk did not have to move.
+ *
+ * WHEN THE WALK DOES MOVE, trailing notes are DROPPED: the cut becomes the last
+ * non-note message still in the head, so a note sitting between that message and
+ * the requested `atSeq` is not copied — including a `compaction` note. That is a
+ * deliberate choice, not an oversight, and the consequence is COST ONLY:
+ *
+ *   - correctness is unaffected. Dropping a compaction note can only WIDEN the
+ *     fork's model view (it falls back to an earlier note, or to the raw
+ *     transcript), and every row that view then covers is a row the fork
+ *     actually holds. It can never point at rows the fork excluded.
+ *   - the price is that the fork's first turn may re-summarize history its
+ *     parent had already summarized — one extra compaction call, once.
+ *
+ * The alternative — copying a note whose `upto` sits past the cut — buys nothing
+ * and costs clarity: `assembleContext` starts the view AT `upto`, so the fork
+ * would render as the summary alone, describing an exchange its own transcript
+ * does not contain. A cheap, self-correcting re-compaction beats a view that
+ * disagrees with the rows underneath it. `fork.test.ts` pins this behaviour.
  */
 export function findForkCut(msgs: AgentMessage[], atSeq?: number): number {
   const lastSeq = msgs.length > 0 ? msgs[msgs.length - 1].seq : -1;
@@ -134,9 +152,15 @@ export async function forkSession(
       usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
       // Copied messages keep their seqs, so the next allocation continues the
-      // source's numbering from the cut. `cut + 1` is also exactly the number
-      // of messages copied (seqs are contiguous from 0), and -1 + 1 = 0 is the
-      // right answer for a fork that copied nothing.
+      // source's numbering from the cut. `cut` is simply the MAX copied seq, so
+      // `cut + 1` is the next free one — and -1 + 1 = 0 is the right answer for
+      // a fork that copied nothing.
+      //
+      // It is NOT the number of messages copied. Seqs are allocated
+      // monotonically but are not contiguous: `discardTurn` deletes rows and
+      // leaves their seqs behind, so a transcript routinely has gaps and a fork
+      // of it holds fewer documents than `cut + 1`. Only the "next free seq"
+      // reading is load-bearing here.
       nextSeq: cut + 1,
       forkedFrom: { sessionId: source._id, seq: cut },
       createdAt: new Date(),

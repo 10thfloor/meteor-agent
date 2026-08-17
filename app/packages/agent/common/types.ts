@@ -33,6 +33,22 @@ export interface AgentSession {
     /** The userId that decided, or null for an anonymous capability-URL owner. */
     by?: string | null;
     reason?: string;
+    /**
+     * Present only when the parked call was an MCP tool: which server it came
+     * from. Recorded at PARK time because that is the last moment anything
+     * knows.
+     *
+     * A whole-server spec (`{ mcp: { server } }`) has no tool names of its own —
+     * they come from `tools/list`. If the server is unreachable when the verdict
+     * resumes the turn, the expanded tool list simply has no entry for the name,
+     * and the resume would report `unknown-tool`: a lie that tells an operator
+     * to go looking for a rename that never happened. With this field it reports
+     * `mcp-unavailable` instead, the same answer the streaming path gives.
+     *
+     * Absent on sessions parked before this field existed, which fall back to
+     * the old `unknown-tool` answer — a stale marker is not worth a migration.
+     */
+    mcpServer?: string;
   };
   lease?: { serverId: string; until: Date };
   budgetSpent: { turns: number; toolCalls: number };
