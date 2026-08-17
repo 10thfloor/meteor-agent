@@ -8,6 +8,7 @@ import { runTurn } from './loop';
 import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
+import { registerMcpServer, type McpServerDef } from './mcp/client';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -184,6 +185,25 @@ export class Agent {
    */
   static method(name: string, options: AgentMethodOptions): AdoptedTool {
     return defineAgentMethod(name, options);
+  }
+
+  /**
+   * Register an MCP server as a tool source. STATIC for the same reason
+   * `Agent.method` is: a server belongs to the app, and any number of agents
+   * may list tools from it.
+   *
+   *   Agent.mcpServer('docs', { command: 'npx', args: ['-y', 'mcp-server-docs'] });
+   *   Support.define({ ..., tools: [
+   *     { mcp: { server: 'docs', tool: 'search' } },  // one tool
+   *     { mcp: { server: 'docs' } },                  // all of them
+   *   ] });
+   *
+   * Nothing is spawned here. The definition is validated (a bad command is a
+   * startup error) and the server is connected lazily, at most once per
+   * process, by the first turn that needs it.
+   */
+  static mcpServer(name: string, def: McpServerDef): void {
+    registerMcpServer(name, def);
   }
 }
 

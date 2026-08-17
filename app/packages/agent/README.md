@@ -66,7 +66,7 @@ call.
 
 ## Tools
 
-A tool is a Meteor method the model may call. Four ways to give an agent one:
+A tool is a Meteor method the model may call. Five ways to give an agent one:
 
 ```ts
 tools: [
@@ -74,6 +74,7 @@ tools: [
   { method: 'orders.lookup', description, args },   //   …with a description for the model
   { name: 'total', description, args, run, gate },  // inline: no method, runs in-process
   { subagent: 'researcher', description },          // another agent (see Subagents)
+  { mcp: { server: 'docs', tool: 'search' } },      // an MCP server (see MCP servers)
 ]
 ```
 
@@ -189,6 +190,71 @@ streaming, and `usage()`/`status()` reactivity all degrade to that polling
 cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
 Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
 Meteor's constraint, not this package's.
+
+### MCP servers
+
+An [MCP](https://modelcontextprotocol.io) server is a subprocess that publishes
+tools. Register one, then list its tools like any other:
+
+```ts
+import { Agent } from 'meteor/10thfloor:agent';
+
+Agent.mcpServer('docs', {
+  command: 'npx',
+  args: ['-y', '@modelcontextprotocol/server-everything'],
+  env: { DOCS_ROOT: '/srv/docs' },      // merged over a safe PATH/HOME subset
+});
+
+Support.define({
+  ...,
+  tools: [
+    { mcp: { server: 'docs', tool: 'search' } },   // one tool
+    { mcp: { server: 'docs' } },                   // every tool it publishes
+    { mcp: { server: 'docs', tool: 'search' },     // …with your own wording
+      name: 'docs_search', description: 'Search our docs', gate: 'ask' },
+  ],
+});
+```
+
+`description` and `args` come from the server's own `tools/list` metadata —
+that is what discovery is for. Supplying either overrides it for that tool. A
+whole-server spec takes `gate` (and, if you insist, `description`) but not
+`name` or `args`: one of each cannot describe many tools.
+
+Requires the SDK as an app-level peer dependency, reached through a loader seam
+exactly as pi-ai is:
+
+```bash
+meteor npm install --save @modelcontextprotocol/sdk
+```
+
+**Connections are lazy and per server.** Nothing spawns at registration. The
+first turn that needs a server connects over stdio, runs `tools/list` once and
+caches both for the life of the process — never one connection per tool. Call
+`stopMcp()` to close them all; a `process.exit` closes them best-effort.
+
+**A server that is down never fails a turn.** A named tool stays listed (with a
+placeholder description) and answers `mcp-unavailable`, which the model reads
+and routes around; a whole-server spec contributes no tools that turn and logs
+one warning. Nothing about the failure is cached, so the next turn — or the
+next call — reconnects. The same is true mid-session: if the child dies, the
+connection is dropped and rebuilt on the next use.
+
+**Results** map to tool rows the ordinary way: text content items concatenate,
+and anything else becomes a `[image content omitted]`-style marker rather than
+a base64 blob in your transcript. A server answering `isError` becomes a
+structured `{ error: 'mcp-tool-failed', reason }`, and that reason is
+**sanitized** — third-party error text is on its way into a published
+transcript, so it is clamped to 200 characters and replaced outright by a
+generic sentence if it looks like a stack trace, a path, a URL, or contains any
+unbroken 24-character run (a token, a key, a secret nobody anticipated). Tool
+OUTPUT is not sanitized; it is the answer, truncated by `maxResultChars` like
+every other result.
+
+**Gates, `canUse` and budgets apply unchanged.** An MCP tool is dispatched
+through the same `runTool` an inline tool is, so `gate: 'ask'` parks it, a
+`canUse` refusal never reaches the server, arguments are checked against the
+discovered schema before the call, and each call costs one `budget.toolCalls`.
 
 ## Use it from the client
 

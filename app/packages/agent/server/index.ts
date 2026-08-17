@@ -14,10 +14,15 @@ export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
   fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS,
   type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
-  type ToolContext, type AgentMethodOptions, type ValidationResult,
+  type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
   type ArgsValidator, type TypeboxValue,
 } from './tools';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
+export {
+  stopMcp, _setMcpClientFactory,
+  type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
+} from './mcp/client';
+export { mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
 export { piAiProvider } from './providers/piai';
 export type {

@@ -4,6 +4,7 @@ import { DDP } from 'meteor/ddp';
 import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
+import { callMcpTool, discoverMcpTools, type McpToolInfo } from './mcp/client';
 
 export interface ToolContext {
   userId: string | null;
@@ -63,19 +64,50 @@ export const SUBAGENT_ARGS = {
   required: ['prompt'],
 } as const;
 
-export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | string;
+/**
+ * A tool on an MCP server registered with `Agent.mcpServer`.
+ *
+ * Two forms:
+ *   `{ mcp: { server: 'docs', tool: 'search' } }` — ONE tool. Its description
+ *      and `args` come from the server's own `tools/list` metadata; supplying
+ *      either here overrides the discovered value.
+ *   `{ mcp: { server: 'docs' } }` — ALL of that server's tools, each with its
+ *      discovered name, description and schema. `gate` (and `description`, if
+ *      you insist) apply to every one of them; `name` and `args` are refused,
+ *      because one of each cannot describe many tools.
+ *
+ * Discovery is async and `resolveTools` is not, so the metadata is filled in by
+ * `expandMcpTools` — see there.
+ */
+export type McpTool = {
+  mcp: { server: string; tool?: string };
+  description?: string;
+  args?: unknown;
+  /** Single-tool form only: expose it to the model under a different name. */
+  name?: string;
+  gate?: 'auto' | 'ask';
+};
+
+export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | McpTool | string;
 
 export interface ResolvedTool {
   name: string;
   description: string;
   args: unknown;
   gate: 'auto' | 'ask';
-  kind: 'inline' | 'adopted' | 'subagent';
+  kind: 'inline' | 'adopted' | 'subagent' | 'mcp';
   method?: string;
   run?: (args: any, ctx: ToolContext) => Promise<unknown>;
   /** `kind: 'subagent'` only: the REGISTRY NAME of the agent to run. Resolved
    *  to a config at dispatch, never here — see `resolveTools`. */
   subagent?: string;
+  /** `kind: 'mcp'` only. `tool` absent means the WHOLE SERVER: a placeholder
+   *  that `expandMcpTools` replaces with one entry per discovered tool, and
+   *  that never reaches dispatch. */
+  mcp?: { server: string; tool?: string };
+  /** `kind: 'mcp'` only: which metadata the SPEC set, so discovery fills in
+   *  only the rest. */
+  mcpExplicit?: { description: boolean; args: boolean };
 }
 
 export interface ToolResult {
@@ -535,21 +567,63 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
     const hasMethod = 'method' in spec && spec.method !== undefined;
     const hasRun = 'run' in spec && spec.run !== undefined;
     const hasSubagent = 'subagent' in spec && (spec as any).subagent !== undefined;
-    const chosen = [hasMethod, hasRun, hasSubagent].filter(Boolean).length;
+    const hasMcp = 'mcp' in spec && (spec as any).mcp !== undefined;
+    const chosen = [hasMethod, hasRun, hasSubagent, hasMcp].filter(Boolean).length;
     if (chosen > 1) {
       const label = (spec as any).name ?? (spec as any).method
-        ?? (spec as any).subagent ?? '(unnamed)';
+        ?? (spec as any).subagent ?? (spec as any).mcp?.server ?? '(unnamed)';
       throw new Error(
-        `[10thfloor:agent] Tool spec has more than one of "method", "run" and `
-        + `"subagent" — pick one: ${label}`,
+        `[10thfloor:agent] Tool spec has more than one of "method", "run", `
+        + `"subagent" and "mcp" — pick one: ${label}`,
       );
     }
     if (chosen === 0) {
       const label = (spec as any).name ?? '(unnamed)';
       throw new Error(
-        `[10thfloor:agent] Tool spec has none of "method", "run" and "subagent" — `
-        + `pick one: ${label}`,
+        `[10thfloor:agent] Tool spec has none of "method", "run", "subagent" and `
+        + `"mcp" — pick one: ${label}`,
       );
+    }
+    if (hasMcp) {
+      const m = spec as McpTool;
+      const server = m.mcp?.server;
+      if (typeof server !== 'string' || server === '') {
+        throw new Error(
+          `[10thfloor:agent] Tool spec's "mcp.server" must be a registered MCP server `
+          + `name: ${JSON.stringify(spec)}`,
+        );
+      }
+      const toolName = m.mcp.tool;
+      if (toolName !== undefined && (typeof toolName !== 'string' || toolName === '')) {
+        throw new Error(
+          `[10thfloor:agent] Tool spec's "mcp.tool" must be a non-empty string (omit it `
+          + `to expose the whole server): ${JSON.stringify(spec)}`,
+        );
+      }
+      if (toolName === undefined && (m.name !== undefined || m.args !== undefined)) {
+        throw new Error(
+          `[10thfloor:agent] A whole-server MCP spec ({ mcp: { server: '${server}' } }) `
+          + 'exposes many tools, so it cannot take a single "name" or "args" — those come '
+          + 'from discovery. Name a "tool" to override them for one.',
+        );
+      }
+      // The server is NOT connected here, deliberately, and neither is its
+      // catalog read: `resolveTools` is synchronous and runs on every turn,
+      // while connecting spawns a subprocess. Discovery happens once per
+      // process in `expandMcpTools`, which is awaited before the schemas are
+      // built — and a server that is down is a structured `mcp-unavailable`
+      // result the model routes around, never a thrown turn.
+      return {
+        // A placeholder for the whole-server form; `expandMcpTools` replaces
+        // the entry entirely, so this name never reaches a provider.
+        name: m.name ?? toolName ?? `mcp:${server}`,
+        description: m.description ?? '',
+        args: m.args ?? { type: 'object', properties: {} },
+        gate: m.gate ?? 'auto',
+        kind: 'mcp' as const,
+        mcp: { server, tool: toolName },
+        mcpExplicit: { description: m.description !== undefined, args: m.args !== undefined },
+      };
     }
     if (hasSubagent) {
       const sub = spec as SubagentTool;
@@ -608,6 +682,107 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       run: inline.run,
     };
   });
+}
+
+/** What a tool the server would not describe is shown as. Enough for the model
+ *  to decide whether to try it; the try answers `mcp-unavailable` if the server
+ *  is still down. */
+function mcpFallbackDescription(server: string, tool: string): string {
+  return `The "${tool}" tool on the MCP server "${server}". Its description could not be `
+    + 'loaded, so call it only if its name clearly fits.';
+}
+
+/** Discovered metadata folded into a resolved MCP tool. An EXPLICIT value from
+ *  the spec always wins — that is the whole contract of the override. */
+function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): ResolvedTool {
+  const explicit = tool.mcpExplicit ?? { description: false, args: false };
+  const { server, tool: name } = tool.mcp!;
+  return {
+    ...tool,
+    description: explicit.description
+      ? tool.description
+      : (info?.description ?? mcpFallbackDescription(server, name ?? tool.name)),
+    args: explicit.args
+      ? tool.args
+      : (info?.inputSchema ?? { type: 'object', properties: {} }),
+  };
+}
+
+/**
+ * Fill in every `kind: 'mcp'` tool from its server's discovered catalog, and
+ * expand a whole-server spec into one tool per discovered tool.
+ *
+ * WHY HERE, and not in `resolveTools`: discovery is asynchronous (it connects,
+ * spawning a subprocess) and `resolveTools`/`toolSchemas` are synchronous and
+ * used by tests and callers that must stay that way. `runTurn` is already
+ * async and already calls both, once, before the think loop — so ONE awaited
+ * line there is the whole integration:
+ *
+ *     const tools = await expandMcpTools(resolveTools(config.tools));
+ *
+ * Everything downstream (schema building, gate checks, `canUse`, dispatch)
+ * sees an ordinary `ResolvedTool[]` and needs no knowledge of MCP at all.
+ * Connections and catalogs are cached per process, so from the second turn on
+ * this is a Map lookup.
+ *
+ * A server that cannot be reached does NOT fail the turn:
+ *  - a NAMED tool survives as a callable entry with a fallback description;
+ *    calling it answers `mcp-unavailable`, which the model reads and routes
+ *    around, and the next turn retries the connection (nothing is cached);
+ *  - a WHOLE-SERVER spec contributes no tools this turn and warns on the
+ *    server log — there is nothing to name, and inventing a name for a tool
+ *    nobody has described would be worse than being briefly absent.
+ *
+ * Name collisions: first definition wins and the loser is dropped with one
+ * warning. Providers reject a tool list with duplicate names outright, so
+ * shipping the collision would break the whole turn rather than one tool.
+ */
+export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedTool[]> {
+  if (!tools.some((t) => t.kind === 'mcp')) return tools;
+
+  const out: ResolvedTool[] = [];
+  const taken = new Set<string>();
+  const push = (tool: ResolvedTool): void => {
+    if (taken.has(tool.name)) {
+      warnUnavailable(
+        `two tools are named "${tool.name}"; the first definition wins and the other is `
+        + 'dropped (a provider rejects a duplicate tool name outright). Give the MCP tool '
+        + 'an explicit "name".',
+      );
+      return;
+    }
+    taken.add(tool.name);
+    out.push(tool);
+  };
+
+  for (const tool of tools) {
+    if (tool.kind !== 'mcp') { push(tool); continue; }
+    const { server, tool: named } = tool.mcp!;
+    // One connect per server per process; `discoverMcpTools` caches the
+    // successful catalog and caches nothing at all about a failure.
+    const found = await discoverMcpTools(server);
+    if (!found.ok) {
+      if (named) push(withMcpMetadata(tool, undefined));
+      else {
+        warnUnavailable(
+          `the MCP server "${server}" could not be listed, so none of its tools are `
+          + `available this turn (it is retried on the next one): ${found.reason}`,
+        );
+      }
+      continue;
+    }
+    if (named) {
+      push(withMcpMetadata(tool, found.tools.find((t) => t.name === named)));
+      continue;
+    }
+    for (const info of found.tools) {
+      push(withMcpMetadata(
+        { ...tool, name: info.name, mcp: { server, tool: info.name } },
+        info,
+      ));
+    }
+  }
+  return out;
 }
 
 export function toolSchemas(tools: ResolvedTool[]): ToolSchema[] {
@@ -768,6 +943,40 @@ export async function runTool(
         reason: 'A subagent runs as a child session and must be dispatched by the turn loop.',
       },
     };
+  }
+  // MCP tools DO route through here, unlike subagents: a `tools/call` is an
+  // ordinary tool body that happens to run in another process, and it needs
+  // nothing from `runTurn`. Routing it here rather than from the loop is what
+  // makes gates, `canUse`, budget accounting, result truncation and the tool
+  // row identical to an inline tool's — by construction, not by a second
+  // implementation that has to be kept in step.
+  if (tool.kind === 'mcp') {
+    const server = tool.mcp?.server;
+    const name = tool.mcp?.tool;
+    if (!server || !name) {
+      // A whole-server placeholder that never went through `expandMcpTools`.
+      // Only reachable by a caller that assembled tools itself; say so rather
+      // than calling a tool named `undefined`.
+      return {
+        ok: false,
+        error: {
+          error: 'tool-failed',
+          reason: 'An MCP server tool group must be expanded before it can be dispatched.',
+        },
+      };
+    }
+    // Checked against the DISCOVERED schema (or the spec's override), for the
+    // same reason an inline tool's arguments are: the model gets `invalid-args`
+    // naming the field, and usually fixes it — cheaper and clearer than a round
+    // trip to a subprocess that answers with prose.
+    const verdict = await validateToolArgs(tool.args, args);
+    if (!verdict.ok) {
+      return { ok: false, error: { error: 'invalid-args', reason: verdict.reason } };
+    }
+    // No `withInvocation`: there is no Meteor method here and no `this` for a
+    // handler to read. `ctx.userId` still governs the call through `canUse` and
+    // the gate, which run before dispatch.
+    return callMcpTool(server, name, args);
   }
   if (tool.kind === 'inline') {
     const verdict = await validateToolArgs(tool.args, args);

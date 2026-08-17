@@ -8,6 +8,7 @@ import './lease.test';
 import './loop.test';
 import './ask.test';
 import './subagent.test';
+import './mcp.test';
 import './fork.test';
 import './watcher.test';
 import './integration.server';

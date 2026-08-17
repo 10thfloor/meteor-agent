@@ -7,7 +7,7 @@ import {
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
 import {
-  resolveTools, runTool, toolSchemas,
+  expandMcpTools, resolveTools, runTool, toolSchemas,
   type ResolvedTool, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
 import { runSubagent, type SubagentDispatch } from './subagent';
@@ -1174,7 +1174,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     maxResultChars: config.maxResultChars ?? 8000,
     canUse: config.canUse,
   };
-  const tools = resolveTools(config.tools);
+  // The ONE async step in tool assembly, and the only concession the loop makes
+  // to MCP: a `{ mcp: … }` spec carries a server name, and its description, its
+  // schema and (for a whole-server spec) its very existence come from that
+  // server's `tools/list`. Resolution stays synchronous; discovery is awaited
+  // here, once per turn, before anything is shown to the model. Connections and
+  // catalogs are cached per process, so this is a Map lookup from the second
+  // turn on, and a no-op array pass-through for an agent with no MCP tools.
+  // A server that is down costs one failed connect and never fails the turn —
+  // see `expandMcpTools`.
+  const tools = await expandMcpTools(resolveTools(config.tools));
   const schemas = toolSchemas(tools);
 
   // Both feed the durable-wake check in the outer `finally` — see there.
