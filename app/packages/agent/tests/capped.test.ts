@@ -108,13 +108,20 @@ describe('publications', () => {
       budgetSpent: { turns: 0, toolCalls: 0 },
       createdAt: new Date(), updatedAt: new Date(),
     };
-    await AgentSessions.insertAsync({ ...base, _id: 'mine', userId: 'u1' } as any);
+    await AgentSessions.insertAsync({
+      ...base, _id: 'mine', userId: 'u1',
+      lease: { serverId: 's1', until: new Date() },
+    } as any);
     await AgentSessions.insertAsync({ ...base, _id: 'theirs', userId: 'u2' } as any);
 
     const handler = (Meteor.server as any).publish_handlers['agent.sessions'];
     const cursor = handler.call({ userId: 'u1' }, 'support');
-    const ids = (await cursor.fetchAsync()).map((d: any) => d._id);
+    const docs = await cursor.fetchAsync();
+    const ids = docs.map((d: any) => d._id);
     assert.deepEqual(ids, ['mine']);
+    // Wire hygiene: `lease` is server-internal (server/lease.ts) and must
+    // never reach the client, even though the doc above was seeded with one.
+    assert.isUndefined(docs[0].lease, 'agent.sessions must not publish `lease`');
   });
 
   it('denies a non-owner of agent.session: publishes nothing', async () => {
@@ -188,6 +195,9 @@ describe('publications', () => {
       _id: sessionId, agent: 'support', userId: 'u1', phase: 'idle', model: 'mock',
       nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
+      // Set deliberately, so the assertion below proves the field is
+      // stripped by the publication rather than merely absent from the doc.
+      lease: { serverId: 's1', until: new Date() },
       createdAt: new Date(), updatedAt: new Date(),
     } as any);
     await AgentMessages.insertAsync({
@@ -201,5 +211,103 @@ describe('publications', () => {
 
     const messages = await result[1].fetchAsync();
     assert.isTrue(messages.some((m: any) => m._id === 'owner-msg-1'));
+
+    // Wire hygiene: `lease` is server-internal (server/lease.ts) and must
+    // never reach the client.
+    const sessionDocs = await result[0].fetchAsync();
+    assert.equal(sessionDocs.length, 1);
+    assert.isUndefined(sessionDocs[0].lease, 'agent.session must not publish `lease`');
+  });
+});
+
+describe('applyRateLimits', () => {
+  it('adds nothing and does not throw when settings are absent', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    assert.equal(applyRateLimits(undefined), 0);
+    assert.equal(applyRateLimits({}), 0);
+    assert.equal(applyRateLimits({ packages: {} }), 0);
+  });
+
+  it('adds a per-connection-pair rule AND a per-user rule per configured entry', async () => {
+    // Two rules per entry is the design, not an accident: the (userId,
+    // connectionId) pair rule isolates anonymous floods per connection, and
+    // the authenticated-only per-user rule caps the multiply-your-limit-by-
+    // opening-N-connections bypass the pair rule alone would allow.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: { sends: { count: 5, intervalMs: 60000 } },
+    });
+    assert.equal(added, 2);
+  });
+
+  it('adds four rules when both sends and starts are configured', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: 5, intervalMs: 60000 },
+        starts: { count: 3, intervalMs: 30000 },
+      },
+    });
+    assert.equal(added, 4);
+  });
+
+  it('throws naming the field for a non-positive count', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { sends: { count: 0, intervalMs: 60000 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a non-positive count must throw');
+    assert.include(threw.message, 'sends.count');
+  });
+
+  it('throws naming the field for a missing intervalMs', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { starts: { count: 5 } as any } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a missing intervalMs must throw');
+    assert.include(threw.message, 'starts.intervalMs');
+  });
+
+  it('registers a rule that actually matches an agent.send method invocation', async () => {
+    // DDPRateLimiter has no supported way to remove a rule or reset between
+    // tests, and rules registered by earlier tests (or by server/index.ts's
+    // own startup call) persist for the life of the process — so this
+    // asserts the MATCH COUNT increased after our call, not that it is
+    // exactly 1. `findAllMatchingRulesAsync` is the least-brittle entry
+    // point available: unlike `_check`/`_increment`/`_checkRules` it carries
+    // no leading underscore, so it is the one DDPRateLimiter internal that
+    // reads as intentionally reusable rather than private, even though it
+    // is not declared in the package's .d.ts (hence the `as any`).
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mSend,
+      userId: 'rl-user-1', connectionId: 'rl-conn-1', clientAddress: '127.0.0.1',
+    };
+    const unrelatedInput = { ...input, name: 'some.other.method' };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    const unrelatedBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(unrelatedInput);
+
+    applyRateLimits({ rateLimit: { sends: { count: 1, intervalMs: 60000 } } });
+
+    const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    assert.isAbove(
+      after.length, before.length,
+      'the newly-registered rule must match a real agent.send invocation',
+    );
+
+    // And it must NOT match an unrelated method name.
+    const unrelatedAfter = await (DDPRateLimiter as any).findAllMatchingRulesAsync(unrelatedInput);
+    assert.equal(
+      unrelatedAfter.length, unrelatedBefore.length,
+      'the rule must be scoped to agent.send, not every method',
+    );
   });
 });

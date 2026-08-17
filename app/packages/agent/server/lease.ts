@@ -4,8 +4,25 @@ import { AgentSessions } from '../common/collections';
 /** Identity of this app server process, regenerated on every boot. */
 export const SERVER_ID: string = Random.id();
 
-export const LEASE_MS = 30_000;
-export const HEARTBEAT_MS = 10_000;
+export let LEASE_MS = 30_000;
+export let HEARTBEAT_MS = 10_000;
+
+/**
+ * Test seam, NOT a public API: shrink the lease/heartbeat timings so a test
+ * can observe heartbeat-renewal behavior without waiting out the real
+ * 30s/10s intervals. `claimLease`/`heartbeat` read the module-level `let`s at
+ * call time, so a caller need only set this BEFORE starting the turn under
+ * test. Returns the previous values so a `finally` can restore them — a
+ * leaked timing change would corrupt every later test in the suite.
+ */
+export function _setLeaseTimings(
+  { leaseMs, heartbeatMs }: { leaseMs?: number; heartbeatMs?: number },
+): { leaseMs: number; heartbeatMs: number } {
+  const previous = { leaseMs: LEASE_MS, heartbeatMs: HEARTBEAT_MS };
+  if (leaseMs !== undefined) LEASE_MS = leaseMs;
+  if (heartbeatMs !== undefined) HEARTBEAT_MS = heartbeatMs;
+  return previous;
+}
 
 /** Claim a run. Succeeds if unleased, expired, or already ours. Atomic on a
  *  single document, so exactly one racing server wins. */

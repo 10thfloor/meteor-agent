@@ -454,7 +454,9 @@ Note the interaction with the mid-stream interrupt check and `toProviderMessages
 git add app/packages/agent && git commit -m "feat(agent): provider retry with backoff, sanitized error notes, phase error"
 ```
 
----### Task 4: Approval gates — park, approve, deny, resume (§4.3, §7)
+---
+
+### Task 4: Approval gates — park, approve, deny, resume (§4.3, §7)
 
 `gate: 'ask'` is currently parsed and silently ignored — a declared safety control that does nothing. Implement park-by-exiting: the loop writes `pending`, releases the lease, and exits; `approve`/`deny` record a verdict and wake the run; the resumed loop executes (or error-results) the parked call and continues. The repair-on-entry `awaiting` guard already protects the parked shape from being discarded — that was built in M1 precisely for this.
 

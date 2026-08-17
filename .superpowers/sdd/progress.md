@@ -68,3 +68,56 @@ Filed-for-M2 (from final review): loader writes into node_modules at runtime (re
   untested; heartbeat untested; gate:'ask' accepted-and-ignored (should reject in M1... left as-is);
   lease.serverId published to client; tool_args chunks discarded; findOneAndUpdate reactivity under
   polling observers unverified.
+
+== MILESTONE 2 (branch milestone-2-production, plan 2026-08-15-agent-harness-milestone-2.md) ==
+M2 Task 1: complete (2a8e3ce..5429bbc, review clean, 63+1 passing; implementer report lost to machine sleep, controller verified suite directly)
+  NOTE plan bug: brief's createRequire().resolve(PKG) throws ERR_PACKAGE_PATH_NOT_EXPORTED (pi-ai
+    exports only import/types conditions). Implementer read exports map manually — correct deviation.
+  Minor: no-write test no longer walks npm/node_modules variant; shim safety comment dropped.
+M2 Task 2: complete (5429bbc..HEAD, review Approved-with-issues, 81+1 passing, 1 pending live-smoke)
+  Probe found real API: Models.streamSimple(model, context) via builtinModels() under providers/all
+    subpath; loader gained subpath param (Map-keyed cache). Brief's presumed API was wrong as expected.
+  Fixed inline post-review: model-identity stamping on replayed assistant messages (isSameMode l/
+    foreign-id rewrite), catalog cache no longer caches rejections.
+  Carried to Task 3: use error `status`/pi-ai retryability; stream-throw delta cleanup (already in plan).
+  Carried to Task 5: pi-ai reports cacheRead/cacheWrite + its own computed usage.cost — widen usage
+    plumbing and prefer provider-reported cost over pricing math.
+  M3 ledger: AbortSignal so interrupt cancels the HTTP request; toolcall_delta contentIndex correlator;
+    ProviderMessage isError flag for tool results; converter-level request-body test via injectable fetch.
+M2 Task 3: complete (26c462e..74235ba, 1 HIGH + 2 MEDIUM fixed, re-review clean, 89+1 passing)
+  HIGH was interrupt-erasure: retry branch overwrote phase:'stopped' with 'retrying' (guardedUpdate
+    filters on lease only, never phase) and committed a cancelled message. Now: a stop outranks retry.
+  MEDIUM: writer.stop() rejection classified as provider failure -> double provider charge on a Mongo
+    blip. MEDIUM: behaviors 2/6 untested -> 4 tests added.
+  Notes for M3: no jitter/cap on backoff (thundering herd); 408 pinned fatal (arguably retryable);
+    'abandon' as a third error classification once AbortSignal lands; note-row client rendering untested.
+M2 Task 4: complete (cc599f8..faea374, work spanned 3 sleep-interrupted implementers + controller
+  assembly + 2 High/3 Medium/4 Low fix pass, re-review Approved, 106+1 passing)
+  The predicted cross-agent-seam bug was real: locateBatch first-match vs repair's windows (H1).
+  M3 ledger: resumed-flag reopens H2 for a SECOND gate in one run (wake bound should be verdict
+    identity, not a boolean); locateBatch unanswered-first can pick an older stranded turn (prefer
+    newest-carrying); turnWindows skips nothing (O(assistants x messages) per entry); s-stop-verdict
+    second half doesn't re-assert single execution after settle.
+M2 Task 5: complete (faea374..HEAD, review found 1 Medium TOCTOU on turn budget — fixed inline as
+  atomic $lt filter, 113+1 passing)
+  Documented trade-offs kept: zero-reported-cost treated as unpriced (pricing fallback may charge a
+  genuinely-free call — overcharge, trips EARLIER, not a brake erosion); resume path's human-approved
+  call exceeds toolCalls budget by at most one.
+M2 Task 6: complete (dd6b264..de01c85 + controller fix, review 1 Medium fixed inline, 122+1 passing)
+  Medium: per-(userId,connectionId) bucketing let an authenticated attacker multiply the limit by
+    opening N connections -> added a second authenticated-only per-user rule per entry (2 rules/entry).
+  Low kept: `sends: null` silently skipped; findAllMatchingRulesAsync is young/undocumented API.
+M2 Task 7: complete (43b484d, 122+1 passing; delete-order falsified against reordered code and
+  restored; heartbeat + drain-remainder now enforced by tests). NOT separately reviewed — the final
+  whole-branch review is instructed to give its diff per-task scrutiny.
+M2 final whole-branch review: MERGE AFTER MUST-FIXES -> applied inline:
+  README rewritten (config surface, budgets, error phases, rateLimit settings shape; stale Scope fixed)
+  retry threaded to AgentConfig/deferTurn; adapter's two config throws hinted retryable:false
+  budget.turns/toolCalls validated as positive integers at define time
+M3 backlog additions from final review: spurious extra turn from the wake self-check (merge with
+  verdict-identity item); wake/finally terminal lists disagree ('error'); rateLimit.interrupts entry;
+  toProviderMessages has zero coverage (three note kinds now flow past it); mSend error-clear untested;
+  rate-limit tests leave live rules (client test fits under them by luck — comment it); rate limits
+  proven to register, never to throttle; drain-remainder comment assumes failed insert never landed
+  (lost-ack duplicate seq truncates in-flight render transiently).
+Suite at M2 close: 122 server (+1 pending live-smoke) + 1 client, 0 failures.
