@@ -175,26 +175,27 @@ export function registerMethods(): void {
       check(text, String);
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
-      const session = await requireSession(agent, sessionId, this.userId ?? null);
+      await requireSession(agent, sessionId, this.userId ?? null);
 
-      // §9: the turn budget, checked BEFORE the allocation below spends it.
-      // `budgetSpent.turns` is $inc'd by this method and nowhere else, so the
-      // pre-inc value read here is exactly "turns already taken" and a budget
-      // of N permits exactly N sends.
+      // §9: the turn budget, enforced INSIDE the atomic allocation below, not
+      // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
+      // here, but concurrent sends all reading the same pre-inc value would
+      // each pass a separate check — with capability-URL sessions the caller
+      // count is unbounded, so the overshoot would be too. Folding
+      // `$lt: limit` into the filter makes check-and-spend one operation: a
+      // budget of N permits exactly N sends under any concurrency.
       //
       // A refusal, not a stop. The other two budgets trip inside a running
       // loop, where the only way to say no is a transcript note; here there is
       // a caller on the other end of a method, so tell them — and write
       // nothing at all, so a refused send costs neither a seq nor a message
-      // nor the budget it was refused for. The `stopped` phase a spend or
-      // tool-call trip leaves behind is what a later send clears; this one has
-      // nothing to clear, and asking again will be refused identically until
-      // an operator raises the limit.
-      if (config.budget?.turns !== undefined
-        && (session.budgetSpent?.turns ?? 0) >= config.budget.turns) {
-        throw new Meteor.Error(
-          'budget-exhausted', 'This session has used its turn budget.',
-        );
+      // nor the budget it was refused for. Asking again is refused identically
+      // until an operator raises the limit.
+      const turnFilter: Record<string, unknown> = { _id: sessionId };
+      if (config.budget?.turns !== undefined) {
+        // Matches when under budget. Sessions seeded before this field existed
+        // have budgetSpent.turns set by mStart, so $lt sees a number.
+        turnFilter['budgetSpent.turns'] = { $lt: config.budget.turns };
       }
 
       // Seq allocation is ATOMIC (single findOneAndUpdate), not read-then-
@@ -203,14 +204,23 @@ export function registerMethods(): void {
       // assistant is about to commit at, making transcript order
       // non-deterministic. The loop allocates its seqs the same way.
       const before = await AgentSessions.rawCollection().findOneAndUpdate(
-        { _id: sessionId },
+        turnFilter,
         {
           $inc: { nextSeq: 1, 'budgetSpent.turns': 1 },
           $set: { updatedAt: new Date() },
         },
         { returnDocument: 'before' },
       );
-      if (!before) throw new Meteor.Error('no-session', 'Session not found');
+      if (!before) {
+        // requireSession above proved the session exists and is the caller's,
+        // so a non-match here can only be the budget filter.
+        if (config.budget?.turns !== undefined) {
+          throw new Meteor.Error(
+            'budget-exhausted', 'This session has used its turn budget.',
+          );
+        }
+        throw new Meteor.Error('no-session', 'Session not found');
+      }
 
       await AgentMessages.insertAsync({
         _id: Random.id(), sessionId, seq: (before as any).nextSeq, role: 'user',
