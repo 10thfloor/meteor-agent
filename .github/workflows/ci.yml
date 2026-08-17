@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Package suite (server + client)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Meteor
+        run: curl https://install.meteor.com/?release=3.5 | sh
+
+      - name: Cache Meteor packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.meteor
+            app/.meteor/local
+          key: meteor-3.5-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
+
+      - name: npm install
+        working-directory: app
+        run: meteor npm ci || meteor npm install
+
+      - name: Install Playwright browser
+        working-directory: app
+        # The client half of the suite runs in headless Chromium via
+        # meteortesting:mocha's playwright driver; without a browser the
+        # client tests silently do not run at all.
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the suite
+        working-directory: app
+        env:
+          TEST_BROWSER_DRIVER: playwright
+        # Port 3200 mirrors local convention; any free port works on a runner.
+        run: meteor test-packages --once --port 3200 --driver-package meteortesting:mocha ./packages/agent
+
+  verify-build:
+    name: Production bundle verification
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Meteor
+        run: curl https://install.meteor.com/?release=3.5 | sh
+
+      - name: Cache Meteor packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.meteor
+            app/.meteor/local
+          key: meteor-3.5-build-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
+
+      - name: npm install
+        working-directory: app
+        run: meteor npm ci || meteor npm install
+
+      - name: Verify the loader against a real bundle
+        # Exercises the pi-ai resolution chain against meteor build's
+        # relocated npm tree — the one layout the dev-tree suite cannot reach.
+        run: ./scripts/verify-build.sh
