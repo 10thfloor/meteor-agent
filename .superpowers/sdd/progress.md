@@ -311,3 +311,11 @@ M4 Task 7 (small candidates + docs close-out): complete. Suite 275 server (+2 pe
   assertion re-pinned from the incidental old behavior. Standalone-Mongo README line: already there.
   v3 backlog consolidated (14 items) in .superpowers/sdd/task-7-report.md — new one from this task:
   no rateLimit entry for agent.compact.
+M4 Tasks 5-7: complete (c09eb2b, 302e75f, 54aa46b; first-reviewed in the final whole-branch review).
+M4 final review: MERGE AFTER MUST-FIXES -> all applied (b865638): compact refuses awaiting/error
+  (H1 was: manual compact destroyed a parked approval and the next send DELETED the parked turn);
+  afterToolResult tested at all three sites; element no-innerHTML XSS test; rateLimit.compacts;
+  canUse-row error guard. 282 (+2 pending) server + 6 client, 0 failures.
+  v3 backlog consolidated in task-7 report + final review triage (idempotency keys, child re-link,
+  parent-interrupt propagation, per-agent hooks, compiled-schema cache, watcher flake tracking,
+  runAs-on-pending render, toolResultContent stringify guard, demo error branch, attribute churn).
