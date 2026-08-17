@@ -1,72 +1,40 @@
 import { Meteor } from 'meteor/meteor';
-import { Tracker } from 'meteor/tracker';
-import { Agent } from 'meteor/10thfloor:agent';
+import { defineAgentChat } from 'meteor/10thfloor:agent';
 
-// Plain DOM + Tracker, no framework: `messages()` is a real minimongo cursor,
-// so one autorun re-rendering from `.fetch()` is the entire data layer. The
-// same cursor drops into React via useTracker or Blaze via a helper unchanged.
-const Demo = new Agent('demo');
+// The demo is now the packaged element's first consumer: one tag in main.html,
+// one `defineAgentChat()` here, and the whole chat — streaming bubbles, tool
+// rows, phases, the approval bar, the composer — comes from the package.
+//
+// The PRE-ELEMENT version of this file is the "no framework needed" reference:
+// ~70 lines of plain DOM over a reactive cursor, which is exactly what
+// `client/element.ts` packages. It lives in git history —
+// `git show ad0dc0b:app/client/main.js` — and is worth reading before deciding
+// you need React to render an agent.
 
-const el = (id) => document.getElementById(id);
+const SESSION_KEY = 'agent-demo-session';
 
-function renderMessage(m) {
-  const row = document.createElement('div');
-  row.className = `msg ${m.role}${m.streaming ? ' streaming' : ''}`;
-  if (m.role === 'note') {
-    row.textContent =
-      m.kind === 'approval'
-        ? `${m.timedOut ? 'Timed out' : m.approved ? 'Approved' : 'Denied'}`
-          + `${m.reason ? ` — ${m.reason}` : ''}`
-        : m.kind === 'compaction'
-          ? '· earlier conversation compacted ·'
-          : m.error?.reason ?? m.kind;
-    return row;
-  }
-  if (m.role === 'tool') {
-    row.textContent = `⚙ ${m.content}`;
-    return row;
-  }
-  row.textContent = (m.truncatedHead ? '…' : '') + (m.content ?? '');
-  if (m.toolCalls?.length) {
-    const call = document.createElement('span');
-    call.className = 'calls';
-    call.textContent = m.toolCalls.map((c) => ` → ${c.name}(${JSON.stringify(c.args)})`).join('');
-    row.appendChild(call);
-  }
-  return row;
-}
+Meteor.startup(() => {
+  const chat = document.querySelector('agent-chat');
 
-Meteor.startup(async () => {
-  const sessionId = await Demo.start({ title: 'demo chat' });
-  Demo.subscribe(sessionId);
+  // Set the attribute BEFORE defining the tag. Registration upgrades the
+  // element immediately, and an upgrade with no `session-id` auto-starts a
+  // fresh session — so defining first would burn a new session on every
+  // reload and then re-subscribe to the saved one a tick later.
+  const saved = localStorage.getItem(SESSION_KEY);
+  if (saved) chat.setAttribute('session-id', saved);
 
-  Tracker.autorun(() => {
-    const messages = Demo.messages(sessionId).fetch();
-    const box = el('messages');
-    box.replaceChildren(...messages.map(renderMessage));
-    box.scrollTop = box.scrollHeight;
-
-    const phase = Demo.status(sessionId);
-    el('phase').textContent = phase;
-    el('phase').dataset.phase = phase;
-
-    const ask = Demo.pending(sessionId);
-    el('approval').hidden = !ask || !!ask.verdict;
-    if (ask && !ask.verdict) {
-      el('approval-text').textContent =
-        `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})`;
-    }
+  // The element only emits this when it started the session itself, which is
+  // exactly when the host has something new to remember.
+  chat.addEventListener('agent-chat:session', (e) => {
+    localStorage.setItem(SESSION_KEY, e.detail.sessionId);
   });
 
-  el('composer').addEventListener('submit', async (e) => {
-    e.preventDefault();
-    const input = el('input');
-    const text = input.value.trim();
-    if (!text) return;
-    input.value = '';
-    await Demo.send(sessionId, text);
+  // Self-healing across a wiped database: if the server no longer knows the
+  // saved session, the first send fails and we drop the id so the next reload
+  // starts clean.
+  chat.addEventListener('agent-chat:error', () => {
+    localStorage.removeItem(SESSION_KEY);
   });
-  el('stop').addEventListener('click', () => Demo.interrupt(sessionId));
-  el('approve').addEventListener('click', () => Demo.approve(sessionId));
-  el('deny').addEventListener('click', () => Demo.deny(sessionId, 'denied from the demo UI'));
+
+  defineAgentChat();
 });

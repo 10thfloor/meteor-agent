@@ -37,6 +37,19 @@ export function mergeView(
     const join = (kind: AgentDelta['kind']) =>
       tail.filter((d) => d.kind === kind).map((d) => d.chunk).join('');
 
+    // Tool arguments are accumulated PER contentIndex, unlike text and
+    // thinking, which are one stream each. Providers interleave parallel tool
+    // calls, so a single joined string would be two calls' JSON spliced
+    // together — valid-looking and unparseable. A delta with no index (a
+    // provider that reports none) buckets under 0.
+    let toolArgs: Record<number, string> | undefined;
+    for (const d of tail) {
+      if (d.kind !== 'tool_args') continue;
+      const idx = typeof d.contentIndex === 'number' ? d.contentIndex : 0;
+      if (!toolArgs) toolArgs = {};
+      toolArgs[idx] = (toolArgs[idx] ?? '') + d.chunk;
+    }
+
     const thinking = join('thinking');
     inFlight.push({
       _id: messageId,
@@ -48,6 +61,7 @@ export function mergeView(
       streaming: true,
       truncatedHead: tail[0].seq !== 0,
       deltaCount: tail.length,
+      ...(toolArgs ? { toolArgs } : {}),
     });
   }
 

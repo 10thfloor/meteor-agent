@@ -33,7 +33,21 @@ export interface ProviderRequest {
 export type ProviderChunk =
   | { kind: 'text'; chunk: string }
   | { kind: 'thinking'; chunk: string }
-  | { kind: 'tool_args'; chunk: string }
+  | { kind: 'tool_args';
+      chunk: string;
+      /**
+       * WHICH tool call this fragment belongs to, as the provider's index into
+       * the assistant message's content blocks. Providers stream PARALLEL tool
+       * calls interleaved, so without it a consumer joining `tool_args` deltas
+       * in arrival order reconstructs one call's JSON spliced into another's —
+       * two valid-looking fragments, neither parseable.
+       *
+       * Optional: a provider that reports no index (the scripted mock) still
+       * streams, and everything downstream buckets those fragments together
+       * under 0. `DeltaWriter` coalesces runs only WITHIN one index, and
+       * `mergeView` accumulates per index.
+       */
+      contentIndex?: number }
   | { kind: 'done';
       toolCalls?: Array<{ id: string; name: string; args: unknown }>;
       usage?: {

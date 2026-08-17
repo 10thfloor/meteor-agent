@@ -216,3 +216,64 @@ describe('mergeView note rows', () => {
     assert.isFalse(view[0].streaming);
   });
 });
+
+describe('mergeView tool-argument attribution', () => {
+  // M4 Task 1. Providers stream PARALLEL tool calls interleaved, tagging each
+  // fragment with the content-block index it belongs to. Joining them in
+  // arrival order produces one string that looks like JSON and parses as
+  // nothing — so accumulation is keyed by that index, all the way from the
+  // delta document to the merged row.
+  const argDelta = (
+    seq: number, chunk: string, contentIndex?: number,
+  ): AgentDelta => ({
+    _id: `m1:${seq}`, sessionId: 's1', messageId: 'm1', msgSeq: 10, seq,
+    kind: 'tool_args', chunk,
+    ...(contentIndex === undefined ? {} : { contentIndex }),
+    at: new Date(0),
+  });
+
+  it('keeps two interleaved tool calls apart, by contentIndex', () => {
+    const view = mergeView([], [
+      argDelta(0, '{"city":', 0),
+      argDelta(1, '{"stock":', 1),
+      argDelta(2, '"Paris"}', 0),
+      argDelta(3, '"ACME"}', 1),
+    ]);
+    assert.lengthOf(view, 1);
+    assert.deepEqual(view[0].toolArgs, {
+      0: '{"city":"Paris"}',
+      1: '{"stock":"ACME"}',
+    });
+    // Both halves are real JSON — the property the naive join destroys.
+    for (const partial of Object.values(view[0].toolArgs!)) JSON.parse(partial);
+  });
+
+  it('is order-independent across shuffles, like the text stream', () => {
+    const src = [
+      argDelta(0, '{"a":', 0), argDelta(1, '{"b":', 1),
+      argDelta(2, '1}', 0), argDelta(3, '2}', 1),
+    ];
+    for (let s = 1; s <= 20; s += 1) {
+      assert.deepEqual(
+        mergeView([], shuffle(src, s))[0].toolArgs,
+        { 0: '{"a":1}', 1: '{"b":2}' },
+        `seed ${s}`,
+      );
+    }
+  });
+
+  it('buckets index-less fragments under 0 and leaves text untouched', () => {
+    const view = mergeView([], [
+      delta('m1', 0, 'thinking about it '),
+      argDelta(1, '{"q":'),
+      argDelta(2, '1}'),
+    ]);
+    assert.equal(view[0].content, 'thinking about it ');
+    assert.deepEqual(view[0].toolArgs, { 0: '{"q":1}' });
+  });
+
+  it('omits toolArgs entirely when no tool-argument fragment arrived', () => {
+    assert.isUndefined(mergeView([], streamOf('m1', 'hello'))[0].toolArgs);
+    assert.isUndefined(mergeView(committed, [])[0].toolArgs);
+  });
+});

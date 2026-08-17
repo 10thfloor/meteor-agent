@@ -7,9 +7,13 @@ import {
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
 import {
-  resolveTools, runTool, toolSchemas,
-  type ResolvedTool, type ToolResult, type ToolSpec,
+  expandMcpTools, resolveTools, runTool, toolSchemas, withSkillTool,
+  type ResolvedTool, type Skill, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
+import { runSubagent, type SubagentDispatch } from './subagent';
+import {
+  runAfterToolResult, runBeforeProviderRequest, type ToolResultHookContext,
+} from './hooks';
 
 export interface RunConfig {
   model: string;
@@ -49,6 +53,11 @@ export interface RunConfig {
    *  routes around — never a park, never a throw. */
   canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
     => boolean | Promise<boolean>;
+  /** The agent's skills. Their descriptions are already in `system` (see
+   *  `buildSystemPrompt`); the loop reads this only to decide whether to add
+   *  the built-in `skill` tool and what it can load. Absent or empty = no
+   *  loader tool at all. */
+  skills?: Skill[];
 }
 
 /** Threaded into every dispatch path as one bundle so a future path cannot
@@ -56,6 +65,28 @@ export interface RunConfig {
 interface DispatchLimits {
   maxResultChars: number;
   canUse?: RunConfig['canUse'];
+}
+
+/**
+ * The ONE way a resolved tool is run, whatever its kind.
+ *
+ * Inline and adopted tools go to `runTool`, which owns argument validation,
+ * the ambient method invocation and error sanitization. A SUBAGENT does not:
+ * it is not a tool body but a nested TURN, so it needs `runTurn` — which lives
+ * here, in the module that imports tools.ts. Routing it from inside `runTool`
+ * would close an import cycle (tools -> subagent -> loop -> tools), so the
+ * split is here instead, at the single point both dispatch paths (a streamed
+ * batch and an approved park's resume) already share. `runSubagent` therefore
+ * takes `runTurn` as an argument: dependency in, no cycle.
+ *
+ * The extra return field is the child's session id, which the caller records on
+ * the tool row so a client can find and subscribe to the child transcript.
+ */
+async function dispatchTool(
+  tool: ResolvedTool, args: unknown, ctx: ToolContext,
+): Promise<SubagentDispatch> {
+  if (tool.kind === 'subagent') return runSubagent(tool, args, ctx, runTurn);
+  return { result: await runTool(tool, args, ctx) };
 }
 
 /** The transcript row content for a tool result, truncated explicitly. */
@@ -230,8 +261,11 @@ export function isRunning(sessionId: string): boolean {
 
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
-class DeltaWriter {
-  private buf: Array<{ kind: string; chunk: string; seq: number }> = [];
+/** Exported as a TEST SEAM. The loop is its only production caller; the
+ *  attribution tests drive it directly because a committed turn deletes its
+ *  own deltas, so nothing survives a full run to assert on. */
+export class DeltaWriter {
+  private buf: Array<{ kind: string; chunk: string; seq: number; contentIndex?: number }> = [];
   private seq = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Non-reentrancy: the interval fires on a wall clock regardless of whether
@@ -265,11 +299,27 @@ class DeltaWriter {
    * Coalescing at push time is also what keeps `seq` contiguous: one run, one
    * seq, one document. `mergeView` walks back only while `seq` decrements by
    * exactly 1, so any gap would silently truncate the rendered message.
+   *
+   * `contentIndex` (tool_args only) is part of the coalescing key, not just a
+   * field along for the ride: two PARALLEL tool calls stream interleaved, so
+   * merging their fragments because both are `tool_args` would concatenate one
+   * call's JSON into the other's and lose the boundary permanently — the
+   * delta document is the only place the attribution can still be recorded.
    */
-  push(kind: string, chunk: string) {
+  push(kind: string, chunk: string, contentIndex?: number) {
+    // `contentIndex` is meaningful for `tool_args` and nothing else — `mergeView`
+    // only accumulates per index there. A stray one (a third-party Provider
+    // stamping it on a text chunk) is DROPPED rather than thrown: deltas are
+    // ephemeral by design and a provider's mistake must not abandon a turn, but
+    // carried through it would split one text run into two coalescing buckets
+    // and reorder nothing visibly — the worst kind of bug to find later.
+    const index = kind === 'tool_args' ? contentIndex : undefined;
     const last = this.buf[this.buf.length - 1];
-    if (last && last.kind === kind) { last.chunk += chunk; return; }
-    this.buf.push({ kind, chunk, seq: this.seq++ });
+    if (last && last.kind === kind && last.contentIndex === index) {
+      last.chunk += chunk;
+      return;
+    }
+    this.buf.push({ kind, chunk, seq: this.seq++, ...(index === undefined ? {} : { contentIndex: index }) });
   }
 
   flush(): Promise<void> {
@@ -298,6 +348,7 @@ class DeltaWriter {
               seq: item.seq,
               kind: item.kind as any,
               chunk: item.chunk,
+              ...(item.contentIndex === undefined ? {} : { contentIndex: item.contentIndex }),
               at: new Date(),
             } as any);
           } catch (e) {
@@ -379,14 +430,83 @@ export function estimateContext(
 }
 
 /**
+ * Walk a proposed transcript boundary BACKWARD until it is batch-safe, and
+ * return the adjusted boundary.
+ *
+ * `eligible` is a seq-sorted, NOTE-FREE message list; `boundary` is the index
+ * of the first message that will NOT be in the head (so `boundary ===
+ * eligible.length` means the head is everything). The head is what one side of
+ * the operation keeps: for compaction it is what gets summarized away, for a
+ * FORK it is what gets copied. Both need the same guarantee — the head must
+ * never contain an assistant's `tool_use` whose `tool_result` is on the other
+ * side of the boundary — so both call this, and the rule cannot drift between
+ * them.
+ *
+ * Batch safety cannot rely on row adjacency: a `send` queued while the session
+ * was `awaiting` puts a USER row between an assistant's toolCalls and its tool
+ * results, so walking back off tool rows alone would cut between them — a
+ * permanent 400 nothing can repair (the transcript itself is healthy; only the
+ * model's view of it is broken). So this uses the same turn-window machinery
+ * repair uses: if any assistant's window spans the boundary, the boundary moves
+ * to before that assistant.
+ */
+export function batchSafeBoundary(eligible: AgentMessage[], boundary: number): number {
+  let cut = Math.max(0, Math.min(boundary, eligible.length));
+  // The first seq NOT in the head — Infinity when the head is the whole list.
+  // That arm is reachable only from a fork (compaction always keeps a tail),
+  // and it is what makes an UNANSWERED batch fall out of the same rule: see
+  // `lastAnswerSeq` below.
+  const boundarySeq = () => (cut < eligible.length ? eligible[cut].seq : Infinity);
+  // Latest window first: moving the boundary earlier can only push it into
+  // EARLIER windows, so processing in reverse handles the cascade in one pass.
+  for (const w of [...turnWindows(eligible)].reverse()) {
+    const calls = w.assistant.toolCalls ?? [];
+    if (calls.length === 0) continue;
+    // A call with NO `tool_result` anywhere in its window has its answer
+    // "after everything" — Infinity — so a head that ends on such an assistant
+    // strands a `tool_use` exactly as a mid-batch cut would, and the same
+    // comparison pushes the boundary back past it. This is what makes forking
+    // an AWAITING session cut before the parked batch with no special case:
+    // the parked assistant is unanswered by construction.
+    //
+    // Compaction is unaffected in practice. Its boundary is never the end of
+    // the list (`keep >= 1` keeps a tail), and repair-on-entry deletes stranded
+    // assistants before a turn ever reaches `maybeCompact`, so the only
+    // unanswered assistant a live transcript can hold is a parked one at the
+    // tail — which is on the KEPT side, where this loop does not look.
+    //
+    // If that arm ever DID fire for compaction, the failure direction is: the
+    // boundary walks back past the unanswered assistant, which therefore stays
+    // in the KEPT tail instead of being summarized away — so the assembled view
+    // carries a `tool_use` with no `tool_result` and every provider call 400s
+    // until repair-on-entry deletes the stranded turn. Degraded and
+    // self-healing, not silent corruption; but it is why the invariant above is
+    // stated rather than assumed.
+    const lastAnswerSeq = calls.every((c) => w.answered.has(c.id))
+      ? Math.max(
+        w.assistant.seq,
+        ...eligible
+          .filter((t) => t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd)
+          .map((t) => t.seq),
+      )
+      : Infinity;
+    // Window spans the boundary: the assistant is in the head while some of
+    // its results are (or would be) on the other side.
+    while (cut > 0 && w.assistant.seq < boundarySeq() && lastAnswerSeq >= boundarySeq()) {
+      cut -= 1;
+    }
+  }
+  return cut;
+}
+
+/**
  * The seq to compact up to (inclusive), keeping the last `keep` non-note
  * messages — or null when there is nothing worth compacting. The cut NEVER
  * splits an assistant-with-toolCalls from its tool results: a summarized
  * `tool_use` whose `tool_result` survives in the tail (or vice versa) is the
  * same unmatched-pair 400 the repair machinery exists to prevent, introduced
- * by our own bookkeeping. Tool rows sit directly after their assistant, so
- * walking the cut backward off any tool row lands it on the owning
- * assistant, which is then KEPT whole with its results.
+ * by our own bookkeeping. `batchSafeBoundary` is the walk that guarantees it —
+ * shared verbatim with session forking.
  */
 export function findCompactionCut(msgs: AgentMessage[], keep: number): number | null {
   const c = latestCompaction(msgs);
@@ -394,33 +514,8 @@ export function findCompactionCut(msgs: AgentMessage[], keep: number): number | 
     (m) => m.role !== 'note' && (!c || m.seq > c.upto),
   );
   if (eligible.length <= keep) return null;
-  let cut = eligible.length - keep; // index of the first KEPT message
-  // Batch safety cannot rely on row adjacency: a `send` queued while the
-  // session was `awaiting` puts a USER row between an assistant's toolCalls
-  // and its tool results, so walking back off tool rows alone would cut
-  // between them — summarizing the tool_use while its tool_results survive
-  // in the tail, a permanent 400 nothing can repair (the transcript itself
-  // is healthy; only the model's view is broken). Use the same turn-window
-  // machinery repair uses: if any assistant's window spans the cut, move the
-  // cut to before that assistant.
-  const boundarySeq = () => eligible[cut].seq; // first kept seq
-  // Latest window first: moving the cut earlier can only push the boundary
-  // into EARLIER windows, so processing in reverse handles the cascade in one
-  // pass.
-  for (const w of [...turnWindows(eligible)].reverse()) {
-    if (!w.assistant.toolCalls?.length) continue;
-    const lastAnswerSeq = Math.max(
-      w.assistant.seq,
-      ...eligible
-        .filter((t) => t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd)
-        .map((t) => t.seq),
-    );
-    // Window spans the boundary: assistant would be summarized (or kept) while
-    // some of its results land on the other side.
-    while (cut > 0 && w.assistant.seq < boundarySeq() && lastAnswerSeq >= boundarySeq()) {
-      cut -= 1;
-    }
-  }
+  // `eligible.length - keep` is the index of the first KEPT message.
+  const cut = batchSafeBoundary(eligible, eligible.length - keep);
   if (cut <= 0) return null;
   return eligible[cut - 1].seq;
 }
@@ -432,16 +527,18 @@ export function findCompactionCut(msgs: AgentMessage[], keep: number): number | 
  * the provider's error to report, and the next iteration tries again), and no
  * error note is written — compaction is bookkeeping, not the user's request.
  * Returns true when a note was committed (the caller re-reads history).
+ *
+ * This is the THRESHOLD half only. The step itself is `compactNow`, which the
+ * manual `Agent.compact` calls directly — see there.
  */
 async function maybeCompact(
-  sessionId: string, config: RunConfig, history: AgentMessage[],
+  sessionId: string, agent: string, config: RunConfig, history: AgentMessage[],
   schemas: ToolSchema[] = [], interruptCheckMs = 250,
 ): Promise<boolean> {
   const ctx = config.context;
   if (!ctx) return false;
   const window = ctx.window ?? 200_000;
   const compactAt = ctx.compactAt ?? 0.8;
-  const keep = ctx.keep ?? 6;
 
   const prior = latestCompaction(history);
   const assembled = assembleContext(history);
@@ -453,14 +550,54 @@ async function maybeCompact(
     ? lastAssistant.usage!.input : undefined;
   if (estimateContext(assembled, reported) <= window * compactAt) return false;
 
+  return compactNow(sessionId, agent, config, history, schemas, interruptCheckMs);
+}
+
+/**
+ * The §9 compaction STEP, with no threshold in it.
+ *
+ * Factored out of `maybeCompact` so the manual `Agent.compact` runs exactly the
+ * automatic path — same cut, same summarizer prompt, same hook seam, same
+ * usage accounting, same degrade-never-fail contract — instead of a second
+ * implementation that would drift. `maybeCompact` is now the estimate and the
+ * `window * compactAt` comparison, and nothing else; everything from the cut
+ * down is here, unchanged.
+ *
+ * `context.keep` still applies (the manual call is "compact now", not "throw
+ * the tail away"), and `config.context` may be absent entirely: a caller that
+ * asked for this explicitly gets the defaults rather than a silent no-op.
+ */
+async function compactNow(
+  sessionId: string, agent: string, config: RunConfig, history: AgentMessage[],
+  schemas: ToolSchema[] = [], interruptCheckMs = 250,
+): Promise<boolean> {
+  const keep = config.context?.keep ?? 6;
+  const prior = latestCompaction(history);
+
   const upto = findCompactionCut(history, keep);
   if (upto === null) return false;
   // Phase-guarded, not just lease-guarded: `guardedUpdate` filters on the
-  // lease only, so without the $ne a stop landing right before this write
+  // lease only, so without the $nin a stop landing right before this write
   // would be silently overwritten — the same interrupt-erasure hole the M2
   // retry branch had, widened here to a full provider round trip.
+  //
+  // `awaiting` and `error` join `stopped` as defence in depth behind
+  // `compactSession`'s own refusals: all three are DECISIONS, and overwriting
+  // one with `compacting` would leave the finally to "restore" a phase that
+  // no longer describes the session (an unanswerable pending verdict, a
+  // laundered failure). It is inert on the automatic path, which is the point
+  // of a backstop — `maybeCompact`'s only call site is inside `runTurn`'s
+  // iteration loop, after the head's `phase === 'stopped'` return and after
+  // the pending-gate that returns on `awaiting`, with `error` terminal (the
+  // loop returns on it, and only a send clears it). The phase there is `idle`
+  // on the first iteration and `streaming`/`calling` on later ones — never
+  // one of these three.
   const entered = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
+    {
+      _id: sessionId,
+      'lease.serverId': SERVER_ID,
+      phase: { $nin: ['stopped', 'awaiting', 'error'] },
+    } as any,
     { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
   );
   if (entered !== 1) return false;
@@ -481,7 +618,13 @@ async function maybeCompact(
       .catch(() => { /* best-effort */ });
   }, interruptCheckMs);
   try {
-    for await (const chunk of config.provider.stream({
+    // The SECOND `beforeProviderRequest` seam, and the reason the hook carries
+    // a `purpose` at all: this request is the harness's own initiative, not the
+    // user's, and an app that wants its own summarizer replaces it here
+    // (`ctx.purpose === 'compaction'`) rather than through a bespoke option.
+    // `signal` is re-stamped below for the same reason it is on the think path:
+    // cancelling this call is the harness's job, not the hook's.
+    const request = await runBeforeProviderRequest({
       model: config.model,
       system:
         'You compact conversation history for an agent. Produce a concise brief '
@@ -502,8 +645,8 @@ async function maybeCompact(
       // the brief; a tool call in its reply is discarded anyway (only text
       // chunks accumulate below).
       tools: schemas,
-      signal: abort.signal,
-    })) {
+    }, { agent, sessionId, purpose: 'compaction' });
+    for await (const chunk of config.provider.stream({ ...request, signal: abort.signal })) {
       if (chunk.kind === 'text') summary += chunk.chunk;
       else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
     }
@@ -536,6 +679,131 @@ async function maybeCompact(
     summary, upto, usage, createdAt: new Date(),
   } as any);
   return true;
+}
+
+/**
+ * What a manual compaction did. A plain union rather than a throw, because this
+ * module is deliberately free of the Meteor namespace — `Agent.compact` turns
+ * every REFUSING outcome into `Meteor.Error('busy')` and `gone` into
+ * `no-session`, and the client sees those.
+ */
+export type CompactOutcome =
+  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone';
+
+/**
+ * The refusing outcomes, and the `reason` each one carries.
+ *
+ * One error CODE (`busy`) across all three, because that is the contract
+ * `Agent.compact` and `agent.compact` already published and every client
+ * branches on — but three distinct reasons, because "a turn is running",
+ * "answer the approval first" and "this session failed" are three different
+ * things for a person to do next, and a UI that only ever sees `busy` would
+ * tell all three of them to wait a moment.
+ *
+ * Here rather than duplicated at the two call sites, which is exactly how the
+ * two would drift.
+ */
+export const COMPACT_REFUSALS: Partial<Record<CompactOutcome, string>> = {
+  busy: 'This session is running a turn; compact it when it is idle.',
+  awaiting: 'This session is waiting on an approval; answer it before compacting.',
+  errored: 'This session has failed; send to it again before compacting.',
+};
+
+/**
+ * §9's compaction step, run ON DEMAND against an idle session — the whole point
+ * being that the threshold does NOT apply. A UI's "compact now" button, a job
+ * trimming a long-running session before it gets expensive.
+ *
+ * It takes the LEASE for the operation (claim, compact, release) rather than
+ * writing under whatever the session's state happens to be. A compaction is a
+ * full provider round trip that commits a note at an allocated seq, which is
+ * precisely what a turn does — running one beside a live turn would interleave
+ * two writers over one transcript. So a session with a live lease, or a turn in
+ * flight in this process, is refused as `busy` instead of queued: the caller is
+ * a human clicking a button, and "try again in a moment" is an answer they can
+ * act on. The in-process `running` Set is held too, for the same reason
+ * `runTurn` holds it — `claimLease` succeeds on its "already ours" branch, so
+ * the lease alone would not stop a `Meteor.defer`red turn in THIS process from
+ * writing straight through the compaction.
+ *
+ * The heartbeat mirrors `runTurn`'s: LEASE_MS is 30s and a summarization of a
+ * long transcript can exceed it, and losing the lease mid-call would make the
+ * note's own lease-guarded write fail silently.
+ *
+ * The watcher is not fought: it recovers sessions whose lease EXPIRED, and this
+ * one is heartbeaten and released. The phase is restored on the way out with
+ * `runTurn`'s exact rule — `stopped`, `error` and `awaiting` are decisions and
+ * are left alone; anything else returns to `idle`, which is what an idle
+ * session that was compacted goes back to being.
+ *
+ * `awaiting` and `error` are refused on the way IN for the same reason the
+ * finally leaves them alone on the way out. Neither is leased — a parked run
+ * releases its lease, and a failed one is long gone — so the lease check below
+ * cannot see them, and without their own guard a compaction would overwrite
+ * the phase with `compacting` and the finally would then "restore" `idle`: an
+ * approval nobody can answer any more (`recordVerdict` and the watcher sweep
+ * both require `awaiting`, and the next send's overtaken-park branch DELETES
+ * the parked turn), or a failure laundered into a healthy-looking session.
+ */
+export async function compactSession(
+  sessionId: string, config: RunConfig,
+): Promise<CompactOutcome> {
+  if (running.has(sessionId)) return 'busy';
+
+  const session = await AgentSessions.findOneAsync(sessionId);
+  if (!session) return 'gone';
+  // An approval is a DECISION, not a state to tidy: a human is being asked
+  // something, and the only two answers are approve and deny.
+  if (session.phase === 'awaiting') return 'awaiting';
+  // A terminal failure is STATUS a UI gates on — a banner, a retry button, an
+  // alert. Compaction is bookkeeping; it must not launder one into `idle`.
+  if (session.phase === 'error') return 'errored';
+  // A live lease is another server's turn (or ours, mid-wind-down). An EXPIRED
+  // one is an orphan the watcher will re-run: `claimLease` would take it, and
+  // compacting an abandoned turn's half-written transcript is not this call's
+  // job — leave it to the recovery that knows how to repair it.
+  if (session.lease) return 'busy';
+
+  running.add(sessionId);
+  try {
+    if (!(await claimLease(sessionId))) return 'busy';
+    const beat = setInterval(() => {
+      void heartbeat(sessionId).catch(() => { /* the guards catch a lost lease */ });
+    }, HEARTBEAT_MS);
+    try {
+      // The same assembly a turn makes, and for the same reason `maybeCompact`
+      // is given `schemas` at all: the compacted head keeps its
+      // tool_use/tool_result blocks, and Anthropic rejects a request carrying
+      // those with no `tools` parameter.
+      const tools = withSkillTool(
+        await expandMcpTools(resolveTools(config.tools)), config.skills,
+      );
+      const history = await AgentMessages
+        .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+      const did = await compactNow(
+        sessionId, session.agent, config, history, toolSchemas(tools),
+        config.interruptCheckMs ?? 250,
+      );
+      return did ? 'compacted' : 'nothing';
+    } finally {
+      clearInterval(beat);
+      // `compactNow` leaves `phase: 'compacting'` behind on success — inside a
+      // turn the next iteration's `streaming` write clears it, and here there
+      // is no next iteration. Same terminal list as `runTurn`'s finally, for
+      // the same reasons: a stop that landed mid-summarization (the abort poll
+      // honors it) and an approval nobody has answered are decisions, not
+      // states to tidy up.
+      const current = await AgentSessions.findOneAsync(sessionId);
+      if (current && !['stopped', 'error', 'awaiting'].includes(current.phase)) {
+        await guardedUpdate(sessionId, SERVER_ID, {
+          $set: { phase: 'idle', updatedAt: new Date() },
+        });
+      }
+      await releaseLease(sessionId);
+    }
+  } finally {
+    running.delete(sessionId);
+  }
 }
 
 /**
@@ -756,6 +1024,10 @@ type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
 
 interface TurnAnchor {
   userId: string | null;
+  /** The session's agent name — half of every hook's ctx. Read off the session
+   *  document rather than threaded through `RunConfig`: a CHILD session's
+   *  agent is the child's, and the session is the only place that is true. */
+  agent: string;
   /** The committed assistant carrying the `tool_use`s — the discard anchor. */
   messageId: string;
   assistantSeq: number;
@@ -785,6 +1057,9 @@ async function dispatchCalls(
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
     return 'abandoned';
   };
+  const hookCtx: ToolResultHookContext = {
+    agent: turn.agent, sessionId, userId: turn.userId,
+  };
 
   for (const call of calls) {
     // §7's backstop, BEFORE the gate: a tool the agent may not use must never
@@ -793,17 +1068,24 @@ async function dispatchCalls(
     // nothing dispatched), and the model routes around it.
     if (limits.canUse
       && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
-      const denied: ToolResult = {
+      // Through the hook like every other row: a refusal is still something
+      // entering a published transcript, and `afterToolResult`'s contract is
+      // that nothing reaches a row unseen.
+      const denied: ToolResult = await runAfterToolResult({
         ok: false,
         error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
-      };
+      }, call, hookCtx);
       const deniedSeq = await allocateSeq(sessionId);
       if (deniedSeq === null) return abandon();
       await AgentMessages.insertAsync({
         _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
         toolCallId: call.id,
         content: toolResultContent(denied, limits.maxResultChars),
-        error: denied.error,
+        // Guarded like the other two row writes: a hook may turn this refusal
+        // into a SUCCESS, and an unguarded write would then stamp `error` onto
+        // a row whose `ok` says otherwise (`ToolResult` carries `error` only on
+        // the failing arm, but a hook is app code and hands back what it likes).
+        error: denied.ok ? undefined : denied.error,
         createdAt: new Date(),
       } as any);
       continue;
@@ -872,6 +1154,13 @@ async function dispatchCalls(
             phase: 'awaiting',
             pending: {
               toolCallId: call.id, name: call.name, args: call.args, requestedAt: new Date(),
+              // MCP only, and only when there is a server to name. The resume
+              // needs this to tell "the tool was renamed away" from "its server
+              // is down" — see the field's comment in common/types.ts. Spread
+              // rather than a plain `undefined` value so a non-MCP park writes
+              // no key at all.
+              ...(tool?.kind === 'mcp' && tool.mcp?.server
+                ? { mcpServer: tool.mcp.server } : {}),
             },
             updatedAt: new Date(),
           },
@@ -884,12 +1173,30 @@ async function dispatchCalls(
       return 'parked';
     }
 
-    const result = tool
-      ? await runTool(tool, call.args, { userId: turn.userId, sessionId })
-      : { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+    const dispatched = tool
+      ? await dispatchTool(tool, call.args, {
+        userId: turn.userId, sessionId, toolCallId: call.id,
+      })
+      : {
+        result: {
+          ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
+        } as ToolResult,
+        childSessionId: undefined,
+      };
+    const { childSessionId } = dispatched;
+    // The `afterToolResult` seam: BEFORE `toolResultContent`'s truncation and
+    // before the row is written, so a hook sees the whole result and its
+    // replacement is what gets truncated, stored, published and sent to the
+    // model. A throwing hook leaves `dispatched.result` standing — see hooks.ts.
+    const result = await runAfterToolResult(dispatched.result, call, hookCtx);
 
     // Same atomic allocation as the commit: `agent.send` can interject between
     // tool results, and read-then-$inc would hand both writers the same seq.
+    //
+    // §9: ONE tool call is what a subagent costs the parent, exactly like any
+    // other tool. Whatever the child spent accrues to the CHILD's session under
+    // the child agent's own config — see `runSubagent`. Nothing extra is
+    // charged here, and nothing needs to be.
     const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
     // The assistant message is already committed but this result never will
     // be: leaving it would strand a tool_use with no tool_result.
@@ -900,6 +1207,9 @@ async function dispatchCalls(
       toolCallId: call.id,
       content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
+      // The handle on the child transcript. Present even for a parked or failed
+      // child — that session is exactly what a human needs to open.
+      childSessionId,
       createdAt: new Date(),
     } as any);
   }
@@ -954,6 +1264,7 @@ async function resumeParkedTurn(
   pending: NonNullable<AgentSession['pending']>,
   tools: ResolvedTool[],
   userId: string | null,
+  agent: string,
   budget: RunConfig['budget'],
   limits: DispatchLimits,
 ): Promise<DispatchOutcome> {
@@ -975,6 +1286,7 @@ async function resumeParkedTurn(
   const calls = assistant.toolCalls ?? [];
   const turn: TurnAnchor = {
     userId,
+    agent,
     messageId: assistant._id,
     assistantSeq: assistant.seq,
     batchIds: calls.map((c) => c.id),
@@ -1010,21 +1322,56 @@ async function resumeParkedTurn(
 
     const tool = tools.find((t) => t.name === call.name);
     let result: ToolResult;
+    let childSessionId: string | undefined;
     if (pending.verdict === 'denied') {
       // A denial is ANSWERED, not dropped. The model has to see the refusal in
       // the transcript to route around it; a missing result would strand the
       // call and a silent success would be a lie.
       result = { ok: false, error: { error: 'denied', reason: pending.reason } };
     } else if (!tool) {
-      // Approved, but the tool is no longer in the config — a rename or a
-      // removal deployed while the request sat on someone's screen. Same
-      // answer the streaming path gives an unknown call, so the batch closes
-      // cleanly instead of wedging on a name that no longer exists.
-      result = { ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` } };
+      // Approved, but the tool is no longer in the expanded list. Either way
+      // the batch closes cleanly rather than wedging on a name that is not
+      // there — but WHICH answer it closes with is a question of honesty.
+      //
+      // `pending.mcpServer` is the discriminator, recorded when the call
+      // parked. A whole-server MCP spec contributes no tools at all while its
+      // server is unreachable, so a perfectly healthy config produces exactly
+      // the same "no such name" here as a rename does. Reporting `unknown-tool`
+      // for it sends an operator hunting a config change that never happened,
+      // and tells the model the tool does not exist when it merely cannot be
+      // reached right now. `mcp-unavailable` is what the streaming path would
+      // have said, so this is the two paths agreeing rather than a special
+      // case.
+      result = pending.mcpServer
+        ? {
+          ok: false,
+          error: {
+            error: 'mcp-unavailable',
+            reason: `The MCP server "${pending.mcpServer}" is unavailable: its tool `
+              + `"${call.name}" could not be resolved when the approval resumed.`,
+          },
+        }
+        : {
+          ok: false,
+          error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
+        };
     } else {
       if (!(await holdsLease(sessionId))) return abandon();
-      result = await runTool(tool, call.args, { userId, sessionId });
+      // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
+      // approved by a human opens its child session here exactly as an
+      // ungated one would have opened it there.
+      ({ result, childSessionId } = await dispatchTool(tool, call.args, {
+        userId, sessionId, toolCallId: call.id,
+      }));
     }
+
+    // The same `afterToolResult` seam the streaming path runs, at the same
+    // point (before truncation, before the row): an approved tool's output, a
+    // denial and an `mcp-unavailable` all reach the transcript through here, so
+    // a redaction hook cannot be dodged by parking a call.
+    result = await runAfterToolResult(result, call, {
+      agent, sessionId, userId,
+    });
 
     // A denied call was never dispatched, so it costs no tool budget.
     const seq = await allocateSeq(
@@ -1036,6 +1383,7 @@ async function resumeParkedTurn(
       _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
       content: toolResultContent(result, limits.maxResultChars),
       error: result.ok ? undefined : result.error,
+      childSessionId,
       createdAt: new Date(),
     } as any);
   }
@@ -1080,9 +1428,6 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     maxResultChars: config.maxResultChars ?? 8000,
     canUse: config.canUse,
   };
-  const tools = resolveTools(config.tools);
-  const schemas = toolSchemas(tools);
-
   // Both feed the durable-wake check in the outer `finally` — see there.
   let owned = false;
   let resumed = false;
@@ -1100,6 +1445,37 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     }, HEARTBEAT_MS);
 
     try {
+      // The ONE async step in tool assembly, and the only concession the loop
+      // makes to MCP: a `{ mcp: … }` spec carries a server name, and its
+      // description, its schema and (for a whole-server spec) its very
+      // existence come from that server's `tools/list`. Resolution stays
+      // synchronous; discovery is awaited here, once per turn, before anything
+      // is shown to the model. Connections and catalogs are cached per process,
+      // so this is a Map lookup from the second turn on, and a no-op array
+      // pass-through for an agent with no MCP tools. A server that is down
+      // costs one failed connect and never fails the turn — see
+      // `expandMcpTools`.
+      //
+      // AFTER `claimLease`, and after the heartbeat is running, deliberately.
+      // Discovery spawns subprocesses and can burn a full
+      // `MCP_DISCOVERY_TIMEOUT_MS` per server; doing it before the lease meant
+      // a run that another server already owns paid the whole bill before
+      // finding out it had nothing to do — every duplicate wake-up spawning its
+      // own copy of every MCP server. Under the heartbeat, a slow discovery
+      // cannot cost us the lease either. Nothing above reads `tools` or
+      // `schemas`, so there is nothing to reorder around.
+      //
+      // The built-in `skill` loader joins the list AFTER expansion, for a
+      // reason that only shows up with MCP in the tree: a whole-server spec's
+      // tool names are not known until discovery has run, so appending earlier
+      // could put two tools named `skill` in front of a provider that rejects
+      // duplicates outright. Appending here makes the collision visible, and
+      // `withSkillTool` resolves it in the app's favor with one warning.
+      const tools = withSkillTool(
+        await expandMcpTools(resolveTools(config.tools)), config.skills,
+      );
+      const schemas = toolSchemas(tools);
+
       if (!(await repairUnansweredToolUse(sessionId))) return;
 
       // An approval gate is resolved BEFORE the think loop, because the
@@ -1147,7 +1523,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         } else {
           resumed = true;
           const outcome = await resumeParkedTurn(
-            sessionId, entry.pending, tools, entry.userId, config.budget, limits,
+            sessionId, entry.pending, tools, entry.userId, entry.agent,
+            config.budget, limits,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -1190,7 +1567,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // would have overflowed is the one that benefits. A committed note
         // changes the assembled view; re-read so this iteration streams
         // against it (the note also occupies a seq).
-        if (await maybeCompact(sessionId, config, history, schemas, interruptCheckMs)) {
+        if (await maybeCompact(
+          sessionId, session.agent, config, history, schemas, interruptCheckMs,
+        )) {
           history = await AgentMessages
             .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
         }
@@ -1251,17 +1630,37 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           const abort = new AbortController();
 
           try {
+            // The `beforeProviderRequest` seam for the turn's own call. Run per
+            // ATTEMPT rather than once per iteration, so a retry re-runs the
+            // chain instead of resending a request a hook built before the
+            // backoff (a hook stamping the current time is the obvious case).
+            //
+            // `signal` is attached AFTER the hooks and never handed to them to
+            // preserve: a hook that rebuilds the request wholesale must not be
+            // able to silently disable the interrupt — cancellation is the
+            // harness's contract with the user, not the extension's.
+            const request = await runBeforeProviderRequest({
+              model: config.model, system: config.system,
+              // The COMPACTED view when a compaction note stands; the raw
+              // (note-filtered) transcript otherwise.
+              messages: assembleContext(history), tools: schemas,
+            }, { agent: session.agent, sessionId, purpose: 'think' });
             try {
               for await (const chunk of config.provider.stream({
-                model: config.model, system: config.system,
-                // The COMPACTED view when a compaction note stands; the raw
-                // (note-filtered) transcript otherwise.
-                messages: assembleContext(history), tools: schemas,
-                signal: abort.signal,
+                ...request, signal: abort.signal,
               })) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
                   thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
+                } else if (chunk.kind === 'tool_args') {
+                  // Streamed for FIDELITY, not for dispatch: the tool calls the
+                  // loop actually runs come off the terminal `done` chunk,
+                  // already parsed. These deltas exist so a client can show a
+                  // tool call forming, and they carry `contentIndex` so two
+                  // calls forming at once stay apart. Nothing accumulates them
+                  // in memory here — a partial-JSON buffer the commit never
+                  // reads would be dead weight on every turn.
+                  writer.push('tool_args', chunk.chunk, chunk.contentIndex);
                 } else if (chunk.kind === 'done') {
                   toolCalls = chunk.toolCalls;
                   usage = chunk.usage ?? usage;
@@ -1419,6 +1818,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
         const outcome = await dispatchCalls(sessionId, toolCalls, tools, {
           userId: session.userId,
+          agent: session.agent,
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,

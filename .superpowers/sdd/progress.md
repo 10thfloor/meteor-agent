@@ -198,3 +198,124 @@ Tier 1 progress: GitHub repo created (10thfloor/meteor-agent, private) + CI gree
   exports map rejects Meteor's .js-suffixed helper imports); .approval[hidden] CSS specificity bug;
   demo script answeredTool must check the LAST message, not .some().
 BLOCKED on user: live smoke (no ANTHROPIC_API_KEY in env), Atmosphere publish (meteor not logged in).
+
+== MILESTONE 4 (branch milestone-4-v2, plan 2026-08-17-agent-harness-milestone-4.md) ==
+Task 1 DONE: full-schema validation via typebox + parallel tool-arg attribution. Suite 204 server
+  (+1 pending) + 1 client, from 185. Probe: pi-ai re-exports typebox's `Type` ONLY (index.d.ts:1-2,
+  46 root exports, no `Value`); the route is typebox's own `exports["./value"]` through a
+  generalized loader seam (loadPackage/loadTypebox/typeboxValueResolvable). Value.Check takes plain
+  JSON Schema and enforces enum/bounds/pattern/format/oneOf/anyOf/const/minItems/additionalProperties/
+  $ref both directions. Degrades to the structural checker with ONE warn; setToolArgsValidator still
+  wins. Agent.method's fail-closed guard now fires only when NO full validator is available.
+  Attribution: ProviderChunk tool_args + AgentDelta gained contentIndex?; DeltaWriter coalesces per
+  index; mergeView exposes `toolArgs?: Record<number, string>` on in-flight rows. verify-build.sh
+  now proves the typebox chain in a real production bundle (URL-import branch wins). Full report:
+  .superpowers/sdd/task-1-report.md
+M4 Task 1: complete (aacc34d..HEAD, review Approved-with-issues, all fixed inline, 204+1 passing)
+  Typebox route: typebox's own exports["./value"] via generalized loader (pi-ai re-exports Type only).
+  Review fixes applied: ViewMessage.createdAt restored (silent type regression); runtime fail-closed
+  guard in co-registered methods (resolve-succeeds/import-fails window); per-kind warn latch;
+  propertyNames/additionalProperties name clamping in published reasons; README format-enforcement note.
+  CORRECTION: zeroUsage (turn-2 live-path crash fix) was M3 close-out work (233d557), NOT a Task 1
+  discovery — Task 1's report re-described it. My interim summary misattributed it.
+  Carry: no compiled-schema cache (typebox/compile) — note for hot loops; tool_args deltas add capped-
+  store pressure; DeltaWriter.push could assert kind for contentIndex.
+M4 Task 2: complete (22a089b..HEAD, review 3 Medium + 4 Low, fixed/documented inline, 218+1 passing)
+  Code fix: activeChild live handle on the parent session (set guarded before the child runs, cleared
+  in a finally) — the documented "watch the child live" path previously had no door. +2 tests (child's
+  own toolCalls budget enforced; activeChild visible mid-stream and cleared after).
+  Documented honestly instead of fixed: at-least-once includes whole subagent runs on abandoned
+  batches (orphaned children possible); depth bounds nesting not fan-out (budget.toolCalls effectively
+  required across a subagent graph); parent interrupt does not stop a running child; child's own
+  budget.approval can auto-deny a parked child; turns is inert for children.
+  Carry to v3 ledger: idempotency keys for subagent dispatch (the at-least-once double-child);
+  re-linking orphaned children; parent-interrupt propagation to children.
+M4 Task 3: complete (session forking, 228+1 passing + 1 client, from 218). agent.fork method +
+  Agent.fork server/client APIs; new server/fork.ts. The compaction batch-safety walk is factored
+  out as loop.ts `batchSafeBoundary(eligible, boundary)` and shared verbatim — findCompactionCut is
+  behavior-identical (its 4 pre-existing assertions unchanged). Two generalizations inside it,
+  inert for compaction and load-bearing for fork: boundarySeq() is Infinity when the head is the
+  whole list, and lastAnswerSeq is Infinity for an UNANSWERED batch — which is what makes forking an
+  awaiting session cut before the parked assistant with no special case.
+  Lineage decisions implemented + commented: parent/depth/activeChild/pending NOT copied (a fork is
+  a new ROOT conversation; forkedFrom is a different relationship), lease/phase fresh, usage and
+  budgetSpent ZEROED, nextSeq = cut+1, compaction notes at-or-before the cut ARE copied (verified by
+  capturing the fork's first provider request), copied tool rows keep childSessionId.
+  Copy is rawCollection().insertMany in chunks of 500 (no hooks exist here); session document is
+  written LAST so a half-copied transcript is unreachable rather than visibly corrupt.
+  Rate limits: mFork rides the existing `starts` entry (session creation), so a starts entry now
+  adds 4 rules — two existing applyRateLimits count assertions updated (4->6, 6->8) plus a new test
+  asserting a real agent.fork invocation matches. Full report: .superpowers/sdd/task-3-report.md
+  Carry: fork of a huge transcript is O(n) docs in one method call (only rateLimit.starts bounds it);
+  the copy is not transactional, so a crash mid-copy leaks inert orphan message rows nothing reaps.
+M4 Task 3 (forking): complete (6234f0a, review Approved; 2 Lows fixed in 7867439 — note-drop semantics
+  pinned+documented, divergence comment, nextSeq justification). Info kept: copied childSessionId
+  points at source's children (correct: same userId audience); child's parent still names the source.
+M4 Task 4 (MCP): complete (c5743e2 + fixes 7867439, 249+2+1 passing). 3 Mediums fixed: 15s discovery
+  deadline + 30s failure cooldown (cooldown != poisoned cache — success clears), expansion moved
+  inside claimLease + concurrent; env probe note corrected (SDK 1.30.0 merges getDefaultEnvironment
+  itself — our merge is insurance); whole-server resume misreport -> pending.mcpServer carries the
+  origin, down-at-resume now says mcp-unavailable. Lows: missing-name warn, dead export removed,
+  separate MCP warn latch, server-map snapshot in the test seam.
+  Ledger: watcher.test.ts 1-run flake noted by two agents (untouched files) — watch it.
+M4 Task 5 (skills + hooks): complete (5d95cac, 260+2 passing + 1 client, from 249 — +11). Skills:
+  config `skills:[{name,description,content}]`, validated at define time (name /^[a-z0-9-]{1,64}$/i,
+  unique, non-empty description+content); buildSystemPrompt appends a `## Skills` listing (names +
+  descriptions ONLY) plus one instruction sentence; built-in inline `skill` tool built at run time,
+  unknown name -> Meteor.Error('unknown-skill') listing available NAMES only. Collision policy: the
+  loader is appended AFTER expandMcpTools (MCP names are unknown before discovery), and an app tool
+  named `skill` WINS with one latched warn — documented + tested.
+  Hooks: new server/hooks.ts. Global registration (Agent.hook / Agent.clearHooks test seam), unknown
+  name throws at registration, registration order, void=keep / object=replace behind a minimal shape
+  check, throw-or-junk = skipped with one warn per KIND. beforeProviderRequest runs at BOTH provider
+  call sites (think, per attempt; and maybeCompact's summarizer) with ctx.purpose — the summarizer
+  hook falls out for free, traced in a test. afterToolResult runs at all THREE tool-row sites
+  (canUse refusal, streamed dispatch, parked resume), before truncation and the row write — a
+  stronger invariant than "after every dispatch", chosen so a redaction hook cannot be dodged.
+  Decisions: hooks NOT in RunConfig (four turn entries would each have to remember them; global
+  matches Pi's extension model — per-agent = v3), agent name for ctx read off the SESSION document
+  (a child reports the child agent), and `signal` is re-stamped AFTER the hooks so a rebuilt request
+  cannot disable the interrupt. Full report: .superpowers/sdd/task-5-report.md
+  Carry: skill bodies obey maxResultChars (no special case); canUse can deny `skill` while the
+  prompt listing stands.
+M4 Task 7 (small candidates + docs close-out): complete. Suite 275 server (+2 pending) + 5 client,
+  from 260 — +15 (12 in a new tests/candidates.test.ts, 3 approvals rate-limit tests in capped).
+  Agent.provider(name, impl): AgentConfig.provider is Provider|string, resolved in buildRunConfig
+  (NOT define — file load order would decide correctness, same reasoning resolveTools gives for
+  subagent names); unknown name THROWS naming it + listing the registered (no silent pi-ai fallback:
+  that bills a real provider for a config that asked for a mock); shape checked eagerly; re-register
+  overwrites with one warn (hot reload). Third documented way to avoid the pi-ai peer entirely.
+  Manual compact: maybeCompact split at the threshold seam -> compactNow(sessionId, agent, config,
+  history, schemas, interruptCheckMs) holds everything from findCompactionCut down, unchanged (the
+  4 existing compaction tests pass untouched). compactSession() takes the LEASE + the in-process
+  running Set (claimLease succeeds on "already ours", so the lease alone would not stop a deferred
+  turn in this process), heartbeats, and restores the phase with runTurn's exact terminal rule ->
+  an idle session ends idle+unleased, nothing for the watcher to claim. Refuses 'busy' when leased
+  (incl. EXPIRED — that is the watcher's orphan) or running, before spending a model call. loop.ts
+  stays Meteor-free: returns 'compacted'|'nothing'|'busy'|'gone'; agent.compact method + Agent.compact
+  + client compact() map it. Works with context absent (defaults) — the caller asked explicitly.
+  runAs: inline+adopted only; withInvocation userId AND ctx.userId move together; presence-not-
+  truthiness everywhere (null = anonymous service context; a present-but-undefined value resolves to
+  null, the fail-safe direction); ToolContext.callerUserId carries the session's real owner in, which
+  is what "check ctx inside the tool" means; authorization (canUse/gate/ownership) does NOT move.
+  Subagent + MCP specs rejected at resolveTools with the reason.
+  rateLimit.approvals: one entry, agent.approve + agent.deny, 4 rules (starts' shape).
+  Docs: README Scope rewritten as "what v2 means now" (bulleted M4 inventory) + RPC/print RETIRED in
+  writing (RPC mode IS DDP, print mode IS Agent.ask()); new ## Providers section; ### runAs section
+  with the escalation warning + a cross-referenced paragraph in Anonymous sessions; compact-on-demand
+  block; approvals in the rate-limit example. CONTRIBUTING: both peers genuinely optional, the three
+  pi-ai escapes with Agent.provider as the third, the two resolveProvider properties to preserve;
+  stale "one pending test" line corrected to two live smokes.
+  Ledger closed: DeltaWriter.push now scopes contentIndex to tool_args — DROPPED not thrown (the
+  value comes off a ProviderChunk; a third-party provider must not abandon turns), one piai.test
+  assertion re-pinned from the incidental old behavior. Standalone-Mongo README line: already there.
+  v3 backlog consolidated (14 items) in .superpowers/sdd/task-7-report.md — new one from this task:
+  no rateLimit entry for agent.compact.
+M4 Tasks 5-7: complete (c09eb2b, 302e75f, 54aa46b; first-reviewed in the final whole-branch review).
+M4 final review: MERGE AFTER MUST-FIXES -> all applied (b865638): compact refuses awaiting/error
+  (H1 was: manual compact destroyed a parked approval and the next send DELETED the parked turn);
+  afterToolResult tested at all three sites; element no-innerHTML XSS test; rateLimit.compacts;
+  canUse-row error guard. 282 (+2 pending) server + 6 client, 0 failures.
+  v3 backlog consolidated in task-7 report + final review triage (idempotency keys, child re-link,
+  parent-interrupt propagation, per-agent hooks, compiled-schema cache, watcher flake tracking,
+  runAs-on-pending render, toolResultContent stringify guard, demo error branch, attribute churn).

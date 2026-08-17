@@ -10,6 +10,7 @@
   "dependencies": {
     "@babel/runtime": "^7.23.5",
     "@earendil-works/pi-ai": "^0.84.2",
+    "@modelcontextprotocol/sdk": "^1.30.0",
     "@swc/helpers": "^0.5.17",
     "meteor-node-stubs": "^1.2.12"
   },

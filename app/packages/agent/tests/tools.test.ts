@@ -298,16 +298,129 @@ describe('validateToolArgs', () => {
     assert.include((notAnArray as any).reason, 'ids');
   });
 
-  it('accepts anything under an empty schema, and anything it cannot model', async () => {
+  it('accepts anything under an empty schema, and tolerates unknown keywords', async () => {
     const { validateToolArgs } = await import('../server/tools');
     assert.isTrue((await validateToolArgs({}, { whatever: [1, 2] })).ok);
     assert.isTrue((await validateToolArgs({}, undefined)).ok);
     assert.isTrue((await validateToolArgs({ type: 'object', properties: {} }, { extra: 1 })).ok);
-    // Keywords outside the checker's contract are passed, not guessed at.
+    // A schema that is not a schema at all constrains nothing rather than
+    // exploding — `Value.Check` throws on these, so the guard above it must not.
+    assert.isTrue((await validateToolArgs(null, { v: 1 })).ok);
+    assert.isTrue((await validateToolArgs('nonsense', { v: 1 })).ok);
+    // Vendor keywords neither checker knows are ignored, not guessed at.
     assert.isTrue((await validateToolArgs(
-      { type: 'object', properties: { v: { oneOf: [{ type: 'string' }] } } },
-      { v: 42 },
+      { type: 'object', properties: { v: { type: 'string', 'x-vendor': 'shout' } } },
+      { v: 'ok' },
     )).ok);
+  });
+});
+
+describe('validateToolArgs — the full checker (typebox Value.Check)', () => {
+  // M4 Task 1. The DEFAULT validator now enforces the whole schema when
+  // typebox is reachable through the loader seam. These assertions are the
+  // reason the seam exists: every one of them passed silently under the
+  // structural checker, which ignores enum, bounds, oneOf and the rest.
+  const rich = {
+    type: 'object',
+    properties: {
+      op: { type: 'string', enum: ['add', 'sub', 'mul'] },
+      n: { type: 'integer', minimum: 1, maximum: 10 },
+      tags: { type: 'array', items: { type: 'string' }, minItems: 1 },
+      who: { oneOf: [{ type: 'string' }, { type: 'number' }] },
+    },
+    required: ['op', 'n'],
+    additionalProperties: false,
+  };
+
+  it('reports the full checker as available in this app tree', async () => {
+    const { fullValidationAvailable } = await import('../server/tools');
+    assert.isTrue(
+      fullValidationAvailable(),
+      'typebox ships as a dependency of pi-ai; the loader seam must reach it',
+    );
+  });
+
+  it('ACCEPTS arguments that satisfy a rich schema', async () => {
+    const { validateToolArgs } = await import('../server/tools');
+    assert.isTrue((await validateToolArgs(rich, { op: 'add', n: 5 })).ok);
+    assert.isTrue((await validateToolArgs(
+      rich, { op: 'mul', n: 10, tags: ['a'], who: 7 },
+    )).ok);
+  });
+
+  it('REJECTS an out-of-enum value, naming the field and never the value', async () => {
+    const { validateToolArgs } = await import('../server/tools');
+    const r = await validateToolArgs(rich, { op: 'SECRET-op', n: 5 });
+    assert.isFalse(r.ok, 'enum is exactly what the structural checker cannot see');
+    assert.include((r as any).reason, 'op');
+    assert.notInclude((r as any).reason, 'SECRET');
+  });
+
+  it('REJECTS values outside numeric bounds, both ends, and non-integers', async () => {
+    const { validateToolArgs } = await import('../server/tools');
+    assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 0 })).ok);
+    assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 11 })).ok);
+    assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 5.5 })).ok);
+    const r = await validateToolArgs(rich, { op: 'add', n: 99 });
+    assert.include((r as any).reason, 'n');
+  });
+
+  it('REJECTS oneOf misses, minItems violations and unexpected fields', async () => {
+    const { validateToolArgs } = await import('../server/tools');
+    assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 5, who: true })).ok);
+    assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 5, tags: [] })).ok);
+    const extra = await validateToolArgs(rich, { op: 'add', n: 5, sneak: 'SECRET-value' });
+    assert.isFalse(extra.ok, 'additionalProperties: false must be enforced');
+    assert.include((extra as any).reason, 'sneak');
+    assert.notInclude((extra as any).reason, 'SECRET');
+  });
+
+  it('keeps the structural checker\'s reason vocabulary for paths and required', async () => {
+    const { validateToolArgs } = await import('../server/tools');
+    const nested = {
+      type: 'object',
+      properties: {
+        customer: { type: 'object', properties: { id: { type: 'string' } }, required: ['id'] },
+        ids: { type: 'array', items: { type: 'string' } },
+      },
+      required: ['customer'],
+    };
+    const missing = await validateToolArgs(nested, { customer: {} });
+    assert.include((missing as any).reason, 'customer.id');
+    assert.include((missing as any).reason, 'required');
+    const item = await validateToolArgs(nested, { customer: { id: 'c' }, ids: ['a', 3] });
+    assert.include((item as any).reason, 'ids[1]');
+  });
+
+  it('degrades to the structural checker, with ONE warning, when typebox will not load', async () => {
+    const { validateToolArgs, setTypeboxValueLoader } = await import('../server/tools');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    // The forced outage: a loader that rejects is exactly what a renamed
+    // typebox export or a pruned production tree looks like at runtime.
+    const restore = setTypeboxValueLoader(async () => { throw new Error('forced outage'); });
+    try {
+      // Rich constraints are no longer enforced — the documented narrowing.
+      assert.isTrue((await validateToolArgs(rich, { op: 'nope', n: 999 })).ok);
+      assert.isTrue((await validateToolArgs(rich, { op: 'add', n: 5, sneak: 1 })).ok);
+      // But structure still is: this is a DEGRADE, not a disable.
+      const missing = await validateToolArgs(rich, { n: 5 });
+      assert.isFalse(missing.ok, 'the structural checker must still enforce required');
+      assert.include((missing as any).reason, 'op');
+      const wrongType = await validateToolArgs(rich, { op: 4, n: 5 });
+      assert.isFalse(wrongType.ok);
+      assert.include((wrongType as any).reason, 'op');
+
+      assert.lengthOf(
+        warnings.filter((w) => w.includes('10thfloor:agent')), 1,
+        'one warning per outage, not one per tool call',
+      );
+      assert.include(warnings[0], 'typebox');
+    } finally {
+      restore();
+      console.warn = originalWarn;
+    }
   });
 });
 
@@ -517,12 +630,17 @@ describe('Agent.method fail-closed registration (final-review ruling)', () => {
     }), 'oneOf');
   });
 
-  it('Agent.method throws at define time for a schema the checker cannot enforce', async () => {
+  it('Agent.method throws at define time when NO full validator is available', async () => {
     const { Agent } = await import('../server/agent');
+    const { setTypeboxValueLoader } = await import('../server/tools');
     // "Accept what I can't check" is the right bias for the MODEL (it
     // retries); on a public DDP endpoint it is an unguarded argument — the
     // selector-injection surface reintroduced by the feature that promised to
     // close it. So an unenforceable schema is a startup error, not a silent gap.
+    //
+    // M4: the guard is now conditional, so the test has to CREATE the
+    // condition — `null` removes the typebox route the app tree really has.
+    const restore = setTypeboxValueLoader(null);
     let threw: any;
     try {
       Agent.method('failclosed.enum', {
@@ -530,12 +648,52 @@ describe('Agent.method fail-closed registration (final-review ruling)', () => {
         args: { type: 'object', properties: { k: { enum: ['a', 'b'] } } },
         run: async () => 'never',
       });
-    } catch (e) { threw = e; }
+    } catch (e) { threw = e; } finally { restore(); }
     assert.isDefined(threw, 'registration must fail closed');
     assert.include(threw.message, 'enum');
     assert.include(threw.message, 'failclosed.enum');
+    assert.include(threw.message, 'setToolArgsValidator');
+    assert.include(threw.message, 'typebox', 'the message must name the fix that now exists');
     // And the method must NOT have been registered.
     assert.isUndefined((Meteor as any).server.method_handlers['failclosed.enum']);
+  });
+
+  it('Agent.method ACCEPTS a rich schema when the full validator is available', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { fullValidationAvailable } = await import('../server/tools');
+    assert.isTrue(fullValidationAvailable());
+    // The whole point of Task 1: with typebox reachable, a schema the
+    // structural checker could not enforce is no longer a registration error —
+    // and the endpoint it produces really does enforce it.
+    const spec = Agent.method('failclosed.rich', {
+      description: 'x',
+      args: {
+        type: 'object',
+        properties: { k: { type: 'string', enum: ['a', 'b'] }, n: { type: 'integer', maximum: 3 } },
+        required: ['k'],
+      },
+      run: async (args: any) => `got ${args.k}`,
+    });
+    assert.equal(spec.method, 'failclosed.rich');
+
+    const { withInvocation } = await import('../server/tools');
+    assert.equal(
+      await withInvocation('u-rich', () => Meteor.callAsync('failclosed.rich', { k: 'a' })),
+      'got a',
+    );
+    let ddpThrew: any;
+    try {
+      await withInvocation('u-rich', () => Meteor.callAsync('failclosed.rich', { k: 'z' }));
+    } catch (e) { ddpThrew = e; }
+    assert.instanceOf(ddpThrew, Meteor.Error);
+    assert.equal(ddpThrew.error, 'invalid-args');
+    let boundsThrew: any;
+    try {
+      await withInvocation('u-rich', () => Meteor.callAsync('failclosed.rich', { k: 'a', n: 9 }));
+    } catch (e) { boundsThrew = e; }
+    assert.instanceOf(boundsThrew, Meteor.Error);
+    assert.equal(boundsThrew.error, 'invalid-args');
   });
 
   it('a plain structural schema still registers fine', async () => {

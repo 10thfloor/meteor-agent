@@ -3,9 +3,9 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { getAgent, buildSystemPrompt, resolveBudget, type AgentConfig } from './registry';
-import { runTurn } from './loop';
-import { piAiProvider } from './providers/piai';
+import { getAgent, buildRunConfig, type AgentConfig } from './registry';
+import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
+import { forkSession } from './fork';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -43,27 +43,10 @@ async function requireSession(agent: string, sessionId: string, userId: string |
  */
 export function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
   Meteor.defer(() => {
-    runTurn(sessionId, {
-      model: config.model,
-      system: buildSystemPrompt(config, { userId }),
-      tools: config.tools ?? [],
-      // `provider` is optional as of Milestone 2: an agent that names none
-      // streams through pi-ai. Resolved HERE rather than at define() time so
-      // defineAgent stays a pure registration and pi-ai is loaded only when a
-      // turn actually runs.
-      provider: config.provider ?? piAiProvider(),
-      maxIterations: config.maxIterations,
-      // §9. `spend` is reduced to dollars here rather than in the loop, so the
-      // loop compares numbers and `'$1.00'` is parsed once per turn instead of
-      // once per iteration. It cannot throw at this point: `defineAgent`
-      // already parsed the same value at startup and refused a bad one.
-      budget: resolveBudget(config.budget),
-      pricing: config.pricing,
-      retry: config.retry,
-      context: config.context,
-      maxResultChars: config.maxResultChars,
-      canUse: config.canUse,
-    }).catch((e) => {
+    // `buildRunConfig` is shared with `Agent.ask` and with a subagent's child
+    // run, so a turn runs on identical terms however it was started — see the
+    // note there.
+    runTurn(sessionId, buildRunConfig(config, userId)).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
   });
@@ -340,6 +323,74 @@ export function registerMethods(): void {
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
       } as any);
+    },
+
+    /**
+     * Branch a session at a batch-safe cut point; returns the NEW session id.
+     *
+     * `atSeq` is a REQUEST, not a command: it is clamped down to the nearest
+     * legal cut (see `findForkCut`), so a UI can hand this the seq of the row a
+     * user clicked without knowing anything about tool batches. Defaults to the
+     * last message — "fork the whole thing".
+     *
+     * Authorization is on the SOURCE only: the fork is created for the source's
+     * owner, so a caller who may drive the source may fork it, and no one else
+     * can name a session id they cannot already read.
+     */
+    async [NAMES.mFork](
+      this: any, agent: string, sessionId: string, atSeq?: number,
+      opts?: { title?: string },
+    ) {
+      check(agent, String);
+      check(sessionId, String);
+      check(atSeq, Match.Maybe(Match.Integer));
+      check(opts, Match.Maybe({ title: Match.Maybe(String) }));
+      // The registry check mirrors mStart/mSend: forking into an agent this
+      // server does not define would produce a session nothing can ever run.
+      if (!getAgent(agent)) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const source = await requireSession(agent, sessionId, this.userId ?? null);
+      // `Match.Maybe` accepts null as well as undefined, and DDP turns a
+      // trailing `undefined` argument into null on the wire — so normalize
+      // rather than letting a null `atSeq` reach the arithmetic downstream.
+      return forkSession(source, { atSeq: atSeq ?? undefined, title: opts?.title });
+    },
+
+    /**
+     * §9's compaction on demand, ignoring the threshold. Resolves true when a
+     * note was committed, false when there was nothing to compact.
+     *
+     * Authorized exactly as every other session method is, then handed to
+     * `compactSession`, which owns the lease for the operation — so this cannot
+     * race a turn, and a session that is running one is refused with `busy`
+     * rather than queued. It is deliberately NOT `deferTurn`-shaped: the caller
+     * asked for a specific piece of bookkeeping and is owed its result, and a
+     * compaction commits at most one note.
+     *
+     * The turn budget is untouched: a compaction is not a turn. Its
+     * summarization call still accrues usage and cost like any other model
+     * call, so `budget.spend` remains the backstop — and `rateLimit.compacts`
+     * is the front one: this is the second method (after `send`) whose every
+     * accepted call buys a provider round trip, so it gets a knob of its own.
+     */
+    async [NAMES.mCompact](this: any, agent: string, sessionId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const session = await requireSession(agent, sessionId, this.userId ?? null);
+
+      // The SESSION's owner, not `this.userId`: an anonymous capability-URL
+      // session compacts under the same null identity its turns run under, and
+      // the two are the same value anyway after `requireSession` matched on it.
+      const outcome = await compactSession(
+        sessionId, buildRunConfig(config, session.userId),
+      );
+      // One code, three reasons — `busy` also covers a session parked on an
+      // approval and one sitting in `error`. See `COMPACT_REFUSALS`.
+      const refusal = COMPACT_REFUSALS[outcome];
+      if (refusal) throw new Meteor.Error('busy', refusal);
+      if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
+      return outcome === 'compacted';
     },
 
     async [NAMES.mApprove](this: any, agent: string, sessionId: string) {

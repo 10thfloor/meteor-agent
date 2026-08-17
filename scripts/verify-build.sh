@@ -25,7 +25,9 @@
 #        the root entry and the `providers/*` wildcard, then tries each loader
 #        branch — bare import, absolute-file-URL import, temp-dir shim — and
 #        asserts pi-ai's namespace loads, `Type` builds a schema, and
-#        `builtinModels()` returns a usable model.
+#        `builtinModels()` returns a usable model — then repeats the whole
+#        chain for `typebox/value`, the full JSON-Schema checker behind
+#        `validateToolArgs`, and checks a rich schema in both directions.
 #
 # WHAT IT DOES NOT NEED
 #   No Mongo, no app boot, no listening port (so it cannot collide with anything
@@ -85,7 +87,7 @@ echo "compiled package: $(du -h "$BUNDLED_PKG" | cut -f1) $BUNDLED_PKG"
 
 # Drift guard. The probe below is a port of server/providers/loader.ts; these
 # markers assert the shipped bundle still contains the code it is a port OF.
-for marker in resolvePiAiEntry shimLoad CANDIDATE_DIRS '@earendil-works/pi-ai'; do
+for marker in resolvePiAiEntry shimLoad CANDIDATE_DIRS '@earendil-works/pi-ai' typeboxValueResolvable; do
   grep -qF -- "$marker" "$BUNDLED_PKG" \
     || fail "loader marker '$marker' missing from the bundle — server/providers/loader.ts
       has changed shape and the probe in this script no longer mirrors it."
@@ -122,13 +124,21 @@ import { createRequire } from 'module';
 import { pathToFileURL } from 'url';
 
 const PKG = '@earendil-works/pi-ai';
+const TYPEBOX = 'typebox';
 const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
+const NESTED_BASES = { [TYPEBOX]: [path.join(...PKG.split('/'), 'node_modules')] };
 
-function findNodeModulesBase() {
+function findNodeModulesBase(pkg = PKG) {
+  const nested = NESTED_BASES[pkg] ?? [];
   let dir = process.cwd();
   for (let i = 0; i < 8; i += 1) {
     for (const c of CANDIDATE_DIRS) {
-      if (fs.existsSync(path.join(dir, c, ...PKG.split('/')))) return path.join(dir, c);
+      const root = path.join(dir, c);
+      if (fs.existsSync(path.join(root, ...pkg.split('/')))) return root;
+      for (const n of nested) {
+        const b = path.join(root, n);
+        if (fs.existsSync(path.join(b, ...pkg.split('/')))) return b;
+      }
     }
     const parent = path.dirname(dir);
     if (parent === dir) break;
@@ -163,17 +173,19 @@ function resolveExportKey(map, key) {
   return undefined;
 }
 
-function resolvePiAiEntry(subpath) {
-  const base = findNodeModulesBase();
-  if (!base) throw new Error(`${PKG} not found walking up from ${process.cwd()}`);
-  const pkgDir = path.join(base, ...PKG.split('/'));
+function resolvePackageEntry(pkg, subpath) {
+  const base = findNodeModulesBase(pkg);
+  if (!base) throw new Error(`${pkg} not found walking up from ${process.cwd()}`);
+  const pkgDir = path.join(base, ...pkg.split('/'));
   const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
   const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
   let rel = resolveExportKey(pkgJson.exports, key);
   if (!rel && key === '.') rel = pkgJson.main ?? 'index.js';
-  if (!rel) throw new Error(`${PKG} does not export "${key}"`);
+  if (!rel) throw new Error(`${pkg} does not export "${key}"`);
   return path.join(pkgDir, rel);
 }
+
+const resolvePiAiEntry = (subpath) => resolvePackageEntry(PKG, subpath);
 
 async function shimLoad(urlHref) {
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-loader-'));
@@ -251,7 +263,47 @@ const model = nsAll.builtinModels().getModel('anthropic', 'claude-sonnet-5');
 if (!model) die('builtinModels() has no anthropic/claude-sonnet-5');
 console.log(`builtinModels()       : anthropic/claude-sonnet-5 -> api=${model.api}`);
 
-console.log(`WINNING LOADER BRANCH : ${winner.label.trim()}`);
+/*
+ * M4: the same chain against typebox's `./value` export, which is what
+ * `validateToolArgs` uses for full JSON-Schema checking. This matters MORE in
+ * production than pi-ai does: if typebox is missing here, validation silently
+ * narrows to the structural checker and `Agent.method` starts refusing rich
+ * schemas at boot — a failure that dev never reproduces, because dev's
+ * node_modules always has it.
+ */
+const valueEntry = resolvePackageEntry(TYPEBOX, 'value');
+if (!fs.existsSync(valueEntry)) die(`typebox/value entry does not exist: ${valueEntry}`);
+console.log(`typebox base          : ${findNodeModulesBase(TYPEBOX)}`);
+console.log(`typebox "./value"     : ${valueEntry}`);
+
+const valueUrl = pathToFileURL(valueEntry).href;
+const tbOutcomes = [];
+for (const [label, fn] of [
+  ['1 bare import', () => import(`${TYPEBOX}/value`)],
+  ['2 URL import', () => import(valueUrl)],
+  ['3 temp shim', () => shimLoad(valueUrl)],
+]) {
+  try { tbOutcomes.push({ label, ok: true, ns: await fn() }); } catch (e) {
+    tbOutcomes.push({ label, ok: false, why: String(e?.code || e?.message || e).slice(0, 140) });
+  }
+}
+for (const o of tbOutcomes) {
+  console.log(`typebox branch ${o.label.padEnd(15)} ${o.ok ? 'ok' : `fail  (${o.why})`}`);
+}
+const tbWinner = tbOutcomes.find((o) => o.ok);
+if (!tbWinner) die('no loader branch resolved typebox/value in the production bundle');
+const V = tbWinner.ns.Value ?? tbWinner.ns;
+if (typeof V.Check !== 'function' || typeof V.Errors !== 'function') {
+  die('typebox/value exposes no Check/Errors');
+}
+// The exact capability the default validator claims: plain JSON Schema, rich
+// keywords, both directions.
+const rich = { type: 'object', properties: { op: { type: 'string', enum: ['a', 'b'] } }, required: ['op'] };
+if (!V.Check(rich, { op: 'a' })) die('Value.Check rejected a valid rich-schema argument');
+if (V.Check(rich, { op: 'z' })) die('Value.Check accepted an out-of-enum argument');
+console.log(`Value.Check(enum)     : ok (accepts "a", rejects "z")`);
+
+console.log(`WINNING LOADER BRANCH : ${winner.label.trim()}  (typebox: ${tbWinner.label.trim()})`);
 PROBE_EOF
 
 # `meteor node` is Meteor's own dev-bundle Node — the version the bundle is

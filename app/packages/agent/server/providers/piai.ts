@@ -230,7 +230,16 @@ export function translateEvent(ev: any): ProviderChunk[] {
     case 'thinking_delta':
       return [{ kind: 'thinking', chunk: String(ev.delta ?? '') }];
     case 'toolcall_delta':
-      return [{ kind: 'tool_args', chunk: String(ev.delta ?? '') }];
+      // `contentIndex` is pi-ai's own attribution (types.d.ts:426-429: every
+      // toolcall_start/_delta/_end carries one), and it is the ONLY thing that
+      // separates two tool calls streaming at once. Threaded through verbatim,
+      // and omitted rather than defaulted when a future release drops it — a
+      // fabricated 0 would silently merge parallel calls back together.
+      return [{
+        kind: 'tool_args',
+        chunk: String(ev.delta ?? ''),
+        ...(typeof ev.contentIndex === 'number' ? { contentIndex: ev.contentIndex } : {}),
+      }];
     case 'done': {
       const content: any[] = ev.message?.content ?? [];
       const calls = content

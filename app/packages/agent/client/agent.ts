@@ -160,6 +160,38 @@ export class Agent {
   }
 
   /**
+   * Branch this session into a new one sharing its history up to `atSeq`, and
+   * resolve with the NEW session id — `subscribe()` it and carry on from there.
+   *
+   * `atSeq` defaults to the whole conversation and is clamped DOWN to the
+   * nearest batch-safe cut point server-side, so passing the seq of the row a
+   * user clicked is always safe even when that row sits inside a tool batch.
+   * The fork shows up in `sessions()` like any other conversation.
+   */
+  fork(sessionId: string, opts?: { atSeq?: number; title?: string }): Promise<string> {
+    return Meteor.callAsync(
+      NAMES.mFork, this.name, sessionId, opts?.atSeq,
+      opts?.title === undefined ? undefined : { title: opts.title },
+    );
+  }
+
+  /**
+   * Compact this session's history NOW, whatever the `context.compactAt`
+   * threshold says — a "compact now" button. Resolves true when a summary note
+   * was committed, false when there was nothing worth compacting.
+   *
+   * Rejects with `busy` while a turn is running: a compaction writes to the
+   * transcript exactly as a turn does. Gate the button on
+   * `status(id) === 'idle'`.
+   *
+   * The transcript keeps every message, so nothing disappears from your UI —
+   * the note changes only what the MODEL sees from here on.
+   */
+  compact(sessionId: string): Promise<boolean> {
+    return Meteor.callAsync(NAMES.mCompact, this.name, sessionId);
+  }
+
+  /**
    * The tool call waiting on a human answer, or undefined when nothing is
    * parked. Reactive, like `status()` — render it beside `status(id) ===
    * 'awaiting'` to show what is being asked, then call `approve`/`deny`.

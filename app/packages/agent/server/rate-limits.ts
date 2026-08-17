@@ -10,6 +10,9 @@ interface RateLimitEntry {
 interface AgentPackageSettings {
   rateLimit?: {
     sends?: RateLimitEntry;
+    /** `agent.start` AND `agent.fork` — both create a session, and the fork
+     *  additionally copies a whole transcript. One entry, two methods; see
+     *  `applyRateLimits`. */
     starts?: RateLimitEntry;
     /**
      * `agent.interrupt`. It starts no model call, so it is not the spend
@@ -21,6 +24,37 @@ interface AgentPackageSettings {
      * cancelling work faster than it can start.
      */
     interrupts?: RateLimitEntry;
+    /**
+     * `agent.approve` AND `agent.deny` — one entry, two methods, exactly as
+     * `starts` covers start and fork.
+     *
+     * An approval answer is the one unauthenticated-reachable method that
+     * RESUMES a turn: each accepted call wakes a run that then makes model
+     * calls. It is single-winner by construction (the verdict write is
+     * conditional on `phase: 'awaiting'` and no verdict yet), so a flood cannot
+     * multiply side effects — but every attempt still costs a session read, a
+     * conditional write and, for the winner, a deferred turn. They share one
+     * budget because they are the same decision made two ways: given separate
+     * knobs, `deny` would be the cheap way to hammer the path `approve`
+     * refuses.
+     */
+    approvals?: RateLimitEntry;
+    /**
+     * `agent.compact`. The one method besides `send` whose every ACCEPTED call
+     * buys a provider round trip — a summarization over the whole compactable
+     * head, which on a long transcript is a bigger request than most turns —
+     * and it is reachable by exactly the same unauthenticated capability-URL
+     * caller. Left unlimited it is a cheaper `send`: no turn budget applies to
+     * it (a compaction is not a turn), so `budget.spend` is the only backstop
+     * behind it, and a flood aimed at an idle session bills a model call per
+     * call until that cap trips.
+     *
+     * Refusing while busy is not a substitute for a limit: a refusal is cheap
+     * for the ATTACKER too, and it still costs a session read — and between
+     * two turns a session is idle, which is exactly when the expensive branch
+     * is the one that runs.
+     */
+    compacts?: RateLimitEntry;
   };
 }
 
@@ -95,13 +129,16 @@ function addRuleFor(methodName: string, entry: RateLimitEntry, label: string): n
  * Register DDP rate-limit rules from `Meteor.settings.packages['10thfloor:agent']`.
  *
  * Returns the number of rules added — the test seam: startup calls this with
- * real settings, tests call it with fixtures.
+ * real settings, tests call it with fixtures. Two rules per METHOD, and two
+ * entries govern two methods each (`starts` → `agent.start`/`agent.fork`,
+ * `approvals` → `agent.approve`/`agent.deny`), so each of those adds four.
  *
  * A missing/empty settings path (no `packages['10thfloor:agent']`, or no
  * `rateLimit` on it) adds nothing and never throws, so a deployment that
  * hasn't configured rate limits still boots. A PRESENT but malformed entry —
- * `sends`, `starts` or `interrupts` given with a non-positive-integer `count`
- * or `intervalMs` — throws a plain `Error` naming the offending field, so a typo
+ * any of `sends`, `starts`, `interrupts`, `approvals` or `compacts` given with
+ * a non-positive-integer `count` or `intervalMs` — throws a plain `Error`
+ * naming the offending field, so a typo
  * in settings.json fails startup loudly instead of silently shipping an
  * unenforced (or nonsensical) limit.
  */
@@ -111,9 +148,36 @@ export function applyRateLimits(settings: unknown): number {
 
   let added = 0;
   if (rateLimit.sends) added += addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
-  if (rateLimit.starts) added += addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
+  if (rateLimit.starts) {
+    added += addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
+    // `agent.fork` is governed by the SAME entry, not one of its own: what a
+    // rate limit on `starts` is protecting is session CREATION, and a fork
+    // creates a session exactly as a start does — one document, one row in
+    // every listing, and (unlike a start) a full copy of a transcript that may
+    // be thousands of messages long. Given its own knob it would be the cheaper
+    // way to do the thing `starts` refuses, so it shares the budget instead.
+    // Each method still gets its own pair of rules — DDPRateLimiter buckets per
+    // method name, so N starts and N forks per interval is the semantics, which
+    // is the same shape `sends` and `interrupts` already have.
+    added += addRuleFor(NAMES.mFork, rateLimit.starts, 'starts');
+  }
   if (rateLimit.interrupts) {
     added += addRuleFor(NAMES.mInterrupt, rateLimit.interrupts, 'interrupts');
+  }
+  if (rateLimit.approvals) {
+    // Two methods, one entry — see the field's comment. Each still gets its own
+    // pair of rules because DDPRateLimiter buckets per method NAME, so the
+    // semantics are N approvals and N denials per interval, the same shape
+    // `starts` has for start and fork.
+    added += addRuleFor(NAMES.mApprove, rateLimit.approvals, 'approvals');
+    added += addRuleFor(NAMES.mDeny, rateLimit.approvals, 'approvals');
+  }
+  if (rateLimit.compacts) {
+    // One method, one entry — the plain shape. `agent.compact` shares no
+    // budget with `sends` deliberately: they buy the same thing (a provider
+    // round trip) but an operator wants to tune them apart, since a compaction
+    // is bookkeeping a UI fires rarely and a send is the product.
+    added += addRuleFor(NAMES.mCompact, rateLimit.compacts, 'compacts');
   }
   return added;
 }

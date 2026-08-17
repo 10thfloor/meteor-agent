@@ -6,11 +6,17 @@ import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections
 
 /**
  * Server half of the live DDP round trip. No describe/it blocks: this file is
- * the FIXTURE the browser-side test in `integration.client.ts` talks to. It
- * registers an agent backed by the scripted provider (no API key, no network)
- * and a reset method so the client half starts from a clean transcript.
+ * the FIXTURE the browser-side tests in `integration.client.ts` and
+ * `element.client.ts` talk to. It registers agents backed by the scripted
+ * provider (no API key, no network) and a reset method so the client half
+ * starts from a clean transcript.
  */
 const AGENT = 'itest';
+/** A SECOND agent rather than a gate bolted onto the first: the streaming test
+ *  wants a turn that runs straight through, and the approval test wants one
+ *  that parks. Two registrations keep both fixtures honest instead of making
+ *  one agent behave two ways depending on the prompt. */
+const GATED = 'itest-gate';
 
 /**
  * Put a wall-clock gap between chunks.
@@ -43,6 +49,30 @@ new Agent(AGENT, {
   instructions: 'You are a test agent.',
   tools: [],
   provider: paced(mockProvider(() => ({ text: 'live streamed reply' })), 110),
+});
+
+/**
+ * The gated fixture: turn one asks for `refund`, which parks on its `gate:
+ * 'ask'`; whatever verdict the browser clicks resolves the call, and turn two
+ * (recognizable by the tool result now in the request) answers in words rather
+ * than asking again — a script that always returned the tool call would loop
+ * until the turn budget stopped it.
+ */
+new Agent(GATED, {
+  model: 'mock',
+  instructions: 'You are a test agent.',
+  tools: [{
+    name: 'refund',
+    description: 'Refund an order.',
+    gate: 'ask',
+    args: { type: 'object', properties: {} },
+    run: async () => ({ refunded: true, amount: 42 }),
+  }],
+  provider: mockProvider((req) => (
+    req.messages.some((m) => m.role === 'tool')
+      ? { text: 'all done' }
+      : { toolCalls: [{ id: 'gate-1', name: 'refund', args: { order: 'A-1' } }] }
+  )),
 });
 
 Meteor.methods({

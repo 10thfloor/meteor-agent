@@ -220,6 +220,29 @@ describe('publications', () => {
   });
 });
 
+/**
+ * WHY EVERY `count` BELOW IS ABSURDLY LARGE.
+ *
+ * These fixtures register REAL `DDPRateLimiter` rules, and DDPRateLimiter has
+ * no supported way to remove a rule or reset its counters — so every rule
+ * added here is live against `agent.start`, `agent.send`, `agent.fork` and
+ * `agent.interrupt` for the rest of the process, and the effective limit on a
+ * method is the TIGHTEST rule matching it. The browser-side tests
+ * (`integration.client.ts`, `element.client.ts`) are the only tests whose
+ * calls actually pass through the limiter (server-side tests invoke method
+ * handlers directly), and they all share one DDP connection, hence one
+ * counter. A `count: 1` fixture therefore used to cap the ENTIRE client suite
+ * at one send per minute, failing with `too-many-requests` in a way that looks
+ * like a harness flake and has nothing to do with the code under test.
+ *
+ * Nothing in this suite asserts on the count VALUE — only on how many rules
+ * were added, and on which method invocations they match — so the headroom is
+ * free. Keep it: raise these numbers rather than rationing calls in the
+ * browser half. The deliberately INVALID entries (count 0, intervalMs 0, a
+ * missing intervalMs) stay exactly as they are; they must still throw.
+ */
+const HEADROOM = 200;
+
 describe('applyRateLimits', () => {
   it('adds nothing and does not throw when settings are absent', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
@@ -235,23 +258,46 @@ describe('applyRateLimits', () => {
     // opening-N-connections bypass the pair rule alone would allow.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
-      rateLimit: { sends: { count: 5, intervalMs: 60000 } },
+      rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } },
     });
     assert.equal(added, 2);
   });
 
-  it('adds four rules when both sends and starts are configured', async () => {
+  it('adds six rules when both sends and starts are configured', async () => {
+    // Two per method, and `starts` governs TWO methods: `agent.start` and
+    // `agent.fork`. A fork creates a session exactly as a start does (and
+    // copies a transcript on top), so it shares the session-creation budget
+    // rather than getting a cheaper knob of its own.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
-        sends: { count: 5, intervalMs: 60000 },
-        starts: { count: 3, intervalMs: 30000 },
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
       },
     });
-    assert.equal(added, 4);
+    assert.equal(added, 6);
   });
 
-  it('adds six rules when interrupts is configured alongside sends and starts', async () => {
+  it('a starts entry registers rules for agent.fork as well as agent.start', async () => {
+    // The pairing is load-bearing, not incidental: forks are session creation,
+    // and an unlimited `agent.fork` would be the cheap way to do the thing a
+    // `starts` limit refuses — one call per copy of an entire transcript.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mFork,
+      userId: 'rl-user-fork', connectionId: 'rl-conn-fork', clientAddress: '127.0.0.1',
+    };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    applyRateLimits({ rateLimit: { starts: { count: HEADROOM, intervalMs: 60000 } } });
+    const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    assert.isAbove(
+      after.length, before.length,
+      'a starts entry must register rules matching a real agent.fork invocation',
+    );
+  });
+
+  it('adds eight rules when interrupts is configured alongside sends and starts', async () => {
     // `interrupts` gets the identical two-rule treatment, not a cheaper one:
     // it is an unauthenticated-reachable write, so the anonymous-isolation
     // pair rule and the per-user cap on multi-connection multiplication both
@@ -259,12 +305,12 @@ describe('applyRateLimits', () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
-        sends: { count: 5, intervalMs: 60000 },
-        starts: { count: 3, intervalMs: 30000 },
-        interrupts: { count: 10, intervalMs: 10000 },
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 6);
+    assert.equal(added, 8);
   });
 
   it('registers a rule that actually matches an agent.interrupt invocation', async () => {
@@ -281,7 +327,7 @@ describe('applyRateLimits', () => {
     const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     const sendBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
 
-    applyRateLimits({ rateLimit: { interrupts: { count: 1, intervalMs: 60000 } } });
+    applyRateLimits({ rateLimit: { interrupts: { count: HEADROOM, intervalMs: 60000 } } });
 
     const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     assert.isAbove(
@@ -293,6 +339,119 @@ describe('applyRateLimits', () => {
       sendAfter.length, sendBefore.length,
       'an interrupts entry must not add rules to agent.send',
     );
+  });
+
+  it('adds twelve rules when approvals joins sends, starts and interrupts', async () => {
+    // `approvals` is the second entry governing TWO methods: `agent.approve`
+    // and `agent.deny` are the same decision made two ways, and separate knobs
+    // would make `deny` the cheap way to hammer the path `approve` limits.
+    // Two rules per method, so the entry adds four — 8 + 4.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
+        approvals: { count: HEADROOM, intervalMs: 10000 },
+      },
+    });
+    assert.equal(added, 12);
+  });
+
+  it('an approvals entry registers rules for BOTH agent.approve and agent.deny', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const approveInput = {
+      type: 'method', name: NAMES.mApprove,
+      userId: 'rl-user-appr', connectionId: 'rl-conn-appr', clientAddress: '127.0.0.1',
+    };
+    const denyInput = { ...approveInput, name: NAMES.mDeny };
+    const approveBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(approveInput);
+    const denyBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(denyInput);
+
+    applyRateLimits({ rateLimit: { approvals: { count: HEADROOM, intervalMs: 60000 } } });
+
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(approveInput)).length,
+      approveBefore.length,
+      'the entry must match a real agent.approve invocation',
+    );
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(denyInput)).length,
+      denyBefore.length,
+      'and a real agent.deny one — one entry, both methods',
+    );
+  });
+
+  it('adds fourteen rules when compacts joins the other four entries', async () => {
+    // `compacts` governs ONE method, so it adds the plain two — 12 + 2. It gets
+    // an entry of its own rather than sharing `sends` because both buy a
+    // provider round trip but an operator tunes them apart: a compaction is
+    // bookkeeping a UI fires rarely, a send is the product.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const added = applyRateLimits({
+      rateLimit: {
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
+        approvals: { count: HEADROOM, intervalMs: 10000 },
+        compacts: { count: HEADROOM, intervalMs: 10000 },
+      },
+    });
+    assert.equal(added, 14);
+  });
+
+  it('a compacts entry registers rules scoped to agent.compact', async () => {
+    // The limit exists because `agent.compact` is the one method besides
+    // `agent.send` whose every accepted call buys a provider round trip, with
+    // no turn budget in front of it — so it must be its own rule, not a
+    // side effect of some other entry.
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mCompact,
+      userId: 'rl-user-comp', connectionId: 'rl-conn-comp', clientAddress: '127.0.0.1',
+    };
+    const sendInput = { ...input, name: NAMES.mSend };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    const sendBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
+
+    applyRateLimits({ rateLimit: { compacts: { count: HEADROOM, intervalMs: 60000 } } });
+
+    assert.isAbove(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(input)).length,
+      before.length,
+      'the entry must match a real agent.compact invocation',
+    );
+    assert.equal(
+      (await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput)).length,
+      sendBefore.length,
+      'a compacts entry must not add rules to agent.send',
+    );
+  });
+
+  it('throws naming the field for a malformed compacts entry', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { compacts: { count: 3, intervalMs: -1 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a negative intervalMs must throw');
+    assert.include(threw.message, 'compacts.intervalMs');
+  });
+
+  it('throws naming the field for a malformed approvals entry', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    let threw: any;
+    try {
+      applyRateLimits({ rateLimit: { approvals: { count: -1, intervalMs: 60000 } } });
+    } catch (e) {
+      threw = e;
+    }
+    assert.isDefined(threw, 'a negative count must throw');
+    assert.include(threw.message, 'approvals.count');
   });
 
   it('throws naming the field for a malformed interrupts entry', async () => {
@@ -351,7 +510,7 @@ describe('applyRateLimits', () => {
     const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     const unrelatedBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(unrelatedInput);
 
-    applyRateLimits({ rateLimit: { sends: { count: 1, intervalMs: 60000 } } });
+    applyRateLimits({ rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } } });
 
     const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     assert.isAbove(

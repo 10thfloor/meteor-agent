@@ -9,12 +9,28 @@ export * from '../common/types';
 export { NAMES } from '../common/names';
 export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 export { mergeView } from '../common/merge';
+// `Agent.provider` / `Agent.compact` are the doors to the provider registry and
+// to manual compaction; the underlying `registerProvider` / `compactSession`
+// stay internal, exactly as `runTurn` and `resolveTools` do.
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
-  type ToolSpec, type InlineTool, type AdoptedTool, type ToolContext,
-  type AgentMethodOptions, type ValidationResult, type ArgsValidator,
+  fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS, SKILL_TOOL_NAME,
+  type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
+  type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
+  type ArgsValidator, type TypeboxValue, type Skill, type ToolResult,
 } from './tools';
+export type {
+  HookName, HookMap, HookPurpose, HookToolCall,
+  BeforeProviderRequestHook, AfterToolResultHook,
+  ProviderRequestHookContext, ToolResultHookContext,
+} from './hooks';
+export { MAX_SUBAGENT_DEPTH } from './subagent';
+export {
+  stopMcp, _setMcpClientFactory,
+  type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
+} from './mcp/client';
+export { mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
 export { piAiProvider } from './providers/piai';
 export type {
