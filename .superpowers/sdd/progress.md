@@ -110,3 +110,14 @@ M2 Task 6: complete (dd6b264..de01c85 + controller fix, review 1 Medium fixed in
 M2 Task 7: complete (43b484d, 122+1 passing; delete-order falsified against reordered code and
   restored; heartbeat + drain-remainder now enforced by tests). NOT separately reviewed — the final
   whole-branch review is instructed to give its diff per-task scrutiny.
+M2 final whole-branch review: MERGE AFTER MUST-FIXES -> applied inline:
+  README rewritten (config surface, budgets, error phases, rateLimit settings shape; stale Scope fixed)
+  retry threaded to AgentConfig/deferTurn; adapter's two config throws hinted retryable:false
+  budget.turns/toolCalls validated as positive integers at define time
+M3 backlog additions from final review: spurious extra turn from the wake self-check (merge with
+  verdict-identity item); wake/finally terminal lists disagree ('error'); rateLimit.interrupts entry;
+  toProviderMessages has zero coverage (three note kinds now flow past it); mSend error-clear untested;
+  rate-limit tests leave live rules (client test fits under them by luck — comment it); rate limits
+  proven to register, never to throttle; drain-remainder comment assumes failed insert never landed
+  (lost-ack duplicate seq truncates in-flight render transiently).
+Suite at M2 close: 122 server (+1 pending live-smoke) + 1 client, 0 failures.

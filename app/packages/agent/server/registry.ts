@@ -34,6 +34,10 @@ export interface AgentConfig {
     spend?: number | string;
   };
   maxIterations?: number;
+  /** §10. Provider retry: `attempts` counts the initial try (default 3),
+   *  backoff is `baseMs * 2^attemptIndex` (default 500). Only transient
+   *  failures (429/5xx/network) retry; auth and request errors fail fast. */
+  retry?: { attempts?: number; baseMs?: number };
   /**
    * Who may answer a `gate: 'ask'` approval, on top of the ownership check
    * every method already makes. Omit it and the session's owner decides —
@@ -84,10 +88,26 @@ export function parseSpend(spend: number | string): number {
   return Number(trimmed.replace('$', ''));
 }
 
+/** A count limit must be a positive integer. Validated with the same rigor as
+ *  `parseSpend`, for the same reason: a string `turns: '5'` would reach mSend's
+ *  `$lt` filter, where BSON type ordering makes a number never less-than a
+ *  string — every send refused, discovered in production, baffling to debug. */
+function assertCountLimit(value: unknown, field: string): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value <= 0) {
+    throw new Error(
+      `[10thfloor:agent] budget.${field} must be a positive integer; `
+      + `got ${JSON.stringify(value)}`,
+    );
+  }
+}
+
 /** The registry's `budget` as the loop consumes it. Undefined in, undefined
  *  out: no budget configured is not the same as a budget of zero. */
 export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | undefined {
   if (!budget) return undefined;
+  assertCountLimit(budget.turns, 'turns');
+  assertCountLimit(budget.toolCalls, 'toolCalls');
   return {
     turns: budget.turns,
     toolCalls: budget.toolCalls,

@@ -80,10 +80,15 @@ export interface PiAiModels {
 export function toPiAiRequest(req: ProviderRequest, now: number = Date.now()): PiAiRequest {
   const slash = req.model.indexOf('/');
   if (slash <= 0 || slash === req.model.length - 1) {
-    throw new Error(
+    const e: any = new Error(
       `[10thfloor:agent] model must be "<provider>/<model-id>" for the pi-ai ` +
       `provider (e.g. "anthropic/claude-sonnet-5"); got "${req.model}"`,
     );
+    // A malformed model string is a configuration error: deterministic, so
+    // retrying burns attempts and backoff on a certainty. The hint routes it
+    // straight to the loop's fatal path (error note + phase 'error').
+    e.retryable = false;
+    throw e;
   }
   // First slash only: openrouter ids are themselves slashed
   // ("openrouter/moonshotai/kimi-k2").
@@ -221,10 +226,14 @@ export function createPiAiProvider(resolveModels: () => Promise<PiAiModels>): Pr
       const models = await resolveModels();
       const model = models.getModel(provider, modelId);
       if (!model) {
-        throw new Error(
+        const e: any = new Error(
           `[10thfloor:agent] pi-ai has no model "${provider}/${modelId}". ` +
           `Check the provider id and model id against pi-ai's catalog.`,
         );
+        // Deterministic configuration error — see the matching hint in
+        // toPiAiRequest. Retrying cannot make the catalog grow the model.
+        e.retryable = false;
+        throw e;
       }
       // Stamp replayed assistant messages with the live model's identity.
       // pi-ai's converters compare `provider`/`api`/`model` on history against

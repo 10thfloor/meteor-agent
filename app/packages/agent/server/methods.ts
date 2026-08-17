@@ -56,6 +56,7 @@ function deferTurn(sessionId: string, config: AgentConfig, userId: string | null
       // already parsed the same value at startup and refused a bad one.
       budget: resolveBudget(config.budget),
       pricing: config.pricing,
+      retry: config.retry,
     }).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
