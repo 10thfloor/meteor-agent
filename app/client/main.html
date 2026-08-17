@@ -4,22 +4,8 @@
 </head>
 
 <body>
-  <main id="chat">
-    <header>
-      <h1>10thfloor:agent</h1>
-      <span id="phase" class="phase">idle</span>
-    </header>
-    <div id="messages"></div>
-    <div id="approval" class="approval" hidden>
-      <span id="approval-text"></span>
-      <button id="approve">Approve</button>
-      <button id="deny">Deny</button>
-    </div>
-    <form id="composer">
-      <input id="input" autocomplete="off"
-             placeholder='Try "what time is it?" or "refund my order"' />
-      <button type="submit">Send</button>
-      <button type="button" id="stop" title="Interrupt the turn">Stop</button>
-    </form>
-  </main>
+  <agent-chat agent="demo"
+              placeholder='Try "what time is it?" or "refund my order"'>
+    <h1 slot="header">10thfloor:agent</h1>
+  </agent-chat>
 </body>

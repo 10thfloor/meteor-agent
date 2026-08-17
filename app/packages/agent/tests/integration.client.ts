@@ -25,20 +25,18 @@ const waitFor = (
  * method call -> turn loop -> capped-collection deltas -> publication -> DDP ->
  * minimongo -> client-side merge -> reactive cursor.
  *
- * BUDGET WARNING — this test runs inside the server's live rate limits.
+ * BUDGET NOTE — this test runs inside the server's live rate limits.
  * `capped.test.ts`'s `applyRateLimits` suite registers REAL `DDPRateLimiter`
- * rules against `agent.start`, `agent.send` and `agent.interrupt`, some with a
- * count as low as 1 per minute, and DDPRateLimiter offers no supported way to
- * remove a rule or reset its counters — so those rules are live for the rest of
- * the process, and this is the only test whose calls actually pass through
- * them (server-side tests invoke method handlers directly and never touch the
- * limiter). Every DDP call made from here must therefore stay within the
- * TIGHTEST count any of those fixtures registers: today that means ONE
- * `start` and ONE `send` per method name for the whole file, and no
- * `interrupt` at all. Adding a second call — or a retry loop around one —
- * fails with `too-many-requests` in a way that looks like a harness flake and
- * has nothing to do with the code under test. If this file ever needs more
- * calls, raise the counts in those fixtures rather than adding calls here.
+ * rules against `agent.start`, `agent.send`, `agent.fork` and
+ * `agent.interrupt`, and DDPRateLimiter offers no supported way to remove a
+ * rule or reset its counters — so those rules are live for the rest of the
+ * process, and the browser half (this file and `element.client.ts`) is the
+ * only place whose calls actually pass through them, over one shared DDP
+ * connection and therefore one shared counter. Those fixtures now register a
+ * deliberate `HEADROOM` count rather than the realistic `1`s and `5`s they
+ * once used, exactly so the browser half can make the calls its assertions
+ * need; see the comment above that constant. If the client suite ever grows
+ * past it, raise `HEADROOM` — do not ration calls here.
  */
 describe('live DDP round trip', () => {
   it('delivers a streamed reply into the merged cursor', async function () {

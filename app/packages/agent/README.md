@@ -432,6 +432,129 @@ The `sessionId` argument is an optional guard: pass it and the teardown is
 skipped if the instance has already been re-subscribed to a newer session, so a
 late unmount cleanup cannot kill the live one.
 
+## The packaged UI
+
+Everything above is a data API, and the demo app renders it in about seventy
+lines of plain DOM. Those seventy lines ship as a custom element, so the common
+case is one tag:
+
+```ts
+import { defineAgentChat } from 'meteor/10thfloor:agent';
+defineAgentChat();          // registers <agent-chat>
+```
+
+```html
+<agent-chat agent="support" placeholder="Ask about your order…">
+  <h1 slot="header">Support</h1>
+</agent-chat>
+```
+
+That is a full chat: streaming assistant bubbles with a cursor, tool rows,
+compaction and budget notes, the phase badge, the approval bar wired to
+`approve`/`deny`, and a composer with Send and Stop.
+
+**It is never registered for you.** A package that called
+`customElements.define('agent-chat', …)` at import time would squat that name
+in every app that depends on it, and a second definition of a name is a hard
+`DOMException`. So `defineAgentChat(tagName = 'agent-chat')` is your call to
+make; it returns the constructor, is a no-op if that tag is already registered,
+and registers a fresh class if you pass a different name
+(`defineAgentChat('support-chat')`).
+
+**It works in whatever you already use.** A custom element is the same element
+in a Blaze template, in JSX, in a Svelte component and in a static HTML file —
+there is no `<AgentChat>` React binding to keep in step with this package,
+because there is nothing to bind. Reactivity lives inside the element (one
+`Tracker.autorun` over the same cursor `Agent.messages()` returns), so the host
+framework never re-renders it.
+
+### Attributes
+
+| Attribute | Meaning |
+| --- | --- |
+| `agent` | **Required.** The name a server-side `new Agent(name, …)` registered. |
+| `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
+| `placeholder` | Composer hint. |
+
+### Auto-start, and remembering the session
+
+With no `session-id`, the element calls `start()` when it connects and then
+emits **`agent-chat:session`** (`detail: { sessionId }`, bubbling and composed)
+so the host can persist an id it never chose:
+
+```js
+chat.addEventListener('agent-chat:session', (e) => {
+  localStorage.setItem('session', e.detail.sessionId);
+});
+```
+
+Give the tag a `session-id` **before** the tag is defined (or before it is
+inserted) when you have a stored one — registration upgrades the element
+immediately, and an upgrade with no id opens a fresh session. The demo app does
+exactly this, in `app/client/main.js`.
+
+A method rejection — a rate limit, a dropped connection, a session the server
+no longer has — is shown as an error note in the transcript *and* emitted as
+**`agent-chat:error`** (`detail: { error, message }`), which is how the demo
+knows to forget a stale saved id. Text that failed to send is put back in the
+composer rather than swallowed.
+
+### Theming
+
+The element carries its own styles in a shadow root, so nothing leaks in or
+out. Restyle it through the two seams — never by piercing:
+
+| Custom property | Default | Used for |
+| --- | --- | --- |
+| `--agent-chat-accent` | `#2b7de9` | User bubbles, buttons, the active phase |
+| `--agent-chat-bg` | `Canvas` | Background of the element and its inputs |
+| `--agent-chat-fg` | `CanvasText` | Text, and every mixed border/tint |
+| `--agent-chat-warn` | `#d97706` | The approval bar and the `awaiting` phase |
+| `--agent-chat-danger` | `#dc2626` | Error notes, the `error`/`stopped` phases |
+| `--agent-chat-radius` | `0.75rem` | Bubble corners |
+| `--agent-chat-font` | `system-ui, sans-serif` | Everything |
+
+The defaults are the CSS system colors under `color-scheme: light dark`, so an
+element you never theme still follows the OS light/dark setting.
+
+| Part | Element |
+| --- | --- |
+| `root`, `header`, `messages`, `composer` | Layout containers |
+| `phase` | The badge; also carries the phase itself (`::part(phase awaiting)`) |
+| `message` | Every transcript row; also carries `user` / `assistant` / `tool` / `note`, plus `streaming` on an in-flight row and the note's `kind` (`::part(note error)`) |
+| `tool-name`, `tool-content` | The two halves of a tool row — the content is line-clamped, `::part(tool-content) { -webkit-line-clamp: none }` unclamps it |
+| `tool-calls` | The ` → name(args)` line under an assistant bubble |
+| `approval`, `approval-text` | The bar and its sentence |
+| `button` | Every button; also carries `send` / `stop` / `approve` / `deny` |
+| `input` | The composer field |
+
+```css
+agent-chat { --agent-chat-accent: rebeccapurple; }
+agent-chat::part(message user) { border-radius: 0.25rem; }
+```
+
+There is one `slot="header"` for your own title; anything you slot in stays in
+the light DOM and keeps your page's CSS.
+
+### When to stop using it
+
+The element owns one session and repaints the whole list on every delta —
+free at chat scale, and deliberately so: it buys zero diffing code. If you are
+rendering thousands of rows, or you want a layout this does not have, drop to
+`Agent` directly (["Use it from the client"](#use-it-from-the-client)) and
+render it yourself. `client/element.ts` is ~450 lines including its CSS and is
+meant to be read as the worked example. The pre-element version of the demo —
+the same UI with no custom element at all — is in git history at
+`git show ad0dc0b:app/client/main.js`, and remains the shortest proof that none
+of this needs a framework.
+
+For anything the element does not do (`fork`, `usage`, a denial with a reason
+you collected from the user), reach through it:
+
+```js
+chat.agentInstance.deny(chat.sessionId, 'the amount is too large');
+```
+
 ## Subagents
 
 A `{ subagent }` tool spec puts one agent behind another's tool call. Calling it

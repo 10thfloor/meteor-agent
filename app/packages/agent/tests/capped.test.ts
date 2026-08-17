@@ -220,6 +220,29 @@ describe('publications', () => {
   });
 });
 
+/**
+ * WHY EVERY `count` BELOW IS ABSURDLY LARGE.
+ *
+ * These fixtures register REAL `DDPRateLimiter` rules, and DDPRateLimiter has
+ * no supported way to remove a rule or reset its counters — so every rule
+ * added here is live against `agent.start`, `agent.send`, `agent.fork` and
+ * `agent.interrupt` for the rest of the process, and the effective limit on a
+ * method is the TIGHTEST rule matching it. The browser-side tests
+ * (`integration.client.ts`, `element.client.ts`) are the only tests whose
+ * calls actually pass through the limiter (server-side tests invoke method
+ * handlers directly), and they all share one DDP connection, hence one
+ * counter. A `count: 1` fixture therefore used to cap the ENTIRE client suite
+ * at one send per minute, failing with `too-many-requests` in a way that looks
+ * like a harness flake and has nothing to do with the code under test.
+ *
+ * Nothing in this suite asserts on the count VALUE — only on how many rules
+ * were added, and on which method invocations they match — so the headroom is
+ * free. Keep it: raise these numbers rather than rationing calls in the
+ * browser half. The deliberately INVALID entries (count 0, intervalMs 0, a
+ * missing intervalMs) stay exactly as they are; they must still throw.
+ */
+const HEADROOM = 200;
+
 describe('applyRateLimits', () => {
   it('adds nothing and does not throw when settings are absent', async () => {
     const { applyRateLimits } = await import('../server/rate-limits');
@@ -235,7 +258,7 @@ describe('applyRateLimits', () => {
     // opening-N-connections bypass the pair rule alone would allow.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
-      rateLimit: { sends: { count: 5, intervalMs: 60000 } },
+      rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } },
     });
     assert.equal(added, 2);
   });
@@ -248,8 +271,8 @@ describe('applyRateLimits', () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
-        sends: { count: 5, intervalMs: 60000 },
-        starts: { count: 3, intervalMs: 30000 },
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
       },
     });
     assert.equal(added, 6);
@@ -266,7 +289,7 @@ describe('applyRateLimits', () => {
       userId: 'rl-user-fork', connectionId: 'rl-conn-fork', clientAddress: '127.0.0.1',
     };
     const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
-    applyRateLimits({ rateLimit: { starts: { count: 2, intervalMs: 60000 } } });
+    applyRateLimits({ rateLimit: { starts: { count: HEADROOM, intervalMs: 60000 } } });
     const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     assert.isAbove(
       after.length, before.length,
@@ -282,9 +305,9 @@ describe('applyRateLimits', () => {
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
-        sends: { count: 5, intervalMs: 60000 },
-        starts: { count: 3, intervalMs: 30000 },
-        interrupts: { count: 10, intervalMs: 10000 },
+        sends: { count: HEADROOM, intervalMs: 60000 },
+        starts: { count: HEADROOM, intervalMs: 30000 },
+        interrupts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
     assert.equal(added, 8);
@@ -304,7 +327,7 @@ describe('applyRateLimits', () => {
     const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     const sendBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(sendInput);
 
-    applyRateLimits({ rateLimit: { interrupts: { count: 1, intervalMs: 60000 } } });
+    applyRateLimits({ rateLimit: { interrupts: { count: HEADROOM, intervalMs: 60000 } } });
 
     const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     assert.isAbove(
@@ -374,7 +397,7 @@ describe('applyRateLimits', () => {
     const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     const unrelatedBefore = await (DDPRateLimiter as any).findAllMatchingRulesAsync(unrelatedInput);
 
-    applyRateLimits({ rateLimit: { sends: { count: 1, intervalMs: 60000 } } });
+    applyRateLimits({ rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } } });
 
     const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
     assert.isAbove(
