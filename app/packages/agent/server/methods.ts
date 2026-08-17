@@ -3,7 +3,7 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { getAgent, buildSystemPrompt, type AgentConfig } from './registry';
+import { getAgent, buildSystemPrompt, resolveBudget, type AgentConfig } from './registry';
 import { runTurn } from './loop';
 import { piAiProvider } from './providers/piai';
 
@@ -50,6 +50,12 @@ function deferTurn(sessionId: string, config: AgentConfig, userId: string | null
       // turn actually runs.
       provider: config.provider ?? piAiProvider(),
       maxIterations: config.maxIterations,
+      // §9. `spend` is reduced to dollars here rather than in the loop, so the
+      // loop compares numbers and `'$1.00'` is parsed once per turn instead of
+      // once per iteration. It cannot throw at this point: `defineAgent`
+      // already parsed the same value at startup and refused a bad one.
+      budget: resolveBudget(config.budget),
+      pricing: config.pricing,
     }).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
@@ -169,7 +175,27 @@ export function registerMethods(): void {
       check(text, String);
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
-      await requireSession(agent, sessionId, this.userId ?? null);
+      const session = await requireSession(agent, sessionId, this.userId ?? null);
+
+      // §9: the turn budget, checked BEFORE the allocation below spends it.
+      // `budgetSpent.turns` is $inc'd by this method and nowhere else, so the
+      // pre-inc value read here is exactly "turns already taken" and a budget
+      // of N permits exactly N sends.
+      //
+      // A refusal, not a stop. The other two budgets trip inside a running
+      // loop, where the only way to say no is a transcript note; here there is
+      // a caller on the other end of a method, so tell them — and write
+      // nothing at all, so a refused send costs neither a seq nor a message
+      // nor the budget it was refused for. The `stopped` phase a spend or
+      // tool-call trip leaves behind is what a later send clears; this one has
+      // nothing to clear, and asking again will be refused identically until
+      // an operator raises the limit.
+      if (config.budget?.turns !== undefined
+        && (session.budgetSpent?.turns ?? 0) >= config.budget.turns) {
+        throw new Meteor.Error(
+          'budget-exhausted', 'This session has used its turn budget.',
+        );
+      }
 
       // Seq allocation is ATOMIC (single findOneAndUpdate), not read-then-
       // insert. A read-then-insert here races the in-flight turn loop: both

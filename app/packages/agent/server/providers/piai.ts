@@ -145,6 +145,27 @@ function toPiAiMessage(
 }
 
 /**
+ * Dollars off a pi-ai `Usage`, or undefined when it has not priced the call.
+ *
+ * pi-ai 0.84's `Usage.cost` is a BREAKDOWN object
+ * (`{input, output, cacheRead, cacheWrite, total}`), not a number — the `total`
+ * is the figure. A plain number is accepted too, so a future release that
+ * flattens the field does not silently start reporting nothing.
+ *
+ * Zero is treated as ABSENT, deliberately. pi-ai reports `total: 0` for a model
+ * its catalog has no rates for, which is indistinguishable from "this call was
+ * free" — and the two differ only in whether `AgentConfig.pricing` gets a
+ * chance to price it. Accruing a zero would silently suppress the operator's
+ * own configured fallback; omitting it costs nothing when the call really was
+ * free, since accruing zero and accruing nothing are the same `$inc`.
+ */
+function reportedCost(usage: any): number | undefined {
+  const raw = typeof usage?.cost === 'number' ? usage.cost : usage?.cost?.total;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return undefined;
+  return raw;
+}
+
+/**
  * One pi-ai stream event -> zero or more `ProviderChunk`s. PURE and stateless:
  * the terminal `done` event carries the complete `AssistantMessage`, so tool
  * calls and usage are read off it rather than accumulated across events.
@@ -168,13 +189,19 @@ export function translateEvent(ev: any): ProviderChunk[] {
         .filter((c) => c?.type === 'toolCall')
         .map((c) => ({ id: c.id, name: c.name, args: c.arguments }));
       const usage = ev.message?.usage;
+      const cost = reportedCost(usage);
       return [{
         kind: 'done',
         toolCalls: calls.length > 0 ? calls : undefined,
-        // pi-ai also reports cacheRead/cacheWrite/reasoning tokens; the
-        // ProviderChunk union carries only input/output, so cache tokens are
-        // currently priced as neither. Task 5 (pricing) will need them.
-        usage: usage ? { input: usage.input ?? 0, output: usage.output ?? 0 } : undefined,
+        // pi-ai also reports cacheRead/cacheWrite/reasoning tokens, which the
+        // ProviderChunk union does not carry — so per-token math over
+        // input/output alone would misprice every cached call. pi-ai has
+        // already done that arithmetic against its own catalog, so its
+        // `cost.total` is passed straight through and the loop prefers it over
+        // any configured `pricing`.
+        usage: usage
+          ? { input: usage.input ?? 0, output: usage.output ?? 0, ...(cost === undefined ? {} : { cost }) }
+          : undefined,
       }];
     }
     default:

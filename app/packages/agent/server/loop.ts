@@ -26,6 +26,38 @@ export interface RunConfig {
    *  throws mid-iteration. `attempts` counts the initial try (default 3);
    *  `baseMs` is the base of `baseMs * 2^attemptIndex` (default 500). */
   retry?: { attempts?: number; baseMs?: number };
+  /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
+   *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
+   *  `mSend`, not here — by the time a turn runs, the send it would refuse has
+   *  already happened. */
+  budget?: { turns?: number; toolCalls?: number; spend?: number };
+  /** $ per million tokens. The FALLBACK for a provider that reports no cost of
+   *  its own; see `accruedCost`. */
+  pricing?: { input: number; output: number };
+}
+
+/**
+ * Dollars to add to `usage.cost` for one model call.
+ *
+ * The provider's own figure wins whenever it reports one. pi-ai prices each
+ * call against its catalog including cacheRead/cacheWrite tokens, which
+ * `ProviderChunk` does not carry and a two-rate table cannot express — so
+ * recomputing from input/output alone would systematically underprice cached
+ * calls, and a spend budget that undercounts is not a budget.
+ *
+ * With no reported cost and no configured `pricing`, this accrues ZERO rather
+ * than guessing. A session with no way to price itself simply has no spend
+ * budget: `usage.cost` stays 0, the spend check never trips, and the turn and
+ * tool-call budgets are what limit the run. Guessing a rate would be worse —
+ * it would trip a cap on a number nobody chose.
+ */
+export function accruedCost(
+  usage: { input: number; output: number; cost?: number },
+  pricing?: { input: number; output: number },
+): number {
+  if (typeof usage.cost === 'number' && Number.isFinite(usage.cost)) return usage.cost;
+  if (!pricing) return 0;
+  return (usage.input * pricing.input + usage.output * pricing.output) / 1e6;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -69,6 +101,44 @@ async function allocateSeq(
     { returnDocument: 'before' },
   );
   return before ? (before as any).nextSeq : null;
+}
+
+/** Which limit tripped, and the sentence a UI shows for it. */
+const BUDGET_REASONS = {
+  turns: 'Turn budget reached.',
+  toolCalls: 'Tool-call budget reached.',
+  spend: 'Spend budget reached.',
+} as const;
+
+/**
+ * Record a tripped budget and stop the session (§9).
+ *
+ * Structured, never prose: `kind: 'budget'` plus the same `{ error, reason }`
+ * shape the provider-failure note uses, plus WHICH budget it was — so a UI can
+ * offer to raise the right limit instead of saying "exhausted" and leaving the
+ * operator to guess.
+ *
+ * `phase: 'stopped'` reuses the interrupt's semantics exactly, including its
+ * durability: the loop refuses to run while it stands and the outer `finally`
+ * preserves it, so the next `agent.send` is what clears it. For `turns` and
+ * `spend` that next send then refuses (`mSend`) or trips again on its first
+ * iteration — the closed loop is the design, not an oversight.
+ *
+ * Both writes are lease-guarded (`allocateSeq`, `guardedUpdate`). Losing the
+ * lease means another server owns the session and will make its own decision;
+ * writing a stop from here would stop ITS turn.
+ */
+async function commitBudgetNote(
+  sessionId: string, budget: keyof typeof BUDGET_REASONS,
+): Promise<void> {
+  const seq = await allocateSeq(sessionId);
+  if (seq === null) return;
+  await AgentMessages.insertAsync({
+    _id: Random.id(), sessionId, seq, role: 'note', kind: 'budget', budget,
+    error: { error: 'budget-exhausted', reason: BUDGET_REASONS[budget] },
+    createdAt: new Date(),
+  } as any);
+  await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'stopped' } });
 }
 
 /**
@@ -389,6 +459,7 @@ async function dispatchCalls(
   calls: Array<{ id: string; name: string; args: unknown }>,
   tools: ResolvedTool[],
   turn: TurnAnchor,
+  budget?: RunConfig['budget'],
 ): Promise<DispatchOutcome> {
   const abandon = async (): Promise<DispatchOutcome> => {
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
@@ -410,6 +481,30 @@ async function dispatchCalls(
     // repair-on-entry would eat the turn next time anyway.
     const phaseCheck = await AgentSessions.findOneAsync(sessionId);
     if (!phaseCheck || phaseCheck.phase === 'stopped') return abandon();
+
+    // §9: BEFORE the dispatch, off the document we just read — a limit of N
+    // permits exactly N calls, because `budgetSpent.toolCalls` is $inc'd in the
+    // same atomic write that allocates each result's seq. It counts calls that
+    // actually RAN: a park spends nothing (the tool has not executed), and a
+    // denial spends nothing (it never dispatched), so a batch that sat at a
+    // gate for a day resumes against the same budget it left.
+    //
+    // The trip precedes the gate check deliberately. Asking a human to approve
+    // work the session cannot afford wastes their attention and leaves an
+    // approval standing that nothing may spend.
+    //
+    // Discard exactly as an interrupt does. Committing the results we DID get
+    // and stopping would strand the remaining calls as unanswered `tool_use` —
+    // a 400 from every provider, forever — and repair-on-entry would eat the
+    // turn on the next run anyway. Discard first, note second: if the note's
+    // writes fail on a lost lease, what is left is a resumable transcript with
+    // no explanation, rather than an explanation over a broken one.
+    if (budget?.toolCalls !== undefined
+      && (phaseCheck.budgetSpent?.toolCalls ?? 0) >= budget.toolCalls) {
+      await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
+      await commitBudgetNote(sessionId, 'toolCalls');
+      return 'abandoned';
+    }
 
     const tool = tools.find((t) => t.name === call.name);
 
@@ -518,6 +613,7 @@ async function resumeParkedTurn(
   pending: NonNullable<AgentSession['pending']>,
   tools: ResolvedTool[],
   userId: string | null,
+  budget?: RunConfig['budget'],
 ): Promise<DispatchOutcome> {
   const msgs = await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
   const batch = locateBatch(msgs, pending.toolCallId);
@@ -611,7 +707,12 @@ async function resumeParkedTurn(
   const remaining = calls.filter(
     (c) => c.id !== pending.toolCallId && !answered.has(c.id),
   );
-  return dispatchCalls(sessionId, remaining, tools, turn);
+  // The approved call itself is NOT budget-checked: a human authorized that
+  // specific side effect while the run was parked, and refusing it here would
+  // discard the very turn they answered. The remainder goes through the
+  // ordinary gate below, so a batch cannot run away past the limit — it can
+  // only exceed it by the one call a person signed for.
+  return dispatchCalls(sessionId, remaining, tools, turn, budget);
 }
 
 /**
@@ -699,7 +800,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         } else {
           resumed = true;
           const outcome = await resumeParkedTurn(
-            sessionId, entry.pending, tools, entry.userId,
+            sessionId, entry.pending, tools, entry.userId, config.budget,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -716,6 +817,24 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // 'streaming' write below would silently erase a stop that landed
         // between iterations — or between Meteor.defer and the first one.
         if (session.phase === 'stopped') return;
+
+        // §9: BEFORE the provider call, not after it — the point of a spend cap
+        // is to prevent the next charge, and a check after the fact only
+        // reports one. Reading it per ITERATION rather than once per turn is
+        // what makes a tool-using run stop at the boundary instead of running
+        // its whole batch out: each iteration is another model call.
+        //
+        // `>=` against the accrued total, so the turn that CROSSES the cap
+        // still completes (its cost was already committed to when it started)
+        // and the next one is refused. Combined with the note's
+        // `phase: 'stopped'`, a session that has overspent needs an operator to
+        // raise the budget: the next send clears the stop, and the very first
+        // iteration trips again right here, before spending anything.
+        if (config.budget?.spend !== undefined
+          && session.usage.cost >= config.budget.spend) {
+          await commitBudgetNote(sessionId, 'spend');
+          return;
+        }
 
         const history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
@@ -735,7 +854,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         let text = '';
         let thinking = '';
         let toolCalls: Array<{ id: string; name: string; args: unknown }> | undefined;
-        let usage = { input: 0, output: 0 };
+        let usage: { input: number; output: number; cost?: number } = { input: 0, output: 0 };
         let interrupted = false;
 
         // §10: pi-ai's adapter (and any other Provider) turns a terminal
@@ -873,9 +992,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // allocated ATOMICALLY in the same write — see allocateSeq. Losing the
         // lease means another server is redoing this turn; abandon without
         // writing, taking the deltas streamed under this messageId with us.
+        // Cost rides the SAME atomic write that allocates the seq and accrues
+        // the tokens — no second write, and no window in which a committed
+        // message exists whose cost the spend budget has not yet seen.
         const commitSeq = await allocateSeq(sessionId, {
           'usage.input': usage.input,
           'usage.output': usage.output,
+          'usage.cost': accruedCost(usage, config.pricing),
         });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
@@ -913,7 +1036,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,
-        });
+        }, config.budget);
         // A park exits the turn with the batch deliberately unanswered; an
         // abandonment has already erased it. Only a fully answered batch may
         // go round again and ask the model what to do with the results.

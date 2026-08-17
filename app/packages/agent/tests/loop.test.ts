@@ -15,6 +15,20 @@ const unansweredToolUses = (msgs: AgentMessage[]): string[] => {
     .filter((id) => !answered.has(id));
 };
 
+/** Deferred work (the resume a verdict schedules, the turn a send defers)
+ *  exposes no promise to await, so every wait here is bounded by a deadline and
+ *  fails loudly rather than hanging the suite. */
+const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await cond()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => { setTimeout(r, 25); });
+  }
+};
+
 const seed = async (sessionId: string, text: string, agent = 'support') => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
   await AgentSessions.removeAsync({});
@@ -837,20 +851,6 @@ describe('turn loop', () => {
 });
 
 describe('approval gates', () => {
-  /** Deferred work (the resume a verdict schedules) exposes no promise to
-   *  await, so every wait here is bounded by a deadline and fails loudly
-   *  rather than hanging the suite. */
-  const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
-    const deadline = Date.now() + ms;
-    for (;;) {
-      // eslint-disable-next-line no-await-in-loop
-      if (await cond()) return;
-      if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
-      // eslint-disable-next-line no-await-in-loop
-      await new Promise((r) => { setTimeout(r, 25); });
-    }
-  };
-
   /**
    * Register an agent, seed a session for it, and run one turn whose first
    * provider response asks for `calls`. Registration is load-bearing: approve
@@ -1622,6 +1622,268 @@ describe('approval gates', () => {
       unansweredToolUses(msgs), [], 'the abandoned batch must take its tool_use with it',
     );
     assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+  });
+});
+
+describe('budgets', () => {
+  it('refuses the send that would exceed the turn budget', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // DDPRateLimiter never sees a loop-initiated call, so the turn budget is
+    // the only thing standing between a user and unbounded model spend.
+    new Agent('budget-turns', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => ({ text: 'ok' })),
+      budget: { turns: 1 },
+    } as any);
+    await seed('s-budget-turns', 'seeded', 'budget-turns');
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    // `seed` commits a user row but spends nothing: mSend is what $incs
+    // budgetSpent.turns, so this send is the one that exhausts a budget of 1.
+    await send.call({ userId: 'u1' }, 'budget-turns', 's-budget-turns', 'first');
+    await waitFor(
+      async () => (await AgentSessions.findOneAsync('s-budget-turns'))!.phase === 'idle',
+      'the first turn to finish',
+    );
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-budget-turns'))!.budgetSpent.turns, 1,
+      'the allowed send must spend its turn',
+    );
+
+    try {
+      await send.call({ userId: 'u1' }, 'budget-turns', 's-budget-turns', 'second');
+      assert.fail('the send past the turn budget must be refused, not queued');
+    } catch (e: any) {
+      assert.equal(e.error, 'budget-exhausted');
+    }
+
+    const doc = (await AgentSessions.findOneAsync('s-budget-turns'))!;
+    assert.equal(
+      doc.budgetSpent.turns, 1,
+      'a refused send must not spend the budget it was refused for',
+    );
+    assert.equal(
+      await AgentMessages
+        .find({ sessionId: 's-budget-turns', content: 'second' } as any).countAsync(), 0,
+      'the refused message must not reach the transcript either',
+    );
+  });
+
+  it('stops mid-turn when the tool-call budget trips, stranding no tool_use', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-budget-tools', 'do both');
+    const ran: string[] = [];
+    let call = 0;
+
+    await runTurn('s-budget-tools', {
+      model: 'mock',
+      system: '',
+      budget: { toolCalls: 1 },
+      tools: [
+        {
+          name: 'first', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { ran.push('first'); return { did: 1 }; },
+        },
+        {
+          name: 'second', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { ran.push('second'); return { did: 2 }; },
+        },
+      ],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? {
+            toolCalls: [
+              { id: 'b1', name: 'first', args: {} },
+              { id: 'b2', name: 'second', args: {} },
+            ],
+          }
+          : { text: 'unreachable' };
+      }),
+    });
+
+    assert.deepEqual(ran, ['first'], 'the check is BEFORE the spend: the limit stops call two');
+    assert.equal(call, 1, 'a tripped budget must not go round the think loop again');
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-budget-tools' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(msgs), [],
+      'a budget trip must discard the in-flight turn exactly as an interrupt does',
+    );
+    assert.lengthOf(
+      msgs.filter((m) => m.role === 'assistant'), 0,
+      'the half-answered assistant must go with the batch it can no longer finish',
+    );
+    assert.equal(
+      msgs.filter((m) => m.role !== 'note').pop()!.role, 'user',
+      'the discarded turn must leave the transcript resumable',
+    );
+
+    const note = msgs.find((m) => m.role === 'note' && m.kind === 'budget') as any;
+    assert.isDefined(note, 'a tripped budget is transcript history, not a silent stop');
+    assert.equal(note.budget, 'toolCalls');
+    assert.deepEqual(note.error, { error: 'budget-exhausted', reason: 'Tool-call budget reached.' });
+    assert.isUndefined(note.content, 'notes carry structured fields, not prose');
+
+    const doc = (await AgentSessions.findOneAsync('s-budget-tools'))!;
+    assert.equal(doc.phase, 'stopped');
+    assert.equal(
+      doc.budgetSpent.toolCalls, 1,
+      'the discarded result still cost a real side effect — the spend stands',
+    );
+  });
+
+  it('refuses the next turn once the spend budget is crossed, before any provider call', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-budget-spend', 'hello');
+    // Just under a one-cent cap. No cost is reported by this provider, so the
+    // configured pricing is what has to move `usage.cost` past the line.
+    await AgentSessions.updateAsync('s-budget-spend', {
+      $set: { 'usage.cost': 0.009 },
+    } as any);
+
+    let calls = 0;
+    const spender: Provider = {
+      async *stream() {
+        calls += 1;
+        yield { kind: 'text', chunk: 'spending' };
+        yield { kind: 'done', usage: { input: 2000, output: 0 } };
+      },
+    };
+    const config = {
+      model: 'mock', system: '', tools: [], provider: spender,
+      pricing: { input: 1, output: 1 },
+      budget: { spend: 0.01 },
+    };
+
+    await runTurn('s-budget-spend', config);
+    assert.equal(
+      calls, 1,
+      'the check is before the spend, so the turn that CROSSES the cap still runs',
+    );
+    let doc = (await AgentSessions.findOneAsync('s-budget-spend'))!;
+    assert.closeTo(doc.usage.cost, 0.011, 1e-9, 'cost must accrue through the commit $inc');
+    assert.equal(doc.phase, 'idle', 'crossing is not tripping');
+    assert.equal(
+      await AgentMessages
+        .find({ sessionId: 's-budget-spend', role: 'note' } as any).countAsync(), 0,
+    );
+
+    await runTurn('s-budget-spend', config);
+    assert.equal(calls, 1, 'the next turn must refuse BEFORE it calls the provider');
+    const note = await AgentMessages.findOneAsync({
+      sessionId: 's-budget-spend', role: 'note', kind: 'budget',
+    } as any) as any;
+    assert.isDefined(note, 'the refusal must be visible in the transcript');
+    assert.equal(note.budget, 'spend');
+    assert.deepEqual(note.error, { error: 'budget-exhausted', reason: 'Spend budget reached.' });
+    doc = (await AgentSessions.findOneAsync('s-budget-spend'))!;
+    assert.equal(doc.phase, 'stopped');
+    assert.lengthOf(
+      await AgentMessages
+        .find({ sessionId: 's-budget-spend', role: 'assistant' }).fetchAsync(), 1,
+      'the refused turn commits nothing of its own',
+    );
+  });
+
+  it('prefers a provider-reported cost over the pricing computation', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-cost-reported', 'hello');
+    // pi-ai computes its own cost and reports it on the done event, including
+    // the cacheRead/cacheWrite tokens a two-rate input/output table cannot
+    // see. Where the provider has priced the call, its number wins.
+    const reporting: Provider = {
+      async *stream() {
+        yield { kind: 'text', chunk: 'x' };
+        yield { kind: 'done', usage: { input: 1000, output: 1000, cost: 0.05 } };
+      },
+    };
+
+    await runTurn('s-cost-reported', {
+      model: 'mock', system: '', tools: [], provider: reporting,
+      pricing: { input: 1, output: 1 },   // would compute 0.002
+    });
+
+    const doc = (await AgentSessions.findOneAsync('s-cost-reported'))!;
+    assert.closeTo(
+      doc.usage.cost, 0.05, 1e-9,
+      'the provider knows what it charged better than a two-rate table does',
+    );
+  });
+
+  it('computes cost from pricing when none is reported, and accrues zero with neither', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // mockProvider is deliberately cost-free, which is what makes it the
+    // fixture for the fallback path.
+    await seed('s-cost-priced', 'hello');
+    await runTurn('s-cost-priced', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'hi', usage: { input: 1000, output: 2000 } })),
+      pricing: { input: 3, output: 15 },   // $ per million tokens
+    });
+    const priced = (await AgentSessions.findOneAsync('s-cost-priced'))!;
+    assert.closeTo(priced.usage.cost, 0.033, 1e-9, '(1000*3 + 2000*15) / 1e6');
+    assert.equal(priced.usage.input, 1000);
+    assert.equal(priced.usage.output, 2000);
+
+    await seed('s-cost-free', 'hello');
+    await runTurn('s-cost-free', {
+      model: 'mock', system: '', tools: [],
+      provider: mockProvider(() => ({ text: 'hi', usage: { input: 1000, output: 2000 } })),
+    });
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-cost-free'))!.usage.cost, 0,
+      'no reported cost and no pricing accrues nothing — never a guess',
+    );
+  });
+});
+
+describe('parseSpend()', () => {
+  it('accepts a dollar string or a plain number and rejects anything else', async () => {
+    const { parseSpend } = await import('../server/registry');
+    assert.equal(parseSpend('$1.50'), 1.5);
+    assert.equal(parseSpend(2), 2);
+    assert.equal(parseSpend('0.25'), 0.25);
+    assert.equal(parseSpend('$0'), 0);
+    assert.throws(() => parseSpend('a dollar fifty'), /spend/);
+    assert.throws(() => parseSpend('$'), /spend/);
+    assert.throws(() => parseSpend('1.5 USD'), /spend/);
+    assert.throws(() => parseSpend(Number.NaN), /spend/);
+    assert.throws(() => parseSpend(-1), /spend/);
+  });
+
+  it('rejects a malformed spend at define() time, not mid-turn', async () => {
+    const { Agent } = await import('../server/agent');
+    // A config error is a STARTUP error. Deferring it to the first turn means
+    // the app boots green and the only brake on loop-initiated work fails
+    // open, in production, under load.
+    assert.throws(
+      () => new Agent('budget-malformed', {
+        model: 'mock', instructions: '', tools: [], budget: { spend: 'lots' },
+      } as any),
+      /spend/,
+    );
   });
 });
 

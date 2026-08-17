@@ -53,12 +53,19 @@ export interface AgentMessage {
   toolCallId?: string;
   error?: { error: string; reason?: string };
   kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval';
+  /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say
+   *  "out of tool calls" rather than "budget exhausted" and an operator can
+   *  raise the right one. The human-readable half lives in `error.reason`. */
+  budget?: 'turns' | 'toolCalls' | 'spend';
   /** `kind: 'approval'` notes only. Structured, never prose: an approval is
    *  transcript history a UI renders and an audit reads, not a sentence. */
   approved?: boolean;
   by?: string | null;
   reason?: string;
-  usage?: { input: number; output: number };
+  /** `cost` is present only when the PROVIDER priced the call; the harness's
+   *  own `pricing` fallback accrues to the session total without claiming the
+   *  message carries a provider-reported figure. */
+  usage?: { input: number; output: number; cost?: number };
   createdAt: Date;
 }
 
