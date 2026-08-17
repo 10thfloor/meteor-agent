@@ -211,3 +211,12 @@ Task 1 DONE: full-schema validation via typebox + parallel tool-arg attribution.
   index; mergeView exposes `toolArgs?: Record<number, string>` on in-flight rows. verify-build.sh
   now proves the typebox chain in a real production bundle (URL-import branch wins). Full report:
   .superpowers/sdd/task-1-report.md
+M4 Task 1: complete (aacc34d..HEAD, review Approved-with-issues, all fixed inline, 204+1 passing)
+  Typebox route: typebox's own exports["./value"] via generalized loader (pi-ai re-exports Type only).
+  Review fixes applied: ViewMessage.createdAt restored (silent type regression); runtime fail-closed
+  guard in co-registered methods (resolve-succeeds/import-fails window); per-kind warn latch;
+  propertyNames/additionalProperties name clamping in published reasons; README format-enforcement note.
+  CORRECTION: zeroUsage (turn-2 live-path crash fix) was M3 close-out work (233d557), NOT a Task 1
+  discovery — Task 1's report re-described it. My interim summary misattributed it.
+  Carry: no compiled-schema cache (typebox/compile) — note for hot loops; tool_args deltas add capped-
+  store pressure; DeltaWriter.push could assert kind for contentIndex.

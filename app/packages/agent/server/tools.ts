@@ -227,19 +227,33 @@ function dottedPath(instancePath: string | undefined): string {
  * strings in `params` are property NAMES, which the structural checker already
  * reports.
  */
+/** Property names in reasons are instance-derived where the instance supplied
+ *  the key (`additionalProperties`, `propertyNames`), and a model can emit an
+ *  arbitrarily long key that would land verbatim in a published transcript.
+ *  Clamp what we interpolate; the schema still rejects the argument either
+ *  way, the reason just refuses to be a megaphone. */
+function clampName(name: string): string {
+  return name.length > 64 ? `${name.slice(0, 61)}…` : name;
+}
+
 function reasonFor(err: TypeboxError): string {
   const path = dottedPath(err.instancePath);
   if (err.keyword === 'required') {
     const missing = (err.params?.requiredProperties ?? [])[0];
     if (typeof missing === 'string') {
-      return `missing required field "${join(path, missing)}"`;
+      return `missing required field "${join(path, clampName(missing))}"`;
     }
   }
   if (err.keyword === 'additionalProperties') {
     const extra = (err.params?.additionalProperties ?? [])[0];
     if (typeof extra === 'string') {
-      return `unexpected field "${join(path, extra)}" is not allowed by the schema`;
+      return `unexpected field "${join(path, clampName(extra))}" is not allowed by the schema`;
     }
+  }
+  if (err.keyword === 'propertyNames') {
+    // typebox's own message interpolates the offending (instance-derived)
+    // names; ours names only the location.
+    return `${label(path)} contains a property whose name is not allowed by the schema`;
   }
   return `${label(path)} ${err.message ?? 'does not match the schema'}`;
 }
@@ -297,6 +311,7 @@ export function setTypeboxValueLoader(next: ValueLoader | null): () => void {
   valuePromise = null;
   degraded = false;
   warnedUnavailable = false;
+  warnedKinds.clear();
   return () => {
     valueLoader = previous;
     valueModule = previousModule;
@@ -394,6 +409,7 @@ export function setToolArgsValidator(next: ArgsValidator | null): () => void {
   const previouslyWarned = warnedUnavailable;
   validator = next;
   warnedUnavailable = false;
+  warnedKinds.clear();
   return () => { validator = previous; warnedUnavailable = previouslyWarned; };
 }
 
@@ -428,8 +444,15 @@ export async function validateToolArgs(
   }
 }
 
+/** One warn PER DISTINCT MESSAGE KIND, not one warn ever: "typebox could not
+ *  load" must not permanently suppress the far more serious "the validator
+ *  threw; arguments are passed through unchecked". Keyed on the message's
+ *  stable prefix so a variable error suffix does not defeat the latch. */
+const warnedKinds = new Set<string>();
 function warnUnavailable(message: string): void {
-  if (warnedUnavailable) return;
+  const kind = message.slice(0, 40);
+  if (warnedKinds.has(kind)) return;
+  warnedKinds.add(kind);
   warnedUnavailable = true;
   console.warn(`[10thfloor:agent] ${message}`);
 }
@@ -604,6 +627,13 @@ export function defineAgentMethod(name: string, options: AgentMethodOptions): Ad
       );
     }
   }
+  // Captured at registration for the runtime guard below: the boot-time check
+  // above trusts a RESOLVE (sync fs probe); if the later import fails, the
+  // validator silently degrades to structural and this endpoint's rich
+  // keywords would go unenforced — announced only by a warn. Fail closed at
+  // call time too: `fullValidationAvailable()` reflects the degrade once it
+  // has happened, so the window between prediction and reality stays shut.
+  const richKeyword = unenforceableKeyword(options.args);
   Meteor.methods({
     async [name](this: any, args: unknown) {
       // The schema below is the real guard. This satisfies
@@ -611,6 +641,12 @@ export function defineAgentMethod(name: string, options: AgentMethodOptions): Ad
       // otherwise fail every call to a method it cannot see validating its
       // arguments — a confusing failure in an app that enables the audit.
       check(args, Match.Any);
+      if (richKeyword && !fullValidationAvailable()) {
+        throw new Meteor.Error(
+          'validation-unavailable',
+          `The schema for '${name}' needs full validation, which failed to load`,
+        );
+      }
       const verdict = await validateToolArgs(options.args, args);
       if (!verdict.ok) throw new Meteor.Error('invalid-args', verdict.reason);
       return options.run.call(this, args);

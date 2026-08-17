@@ -109,6 +109,10 @@ Inline tools are checked the same way, against the **whole** JSON Schema —
 `properties`/`items` are all enforced. The checker is typebox's `Value.Check`,
 loaded lazily through the same seam the pi-ai provider uses; typebox already
 ships as a dependency of `@earendil-works/pi-ai`, so nothing new to install.
+One upgrade note: `format` is now ENFORCED (`format: 'uri'` rejects a
+non-URI), where JSON Schema treats it as annotation by default — a schema that
+used `format` decoratively will start rejecting arguments that never matched
+it. Unknown format names are still tolerated.
 
 If typebox cannot be loaded, the package logs **one** warning and falls back to
 a minimal structural checker — `type`, object `required`/`properties`, array

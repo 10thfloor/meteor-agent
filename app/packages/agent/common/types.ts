@@ -119,4 +119,7 @@ export interface ViewMessage extends Omit<AgentMessage, 'createdAt'> {
    * collect under `0`.
    */
   toolArgs?: Record<number, string>;
+  /** Present on committed rows (copied from the message); absent on in-flight
+   *  reconstructions, which have not been created yet in any durable sense. */
+  createdAt?: Date;
 }
