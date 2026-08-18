@@ -10,6 +10,14 @@ meteor add 10thfloor:agent
 meteor npm install --save @earendil-works/pi-ai
 ```
 
+**Remove `insecure` and `autopublish`** from your app (`meteor remove insecure
+autopublish`) — the defaults Meteor ships in every new app. `autopublish` would
+push transcripts to every client, and `insecure` grants clients direct write
+access to collections, which voids the method-and-publication auth model
+wholesale. The package registers a blanket client-write `deny` on its three
+collections at startup as a backstop against `insecure`, but removing it is the
+correct fix.
+
 ## Define an agent
 
 ```ts
@@ -819,6 +827,27 @@ JSON into that first message (declare a `prompt` string property to keep the
 plain-prose form). `name` defaults to the agent's name; `gate: 'ask'` works
 exactly as on any other tool, and gates the *opening* of the child session.
 
+**Making an agent subagent-only.** By default every defined agent is also a
+public endpoint: a client can `agent.start` it directly and drive it, bypassing
+whatever gates the parent applies before delegating. Set `startable: false` on a
+specialist to close that door — `agent.start` (and `agent.fork`) then throw
+`not-startable`, while the subagent-dispatch path and `Agent.ask` are unaffected
+(neither goes through `agent.start`), so the agent still runs as a child and
+still answers a headless one-shot.
+
+```ts
+new Agent('researcher', {
+  model, instructions: 'You look things up.', tools: [...],
+  startable: false,                 // reachable only as a subagent / Agent.ask target
+});
+```
+
+`startable: false` is a coarse on/off switch. For finer control — start the
+child only for certain callers, or only when a certain parent delegates — leave
+the child startable and put a **`canUse` on the parent** that inspects its own
+`ctx` (`userId`, `sessionId`) and refuses the subagent tool when the caller is
+not entitled; the child then runs only through a parent that allowed it.
+
 **The child persists, and streams.** WHILE the child runs, the parent
 session's `activeChild` field carries `{ sessionId, toolCallId }` — that is
 the live handle, present exactly as long as the dispatch is in flight. Once
@@ -1080,6 +1109,26 @@ to the *listing* and not to the session (see **`runAs` — a tool with a fixed
 identity**). If an agent can be reached without a login, either keep `runAs`
 off its tools, or gate them and check `ctx.callerUserId` — which is `null` for
 exactly these sessions.
+
+### Production ceilings
+
+The spend controls this package ships are all **opt-in and scoped below the
+deployment**. `budget` (`turns`/`toolCalls`/`spend`) is **per session**: it
+bounds one conversation, not the sum of all of them, and an agent defined with
+no `budget` has no brake of its own — startup logs a warning naming every such
+agent. DDP `rateLimit` entries (`sends`, `compacts`, …) are **opt-in and bucket
+per connection** for anonymous callers (per user for authenticated ones), so
+they cap one caller's rate, not the fleet's aggregate cost.
+
+None of that is a deployment-wide ceiling, and an **anonymous-reachable agent
+has no per-caller identity to bound** — a capability-URL flood is N connections,
+each with its own bucket and its own fresh session budget. So a production
+deployment that exposes an agent without a login needs a ceiling this package
+cannot provide: an **app-level per-IP or global limit** in front of `agent.send`
+/ `agent.compact` (a reverse-proxy rate limit, a gateway quota, or a global
+spend kill-switch), on top of per-session `budget` and the opt-in `rateLimit`
+knobs. Configure a `sends` rate limit and give every agent a `budget` at
+minimum; treat the aggregate ceiling as the operator's responsibility.
 
 ## Scope
 

@@ -108,6 +108,22 @@ export interface AgentConfig {
    * the caller gets `Meteor.Error('not-allowed')` and the run stays parked.
    */
   approve?: (ctx: { userId: string | null }) => boolean | Promise<boolean>;
+  /**
+   * May `agent.start` (and `agent.fork`) open a session for this agent directly?
+   *
+   * Undefined (the default) means YES — every agent is a startable endpoint, the
+   * behavior that predates this flag. Set it to `false` for a SPECIALIST that
+   * should only ever be reached as a subagent or an `Agent.ask` target: those
+   * paths do not go through `agent.start`, so a `startable: false` agent still
+   * runs as a child session and still answers a headless one-shot, but a client
+   * can no longer independently start it and bypass the parent's gates.
+   *
+   * This is coarse — an on/off switch on the public start method. For finer
+   * control (start it only for certain callers, or only from a certain parent)
+   * write a `canUse` on the PARENT that inspects `ctx` and keep the child
+   * ungated. See the README's Subagents section.
+   */
+  startable?: boolean;
 }
 
 /** `budget` with `spend` reduced to a plain dollar number — what the loop and
@@ -294,6 +310,18 @@ export function defineAgent(name: string, config: AgentConfig): void {
 
 export function getAgent(name: string): AgentConfig | undefined {
   return registry.get(name);
+}
+
+/**
+ * Every registered agent as `[name, config]` pairs, in registration order.
+ *
+ * The registry is otherwise keyed lookup only; startup needs to WALK it to warn
+ * about agents shipped with no spend ceiling (see `server/index.ts`), and a host
+ * that builds its own admin surface may want the same. A fresh array each call —
+ * the internal Map is not handed out.
+ */
+export function listAgents(): Array<[string, AgentConfig]> {
+  return [...registry.entries()];
 }
 
 /**

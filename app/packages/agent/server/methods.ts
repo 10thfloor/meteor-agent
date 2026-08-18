@@ -4,7 +4,7 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
-import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
+import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
 import { MAX_SUBAGENT_DEPTH } from './subagent';
 import { ACTIVE_PHASES } from '../common/types';
@@ -306,6 +306,16 @@ export function registerMethods(): void {
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      // §7. A `startable: false` agent is a specialist meant to be reached only
+      // as a subagent or an `Agent.ask` target — neither of which comes through
+      // here — so refuse a direct start. Without this a caller could open a
+      // session on a child agent and drive it independently, bypassing the gates
+      // its parent applies before delegating. `=== false` only: undefined is the
+      // compat default (every agent startable), and the check must never turn a
+      // config that simply omitted the flag into a dead endpoint.
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be started directly');
+      }
       const _id = Random.id();
       await AgentSessions.insertAsync({
         _id, agent, userId: this.userId ?? null, title: opts?.title,
@@ -444,7 +454,16 @@ export function registerMethods(): void {
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       // The registry check mirrors mStart/mSend: forking into an agent this
       // server does not define would produce a session nothing can ever run.
-      if (!getAgent(agent)) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      // §7. A fork opens a new, independently-drivable session for this agent —
+      // the very thing `startable: false` forbids — so refuse it here the same
+      // way mStart does. The registry/README doc names `agent.start` AND
+      // `agent.fork` as the two doors this flag shuts. `=== false` only, for the
+      // compat default (see mStart).
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be started directly');
+      }
       const source = await requireSession(agent, sessionId, this.userId ?? null);
       // `Match.Maybe` accepts null as well as undefined, and DDP turns a
       // trailing `undefined` argument into null on the wire — so normalize
@@ -482,6 +501,12 @@ export function registerMethods(): void {
       const outcome = await compactSession(
         sessionId, buildRunConfig(config, session.userId),
       );
+      // A session over its spend budget is refused compaction with its OWN code
+      // — a compaction bills like a turn, so `budget-exhausted` is the honest
+      // answer, not `busy`. Checked before the `busy` family below.
+      if (outcome === 'over-budget') {
+        throw new Meteor.Error('budget-exhausted', COMPACT_OVER_BUDGET);
+      }
       // One code, three reasons — `busy` also covers a session parked on an
       // approval and one sitting in `error`. See `COMPACT_REFUSALS`.
       const refusal = COMPACT_REFUSALS[outcome];

@@ -5,7 +5,7 @@ import {
   defineAgent, getAgent, buildRunConfig, registerProvider, type AgentConfig,
 } from './registry';
 import type { Provider } from './providers/types';
-import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
+import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
@@ -218,6 +218,10 @@ export class Agent {
     const outcome = await compactSession(
       sessionId, buildRunConfig(config, session.userId),
     );
+    // A spend-budget refusal has its own code — see `agent.compact` in methods.ts.
+    if (outcome === 'over-budget') {
+      throw new Meteor.Error('budget-exhausted', COMPACT_OVER_BUDGET);
+    }
     const refusal = COMPACT_REFUSALS[outcome];
     if (refusal) throw new Meteor.Error('busy', refusal);
     if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');

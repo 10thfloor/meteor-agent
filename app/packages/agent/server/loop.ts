@@ -151,7 +151,30 @@ function toolResultContent(
   const content = raw.length <= maxChars
     ? raw
     : `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
-  return { content, error: result.ok ? undefined : result.error };
+  return { content, error: result.ok ? undefined : clampErrorReason(result.error, maxChars) };
+}
+
+/**
+ * Clamp a failed row's `error.reason` to `maxChars`, the same ceiling and the
+ * same explicit marker `content` gets above.
+ *
+ * `reason` reaches a published row from model- and caller-controlled strings — a
+ * denial reason typed into `agent.deny`, a subagent's composed message, an MCP
+ * server's answer — and unlike `content` it rides as its own field, so the
+ * content clamp does not bound it. A million-character reason on a published,
+ * capped-adjacent transcript is the same hazard truncation exists to prevent.
+ */
+function clampErrorReason(
+  error: { error: string; reason?: string } | undefined, maxChars: number,
+): { error: string; reason?: string } | undefined {
+  if (!error || typeof error.reason !== 'string' || error.reason.length <= maxChars) {
+    return error;
+  }
+  return {
+    ...error,
+    reason: `${error.reason.slice(0, maxChars)}…[truncated ${error.reason.length - maxChars} `
+      + `of ${error.reason.length} chars]`,
+  };
 }
 
 /**
@@ -803,7 +826,7 @@ async function compactNow(
  * `no-session`, and the client sees those.
  */
 export type CompactOutcome =
-  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone';
+  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone' | 'over-budget';
 
 /**
  * The refusing outcomes, and the `reason` each one carries.
@@ -823,6 +846,17 @@ export const COMPACT_REFUSALS: Partial<Record<CompactOutcome, string>> = {
   awaiting: 'This session is waiting on an approval; answer it before compacting.',
   errored: 'This session has failed; send to it again before compacting.',
 };
+
+/**
+ * The reason `over-budget` carries. Kept OUT of `COMPACT_REFUSALS` on purpose:
+ * that map's every entry maps to `Meteor.Error('busy')`, and this is a distinct
+ * `budget-exhausted` code — a compaction bills a provider round trip like a turn
+ * does, and a session over its `budget.spend` must be refused it, not told to
+ * "try again in a moment". The two call sites (`agent.compact`, `Agent.compact`)
+ * branch on `over-budget` before the generic `busy` lookup.
+ */
+export const COMPACT_OVER_BUDGET =
+  'This session has reached its spend budget; compaction bills like a turn.';
 
 /**
  * §9's compaction step, run ON DEMAND against an idle session — the whole point
@@ -873,6 +907,17 @@ export async function compactSession(
   // A terminal failure is STATUS a UI gates on — a banner, a retry button, an
   // alert. Compaction is bookkeeping; it must not launder one into `idle`.
   if (session.phase === 'error') return 'errored';
+  // §9. A compaction's summarization is a full provider round trip that accrues
+  // `usage.cost` like any other model call, and `budget.spend` is the README's
+  // named backstop behind it — but nothing checked it here, so a session already
+  // at its spend cap could still be made to bill one more call per compact.
+  // Refuse BEFORE claiming the lease or spending anything, exactly where the
+  // other decisions above refuse. `>=`, so a limit of N stops the call that
+  // would take it past N; `!== undefined` so a session with no spend budget is
+  // never refused on a zero it never set.
+  if (config.budget?.spend !== undefined && session.usage.cost >= config.budget.spend) {
+    return 'over-budget';
+  }
   // A live lease is another server's turn (or ours, mid-wind-down). An EXPIRED
   // one is an orphan the watcher will re-run: `claimLease` would take it, and
   // compacting an abandoned turn's half-written transcript is not this call's
@@ -1502,6 +1547,10 @@ async function resumeParkedTurn(
     const tool = tools.find((t) => t.name === call.name);
     let result: ToolResult;
     let childSessionId: string | undefined;
+    // A `canUse` refusal at resume dispatched nothing, so — like a denial — it
+    // must cost no tool budget. Tracked here rather than re-derived from
+    // `result.error.error` (a hook may have rewritten it) below.
+    let refusedByCanUse = false;
     if (pending.verdict === 'denied') {
       // A denial is ANSWERED, not dropped. The model has to see the refusal in
       // the transcript to route around it; a missing result would strand the
@@ -1534,6 +1583,23 @@ async function resumeParkedTurn(
           ok: false,
           error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
         };
+    } else if (limits.canUse
+      && !(await limits.canUse(call.name, { userId, sessionId }))) {
+      // §7's backstop, re-checked at RESUME — the same `canUse` call
+      // `dispatchCalls` makes before a streaming dispatch. `registry.ts`
+      // documents `canUse` as "checked before dispatch AND before parking", but
+      // an APPROVED park resumes straight into dispatch, so without this a
+      // revoked entitlement or a kill-switch flipped while the request sat on
+      // someone's screen would not stop the already-parked call. The GATE is
+      // deliberately NOT re-evaluated here (a human answered it); `canUse` is a
+      // different question — "may this agent use this tool AT ALL" — and the
+      // answer can legitimately have changed since the park. A refusal is the
+      // structured `not-allowed` result the model reads, never a dispatch.
+      refusedByCanUse = true;
+      result = {
+        ok: false,
+        error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+      };
     } else {
       if (!(await holdsLease(sessionId))) return abandon();
       // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
@@ -1563,9 +1629,11 @@ async function resumeParkedTurn(
       agent, sessionId, userId,
     });
 
-    // A denied call was never dispatched, so it costs no tool budget.
+    // A denied call — or one refused by `canUse` — was never dispatched, so it
+    // costs no tool budget.
     const seq = await allocateSeq(
-      sessionId, pending.verdict === 'denied' ? {} : { 'budgetSpent.toolCalls': 1 },
+      sessionId,
+      (pending.verdict === 'denied' || refusedByCanUse) ? {} : { 'budgetSpent.toolCalls': 1 },
     );
     if (seq === null) return abandon();
 

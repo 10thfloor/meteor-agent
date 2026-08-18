@@ -5,7 +5,7 @@ import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
 import {
-  callMcpTool, discoverMcpTools, warnMcp, type McpToolInfo,
+  callMcpTool, discoverMcpTools, sanitizeMcpReason, warnMcp, type McpToolInfo,
 } from './mcp/client';
 
 /* ---------------------------------------------------------------------------
@@ -1114,6 +1114,31 @@ function mcpFallbackDescription(server: string, tool: string): string {
     + 'loaded, so call it only if its name clearly fits.';
 }
 
+/**
+ * Recursively strip `pattern` and `format` from a DISCOVERED MCP schema before
+ * it becomes a tool's `args`.
+ *
+ * Both are attacker-influenced-regex hazards on the single-threaded event loop:
+ * a `pattern` keyword is compiled and run as a RegExp against the model's
+ * arguments by `Value.Check`/`Compile`, and a catastrophically-backtracking
+ * pattern from an untrusted server is a ReDoS that stalls every session on the
+ * process, not just the offending turn. `format` (`email`, `uri`, `date-time`,
+ * …) is enforced by regexes too, some historically ReDoS-prone. An app-authored
+ * schema is trusted and keeps both (this runs only on the discovered branch
+ * below); a discovered one loses them and is validated on structure alone. A
+ * fresh object is returned — the server's catalog object is never mutated.
+ */
+function stripUntrustedSchemaKeywords(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(stripUntrustedSchemaKeywords);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    if (k === 'pattern' || k === 'format') continue;
+    out[k] = stripUntrustedSchemaKeywords(v);
+  }
+  return out;
+}
+
 /** Discovered metadata folded into a resolved MCP tool. An EXPLICIT value from
  *  the spec always wins — that is the whole contract of the override. */
 function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): ResolvedTool {
@@ -1126,7 +1151,11 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
       : (info?.description ?? mcpFallbackDescription(server, name ?? tool.name)),
     args: explicit.args
       ? tool.args
-      : (info?.inputSchema ?? { type: 'object', properties: {} }),
+      // The discovered schema is third-party; strip its regex-bearing keywords
+      // before it is ever run against model arguments. See the function above.
+      : (info?.inputSchema
+        ? stripUntrustedSchemaKeywords(info.inputSchema)
+        : { type: 'object', properties: {} }),
   };
 }
 
@@ -1155,9 +1184,15 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
  *    server log — there is nothing to name, and inventing a name for a tool
  *    nobody has described would be worse than being briefly absent.
  *
- * Name collisions: first definition wins and the loser is dropped with one
- * warning. Providers reject a tool list with duplicate names outright, so
- * shipping the collision would break the whole turn rather than one tool.
+ * Name collisions: an APP-AUTHORED tool (inline/adopted/subagent) always wins
+ * over a discovered MCP name regardless of list order, and a colliding MCP name
+ * is dropped with a LOUD warning — a discovered tool silently capturing an app
+ * tool's name would inherit its gate and its place in the model's mind, which is
+ * the whole shadowing hazard. The built-in `skill` tool name is reserved the
+ * same way. Between two MCP tools (or two app tools) the first definition wins
+ * and the loser is dropped with the latched warning. Providers reject a tool
+ * list with duplicate names outright, so shipping any collision would break the
+ * whole turn rather than one tool.
  *
  * Servers are discovered CONCURRENTLY. Every discovery has its own deadline
  * (`MCP_DISCOVERY_TIMEOUT_MS`), and awaiting them one after another made the
@@ -1185,6 +1220,30 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
     out.push(tool);
   };
 
+  // App-authored tool names (inline/adopted/subagent) — everything that is NOT
+  // itself an MCP entry. A discovered MCP name colliding with one of these, or
+  // with the reserved built-in `skill` name, must never win: it would capture
+  // the app tool's gate and identity. Precomputed so the rule holds regardless
+  // of whether the MCP spec is listed before or after the app tool.
+  const appNames = new Set(
+    tools.filter((t) => t.kind !== 'mcp').map((t) => t.name),
+  );
+  const pushMcp = (tool: ResolvedTool): void => {
+    if (appNames.has(tool.name) || tool.name === SKILL_TOOL_NAME) {
+      // LOUD, not the latched `warnMcp`: an MCP server quietly shadowing an app
+      // tool (or the skill loader) is a security-relevant event an operator
+      // must see every time it happens, not once per process.
+      console.warn(
+        `[10thfloor:agent] a discovered MCP tool named "${tool.name}" collides with `
+        + `${tool.name === SKILL_TOOL_NAME ? 'the reserved built-in "skill" tool'
+          : 'an app-defined tool'} and was DROPPED — the app tool keeps the name and its `
+        + 'gate. Give the MCP tool an explicit "name" if you need both.',
+      );
+      return;
+    }
+    push(tool);
+  };
+
   // One connect per SERVER per process even when several specs name the same
   // one: dedupe first, then discover every distinct server at once.
   const names = [...new Set(
@@ -1199,7 +1258,7 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
     const { server, tool: named } = tool.mcp!;
     const found = discovered.get(server)!;
     if (!found.ok) {
-      if (named) push(withMcpMetadata(tool, undefined));
+      if (named) pushMcp(withMcpMetadata(tool, undefined));
       else {
         warnMcp(
           `the MCP server "${server}" could not be listed, so none of its tools are `
@@ -1225,11 +1284,11 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
           + '"mcp.tool" against the server\'s tools/list.',
         );
       }
-      push(withMcpMetadata(tool, info));
+      pushMcp(withMcpMetadata(tool, info));
       continue;
     }
     for (const info of found.tools) {
-      push(withMcpMetadata(
+      pushMcp(withMcpMetadata(
         { ...tool, name: info.name, mcp: { server, tool: info.name } },
         info,
       ));
@@ -1587,9 +1646,23 @@ export async function runTool(
     // same reason an inline tool's arguments are: the model gets `invalid-args`
     // naming the field, and usually fixes it — cheaper and clearer than a round
     // trip to a subprocess that answers with prose.
+    //
+    // The reason is SANITIZED here and nowhere else in the tool paths, because
+    // an MCP tool's `args` schema is third-party: `reasonFor` interpolates the
+    // validator's schema-derived `err.message`, which for a discovered schema is
+    // unbounded text this package did not write, on its way into a published
+    // row. The same clamp `mcp-tool-failed` reasons go through drops anything
+    // stack- or secret-shaped and caps the length. An inline/adopted tool's
+    // schema is app-authored and needs no such treatment.
     const verdict = await validateToolArgs(tool.args, args);
     if (!verdict.ok) {
-      return { ok: false, error: { error: 'invalid-args', reason: verdict.reason } };
+      return {
+        ok: false,
+        error: {
+          error: 'invalid-args',
+          reason: sanitizeMcpReason(verdict.reason, 'the arguments do not match the tool schema'),
+        },
+      };
     }
     // No `withInvocation`: there is no Meteor method here and no `this` for a
     // handler to read. `ctx.userId` still governs the call through `canUse` and

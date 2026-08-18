@@ -2190,6 +2190,93 @@ describe('approval gates', () => {
     );
     assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
   });
+
+  it('re-checks canUse on approval-resume: a revoked entitlement stops the parked call (M-CANUSE)', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // canUse is TRUE at park time — the call has to reach `awaiting` for the
+    // resume path to be what's under test — then flipped FALSE before the human
+    // approves, modelling a kill-switch or a revoked entitlement.
+    let allow = true;
+    const state = await buildFixture('s-canuse-resume', 'gate-canuse-resume', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ], { canUse: async () => allow });
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-canuse-resume'))!.phase, 'awaiting',
+      'the fixture must actually park before the entitlement is revoked',
+    );
+
+    allow = false;
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-canuse-resume', 's-canuse-resume');
+
+    // The turn still finishes — the model sees the refusal and routes around it —
+    // but the tool never ran.
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-canuse-resume', role: 'assistant' }).countAsync()) === 2,
+      'the resumed turn to finish after the canUse refusal',
+    );
+    assert.deepEqual(state.ran, [], 'a canUse refusal at resume must NOT dispatch the tool');
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-canuse-resume' }, { sort: { seq: 1 } }).fetchAsync();
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.isDefined(row, 'the approved-but-forbidden call must still be answered');
+    assert.equal(row.error!.error, 'not-allowed', 'the row carries the structured refusal');
+    assert.deepEqual(unansweredToolUses(msgs), [], 'no tool_use may be left stranded');
+
+    // A refused call costs no tool budget — same accounting a denial gets.
+    const doc = (await AgentSessions.findOneAsync('s-canuse-resume'))!;
+    assert.equal(
+      (doc.budgetSpent as any).toolCalls, 0,
+      'a call that never dispatched must not be billed a tool call',
+    );
+    assert.isUndefined(doc.pending, 'the marker clears once resolved');
+  });
+
+  it('clamps a committed row error.reason to maxResultChars (L-ERRREASON)', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // A denial's reason is caller-controlled (typed into `agent.deny`) and rides
+    // as its OWN `error.reason` field, which the content clamp does not bound —
+    // so it must be clamped the same way `content` is, or a megabyte reason
+    // reaches every later model call and the published transcript.
+    await buildFixture('s-errreason', 'gate-errreason', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ], { maxResultChars: 50 });
+    assert.equal((await AgentSessions.findOneAsync('s-errreason'))!.phase, 'awaiting');
+
+    const hugeReason = 'X'.repeat(500);
+    const deny = (Meteor.server as any).method_handlers[NAMES.mDeny];
+    await deny.call({ userId: 'u1' }, 'gate-errreason', 's-errreason', hugeReason);
+
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync(
+        { sessionId: 's-errreason', role: 'tool', toolCallId: 'g1' } as any,
+      )),
+      'the denied tool row to commit',
+    );
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-errreason', role: 'tool', toolCallId: 'g1' } as any,
+    ))!;
+    assert.equal(row.error!.error, 'denied');
+    assert.isBelow(
+      row.error!.reason!.length, hugeReason.length,
+      'the reason must be truncated, not stored whole',
+    );
+    assert.include(row.error!.reason!, 'truncated', 'and it must say it was truncated');
+    assert.isTrue(
+      row.error!.reason!.startsWith('X'.repeat(50)),
+      'the first maxResultChars characters survive, the rest are dropped',
+    );
+  });
 });
 
 describe('budgets', () => {

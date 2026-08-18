@@ -1007,3 +1007,107 @@ describe('subagents: budgets and the live handle', () => {
     assert.isUndefined(child.pending!.verdict);
   });
 });
+
+/**
+ * H-STARTABLE. `startable: false` closes the public `agent.start`/`agent.fork`
+ * door on a specialist while leaving the two paths that do NOT go through those
+ * methods — subagent dispatch and `Agent.ask` — fully working. That asymmetry is
+ * the whole point: a child that a parent gates before delegating must not be
+ * independently reachable, yet must still run as a child and as a headless
+ * one-shot.
+ */
+describe('subagents: startable:false (H-STARTABLE)', () => {
+  it('refuses a direct agent.start, and agent.fork, on a startable:false agent', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('specialist-locked', {
+      model: 'mock', instructions: 'you are a subagent only',
+      provider: mockProvider(() => ({ text: 'x' })),
+      startable: false,
+    });
+
+    const start = (Meteor.server as any).method_handlers[NAMES.mStart];
+    let threw: any;
+    try {
+      await start.call({ userId: 'u1' }, 'specialist-locked');
+    } catch (e) { threw = e; }
+    assert.isDefined(threw, 'a startable:false agent must refuse a direct start');
+    assert.equal(threw.error, 'not-startable');
+
+    // A fork opens another independently-drivable session, so it is shut too.
+    const fork = (Meteor.server as any).method_handlers[NAMES.mFork];
+    let forkThrew: any;
+    try {
+      await fork.call({ userId: 'u1' }, 'specialist-locked', 'some-session');
+    } catch (e) { forkThrew = e; }
+    assert.isDefined(forkThrew, 'fork of a startable:false agent must refuse too');
+    assert.equal(forkThrew.error, 'not-startable');
+  });
+
+  it('an undefined startable still starts — the compat default is unchanged', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('specialist-open', {
+      model: 'mock', instructions: 'ordinary agent',
+      provider: mockProvider(() => ({ text: 'x' })),
+    });
+
+    const start = (Meteor.server as any).method_handlers[NAMES.mStart];
+    const id = await start.call({ userId: 'u1' }, 'specialist-open');
+    assert.isString(id, 'an agent that omits startable is a normal endpoint');
+    assert.isDefined(await AgentSessions.findOneAsync(id));
+  });
+
+  it('still runs as a subagent even though it cannot be started', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    new Agent('sub-locked-child', {
+      model: 'mock', instructions: '',
+      provider: mockProvider(() => ({ text: 'Ottawa' })),
+      startable: false,
+    });
+
+    await seedRoot('s-locked-sub', 'sub-locked-parent', 'capital?');
+    await runTurn('s-locked-sub', {
+      model: 'mock', system: '',
+      tools: [{ subagent: 'sub-locked-child', description: 'ask the specialist' }],
+      provider: await delegating('sub-locked-child', { prompt: 'capital' }),
+    });
+
+    const parentMsgs = await AgentMessages
+      .find({ sessionId: 's-locked-sub' }, { sort: { seq: 1 } }).fetchAsync();
+    const row = parentMsgs.find((m) => m.role === 'tool')!;
+    assert.isDefined(row, 'the subagent dispatch does not go through agent.start');
+    assert.isUndefined(row.error, 'a startable:false child runs as a child');
+    assert.equal(row.content, JSON.stringify('Ottawa'));
+    assert.isString(row.childSessionId);
+  });
+
+  it('still answers a headless Agent.ask even though it cannot be started', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    const oneshot = new Agent('ask-locked', {
+      model: 'mock', instructions: 'answer directly',
+      provider: mockProvider(() => ({ text: 'the answer' })),
+      startable: false,
+    });
+
+    const answer = await oneshot.ask('the question', { userId: 'u1' });
+    assert.equal(answer, 'the answer', 'ask() does not go through agent.start either');
+  });
+});
