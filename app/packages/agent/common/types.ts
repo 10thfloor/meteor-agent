@@ -2,6 +2,19 @@ export type Phase =
   | 'idle' | 'streaming' | 'calling' | 'awaiting'
   | 'compacting' | 'retrying' | 'stopped' | 'error';
 
+/**
+ * Phases in which a turn is supposed to be RUNNING.
+ *
+ * ONE definition, deliberately: the watcher asks "is this session leased by a
+ * process that should be driving it?" (a session in one of these with no live
+ * lease is an orphan) and subagent dispatch asks "is this child mid-run?"
+ * (a child in one of these has no outcome to report yet, whether it is running
+ * elsewhere or orphaned). Two lists answering the same question is how they
+ * drift; the harness has been bitten by exactly that once already (the loop's
+ * wake exclusions vs. its terminal phases).
+ */
+export const ACTIVE_PHASES: Phase[] = ['streaming', 'calling', 'retrying', 'compacting'];
+
 export interface Usage { input: number; output: number; cost: number }
 
 export interface AgentSession {
@@ -49,6 +62,25 @@ export interface AgentSession {
      * the old `unknown-tool` answer — a stale marker is not worth a migration.
      */
     mcpServer?: string;
+    /**
+     * IDENTITY for the wake this verdict schedules, stamped by `writeVerdict`
+     * in the same atomic write as the verdict itself.
+     *
+     * The loop's wind-down self-check re-reads the session inside its deferred
+     * callback, because a legitimate resume can start AND finish in between.
+     * Re-checking that "a verdict still stands" is a BOOLEAN answer to an
+     * IDENTITY question: verdict A can be consumed, the batch re-park on its
+     * next gate, and a second verdict B be written and already deferred by the
+     * time the first timer fires — three writes later, the boolean still says
+     * yes. The token says WHICH verdict was seen: the deferred callback
+     * proceeds only if the token it captured is still the one on the document.
+     *
+     * A fresh park writes a whole new `pending` object, so a re-park clears it
+     * — which is the point. Absent on verdicts written before this field
+     * existed (and by tests that stamp a verdict directly), where the check
+     * degrades to the old boolean form rather than refusing to wake at all.
+     */
+    wakeToken?: string;
   };
   lease?: { serverId: string; until: Date };
   budgetSpent: { turns: number; toolCalls: number };

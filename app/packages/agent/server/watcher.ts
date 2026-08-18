@@ -1,5 +1,5 @@
 import { AgentSessions } from '../common/collections';
-import type { AgentSession, Phase } from '../common/types';
+import { ACTIVE_PHASES, type AgentSession, type Phase } from '../common/types';
 import { getAgent } from './registry';
 import { deferTurn, recordTimeoutVerdict } from './methods';
 import { isRunning } from './loop';
@@ -37,8 +37,10 @@ import { isRunning } from './loop';
  */
 
 /** Phases in which a turn is supposed to be RUNNING. A session sitting in one of
- *  these with no live lease is, by definition, nobody's. */
-export const ACTIVE_PHASES: Phase[] = ['streaming', 'calling', 'retrying', 'compacting'];
+ *  these with no live lease is, by definition, nobody's. Defined in
+ *  `common/types` and re-exported here, where it was born: subagent dispatch
+ *  needs the same list to tell a mid-run child from a settled one. */
+export { ACTIVE_PHASES };
 
 /** Phases that are not the watcher's to wake, and the same list the loop's own
  *  wake self-check excludes: `awaiting` is a live question for a human,

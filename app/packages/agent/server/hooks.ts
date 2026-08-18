@@ -140,7 +140,17 @@ export function clearHooks(): void {
  *  provider. */
 function isProviderRequest(value: unknown): value is ProviderRequest {
   const v = value as any;
-  return !!v && typeof v === 'object' && typeof v.model === 'string' && Array.isArray(v.messages);
+  return !!v && typeof v === 'object'
+    && typeof v.model === 'string'
+    // `system` is not optional on `ProviderRequest`, and a hook that rebuilt the
+    // request from scratch and forgot it would silently send the model NO system
+    // prompt at all: no instructions, no skills listing, no §7 tool guidance —
+    // an agent that answers as a bare chat model. Adapters differ on what they
+    // do with `undefined` there (pi-ai stringifies it), so the harness will not
+    // find out from the provider either. A missing `system` is a malformed
+    // replacement, and the request the harness built stands.
+    && typeof v.system === 'string'
+    && Array.isArray(v.messages);
 }
 
 /** The same minimum for a replacement tool result: `ok` is what every consumer
@@ -178,7 +188,8 @@ export async function runBeforeProviderRequest(
         warnHook(
           'beforeProviderRequest:shape',
           'a beforeProviderRequest hook returned something that is not a provider request '
-          + '(it needs `model` and `messages`); the hook was skipped and the request stands',
+          + '(it needs `model`, `system` and `messages`); the hook was skipped and the '
+          + 'request stands',
         );
         continue;
       }

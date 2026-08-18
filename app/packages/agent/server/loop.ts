@@ -89,11 +89,64 @@ async function dispatchTool(
   return { result: await runTool(tool, args, ctx) };
 }
 
-/** The transcript row content for a tool result, truncated explicitly. */
-function toolResultContent(result: ToolResult, maxChars: number): string {
-  const raw = JSON.stringify(result.ok ? result.value : result.error) ?? 'null';
-  if (raw.length <= maxChars) return raw;
-  return `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
+/**
+ * One warn per DISTINCT serialization failure kind (`TypeError` for a circular
+ * value, `TypeError` for a BigInt, whatever a throwing `toJSON` raises).
+ *
+ * The same latch pattern as hooks.ts's and the validator's, for the same
+ * reason: a tool or hook that returns an unserializable value returns one every
+ * single call, and an unlatched warning would be a log line per tool result
+ * forever. Keyed per kind rather than once ever, so one failure mode cannot
+ * permanently suppress the next.
+ */
+const warnedSerialization = new Set<string>();
+
+/** What a row says when its result could not be turned into JSON. Structured,
+ *  like every other harness-authored failure: the model can read it and route
+ *  around, and a UI can render it as an error rather than as an answer. */
+const UNSERIALIZABLE = {
+  error: 'unserializable-result',
+  reason: 'The tool result could not be serialized.',
+} as const;
+
+/**
+ * The transcript row for a tool result: its `content`, truncated explicitly,
+ * and the `error` the row must carry alongside it.
+ *
+ * `JSON.stringify` THROWS on a circular object and on a BigInt, and a tool's
+ * value is app data — a hook's replacement even more so. Unguarded, that throw
+ * escapes the dispatch loop and abandons a turn that had already done all of
+ * its work, which is a harness failure wearing an app's mistake. Guarded, the
+ * row records a structured `unserializable-result` and the turn completes: the
+ * model is told the call produced nothing usable and can try something else.
+ *
+ * Returning the error alongside the content rather than leaving it to the three
+ * call sites is deliberate — a site that wrote the substituted content but kept
+ * `result.ok`'s `undefined` error would publish a row that claims success and
+ * carries an apology.
+ */
+function toolResultContent(
+  result: ToolResult, maxChars: number,
+): { content: string; error?: { error: string; reason?: string } } {
+  let raw: string;
+  try {
+    raw = JSON.stringify(result.ok ? result.value : result.error) ?? 'null';
+  } catch (e) {
+    const kind = (e as Error)?.name ?? 'Error';
+    if (!warnedSerialization.has(kind)) {
+      warnedSerialization.add(kind);
+      console.warn(
+        '[10thfloor:agent] a tool result could not be serialized for the transcript '
+        + `(${kind}: ${(e as Error)?.message}); the row records `
+        + 'unserializable-result (warned once per kind)',
+      );
+    }
+    return { content: JSON.stringify(UNSERIALIZABLE), error: { ...UNSERIALIZABLE } };
+  }
+  const content = raw.length <= maxChars
+    ? raw
+    : `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
+  return { content, error: result.ok ? undefined : result.error };
 }
 
 /**
@@ -1077,15 +1130,16 @@ async function dispatchCalls(
       }, call, hookCtx);
       const deniedSeq = await allocateSeq(sessionId);
       if (deniedSeq === null) return abandon();
+      // `error` comes back from the serializer with the content: a hook may
+      // turn this refusal into a SUCCESS (`ToolResult` carries `error` only on
+      // the failing arm, but a hook is app code and hands back what it likes),
+      // and a result that cannot be serialized at all carries its own.
+      const deniedRow = toolResultContent(denied, limits.maxResultChars);
       await AgentMessages.insertAsync({
         _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
         toolCallId: call.id,
-        content: toolResultContent(denied, limits.maxResultChars),
-        // Guarded like the other two row writes: a hook may turn this refusal
-        // into a SUCCESS, and an unguarded write would then stamp `error` onto
-        // a row whose `ok` says otherwise (`ToolResult` carries `error` only on
-        // the failing arm, but a hook is app code and hands back what it likes).
-        error: denied.ok ? undefined : denied.error,
+        content: deniedRow.content,
+        error: deniedRow.error,
         createdAt: new Date(),
       } as any);
       continue;
@@ -1202,11 +1256,12 @@ async function dispatchCalls(
     // be: leaving it would strand a tool_use with no tool_result.
     if (toolSeq === null) return abandon();
 
+    const row = toolResultContent(result, limits.maxResultChars);
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
       toolCallId: call.id,
-      content: toolResultContent(result, limits.maxResultChars),
-      error: result.ok ? undefined : result.error,
+      content: row.content,
+      error: row.error,
       // The handle on the child transcript. Present even for a parked or failed
       // child — that session is exactly what a human needs to open.
       childSessionId,
@@ -1379,10 +1434,11 @@ async function resumeParkedTurn(
     );
     if (seq === null) return abandon();
 
+    const row = toolResultContent(result, limits.maxResultChars);
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
-      content: toolResultContent(result, limits.maxResultChars),
-      error: result.ok ? undefined : result.error,
+      content: row.content,
+      error: row.error,
       childSessionId,
       createdAt: new Date(),
     } as any);
@@ -1874,6 +1930,17 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       if (after?.pending?.verdict
         && after.phase !== 'awaiting' && after.phase !== 'stopped' && after.phase !== 'error'
         && !running.has(sessionId)) {
+        // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
+        // with every verdict, so this is identity where the old re-check had
+        // only a boolean: a verdict consumed, the batch re-parked on its next
+        // gate, and a SECOND verdict written (with its own deferred resume
+        // already queued) all before this timer fires is three writes that
+        // still leave "a verdict stands" true — and this callback would then
+        // run a turn nobody asked for, behind the resume that already owns it.
+        // Undefined only for a verdict written before the field existed, where
+        // the comparison degrades to the old boolean form rather than
+        // stranding the session.
+        const wakeToken = after.pending.wakeToken;
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
         // plumbing and calls in), and the only thing `defer` would add is an
@@ -1891,6 +1958,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // assistant row appended to a turn the user considered finished.
             const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
             if (!still?.pending?.verdict
+              || still.pending.wakeToken !== wakeToken
               || still.phase === 'awaiting' || still.phase === 'stopped'
               || still.phase === 'error' || running.has(sessionId)) return;
             await runTurn(sessionId, config);

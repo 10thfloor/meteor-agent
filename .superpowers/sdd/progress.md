@@ -319,3 +319,32 @@ M4 final review: MERGE AFTER MUST-FIXES -> all applied (b865638): compact refuse
   v3 backlog consolidated in task-7 report + final review triage (idempotency keys, child re-link,
   parent-interrupt propagation, per-agent hooks, compiled-schema cache, watcher flake tracking,
   runAs-on-pending render, toolResultContent stringify guard, demo error branch, attribute churn).
+
+== MILESTONE 5 (branch milestone-5-v3, plan 2026-08-17-agent-harness-milestone-5.md) ==
+M5 Task 1 (loop robustness residuals): complete. Suite 287 (+2 pending) server + 6 client, from
+  282 — +5, three consecutive clean runs.
+  Subagent idempotency: the key is (parent.sessionId, parent.toolCallId, agent) + UNCLAIMED (no
+  role:'tool' row in the parent naming the child) + the child's seq-0 prompt matching
+  subagentPrompt(args), newest first. The parent's assistant messageId was rejected as a key
+  component: discardTurn DELETES that row and the retry re-creates it with a new _id, so it can
+  never match in the one case the lookup exists for. UNCLAIMED is the recency bound and the discard
+  supplies it free — a child becomes reusable exactly when its call becomes re-dispatchable, and a
+  healthy older turn's child never does. reuse-if-terminal (readTurnOutcome, no new child, no model
+  call) / park-if-parked (subagent-parked naming the EXISTING childSessionId) / otherwise fresh.
+  Lease liveness deliberately NOT read: live and orphaned both mean "no outcome to report and not
+  ours to wait on", so phase alone decides; the orphan is Task 2's re-link to reach. Residual: a
+  provider reusing one call id across two turns of one session, same agent, byte-identical args,
+  earlier child left unclaimed -> a stale answer to an identical question. ACTIVE_PHASES moved to
+  common/types.ts (one definition, watcher re-exports).
+  Wake token: writeVerdict stamps pending.wakeToken with the verdict in the same atomic write; the
+  wind-down self-check captures it and the deferred callback proceeds only on identity. Absent
+  token degrades to the old boolean, which is why the two existing wake tests needed NO seam change.
+  toolResultContent now returns {content, error} and substitutes a structured unserializable-result
+  on a stringify throw (one warn per error name); all three row sites updated.
+  isProviderRequest requires system:string — a rebuilt request without it sends the model no
+  instructions at all and no provider reports it.
+  WATCHER FLAKE ROOT CAUSE (measured, not theorized): a TEST race. Four Mongo round trips separate
+  the assistant-row insert from the finally's phase-idle + releaseLease; the tests polled on the row
+  count and asserted the terminal state immediately. A 12-run probe caught phase=streaming +
+  lease held 12/12. Fixed by a shared finished(sessionId, n) predicate (row count AND idle AND no
+  lease) on all five waits. No production change. Report: .superpowers/sdd/task-1-report.md

@@ -81,6 +81,13 @@ async function writeVerdict(
   const $set: Record<string, unknown> = {
     'pending.verdict': verdict,
     'pending.by': by,
+    // The wake's IDENTITY, written in the same atomic write as the verdict it
+    // identifies — never separately, or a deferred resume could capture a
+    // token for a verdict that is not yet there. The loop's wind-down
+    // self-check captures it and re-checks it inside its deferred callback:
+    // "is a verdict standing" is a boolean answer to the question "is it still
+    // MY verdict standing". See `AgentSession.pending.wakeToken`.
+    'pending.wakeToken': Random.id(),
     phase: 'idle',
     updatedAt: new Date(),
   };

@@ -440,7 +440,16 @@ Three rules for both:
 - **returning nothing keeps the value** — an observer needs no return statement;
 - a hook that **throws**, or returns the wrong shape, is skipped with one
   warning and the value it was given stands. A broken extension must not kill
-  turns.
+  turns. A replacement request needs `model`, `system` **and** `messages` — a
+  rebuilt request that drops `system` would send the model no instructions at
+  all, so it is treated as malformed rather than sent; a replacement result
+  needs a boolean `ok`.
+
+A tool result that cannot be serialized — a circular object, a `BigInt`, a
+throwing `toJSON`, whether it came from your tool or from your hook — does not
+abandon the turn. The row records a structured
+`{ error: 'unserializable-result' }`, the model is told the call produced
+nothing usable, and the turn finishes.
 
 An unknown hook name throws at registration rather than silently never running.
 `Agent.clearHooks()` removes them all; it is a **test seam** (call it in a
@@ -727,11 +736,20 @@ cost.
 
 Three operational truths to design around: **interrupting the parent does not
 interrupt a running child** — the child streams to completion on its own budget
-and the parent picks up afterwards; **delivery is at-least-once at the
-subagent granularity** — a parent turn abandoned mid-batch (lease steal, crash)
-is re-dispatched by recovery, and a subagent call in that batch runs a whole
-second child; and an abandoned batch's discarded tool rows can leave a
-completed child session with no durable pointer to it from any transcript.
+and the parent picks up afterwards; **a re-dispatched subagent call reuses the
+child it already opened** — a parent turn abandoned mid-batch (lease steal,
+crash) is re-dispatched by recovery, and the lookup that runs before any child
+is created finds the earlier one by `(parent session, tool call id, agent,
+prompt)` and answers from it: a finished child's answer is reused with no new
+model call, a parked child is reported with the session id a human can already
+approve. It matches only a child that is still *unclaimed* (no tool row in the
+parent transcript names it), which is precisely the state a discard leaves
+behind. Two cases still open a second child: a provider that mints a fresh call
+id on the retry (nothing links the two dispatches), and a child that is still
+mid-run when the parent is re-dispatched (it has no outcome to report, and the
+parent may not block on work it does not own). And: an abandoned batch's
+discarded tool rows can leave a completed child session with no durable pointer
+to it from any transcript.
 
 ## Forking
 

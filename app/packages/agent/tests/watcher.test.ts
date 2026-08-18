@@ -17,6 +17,34 @@ const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 20000) 
 
 const settle = (ms: number) => new Promise((r) => { setTimeout(r, ms); });
 
+/**
+ * The turn is FINISHED — not merely visible.
+ *
+ * A committed assistant row is not the end of a turn. The loop still removes
+ * the message's deltas, checks for a user message that interjected mid-stream,
+ * and only THEN, in its `finally`, writes `phase: 'idle'` and releases the
+ * lease: four Mongo round trips separate "the answer is in the transcript" from
+ * "the session is back at rest". A wait that ends at the first and then asserts
+ * the second is asserting on state that has not been written yet.
+ *
+ * That is the one-run flake two agents saw here and neither could pin. It is a
+ * TEST race, not a watcher one — measured with a sampler that read the session
+ * the instant the row appeared: `streaming`, lease held, twelve times out of
+ * twelve. The 25ms poll below usually lands outside the window and occasionally
+ * lands inside it, which is exactly the reported shape (one run in many, always
+ * on an orphan-claim path, never reproducible on demand).
+ *
+ * So every wait ends on the TERMINAL state, and the assertions that follow
+ * re-state what was waited for rather than racing it.
+ */
+const finished = async (sessionId: string, assistants: number): Promise<boolean> => {
+  const { AgentSessions, AgentMessages } = await import('../common/collections');
+  const n = await AgentMessages.find({ sessionId, role: 'assistant' }).countAsync();
+  if (n !== assistants) return false;
+  const doc = await AgentSessions.findOneAsync(sessionId);
+  return !!doc && doc.phase === 'idle' && !doc.lease;
+};
+
 const reset = async () => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
   await AgentSessions.removeAsync({});
@@ -115,8 +143,7 @@ describe('orphan-claim watcher', () => {
       // Generous: with no oplog available the live query degrades to
       // poll-and-diff, whose default interval is 10s.
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-obs', role: 'assistant' }).countAsync()) === 1,
+        () => finished('s-obs', 1),
         'the observer to claim the orphan and finish its turn',
         40000,
       );
@@ -155,8 +182,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 120 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-sweep', role: 'assistant' }).countAsync()) === 1,
+        () => finished('s-sweep', 1),
         'the sweep to notice the expired lease',
       );
       const msg = await AgentMessages.findOneAsync({ sessionId: 's-sweep', role: 'assistant' });
@@ -203,8 +229,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-timeout', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-timeout', 2),
         'the timed-out turn to resume and finish',
       );
 
@@ -313,8 +338,7 @@ describe('orphan-claim watcher', () => {
     const b = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-race-timeout', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-race-timeout', 2),
         'the timed-out turn to resume and finish',
       );
       await settle(400);
@@ -412,8 +436,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60, verdictGraceMs: 1000 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-standing', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-standing', 2),
         'the sweep to pick up the dropped wake',
       );
       assert.deepEqual(state.ran, ['refund'], 'the approved tool must finally run — once');
@@ -430,3 +453,4 @@ describe('orphan-claim watcher', () => {
     }
   });
 });
+

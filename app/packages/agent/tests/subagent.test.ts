@@ -672,4 +672,199 @@ describe('subagents: budgets and the live handle', () => {
     assert.equal((row as any).childSessionId, seenDuring.sessionId,
       'the durable handle and the live handle must name the same child');
   });
+
+  /**
+   * IDEMPOTENCY. A parent turn abandoned mid-batch is recovered by discarding
+   * its assistant row and running the turn again, so the same subagent call is
+   * DISPATCHED TWICE — and used to open a whole second child.
+   *
+   * Both tests below drive that through the lease-steal-mid-batch idiom the loop
+   * suite uses: a two-call batch whose SECOND call steals the lease from inside
+   * its own `run`, after the subagent's result row has already landed. The
+   * abandonment discards the assistant and the whole batch's rows; the child
+   * session survives, unclaimed, which is exactly the state the lookup exists
+   * to recognize.
+   */
+  const stealOnce = (sessionId: string, state: { steals: number }) => ({
+    name: 'thief',
+    description: 'x',
+    args: { type: 'object', properties: {} },
+    run: async () => {
+      const { AgentSessions } = await import('../common/collections');
+      state.steals += 1;
+      // ONCE. The second dispatch must be allowed to finish, or the recovery
+      // this test is about would never commit anything.
+      if (state.steals === 1) {
+        await AgentSessions.updateAsync(sessionId, {
+          $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60_000) } },
+        } as any);
+      }
+      return { stole: state.steals };
+    },
+  });
+
+  /** The parent's script: one batch of [subagent, thief], then a plain answer
+   *  once the batch is answered. Branches on HISTORY, so the re-dispatch after
+   *  a discard re-emits the identical batch — including the identical call ids,
+   *  which is what a provider that reuses ids does and what the lookup keys on. */
+  const batchProvider = async (childTool: string, state: { calls: number }) => {
+    const { mockProvider } = await import('../server/providers/mock');
+    return mockProvider((req) => {
+      state.calls += 1;
+      return req.messages.some((m) => m.role === 'tool')
+        ? { text: 'wrapped up' }
+        : {
+          toolCalls: [
+            { id: 'c1', name: childTool, args: { prompt: 'look it up' } },
+            { id: 'c2', name: 'thief', args: {} },
+          ],
+        };
+    });
+  };
+
+  it('reuses the finished child when recovery re-dispatches an abandoned batch', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    const child = { calls: 0 };
+    new Agent('sub-idem', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: mockProvider(() => { child.calls += 1; return { text: 'the answer' }; }),
+    });
+
+    await seedRoot('s-idem', 'sub-idem-parent');
+    const thief = { steals: 0 };
+    const parent = { calls: 0 };
+    const config = {
+      model: 'mock',
+      system: '',
+      tools: [
+        { subagent: 'sub-idem', description: 'ask the child' },
+        stealOnce('s-idem', thief),
+      ],
+      provider: await batchProvider('sub-idem', parent),
+    };
+
+    await runTurn('s-idem', config as any);
+
+    // The abandonment: nothing of the turn survives except the child itself.
+    assert.equal(thief.steals, 1, 'the steal must actually have fired');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-idem', role: 'assistant' }).countAsync(), 0,
+      'the abandoned assistant row must be discarded',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-idem', role: 'tool' }).countAsync(), 0,
+      "and the batch's already-landed result with it — which is what makes the child unclaimed",
+    );
+    const firstChild = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-idem' } as any,
+    ))!;
+    assert.isDefined(firstChild, 'the child session outlives the turn that opened it');
+    assert.equal(child.calls, 1, 'the child ran exactly once');
+
+    // Recovery. The stolen lease is released (the steal is what drove the
+    // abandonment, not a claim this test means to keep contesting) and the turn
+    // is simply run again — recovery is calling `runTurn` again, nothing more.
+    await AgentSessions.updateAsync('s-idem', { $unset: { lease: 1 } } as any);
+    await runTurn('s-idem', config as any);
+
+    assert.equal(
+      await AgentSessions.find({ 'parent.sessionId': 's-idem' } as any).countAsync(), 1,
+      'a re-dispatched subagent call must NOT open a second child session',
+    );
+    assert.equal(
+      child.calls, 1,
+      'and must not call the provider again — the finished child already has the answer',
+    );
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-idem', role: 'tool', toolCallId: 'c1' } as any,
+    ))!;
+    assert.isDefined(row, 'the recovered turn answers the subagent call');
+    assert.isUndefined(row.error, 'a reused finished child answers exactly as a fresh one would');
+    assert.equal(row.content, JSON.stringify('the answer'));
+    assert.equal(row.childSessionId, firstChild._id, 'and names the child that actually ran');
+    const last = await AgentMessages.findOneAsync(
+      { sessionId: 's-idem', role: 'assistant' } as any, { sort: { seq: -1 } },
+    );
+    assert.equal((last as any).content, 'wrapped up', 'the recovered turn runs to completion');
+    assert.equal(
+      parent.calls, 3,
+      'the PARENT still pays for its own turns (one abandoned batch, one re-dispatched batch, '
+      + 'one wrap-up) — idempotency is about the child, not about free model calls',
+    );
+  });
+
+  it('reuses a PARKED child on re-dispatch, naming the session already open', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    const child = { calls: 0, ran: [] as string[] };
+    new Agent('sub-idem-park', {
+      model: 'mock',
+      instructions: '',
+      tools: [{
+        name: 'refund',
+        description: 'x',
+        gate: 'ask' as const,
+        args: { type: 'object', properties: {} },
+        run: async () => { child.ran.push('refund'); return { did: 'refund' }; },
+      }],
+      provider: mockProvider(() => {
+        child.calls += 1;
+        return { toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5 } }] };
+      }),
+    });
+
+    await seedRoot('s-idem-park', 'sub-idem-park-parent');
+    const thief = { steals: 0 };
+    const parent = { calls: 0 };
+    const config = {
+      model: 'mock',
+      system: '',
+      tools: [
+        { subagent: 'sub-idem-park', description: 'ask the child' },
+        stealOnce('s-idem-park', thief),
+      ],
+      provider: await batchProvider('sub-idem-park', parent),
+    };
+
+    await runTurn('s-idem-park', config as any);
+    const parked = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-idem-park' } as any,
+    ))!;
+    assert.equal(parked.phase, 'awaiting', 'the child parked on its ask-gate');
+    assert.equal(child.calls, 1);
+
+    await AgentSessions.updateAsync('s-idem-park', { $unset: { lease: 1 } } as any);
+    await runTurn('s-idem-park', config as any);
+
+    assert.equal(
+      await AgentSessions.find({ 'parent.sessionId': 's-idem-park' } as any).countAsync(), 1,
+      'a re-dispatch must not open a SECOND session parked on the same question',
+    );
+    assert.equal(child.calls, 1, 'and must not re-run the child to re-discover the park');
+    assert.deepEqual(child.ran, [], 'the gated tool is still waiting for a human');
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-idem-park', role: 'tool', toolCallId: 'c1' } as any,
+    ))!;
+    assert.equal(row.error?.error, 'subagent-parked');
+    assert.equal(
+      row.childSessionId, parked._id,
+      'the parent must be pointed at the child that is ALREADY open — approving that one '
+      + 'is what completes the call',
+    );
+    const stillParked = (await AgentSessions.findOneAsync(parked._id))!;
+    assert.equal(stillParked.phase, 'awaiting', 'reuse must not disturb the parked child');
+  });
 });

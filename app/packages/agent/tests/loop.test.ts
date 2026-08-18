@@ -1909,6 +1909,102 @@ describe('approval gates', () => {
     assert.deepEqual(state!.ran, [], 'nothing was approved any more, so nothing runs');
   });
 
+  it('a wake refuses a verdict that is not the one it captured', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // The residual the boolean re-check could not see. "Is a verdict standing?"
+    // is a boolean answer to an IDENTITY question: verdict A can be consumed,
+    // the batch re-park on its NEXT gate, and a second verdict B be recorded —
+    // with its own resume already deferred — before the first timer fires.
+    // Three writes later the boolean still says yes, and the stale callback
+    // runs a turn behind the resume that legitimately owns B.
+    //
+    // Forced here through the wind-down read itself: the moment the self-check
+    // snapshots a session carrying verdict A with the lease already released,
+    // `pending` is replaced wholesale with a DIFFERENT verdict under a
+    // different token — exactly the document B's resume would have left.
+    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    let superseded = false;
+    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
+      const doc = await original(...args);
+      if (!superseded && doc?._id === 's-wake-token' && doc.pending?.verdict && !doc.lease) {
+        superseded = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token' } as any,
+          {
+            $set: {
+              pending: {
+                toolCallId: 'g2', name: 'refund', args: {},
+                verdict: 'approved', by: 'u1', wakeToken: 'TOKEN-B',
+              },
+            },
+          } as any,
+        );
+      }
+      return doc;
+    };
+
+    // Verdict A, stamped with its own token, injected on the park write with no
+    // defer of its own — so the winding-down run's self-check is the only thing
+    // that can act on it, exactly as the two tests above arrange.
+    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      const n = await originalUpdate(sel, mod, ...rest);
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token' } as any,
+          {
+            $set: {
+              'pending.verdict': 'approved',
+              'pending.by': 'u1',
+              'pending.wakeToken': 'TOKEN-A',
+              phase: 'idle',
+            },
+          } as any,
+        );
+      }
+      return n;
+    };
+
+    let state: { ran: string[]; providerCalls: number } | null = null;
+    try {
+      state = await buildFixture('s-wake-token', 'gate-wake-token', [
+        { id: 'g1', name: 'refund', gate: 'ask' },
+      ]);
+    } finally {
+      if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
+      else delete (AgentSessions as any).updateAsync;
+      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
+      else delete (AgentSessions as any).findOneAsync;
+    }
+    assert.isTrue(injected, 'verdict A must have landed on the park write');
+    assert.isTrue(superseded, 'verdict B must have replaced it inside the wake window');
+
+    // The deferred re-run fires on a zero timer; give it room to misbehave.
+    await new Promise((r) => { setTimeout(r, 400); });
+
+    assert.equal(
+      state!.providerCalls, 1,
+      'the wake must not run: the verdict standing is not the one it captured, and B '
+      + 'already has a resume of its own',
+    );
+    assert.lengthOf(
+      await AgentMessages
+        .find({ sessionId: 's-wake-token', role: 'assistant' }).fetchAsync(), 1,
+      'no extra assistant row may appear',
+    );
+    assert.deepEqual(state!.ran, [], 'and no tool may run for a verdict this wake never saw');
+    // B is left exactly as found — untouched, for the resume that owns it.
+    const doc = (await AgentSessions.findOneAsync('s-wake-token'))!;
+    assert.equal(doc.pending?.wakeToken, 'TOKEN-B');
+    assert.equal(doc.pending?.verdict, 'approved');
+  });
+
   it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
