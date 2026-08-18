@@ -127,14 +127,16 @@ function warnUncappedAgents(settings: any): void {
 }
 
 Meteor.startup(async () => {
+  // FIRST — before any `await` yields the event loop. A write-lockout is a
+  // security control, and it must not sit behind capped-collection or index
+  // setup: registering it synchronously means there is never a tick between
+  // boot and the deny where a client could slip a write past `insecure`.
+  denyAllClientWrites();
+
   await ensureCapped();
   // After ensureCapped and before anything serves: the watcher's sweeps and
   // every transcript read depend on these. Non-fatal by design — see the file.
   await ensureIndexes();
-  // BEFORE publications: shut the `insecure` write door before any client can
-  // subscribe. Ordering is not load-bearing (deny rules take effect whenever
-  // they register), but "locked before open for business" is the clearer story.
-  denyAllClientWrites();
   registerPublications();
   registerMethods();
   // `Meteor.settings.packages` is undefined whenever no `--settings` file was
