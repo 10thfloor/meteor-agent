@@ -6,6 +6,8 @@ import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
 import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
+import { MAX_SUBAGENT_DEPTH } from './subagent';
+import { ACTIVE_PHASES } from '../common/types';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -178,6 +180,67 @@ export async function recordTimeoutVerdict(sessionId: string): Promise<boolean> 
 }
 
 /**
+ * Stop the RUNNING DESCENDANTS of an interrupted session.
+ *
+ * Stop must stop the work the user can see. A parent that delegates spends most
+ * of its turn inside `runSubagent`, and stopping only the parent left the child
+ * streaming to completion on the parent's clock — tokens billed, a transcript
+ * growing, and a Stop button that had visibly done nothing. The chain is walked
+ * through `activeChild`, which is the live handle and is set for exactly as long
+ * as a dispatch is in flight (a child may itself be dispatching, hence a walk
+ * rather than a single hop).
+ *
+ * TWO THINGS IT WILL NOT DO.
+ *
+ * It will not touch a PARKED descendant. A child sitting in `awaiting` is a
+ * question in front of a human, and the parent's turn already gave up on it:
+ * `subagent-parked` told the model so, and the whole design of that answer is
+ * that the child stays open and answerable through `agent.approve` afterwards.
+ * Stopping it would cancel a decision the parent's interrupt was never about,
+ * and (because a stop is durable until the next `agent.send`) would strand a
+ * request nobody can ever answer — a parked child has no `send` path a UI
+ * offers. The phase filter is what encodes this: only `ACTIVE_PHASES` match,
+ * so `awaiting`, `idle`, `error` and an already-`stopped` descendant are all
+ * left exactly as they are.
+ *
+ * It will not recurse without a bound. `MAX_SUBAGENT_DEPTH` hops is the whole
+ * legal chain, so the cap is not a heuristic; it is also what keeps a stale or
+ * cyclic `activeChild` (a marker left behind by a lease steal mid-dispatch —
+ * the field's own docs call it a hint, not a contract) from turning a Stop into
+ * an unbounded walk.
+ *
+ * The writes are plain, unguarded `$set`s, exactly like the interrupt's own —
+ * and for the identical reason. There is no lease to hold: the interrupting
+ * CALLER owns no session, and the process driving the descendant is precisely
+ * the one this write is trying to reach. `stopped` is a terminal state every
+ * writer in the loop already defends (the commit, the park and the retry
+ * branch are all conditional on `phase: { $ne: 'stopped' }`, and the outer
+ * `finally` preserves it), so the worst a racing write can do is arrive at a
+ * session that has already finished — which the phase filter then declines to
+ * stop. The walk is a best-effort read of hints, so it neither retries nor
+ * reports: what makes the stop authoritative is the descendant's own mid-stream
+ * check, not this write's return value.
+ */
+async function stopRunningDescendants(sessionId: string): Promise<void> {
+  let current = await AgentSessions.findOneAsync(sessionId);
+  for (let hop = 0; hop < MAX_SUBAGENT_DEPTH; hop += 1) {
+    const next = current?.activeChild?.sessionId;
+    if (!next) return;
+    // eslint-disable-next-line no-await-in-loop
+    await AgentSessions.updateAsync(
+      { _id: next, phase: { $in: ACTIVE_PHASES } } as any,
+      { $set: { phase: 'stopped', updatedAt: new Date() } } as any,
+    );
+    // Re-read rather than trusting the write: the walk continues past a
+    // descendant it did NOT stop (a parked one, or one that finished a
+    // microsecond ago) because that descendant's own children — if it somehow
+    // has any in flight — are still the user's work.
+    // eslint-disable-next-line no-await-in-loop
+    current = await AgentSessions.findOneAsync(next);
+  }
+}
+
+/**
  * The shared body of `agent.approve` and `agent.deny`: authorize, decide once,
  * record the verdict in the transcript, and wake the parked run.
  *
@@ -330,6 +393,20 @@ export function registerMethods(): void {
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
       } as any);
+
+      // The named session first, its running descendants second. Order is not
+      // cosmetic: a subagent chain is driven from the top, so stopping the
+      // parent before the child means the parent cannot start ANOTHER child
+      // between the two writes (its next dispatch reads a stopped phase and
+      // abandons the batch). The reverse order leaves exactly that hole.
+      //
+      // Authorization is the parent's, and needs no addition: a child inherits
+      // its parent's `userId`, so anyone entitled to stop the parent is
+      // entitled to stop the work the parent started. There is no path from
+      // here to a session outside that lineage — `activeChild` is written only
+      // by a dispatch, only on the dispatching session, and only ever naming
+      // the child it just created.
+      await stopRunningDescendants(sessionId);
     },
 
     /**

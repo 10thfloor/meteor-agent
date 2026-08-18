@@ -65,7 +65,20 @@ export async function readTurnOutcome(sessionId: string): Promise<TurnOutcome> {
     return {
       ok: false,
       kind: 'failed',
-      reason: (note as any)?.error?.reason ?? 'The turn did not complete.',
+      // An INTERRUPT is the one terminal state that writes no note: the loop
+      // deletes the partial's deltas and returns, and `agent.interrupt` — which
+      // set the phase — is a method with a caller, not a turn with a
+      // transcript. So `stopped` with no note means exactly one thing, and
+      // saying it beats the generic sentence: with parent-interrupt
+      // propagation a stopped CHILD is now an everyday outcome, and "the
+      // subagent did not answer: the turn did not complete" would send a
+      // reader looking for a failure when the answer is "you pressed Stop".
+      // A BUDGET stop still reports its own note, which is more specific
+      // still, so this fallback never shadows one.
+      reason: (note as any)?.error?.reason
+        ?? (session.phase === 'stopped'
+          ? 'The turn was interrupted.'
+          : 'The turn did not complete.'),
     };
   }
 

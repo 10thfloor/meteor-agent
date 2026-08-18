@@ -176,6 +176,12 @@ function noteText(m: ViewMessage): string {
     return `${verdict}${m.reason ? ` — ${m.reason}` : ''}`;
   }
   if (m.kind === 'compaction') return '· earlier conversation compacted ·';
+  // The watcher's re-link. The row exists to be a HANDLE (it carries
+  // `childSessionId` + `childAgent`), so the sentence names the agent a reader
+  // would go looking for rather than the slug.
+  if (m.kind === 'orphan-child') {
+    return `· recovered subagent session${m.childAgent ? ` — ${m.childAgent}` : ''} ·`;
+  }
   return m.error?.reason ?? m.kind ?? '';
 }
 

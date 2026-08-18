@@ -148,16 +148,33 @@ export interface AgentMessage {
   thinking?: string;
   toolCalls?: AgentToolCall[];
   toolCallId?: string;
-  /** `role: 'tool'` rows answering a SUBAGENT call only: the child session the
-   *  call ran. It is the handle — a client holding this transcript subscribes
-   *  to `agent.session` with the child agent's name and this id to follow the
-   *  child's own live transcript. Present even when the result is an error
-   *  (`subagent-parked`, `subagent-failed`), because the child session exists
-   *  and is exactly what a human needs to look at; absent when no child was
-   *  ever created (`subagent-depth`, an unknown agent name). */
+  /** `role: 'tool'` rows answering a SUBAGENT call, and `kind: 'orphan-child'`
+   *  notes: the child session the call ran. It is the handle — a client holding
+   *  this transcript subscribes to `agent.session` with the child agent's name
+   *  and this id to follow the child's own live transcript. Present even when
+   *  the result is an error (`subagent-parked`, `subagent-failed`), because the
+   *  child session exists and is exactly what a human needs to look at; absent
+   *  when no child was ever created (`subagent-depth`, an unknown agent name).
+   *
+   *  These two row kinds are the ONLY carriers of the field, which is what lets
+   *  the watcher ask "is this child reachable from its parent's transcript at
+   *  all" with one query over `childSessionId` and no role filter. */
   childSessionId?: string;
+  /** `kind: 'orphan-child'` notes only: which AGENT the recovered child ran.
+   *  Subscribing to a child needs its agent name as well as its id
+   *  (`agent.session` is scoped by both), and the note is the only place a
+   *  client holding the parent transcript can learn it — the child session
+   *  document itself is not published to a client that cannot already name it. */
+  childAgent?: string;
   error?: { error: string; reason?: string };
-  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval';
+  /**
+   * `orphan-child`: the watcher found a child session whose parent transcript
+   * had no row naming it — a dispatch abandoned after the child was created and
+   * before its result row landed — and wrote this pointer so the child is
+   * reachable from the conversation again (§4.3). It answers no tool call and
+   * carries no result: the child's own transcript is the record of what it did.
+   */
+  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child';
   /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say
    *  "out of tool calls" rather than "budget exhausted" and an operator can
    *  raise the right one. The human-readable half lives in `error.reason`. */
@@ -166,6 +183,9 @@ export interface AgentMessage {
    *  transcript history a UI renders and an audit reads, not a sentence. */
   approved?: boolean;
   by?: string | null;
+  /** A structured TOKEN, not a sentence: `'approval timed out'` on a timeout
+   *  row, `'recovered'` on an `orphan-child` note. A UI renders its own prose
+   *  from it. */
   reason?: string;
   /** `kind: 'approval'` notes only, and only when true: the watcher denied this
    *  request because `budget.approval` elapsed with nobody answering (§4.3).

@@ -1,4 +1,4 @@
-import { AgentSessions } from '../common/collections';
+import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, type AgentSession, type Phase } from '../common/types';
 import { getAgent } from './registry';
 import { deferTurn, recordTimeoutVerdict } from './methods';
@@ -8,7 +8,7 @@ import { isRunning } from './loop';
  * §4.3. Recovery with nobody present.
  *
  * Every other entry point into a turn needs a person: a send, an approve, a
- * deny. That leaves three states no user action will ever clear —
+ * deny. That leaves four states no user action will ever clear —
  *
  *   1. An ORPHAN: a session parked in an active phase whose owner died. The
  *      lease expires and nothing notices, because noticing was the dead
@@ -21,19 +21,30 @@ import { isRunning } from './loop';
  *      window it can see; a process that dies inside that window leaves the
  *      verdict standing forever.
  *
- * This module NOTICES those three and CALLS the machinery that already handles
+ *   4. An ORPHANED CHILD: a subagent session whose parent transcript never got
+ *      the tool row that names it. The dispatch died between creating the child
+ *      and committing its result, so the child is real, finished (or claimable
+ *      by case 1) and reachable from NOTHING a client can see. Unlike the other
+ *      three there is no turn to resume here — the repair is a pointer.
+ *
+ * For 1–3 this module NOTICES and CALLS the machinery that already handles
  * them — `runTurn` (via `deferTurn`, so a recovered turn runs with exactly the
  * config a user-initiated one would) and `recordTimeoutVerdict` (via the same
  * single-winner conditional write a human verdict goes through). It contains no
  * repair logic, no lease logic and no verdict logic of its own: `claimLease` and
  * repair-on-entry are what make a recovered turn safe, and duplicating either
  * here would give the fleet two implementations of the thing that must be
- * exactly one.
+ * exactly one. Case 4 is the one exception, and only because there is nothing to
+ * delegate to: no other caller writes an `orphan-child` note, and the write
+ * itself is one transcript row through the same atomic-seq idiom `writeVerdict`
+ * uses for its own.
  *
  * Multi-server safety needs no new coordination for the same reason. Two servers
  * racing on one orphan resolve through `claimLease` (one wins, the loser's
  * `runTurn` returns without writing); racing on one timeout resolve through the
- * verdict's conditional write (one wins, the loser gets a quiet false).
+ * verdict's conditional write (one wins, the loser gets a quiet false); racing
+ * on one orphaned child resolve through the note's DERIVED `_id` (one wins, the
+ * loser's insert is a duplicate key it swallows).
  */
 
 /** Phases in which a turn is supposed to be RUNNING. A session sitting in one of
@@ -68,6 +79,21 @@ export interface WatcherOptions {
    * state has no other writer. Default one sweep interval, floored at 1s.
    */
   verdictGraceMs?: number;
+  /**
+   * How old a CHILD session must be before the sweep will re-link it (case 4).
+   *
+   * The same reasoning as `verdictGraceMs`, against a different race. A live
+   * dispatch writes the child session first and the parent's `activeChild`
+   * marker second; for the width of that one write a perfectly healthy child
+   * looks exactly like an abandoned one. The `activeChild` check is what
+   * normally excludes a live dispatch, and this is what covers the window
+   * BEFORE that marker exists.
+   *
+   * `createdAt` is the clock — a child's birth is the only moment that matters
+   * here, and it never moves. Default one sweep interval, floored at 1s; tests
+   * lower it to make a sweep observable.
+   */
+  relinkGraceMs?: number;
 }
 
 export interface Watcher {
@@ -120,6 +146,41 @@ function warnUnregisteredOnce(session: AgentSession, why: string): void {
   );
 }
 
+/** Warned-once child ids, for the same reason as `warnedUnregistered`: a child
+ *  whose parent document is gone matches every sweep forever, because the sweep
+ *  deliberately does not delete it. */
+const warnedParentless = new Set<string>();
+
+/**
+ * A child whose PARENT SESSION no longer exists.
+ *
+ * Nothing in the harness produces this today and the audit trail is worth more
+ * than the tidiness would be, so the sweep leaves the document exactly where it
+ * is and says so once. `Agent.ask` deletes its own headless session, and it
+ * cannot leave children behind: an `ask` session is a root (no `parent`), and a
+ * child of it would be created and finished INSIDE the turn `ask` awaits, so
+ * the delete happens after the child is already settled — the child survives,
+ * pointing at a parent id that resolves to nothing. That is the one shape this
+ * warning is really for. A fork does not copy `parent`, so a fork's source
+ * being deleted cannot orphan anything either.
+ *
+ * POLICY, stated so the next reader does not have to guess: a sweep NEVER
+ * deletes session data. Deciding that an unreachable child is garbage is a
+ * retention question (how long, whose consent, what about its transcript), and
+ * a background loop that quietly removes documents on a rule nobody configured
+ * is the worst possible place to answer it. Left for v4 alongside the rest of
+ * retention.
+ */
+function warnParentlessOnce(child: AgentSession): void {
+  if (warnedParentless.has(child._id)) return;
+  warnedParentless.add(child._id);
+  console.warn(
+    `[10thfloor:agent] watcher: child session ${child._id} names parent `
+    + `${child.parent?.sessionId} which no longer exists; leaving it in place `
+    + '(warned once per process)',
+  );
+}
+
 function wake(session: AgentSession, why: string): void {
   const config = getAgent(session.agent);
   if (!config) {
@@ -129,14 +190,115 @@ function wake(session: AgentSession, why: string): void {
   deferTurn(session._id, config, session.userId);
 }
 
+/**
+ * CASE 4 — children the parent transcript lost.
+ *
+ * THREE QUERIES for the whole sweep, not three per child. The candidate set is
+ * every child session older than the grace period, which in a healthy
+ * deployment is every child that ever ran — so a per-child parent lookup and a
+ * per-child transcript lookup would make this the most expensive thing the
+ * watcher does, forever, to discover that nothing is wrong. Batching by `$in`
+ * keeps the cost proportional to sweeps rather than to history.
+ *
+ * REACHABILITY is the test, and one query answers it: `childSessionId` is
+ * carried by exactly two kinds of row — the `role: 'tool'` result that answers
+ * the dispatch, and this note — so a child named by ANY row in its parent's
+ * transcript is already reachable and needs nothing. That single set gives both
+ * the claimed check (a) and the idempotence check (b) at once.
+ *
+ * What it deliberately does NOT read is the child's phase. A child still
+ * streaming under a dead server is the case that most needs a pointer (case 1
+ * will finish it, and the finished transcript should be reachable when it
+ * does); a settled one needs it just as much. The live-dispatch exclusion is
+ * `activeChild` plus the grace period, not liveness.
+ */
+async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Promise<void> {
+  const children = await AgentSessions.find(
+    { 'parent.sessionId': { $exists: true }, createdAt: { $lt: cutoff } } as any,
+    { fields: { agent: 1, parent: 1 } },
+  ).fetchAsync();
+  if (children.length === 0) return;
+
+  const parentIds = [...new Set(children.map((c) => c.parent!.sessionId))];
+  const parents = new Map(
+    (await AgentSessions.find(
+      { _id: { $in: parentIds } } as any, { fields: { activeChild: 1 } },
+    ).fetchAsync()).map((p) => [p._id, p] as [string, AgentSession]),
+  );
+  const reachable = new Set(
+    (await AgentMessages.find(
+      {
+        sessionId: { $in: parentIds },
+        childSessionId: { $in: children.map((c) => c._id) },
+      } as any,
+      { fields: { childSessionId: 1 } },
+    ).fetchAsync()).map((m) => m.childSessionId),
+  );
+
+  for (const child of children) {
+    if (isStopped()) return;
+    const parentId = child.parent!.sessionId;
+    const parent = parents.get(parentId);
+    if (!parent) { warnParentlessOnce(child); continue; }
+    // A dispatch in flight: the parent will write the tool row itself when the
+    // child resolves, and a note for a child that is about to be claimed is
+    // noise in a transcript a person reads.
+    if (parent.activeChild?.sessionId === child._id) continue;
+    if (reachable.has(child._id)) continue;
+
+    // The same atomic allocation `agent.send` and `writeVerdict` use, and for
+    // the same reason: the parent may be running a turn right now (this child
+    // is not that turn's business), and read-then-insert would hand this note
+    // the seq the running loop is about to commit its assistant at.
+    // eslint-disable-next-line no-await-in-loop
+    const before = await AgentSessions.rawCollection().findOneAndUpdate(
+      { _id: parentId },
+      { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
+      { returnDocument: 'before' },
+    );
+    // The parent went away between the two reads. Next sweep warns.
+    if (!before) continue;
+
+    try {
+      // DERIVED `_id`, not `Random.id()`: it is what makes "one note per child"
+      // hold across SERVERS, whose sweeps cannot see each other's reachability
+      // sets. The loser's insert fails on the primary key and the catch below
+      // swallows it, leaving the winner's row and a skipped seq — a gap in the
+      // sequence is already ordinary (`discardTurn` leaves them) and costs
+      // nothing but a number.
+      // eslint-disable-next-line no-await-in-loop
+      await AgentMessages.insertAsync({
+        _id: `orphan-child-${child._id}`,
+        sessionId: parentId,
+        seq: (before as any).nextSeq,
+        role: 'note',
+        kind: 'orphan-child',
+        childSessionId: child._id,
+        childAgent: child.agent,
+        reason: 'recovered',
+        createdAt: new Date(),
+      } as any);
+    } catch (e: any) {
+      // 11000 is the duplicate key another server's sweep just won (matched on
+      // the message too, because what wraps a driver error on the way through
+      // Meteor's collection layer is not this module's to assume). Anything
+      // else is a real write failure and belongs in the sweep's error handler.
+      const duplicate = e?.code === 11000 || /duplicate key/i.test(String(e?.message ?? ''));
+      if (!duplicate) throw e;
+    }
+  }
+}
+
 export function startWatcher(opts: WatcherOptions = {}): Watcher {
   const sweepMs = opts.sweepMs ?? 15_000;
   const verdictGraceMs = opts.verdictGraceMs ?? Math.max(sweepMs, 1000);
+  const relinkGraceMs = opts.relinkGraceMs ?? Math.max(sweepMs, 1000);
 
   let stopped = false;
 
   /**
-   * One sweep. Three queries, one wake per session.
+   * One sweep. Three queries for the three wake/timeout cases (one wake per
+   * session), then case 4's three of its own.
    *
    * Cases 1 and 3 both end in the same call, and a session can match both (an
    * active phase, no lease, and a standing verdict is one document), so they are
@@ -207,6 +369,12 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       // eslint-disable-next-line no-await-in-loop
       await recordTimeoutVerdict(session._id);
     }
+
+    // CASE 4 — a child nothing points at. Last, and awaited: it competes with
+    // nothing above (no session it touches is one the wakes above can be
+    // driving) and it is the only case that writes a transcript row of its own.
+    if (stopped) return;
+    await relinkOrphanChildren(new Date(now.getTime() - relinkGraceMs), () => stopped);
   };
 
   /** In-flight sweep, so `stop()` can await it. A sweep that outlives its

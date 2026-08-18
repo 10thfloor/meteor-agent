@@ -180,8 +180,10 @@ continues. Omit it and a parked request waits forever.
 **Provider failures** retry with exponential backoff under `phase:'retrying'`;
 auth/request errors fail immediately. Either terminal failure writes a
 `kind:'error'` note and sets `phase:'error'`; the next `send` clears it and
-tries again. Your transcript UI should render three note kinds: `error`,
-`budget`, and `approval`.
+tries again. Your transcript UI should render four note kinds: `error`,
+`budget`, `approval`, and `orphan-child` (a recovered subagent session — see
+*Recovery runs itself*; it carries `childSessionId` and `childAgent` rather than
+prose).
 
 **Rate limits** come from settings — this shape in `settings.json`:
 
@@ -212,10 +214,18 @@ turn budget applies to it, so an unlimited one is a cheaper `send` with
 sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
 mid-turn) and re-runs the turn, which repairs its own transcript on entry. A
 15s sweep backs the observer up, because a lease can expire without any document
-change to observe, and the same sweep enforces `budget.approval` and picks up a
-verdict whose resume died before consuming it. Two servers racing on one session
-resolve through the lease and the verdict's conditional write — one winner, no
-new coordination. Turn it off with
+change to observe, and the same sweep enforces `budget.approval`, picks up a
+verdict whose resume died before consuming it, and **re-links orphaned
+children**: a subagent dispatch that died between creating the child session and
+committing its result leaves a real child that no published document points at,
+so the sweep writes a `role: 'note', kind: 'orphan-child'` row into the *parent*
+transcript carrying `childSessionId` and `childAgent` — the handle a client
+needs to find it again. One note per child, and never for a child the parent is
+actively dispatching. It writes a pointer and nothing else: a sweep never
+deletes session data, so a child whose parent document is gone entirely is
+warned about once per process and left standing. Two servers racing on one
+session resolve through the lease, the verdict's conditional write, and the
+note's derived `_id` — one winner, no new coordination. Turn it off with
 `{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
 `startWatcher({ sweepMs })` yourself.
 
@@ -734,9 +744,17 @@ subagent-heavy parent from two directions: the parent's `toolCalls` caps how
 many consultations happen, and each child agent's `spend` caps what one may
 cost.
 
-Three operational truths to design around: **interrupting the parent does not
-interrupt a running child** — the child streams to completion on its own budget
-and the parent picks up afterwards; **a re-dispatched subagent call reuses the
+Three operational truths to design around: **interrupting the parent interrupts
+its running descendants** — `agent.interrupt` walks the `activeChild` chain (to
+the same three-hop depth cap) and stops every descendant currently *running*,
+because Stop has to stop the work the user can see; the child honors it through
+the same mid-stream check an interrupt aimed at the child directly would use, so
+it commits no assistant row, and the parent's tool call is answered
+`subagent-failed` with an interrupted reason — an answered batch, so the parent
+transcript stays resumable with the next `send`. A **parked** descendant is
+deliberately *not* touched: it is a question in front of a human, the parent
+already gave up on it (`subagent-parked`) and stopping it would strand a request
+nobody could answer; **a re-dispatched subagent call reuses the
 child it already opened** — a parent turn abandoned mid-batch (lease steal,
 crash) is re-dispatched by recovery, and the lookup that runs before any child
 is created finds the earlier one by `(parent session, tool call id, agent,
@@ -747,9 +765,11 @@ parent transcript names it), which is precisely the state a discard leaves
 behind. Two cases still open a second child: a provider that mints a fresh call
 id on the retry (nothing links the two dispatches), and a child that is still
 mid-run when the parent is re-dispatched (it has no outcome to report, and the
-parent may not block on work it does not own). And: an abandoned batch's
-discarded tool rows can leave a completed child session with no durable pointer
-to it from any transcript.
+parent may not block on work it does not own); **and a child left with no
+pointer is re-linked, not lost** — when an abandoned batch's discarded tool rows
+leave a child session that no transcript names, the watcher's sweep writes the
+`orphan-child` note described under *Recovery runs itself*, so it is reachable
+from the parent conversation again within a sweep interval.
 
 ## Forking
 

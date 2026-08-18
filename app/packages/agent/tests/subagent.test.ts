@@ -867,4 +867,143 @@ describe('subagents: budgets and the live handle', () => {
     const stillParked = (await AgentSessions.findOneAsync(parked._id))!;
     assert.equal(stillParked.phase, 'awaiting', 'reuse must not disturb the parked child');
   });
+
+  /**
+   * STOP MUST STOP THE WORK THE USER SEES.
+   *
+   * A parent that delegates spends its turn inside the child's stream, so an
+   * interrupt that stopped only the parent left the child streaming to
+   * completion — tokens billed, a transcript growing, and a Stop button that
+   * had visibly done nothing. `mInterrupt` now walks `activeChild` and stops
+   * every RUNNING descendant.
+   */
+  it('a parent interrupt stops the running child, and the parent records why', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    let chunksAfterStop = 0;
+    new Agent('int-child', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: {
+        async *stream() {
+          yield { kind: 'text', chunk: 'half a thought' };
+          // The user presses Stop on the PARENT, mid-child-stream. Through the
+          // real method, because the propagation walk lives in it.
+          const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+          await interrupt.call({ userId: 'u1' }, 'int-parent', 's-interrupt-parent');
+          // Keep streaming: nothing here ends the turn. The CHILD's own
+          // mid-stream phase check is what has to notice, exactly as it would
+          // for an interrupt aimed at the child directly.
+          for (let i = 0; i < 400; i += 1) {
+            chunksAfterStop += 1;
+            yield { kind: 'text', chunk: '.' };
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 20); });
+          }
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      },
+    } as any);
+
+    await seedRoot('s-interrupt-parent', 'int-parent');
+    await runTurn('s-interrupt-parent', {
+      model: 'mock',
+      system: '',
+      tools: [{ subagent: 'int-child', description: 'the child that gets stopped' }],
+      provider: mockProvider((req) => (
+        req.messages.some((m) => m.role === 'tool')
+          ? { text: 'never reached' }
+          : { toolCalls: [{ id: 'ic1', name: 'int-child', args: { prompt: 'think hard' } }] }
+      )),
+    });
+
+    const child = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-interrupt-parent' } as any,
+    ))!;
+    assert.isDefined(child, 'the child session persists — a stop is not a delete');
+    assert.equal(child.phase, 'stopped', 'the interrupt reached the descendant');
+    assert.isBelow(
+      chunksAfterStop, 400,
+      'the child stopped consuming its stream rather than running it to the end',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: child._id, role: 'assistant' }).countAsync(), 0,
+      'an interrupted turn commits no assistant row',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: child._id, kind: 'orphan-child' } as any).countAsync(),
+      0,
+    );
+
+    // The parent still holds its lease through the wind-down, so the tool row
+    // lands: the batch is ANSWERED, which is what keeps the transcript legal
+    // for the provider on the next send.
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-interrupt-parent', role: 'tool' } as any,
+    ))!;
+    assert.isDefined(row, 'a stopped child still answers the parent call it was dispatched for');
+    assert.equal(row.toolCallId, 'ic1');
+    assert.equal(row.error?.error, 'subagent-failed');
+    assert.include(
+      row.error!.reason!, 'interrupted',
+      'the reason must say the user stopped it, not that the child mysteriously failed',
+    );
+    assert.equal(row.childSessionId, child._id, 'and still points at the child to inspect');
+
+    const parent = (await AgentSessions.findOneAsync('s-interrupt-parent'))!;
+    assert.equal(parent.phase, 'stopped');
+    assert.isUndefined(parent.activeChild, 'the live marker is cleared on every exit');
+    const assistants = await AgentMessages
+      .find({ sessionId: 's-interrupt-parent', role: 'assistant' } as any).fetchAsync();
+    assert.lengthOf(assistants, 1, 'the interrupted parent asked the model exactly once');
+    assert.deepEqual(
+      (assistants[0].toolCalls ?? []).map((c) => c.id), ['ic1'],
+      'and its one tool_use has the matching tool_result above — the transcript is resumable',
+    );
+  });
+
+  it('a parent interrupt does not stop a PARKED descendant', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const { row } = await parkFixture('s-interrupt-parked', 'int-parked-child');
+    const childId = row.childSessionId!;
+    assert.equal(
+      (await AgentSessions.findOneAsync(childId))!.phase, 'awaiting',
+      'the fixture leaves a child waiting on a human',
+    );
+
+    // The stale marker the field's own docs warn about: a dispatch that lost
+    // its lease cannot clear `activeChild`, so a parked child CAN still be
+    // named by one. That is the only way the walk ever reaches a parked
+    // session, and it is exactly the case the phase filter exists for.
+    await AgentSessions.updateAsync('s-interrupt-parked', {
+      $set: { activeChild: { sessionId: childId, toolCallId: 'g1' } },
+    } as any);
+
+    const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+    await interrupt.call({ userId: 'u1' }, 'park-parent', 's-interrupt-parked');
+
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-interrupt-parked'))!.phase, 'stopped',
+      'the named session is stopped as always',
+    );
+    const child = (await AgentSessions.findOneAsync(childId))!;
+    assert.equal(
+      child.phase, 'awaiting',
+      'a parked child is a question in front of a human: the parent already gave up on it '
+      + '(subagent-parked) and stopping it would strand a request nobody can answer',
+    );
+    assert.isDefined(child.pending, 'and the request itself is untouched');
+    assert.isUndefined(child.pending!.verdict);
+  });
 });
