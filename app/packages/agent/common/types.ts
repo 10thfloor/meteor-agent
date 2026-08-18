@@ -37,6 +37,28 @@ export const ACTIVE_PHASES: Phase[] = ['streaming', 'calling', 'retrying', 'comp
  */
 export const DECIDED_PHASES: Phase[] = ['stopped', 'error', 'awaiting'];
 
+/**
+ * The dotted session-counter paths a `$inc` may name.
+ *
+ * Mongo modifier keys are STRINGS, so `{ $inc: { 'budgetSpent.toolCall': 1 } }`
+ * — a typo for `toolCalls` — type-checks fine as a plain object and silently
+ * disables the budget it was meant to raise. That is the one bug class the
+ * type gate could not otherwise catch (the collection writes go through
+ * `rawCollection()`, whose driver types the modifier as `any`). Constraining
+ * every counter `$inc` to `SessionInc` turns that typo back into a compile
+ * error. Add a path here when you add a counter; a stray key is then rejected.
+ */
+export type SessionCounterPath =
+  | 'nextSeq'
+  | 'budgetSpent.turns'
+  | 'budgetSpent.toolCalls'
+  | 'usage.input'
+  | 'usage.output'
+  | 'usage.cost';
+
+/** A `$inc` payload over the session counters — see `SessionCounterPath`. */
+export type SessionInc = Partial<Record<SessionCounterPath, number>>;
+
 export interface Usage { input: number; output: number; cost: number }
 
 export interface AgentSession {

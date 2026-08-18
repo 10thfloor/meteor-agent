@@ -1,6 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import { DECIDED_PHASES, type AgentMessage, type AgentSession } from '../common/types';
+import { DECIDED_PHASES, type AgentMessage, type AgentSession, type SessionInc } from '../common/types';
 import type { Provider, ProviderMessage, ToolSchema } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
@@ -269,7 +269,11 @@ export function _setBackoff(fn: typeof backoffDelay | null): () => void {
  */
 async function allocateSeq(
   sessionId: string,
-  inc: Record<string, number> = {},
+  // Typed to the counter-path union, not `Record<string, number>`: this is the
+  // funnel every committing turn's budget/usage `$inc` passes through, so a
+  // mistyped path here is a compile error rather than a silently-dropped
+  // increment. See `SessionInc`.
+  inc: SessionInc = {},
 ): Promise<number | null> {
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     { _id: sessionId, 'lease.serverId': SERVER_ID } as any,

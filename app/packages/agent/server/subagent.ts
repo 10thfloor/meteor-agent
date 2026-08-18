@@ -1,6 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { ACTIVE_PHASES, type AgentSession } from '../common/types';
+import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
 import { buildRunConfig, getAgent } from './registry';
 import { guardedUpdate, SERVER_ID } from './lease';
 import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
@@ -391,7 +391,7 @@ export async function runSubagent(
     // turn budget, as a `send` would.
     const before = await AgentSessions.rawCollection().findOneAndUpdate(
       { _id: childSessionId },
-      { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 }, $set: { updatedAt: new Date() } },
+      { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
       { returnDocument: 'before' },
     );
     if (!before) {

@@ -417,3 +417,23 @@ V4 SPACE (consolidated, for the audits to triage against):
      do. Minor next to the interleaving finding, which coalescing cannot help at all.
   7. No standing guard on compiled-vs-interpreted divergence: six rejection cases are pinned,
      nothing detects a future typebox release disagreeing on a seventh.
+
+== M5 AUDITS + FIXES ==
+Code review (cold-eyes) + Security review (attack-surface) both run. Verdicts: code "careful code,
+poor safety net" — 1 Critical (no type-check in CI), 3 High; security 0 Critical, 3 High, 8 Medium
+(+ strong positive findings confirming auth model / sanitization / runAs containment are sound).
+Security wave (cafadbc + 69a5ed3): deny-rules (safety vs insecure, moved before first await),
+startable agents (+fork guard), uncapped-agent startup warn, canUse on approval-resume, compact
+budget check, MCP name-shadow + schema pattern/format strip + reason clamp, wakeToken projection,
+error.reason clamp. Code/tooling wave (f506a7f): tsconfig + @types/meteor shim + CI typecheck job
+(tsc --noEmit CLEAN), typebox as direct peer, DECIDED_PHASES dedup (6 sites), docs drift (7 items;
+format-enforcement CONFIRMED+tested).
+CONTROLLER FIX on the Critical: the delivered type gate did NOT catch the audit's headline typo
+(`$inc: {'budgetSpent.toolCall'}` — Mongo keys are strings under `as any`/rawCollection). Added
+SessionCounterPath/SessionInc union; narrowed allocateSeq + `satisfies SessionInc` on 5 raw
+findOneAndUpdate sites. VERIFIED: the exact typo is now TS2353. CI comment corrected to state the
+real reach (counter paths yes; arbitrary string modifier paths still unchecked = the as-any burndown).
+DEFERRED to v4: loop.ts 2113-line file split (maintainability, risky post-audit); the as-any burndown;
+security Mediums M7 watcher-scan-growth (has index now, unbounded set remains), M8 hook fail-open
+opt-in, M6 length caps (partial: clamps added, no check-time text ceiling); parentless-child retention.
+Suite: 334 (+2 pending) server + 7 client.

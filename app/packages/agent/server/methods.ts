@@ -7,7 +7,7 @@ import { getAgent, buildRunConfig, type AgentConfig } from './registry';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
 import { MAX_SUBAGENT_DEPTH } from './subagent';
-import { ACTIVE_PHASES } from '../common/types';
+import { ACTIVE_PHASES, type SessionInc } from '../common/types';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -116,7 +116,7 @@ async function writeVerdict(
   // with a running turn.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     { _id: sessionId },
-    { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
+    { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
     { returnDocument: 'before' },
   );
   if (before) {
@@ -369,7 +369,7 @@ export function registerMethods(): void {
       const before = await AgentSessions.rawCollection().findOneAndUpdate(
         turnFilter,
         {
-          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 },
+          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc,
           $set: { updatedAt: new Date() },
         },
         { returnDocument: 'before' },

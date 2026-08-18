@@ -34,10 +34,15 @@ jobs:
 
       - name: Type-check the package
         working-directory: app
-        # No emit — Meteor transpiles by stripping types, so this is the ONLY
-        # gate that catches a mistyped Mongo field (e.g. `budgetSpent.toolCall`)
-        # that would otherwise compile and silently disable a budget. A type
-        # error MUST fail the build; `tsc` exits non-zero on any diagnostic.
+        # No emit — Meteor transpiles by stripping types, so this is the only
+        # gate that type-checks the package at all: signatures, imports,
+        # property access, return drift, and — because the session counters go
+        # through the `SessionInc` union — a mistyped `$inc` path like
+        # `budgetSpent.toolCall` that would otherwise compile and silently
+        # disable a budget. A type error MUST fail the build; `tsc` exits
+        # non-zero on any diagnostic. (Arbitrary string modifier paths OUTSIDE
+        # the counter set remain unchecked — the `as any` collection casts are
+        # the follow-on burndown, tracked in the ledger.)
         run: npx tsc --noEmit
 
   test:

@@ -1,3 +1,4 @@
+import type { SessionInc } from '../common/types';
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
@@ -90,7 +91,7 @@ export class Agent {
       // runs so the accounting a nested run inherits is the real one.
       const before = await AgentSessions.rawCollection().findOneAndUpdate(
         { _id: sessionId },
-        { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 }, $set: { updatedAt: new Date() } },
+        { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
         { returnDocument: 'before' },
       );
       if (!before) throw new Meteor.Error('ask-failed', 'The throwaway session vanished.');
