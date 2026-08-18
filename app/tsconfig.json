@@ -1,0 +1,39 @@
+{
+  // Type-check-ONLY config (never emits): Meteor transpiles by stripping types,
+  // so nothing here compiles the app — `tsc --noEmit` exists purely to catch the
+  // one class of bug Meteor's build silently ships, a mistyped field name in a
+  // `$set`/`$inc` (e.g. `budgetSpent.toolCall`) that quietly disables a budget.
+  // The goal is catching typos, NOT a zero-`any` codebase: the package leans on
+  // Mongo's loosely-typed modifiers and Meteor globals, so `strict` is on but the
+  // known-residual surface is documented in .superpowers/sdd/audit-fix-code.md.
+  "compilerOptions": {
+    "noEmit": true,
+    "strict": true,
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "bundler",
+    "lib": ["ES2023", "DOM"],
+    "types": ["meteor", "mocha", "chai", "node"],
+    "allowJs": false,
+    "skipLibCheck": true,
+    "esModuleInterop": true,
+    "resolveJsonModule": true,
+    "forceConsistentCasingInFileNames": true,
+    "noImplicitAny": false,
+    "useUnknownInCatchVariables": false,
+    "paths": {
+      // The package imports its own public surface through the Meteor namespace
+      // (`meteor/10thfloor:agent`); off the Meteor build there is no such module,
+      // so point it at the client entry that re-exports that surface.
+      "meteor/10thfloor:agent": ["./packages/agent/client/index.ts"]
+    }
+  },
+  "include": [
+    "packages/agent/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".meteor"
+  ]
+}

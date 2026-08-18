@@ -1,6 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import type { AgentMessage, AgentSession } from '../common/types';
+import { DECIDED_PHASES, type AgentMessage, type AgentSession } from '../common/types';
 import type { Provider, ProviderMessage, ToolSchema } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
@@ -734,7 +734,7 @@ async function compactNow(
     {
       _id: sessionId,
       'lease.serverId': SERVER_ID,
-      phase: { $nin: ['stopped', 'awaiting', 'error'] },
+      phase: { $nin: DECIDED_PHASES },
     } as any,
     { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
   );
@@ -954,7 +954,7 @@ export async function compactSession(
       // honors it) and an approval nobody has answered are decisions, not
       // states to tidy up.
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && !['stopped', 'error', 'awaiting'].includes(current.phase)) {
+      if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, {
           $set: { phase: 'idle', updatedAt: new Date() },
         });
@@ -2103,9 +2103,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // being asked) that the phase exists to preserve. For `awaiting` the
       // damage would be worse than cosmetic: approve/deny only fire on that
       // phase, so idling it back would strand the parked call permanently.
-      const terminal = ['stopped', 'error', 'awaiting'];
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && !terminal.includes(current.phase)) {
+      if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
       }
       await releaseLease(sessionId);
@@ -2137,7 +2136,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // the finally's terminal list: a failed turn is not ours to wake, and
       // the two lists disagreeing was itself a reviewed defect.
       if (after?.pending?.verdict
-        && after.phase !== 'awaiting' && after.phase !== 'stopped' && after.phase !== 'error'
+        && !DECIDED_PHASES.includes(after.phase)
         && !running.has(sessionId)) {
         // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
         // with every verdict, so this is identity where the old re-check had
@@ -2168,8 +2167,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
             if (!still?.pending?.verdict
               || still.pending.wakeToken !== wakeToken
-              || still.phase === 'awaiting' || still.phase === 'stopped'
-              || still.phase === 'error' || running.has(sessionId)) return;
+              || DECIDED_PHASES.includes(still.phase) || running.has(sessionId)) return;
             await runTurn(sessionId, config);
           })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);

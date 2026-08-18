@@ -27,11 +27,18 @@ one when `MCP_LIVE_TEST=1` is.
 
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
-The package has exactly two app-level npm peers — `@earendil-works/pi-ai` and
-`@modelcontextprotocol/sdk` — and neither is ever an `Npm.depends`. pi-ai is
-**pre-1.0 and its API has moved during this project** (0.73 → 0.84 renamed the
-scope and reshaped the streaming surface); the MCP SDK is post-1.0 but ships
-weekly. The package survives both because of three rules — keep them:
+The package has three app-level npm dependencies — `@earendil-works/pi-ai`,
+`@modelcontextprotocol/sdk`, and `typebox` — and none is ever an `Npm.depends`.
+pi-ai is **pre-1.0 and its API has moved during this project** (0.73 → 0.84
+renamed the scope and reshaped the streaming surface); the MCP SDK is post-1.0
+but ships weekly; typebox is post-1.0 and its `Compile`/`Value` surface is
+probed off the installed files exactly as the other two are. The first two are
+genuinely optional peers (see below); typebox is a **direct dependency** —
+argument validation degrades to a structural checker without it, but it must be
+pinned directly rather than leaned on as a transitive of pi-ai, because a pi-ai
+bump or a hoisting change could otherwise remove it and, worse, make
+`defineAgentMethod` throw at registration when full validation is expected. The
+package survives all three because of three rules — keep them:
 
 1. **Each dependency is imported by exactly one file.** pi-ai (and typebox)
    only by `server/providers/loader.ts`, reached elsewhere through
@@ -76,8 +83,11 @@ weekly. The package survives both because of three rules — keep them:
      `MCP_LIVE_TEST=1` (it spawns `npx -y @modelcontextprotocol/server-everything`
      and is the only test that proves the real protocol round trip).
 
-The app pins `^0.84.2` and `^1.30.0`. Do not widen either range in a commit that
-changes anything else.
+The app pins `^0.84.2` (pi-ai), `^1.30.0` (MCP SDK), and `^1.3.7` (typebox). Do
+not widen any range in a commit that changes anything else. A typebox bump is a
+verification event too: run the suite (the tools suite pins the full ladder and
+`format` enforcement) and re-read the `Compile`/`Value` probe notes at the top
+of `server/tools.ts`.
 
 **Both peers are genuinely optional, and that is a property to preserve.** An
 app that installs neither still runs agents: the MCP SDK is reached only by a

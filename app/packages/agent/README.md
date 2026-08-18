@@ -5,10 +5,19 @@ streaming tokens are a capped collection, and tools are Meteor methods.
 
 ## Install
 
+The package is **not yet published to Atmosphere**. Vendor it into your app's
+`packages/` directory (or add it as a git submodule / `METEOR_PACKAGE_DIRS`
+entry) so that `meteor add 10thfloor:agent` resolves it locally:
+
 ```bash
 meteor add 10thfloor:agent
-meteor npm install --save @earendil-works/pi-ai
+meteor npm install --save @earendil-works/pi-ai typebox
 ```
+
+`typebox` powers full argument validation. It happens to be a transitive
+dependency of `@earendil-works/pi-ai` today, but install it directly so a pi-ai
+bump or a hoisting change cannot remove it — see CONTRIBUTING's dependency
+policy.
 
 **Remove `insecure` and `autopublish`** from your app (`meteor remove insecure
 autopublish`) — the defaults Meteor ships in every new app. `autopublish` would
@@ -177,13 +186,22 @@ next call, since a bad argument answers the call rather than failing the turn.
 Inline tools are checked the same way, against the **whole** JSON Schema —
 `enum`, `const`, numeric and length bounds, `pattern`, `format`, `minItems`,
 `oneOf`/`anyOf`, `additionalProperties: false`, internal `$ref`, and nested
-`properties`/`items` are all enforced. The checker is typebox's `Value.Check`,
-loaded lazily through the same seam the pi-ai provider uses; typebox already
-ships as a dependency of `@earendil-works/pi-ai`, so nothing new to install.
-One upgrade note: `format` is now ENFORCED (`format: 'uri'` rejects a
-non-URI), where JSON Schema treats it as annotation by default — a schema that
-used `format` decoratively will start rejecting arguments that never matched
-it. Unknown format names are still tolerated.
+`properties`/`items` are all enforced. The default checker compiles each
+schema once with typebox's `Compile` and reuses the compiled checker for every
+later call (`Compile(schema).Check`, cached weakly on the schema object);
+typebox's interpreted `Value.Check` is the fallback rung, used only when the
+compiler is unreachable. Both are loaded lazily through the same seam the pi-ai
+provider uses. typebox is a direct dependency of the demo app (`meteor npm
+install typebox`) — see the dependency policy in CONTRIBUTING. The full ladder
+is documented under Operations.
+
+`format` is ENFORCED, not treated as a decorative annotation: `format: 'uri'`
+rejects a non-URI, where bare JSON Schema treats `format` as an annotation by
+default. typebox 1.x ships its string formats registered, so this needs no
+setup of your own; a schema that used `format` decoratively will reject
+arguments that never matched it. Unknown format names are still tolerated. The
+tools suite pins this (`ENFORCES \`format\`` in `tests/tools.test.ts`) so a
+typebox bump that reverted to annotation-only would fail loudly.
 
 If typebox cannot be loaded, the package logs **one** warning and falls back to
 a minimal structural checker — `type`, object `required`/`properties`, array
@@ -222,10 +240,11 @@ continues. Omit it and a parked request waits forever.
 **Provider failures** retry with exponential backoff under `phase:'retrying'`;
 auth/request errors fail immediately. Either terminal failure writes a
 `kind:'error'` note and sets `phase:'error'`; the next `send` clears it and
-tries again. Your transcript UI should render four note kinds: `error`,
-`budget`, `approval`, and `orphan-child` (a recovered subagent session — see
-*Recovery runs itself*; it carries `childSessionId` and `childAgent` rather than
-prose).
+tries again. Your transcript UI should render five note kinds: `error`,
+`budget`, `approval`, `compaction` (an earlier stretch of the conversation was
+summarized — see *Compaction*), and `orphan-child` (a recovered subagent
+session — see *Recovery runs itself*; it carries `childSessionId` and
+`childAgent` rather than prose).
 
 **Rate limits** come from settings — this shape in `settings.json`:
 
@@ -434,9 +453,15 @@ caches both for the life of the process — never one connection per tool. Call
 **A server that is down never fails a turn.** A named tool stays listed (with a
 placeholder description) and answers `mcp-unavailable`, which the model reads
 and routes around; a whole-server spec contributes no tools that turn and logs
-one warning. Nothing about the failure is cached, so the next turn — or the
-next call — reconnects. The same is true mid-session: if the child dies, the
-connection is dropped and rebuilt on the next use.
+one warning. A failed open starts a **cooldown** (default 30s,
+`MCP_FAILURE_COOLDOWN_MS`): the next spawn attempt within that window is
+suppressed and answers `mcp-unavailable` immediately rather than paying the
+connect timeout again, so one dead server cannot make every turn slow. Once the
+window elapses the next turn — or the next call — reconnects. Set `cooldownMs`
+on the server spec to tune the window, or `0` to disable it and retry on every
+call. Re-registering a server clears its cooldown (no waiting out the window
+after a config fix). The same is true mid-session: if the child dies, the
+connection is dropped and rebuilt after the cooldown on the next use.
 
 **Results** map to tool rows the ordinary way: text content items concatenate,
 and anything else becomes a `[image content omitted]`-style marker rather than
@@ -790,7 +815,7 @@ The element owns one session and repaints the whole list on every delta —
 free at chat scale, and deliberately so: it buys zero diffing code. If you are
 rendering thousands of rows, or you want a layout this does not have, drop to
 `Agent` directly (["Use it from the client"](#use-it-from-the-client)) and
-render it yourself. `client/element.ts` is ~450 lines including its CSS and is
+render it yourself. `client/element.ts` is ~534 lines including its CSS and is
 meant to be read as the worked example. The pre-element version of the demo —
 the same UI with no custom element at all — is in git history at
 `git show ad0dc0b:app/client/main.js`, and remains the shortest proof that none
@@ -1132,7 +1157,7 @@ minimum; treat the aggregate ceiling as the operator's responsibility.
 
 ## Scope
 
-**This is what v2 means now: the whole list, shipped.**
+**Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**
 
 The production core (milestone 2): the pi-ai provider by default, retry with
 backoff and error surfacing, approval gates, budgets and cost accounting, DDP
@@ -1162,6 +1187,27 @@ Milestone 4 finished the v2 list:
   name registry (see **Providers**), **manual `compact()`** (see **Define an
   agent**), **`runAs`** on tool specs (see **`runAs` — a tool with a fixed
   identity**), and a **rate-limit entry for approvals**.
+
+Milestone 5 (v3) shipped on top of that list:
+
+- **Predicate gates** — `gate` may be a function that reads the arguments and
+  the caller, not only the tool name (see **Tools**).
+- **Per-agent hooks** — `agentInstance.hook(...)` beside the global
+  `Agent.hook(...)`, globals running first (see **Hooks**).
+- **Idempotent subagent dispatch** — a recovered parent turn reuses the child
+  it already created rather than running a second one (see **Subagents**).
+- **Orphan re-link** — the sweep writes an `orphan-child` pointer into the
+  parent transcript when a dispatch died before committing its result, so no
+  child is stranded (see *Recovery runs itself*).
+- **Interrupt propagation** — Stop walks the `activeChild` chain and stops the
+  subagent work the user can actually see.
+- **Compiled argument validation** — the default checker compiles each schema
+  once with typebox's `Compile` and caches it, with `Value.Check` as the
+  interpreted fallback rung (see **Operations**).
+- **Startup indexes** — the transcript read and the watcher's sweeps stopped
+  being collection scans.
+- **A `tool_args` delta clamp** — one runaway argument stream can no longer
+  evict every other session's tokens from the capped delta collection.
 
 **The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
 `afterToolResult` are the two seams this package offers an app for changing what

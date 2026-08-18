@@ -1,5 +1,5 @@
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { ACTIVE_PHASES, type AgentSession, type Phase } from '../common/types';
+import { ACTIVE_PHASES, DECIDED_PHASES, type AgentSession } from '../common/types';
 import { getAgent } from './registry';
 import { deferTurn, recordTimeoutVerdict } from './methods';
 import { isRunning } from './loop';
@@ -57,8 +57,9 @@ export { ACTIVE_PHASES };
  *  wake self-check excludes: `awaiting` is a live question for a human,
  *  `stopped` is an interrupt that outranks any standing verdict until the next
  *  send, and `error` is a failed turn whose note is already in the transcript.
- *  The two lists disagreeing was a reviewed defect once; they must stay equal. */
-const WAKE_EXCLUDED: Phase[] = ['awaiting', 'stopped', 'error'];
+ *  The two lists disagreeing was a reviewed defect once; they now share ONE
+ *  definition (`DECIDED_PHASES` in `common/types`) so they cannot drift. */
+const WAKE_EXCLUDED = DECIDED_PHASES;
 
 export interface WatcherOptions {
   /** How often the sweep runs. Default 15s; tests lower it. */

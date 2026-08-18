@@ -303,6 +303,11 @@ export function registerMethods(): void {
   Meteor.methods({
     async [NAMES.mStart](this: any, agent: string, opts?: { title?: string }) {
       check(agent, String);
+      // Read the title BEFORE the `check` assertion: @types/meteor's
+      // `check(x, Match.Maybe({...}))` narrows `x` to a type whose object
+      // fields resolve to `never`, so `opts?.title` read afterwards fails to
+      // type-check even though the value is a plain `string | undefined`.
+      const title = opts?.title;
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
@@ -318,7 +323,7 @@ export function registerMethods(): void {
       }
       const _id = Random.id();
       await AgentSessions.insertAsync({
-        _id, agent, userId: this.userId ?? null, title: opts?.title,
+        _id, agent, userId: this.userId ?? null, title,
         phase: 'idle', model: config.model, nextSeq: 0,
         usage: { input: 0, output: 0, cost: 0 },
         budgetSpent: { turns: 0, toolCalls: 0 },
@@ -451,6 +456,9 @@ export function registerMethods(): void {
       check(agent, String);
       check(sessionId, String);
       check(atSeq, Match.Maybe(Match.Integer));
+      // Read before the assertion — see mStart: @types/meteor narrows `opts`
+      // to a `never`-fielded type after this `check`.
+      const title = opts?.title;
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       // The registry check mirrors mStart/mSend: forking into an agent this
       // server does not define would produce a session nothing can ever run.
@@ -468,7 +476,7 @@ export function registerMethods(): void {
       // `Match.Maybe` accepts null as well as undefined, and DDP turns a
       // trailing `undefined` argument into null on the wire — so normalize
       // rather than letting a null `atSeq` reach the arithmetic downstream.
-      return forkSession(source, { atSeq: atSeq ?? undefined, title: opts?.title });
+      return forkSession(source, { atSeq: atSeq ?? undefined, title });
     },
 
     /**

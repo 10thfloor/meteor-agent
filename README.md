@@ -136,12 +136,14 @@ send() ─▶ method (authorize, atomic seq) ─▶ lease claim ─▶ turn loop
                      └──done──▶ [messages]  (committed at boundaries only)
 ```
 
-Five documents' worth of design reasoning — the lease model, the repair
-invariants, the approval-gate semantics, why the merge walks backward — live
-in [`docs/superpowers/specs/`](docs/superpowers/specs/), and every mechanism
-was built against failure-injection tests (lease steals mid-stream, crashes
-between a tool call and its result, racing approvers, jittered retries). The
-review history that shaped the invariants is preserved in the milestone plans
+The design reasoning — the lease model, the repair invariants, the
+approval-gate semantics, why the merge walks backward — lives in the design
+spec ([`docs/superpowers/specs/`](docs/superpowers/specs/)), and the five
+milestone plans that built on it are in
+[`docs/superpowers/plans/`](docs/superpowers/plans/). Every mechanism was built
+against failure-injection tests (lease steals mid-stream, crashes between a tool
+call and its result, racing approvers, jittered retries), and the review
+history that shaped the invariants is preserved in those milestone plans
 alongside the spec.
 
 ## Project layout

@@ -10,6 +10,36 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  typecheck:
+    name: Type-check (tsc --noEmit)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Meteor
+        run: curl https://install.meteor.com/?release=3.5 | sh
+
+      - name: Cache Meteor packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.meteor
+            app/.meteor/local
+          key: meteor-3.5-typecheck-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
+
+      - name: npm install
+        working-directory: app
+        run: meteor npm ci || meteor npm install
+
+      - name: Type-check the package
+        working-directory: app
+        # No emit — Meteor transpiles by stripping types, so this is the ONLY
+        # gate that catches a mistyped Mongo field (e.g. `budgetSpent.toolCall`)
+        # that would otherwise compile and silently disable a budget. A type
+        # error MUST fail the build; `tsc` exits non-zero on any diagnostic.
+        run: npx tsc --noEmit
+
   test:
     name: Package suite (server + client)
     runs-on: ubuntu-latest

@@ -1404,7 +1404,7 @@ describe('approval gates', () => {
     // turn, and the loop must exit still parked rather than re-streaming over
     // an unanswered tool_use.
     await runTurn('s-park-repair', {
-      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider as Provider,
     });
 
     const msgs = await AgentMessages
@@ -2031,7 +2031,7 @@ describe('approval gates', () => {
     } as any);
 
     await runTurn('s-stop-verdict', {
-      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider as Provider,
     });
 
     assert.deepEqual(state.ran, [], 'a stop must cancel an approved tool that has not run yet');

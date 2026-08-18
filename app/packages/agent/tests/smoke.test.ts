@@ -3,6 +3,7 @@ import { NAMES, DELTA_CAP_BYTES } from '../common/names';
 import {
   AgentSessions, AgentMessages, AgentDeltas,
 } from '../common/collections';
+import { ACTIVE_PHASES, DECIDED_PHASES, type Phase } from '../common/types';
 
 describe('10thfloor:agent scaffold', () => {
   it('exposes stable collection names', () => {
@@ -13,6 +14,46 @@ describe('10thfloor:agent scaffold', () => {
 
   it('sizes the delta cap in bytes', () => {
     assert.isAbove(DELTA_CAP_BYTES, 1024 * 1024);
+  });
+});
+
+/**
+ * H-DECIDED-PHASES. `ACTIVE_PHASES` (running) and `DECIDED_PHASES` (settled)
+ * are each a single definition in `common/types` precisely so the six inline
+ * copies of the terminal list cannot drift. This pins the invariant that gives
+ * them meaning: the two are disjoint and together cover every `Phase` except
+ * the one deliberately-neither phase, `idle`. Enumerating the whole union here
+ * means adding a new `Phase` breaks this test until it is classified as active,
+ * decided, or explicitly neither — the compile-time union has no other guard.
+ */
+describe('phase classification is a partition (H-DECIDED-PHASES)', () => {
+  const ALL_PHASES: Phase[] = [
+    'idle', 'streaming', 'calling', 'awaiting',
+    'compacting', 'retrying', 'stopped', 'error',
+  ];
+  const NEITHER: Phase[] = ['idle'];
+
+  it('active and decided sets do not overlap', () => {
+    const overlap = ACTIVE_PHASES.filter((p) => DECIDED_PHASES.includes(p));
+    assert.deepEqual(overlap, [], `phases in both ACTIVE and DECIDED: ${overlap.join(', ')}`);
+  });
+
+  it('active + decided + neither cover every Phase exactly once', () => {
+    const union = [...ACTIVE_PHASES, ...DECIDED_PHASES, ...NEITHER].sort();
+    assert.deepEqual(
+      union,
+      [...ALL_PHASES].sort(),
+      'every Phase must be classified as active, decided, or explicitly neither',
+    );
+    assert.equal(
+      union.length,
+      new Set(union).size,
+      'no Phase may appear in more than one classification',
+    );
+  });
+
+  it('pins the exact decided set', () => {
+    assert.deepEqual([...DECIDED_PHASES].sort(), ['awaiting', 'error', 'stopped']);
   });
 });
 

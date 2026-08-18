@@ -15,6 +15,28 @@ export type Phase =
  */
 export const ACTIVE_PHASES: Phase[] = ['streaming', 'calling', 'retrying', 'compacting'];
 
+/**
+ * Phases in which a turn has been DECIDED and is not the harness's to wake or
+ * idle back: `stopped` is a deliberate interrupt that outranks any standing
+ * verdict until the next send, `error` is a failed turn whose note is already
+ * in the transcript, and `awaiting` is a live approval question a human still
+ * owns (idling it would strand the parked call — approve/deny only fire on that
+ * phase).
+ *
+ * ONE definition, deliberately — the same rule as `ACTIVE_PHASES` above. This
+ * exact three-element set was written out inline six times (the loop's `$nin`
+ * entry guard, its two winding-down `finally` blocks, the two wake self-checks,
+ * and the watcher's wake exclusions); those copies disagreeing about whether
+ * `error` belonged was itself a reviewed defect. A new terminal phase must be
+ * added here and nowhere else.
+ *
+ * Note the partition: `ACTIVE_PHASES` (running) and `DECIDED_PHASES` (settled)
+ * are disjoint and together cover every phase except `idle` — the only phase
+ * that is neither mid-run nor decided. The unit test asserts that split so a
+ * newly added `Phase` cannot be silently left unclassified.
+ */
+export const DECIDED_PHASES: Phase[] = ['stopped', 'error', 'awaiting'];
+
 export interface Usage { input: number; output: number; cost: number }
 
 export interface AgentSession {
