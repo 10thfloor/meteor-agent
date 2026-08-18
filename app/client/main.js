@@ -32,7 +32,16 @@ Meteor.startup(() => {
   // Self-healing across a wiped database: if the server no longer knows the
   // saved session, the first send fails and we drop the id so the next reload
   // starts clean.
-  chat.addEventListener('agent-chat:error', () => {
+  //
+  // ONLY on `no-session`. The element emits `agent-chat:error` for every method
+  // rejection it surfaces — a rate limit, a dropped connection, a budget
+  // refusal — and forgetting the session on any of them threw away a perfectly
+  // live conversation because the user clicked Send twice too quickly. The
+  // detail's `error` is the raw rejection (a `Meteor.Error`, whose `.error` is
+  // the machine-readable code), and `no-session` is the one the server sends
+  // when it genuinely does not have this session.
+  chat.addEventListener('agent-chat:error', (e) => {
+    if (e.detail?.error?.error !== 'no-session') return;
     localStorage.removeItem(SESSION_KEY);
   });
 

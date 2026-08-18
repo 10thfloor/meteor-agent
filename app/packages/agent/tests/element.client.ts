@@ -179,6 +179,15 @@ describe('<agent-chat>', () => {
       part(el, 'approval-text').textContent ?? '', 'refund',
       'the bar must name the tool the agent wants to run',
     );
+    // …and WHO it will run as. The fixture's tool carries `runAs`, so the
+    // approver is authorizing an escalation, not an ordinary call — free to
+    // assert here (no extra DDP calls, see the budget note above) and the only
+    // end-to-end proof that `pending.runAs` survives park, publication and
+    // render.
+    assert.include(
+      part(el, 'approval-text').textContent ?? '', 'runs as refund-service',
+      'a parked tool with runAs must say so in front of the approver',
+    );
     assert.equal(part(el, 'phase').textContent, 'awaiting');
 
     part<HTMLButtonElement>(el, 'approve').click();
@@ -277,6 +286,47 @@ describe('<agent-chat>', () => {
     assert.isUndefined(
       (window as any).__xss,
       'and nothing in it may execute — no onerror, no inline script',
+    );
+  });
+
+  /**
+   * LAST in the file: it resets the fixtures' collections, which the tests
+   * above reuse across each other.
+   *
+   * Re-pointing an element takes two attribute writes, and attributes arrive
+   * one at a time. Attaching on each of them made the INTERMEDIATE combination
+   * real — session-id removed, old agent still in place — which has no session
+   * and therefore auto-STARTS one, on the server, that nothing will ever
+   * render. The generation guard hides it from the client, which is exactly why
+   * the assertion has to be a server-side count.
+   */
+  it('coalesces synchronous attribute churn into ONE attach, with no orphan session', async function () {
+    this.timeout(60000);
+    await Meteor.callAsync('itest.reset');
+
+    // A session id nobody has: the publication authorizes nothing and serves
+    // nothing, which is all this needs — the element is attached and quiet, and
+    // it has cost the rate limiter no `agent.start` at all.
+    const el = mount({ agent: 'itest', 'session-id': 'no-such-session' });
+    await waitFor('the element to settle on the given session', 20000, () =>
+      el.sessionId === 'no-such-session');
+
+    // The churn, synchronously, in the order a host would write it.
+    el.removeAttribute('session-id');
+    el.setAttribute('agent', 'itest-gate');
+
+    await waitFor('the coalesced attach to start exactly one session', 30000, () =>
+      !!el.sessionId && el.sessionId !== 'no-such-session');
+    // A stray start would have been issued BEFORE the surviving one and, on one
+    // ordered DDP connection, answered before it too — so it is already in the
+    // database by now. The pause is belt and braces.
+    await new Promise((resolve) => { setTimeout(resolve, 500); });
+
+    const counts = await Meteor.callAsync('itest.sessionCounts');
+    assert.deepEqual(
+      counts, { 'itest-gate': 1 },
+      'exactly one session, for the agent the attributes FINALLY named — an `itest` '
+      + 'session here is the orphan the intermediate attribute state used to start',
     );
   });
 });

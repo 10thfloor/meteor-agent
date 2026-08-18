@@ -286,6 +286,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  attribute — so without this flag a `<agent-chat agent="x">` already in
      *  the markup would attach three times over. */
     private live = false;
+    /** A re-attach is already queued for the end of this microtask — see
+     *  `queueReattach`. */
+    private reattachQueued = false;
+    /** The generation the queued re-attach expects to still be current. */
+    private reattachGeneration = -1;
     private failure: string | null = null;
 
     constructor() {
@@ -337,12 +342,53 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     attributeChangedCallback(name: string, before: string | null, after: string | null) {
       if (before === after || !this.live) return;
       if (name === 'placeholder') { this.applyPlaceholder(); return; }
-      // `agent` or `session-id`: a clean re-subscribe. detach() stops the old
-      // subscription and merge computation and clears the view, so nothing of
-      // the previous session survives into the next one.
+      // `agent` or `session-id`: a clean re-subscribe, COALESCED — see
+      // `queueReattach`.
+      this.queueReattach();
+    }
+
+    /**
+     * Tear down now, re-attach once, at the end of the microtask.
+     *
+     * Attributes are set one at a time and re-pointing an element routinely
+     * takes two of them (`el.removeAttribute('session-id')` then
+     * `el.setAttribute('agent', …)`, or a framework patching both in one
+     * render). Attaching on each callback made the INTERMEDIATE combination
+     * real: the element with the session-id removed and the old agent still in
+     * place has no session, so `attach()` called `start()` — and a moment later
+     * the second attribute landed, detached, and started again. The generation
+     * guard stopped the first session from ever being rendered, which is
+     * precisely the problem: it was created on the server, owned by nobody, and
+     * left in the user's session list. One orphan per re-point.
+     *
+     * The DETACH still happens synchronously, on every callback. It is what
+     * stops the old subscription and bumps the generation, and an in-flight
+     * `start()` must be orphaned the instant the attributes stop describing it,
+     * not a microtask later.
+     *
+     * The re-attach is deferred to a microtask and deduped, so a run of
+     * synchronous attribute writes produces exactly ONE attach, against the
+     * attribute values as they finally stand. The generation captured after the
+     * detach is the guard: any connect, disconnect or further churn in between
+     * bumps it, and the queued attach — now describing a state that no longer
+     * exists — does nothing.
+     */
+    private queueReattach() {
       this.detach();
       this.failure = null;
-      this.attach();
+      // The LATEST detach's generation, on a field rather than in the closure:
+      // the second write of a churn re-detaches (bumping the generation again)
+      // but does not queue a second microtask, so a captured local would leave
+      // the one queued callback comparing against a stale number and skipping
+      // the attach entirely.
+      this.reattachGeneration = this.generation;
+      if (this.reattachQueued) return;
+      this.reattachQueued = true;
+      queueMicrotask(() => {
+        this.reattachQueued = false;
+        if (!this.live || this.generation !== this.reattachGeneration) return;
+        this.attach();
+      });
     }
 
     private applyPlaceholder() {
@@ -420,8 +466,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const parked = !!ask && !ask.verdict;
       (this.ui.approval as HTMLElement).hidden = !parked;
       if (parked) {
+        // `runAs` is announced whenever the parked tool has one, because the
+        // person clicking Approve is authorizing an IDENTITY as well as an
+        // action: a tool that runs as `service-account` is not the same request
+        // as one that runs as them. Presence, not truthiness — `null` is the
+        // anonymous service context and says so in words, while an absent field
+        // means the ordinary case (the tool runs as the session's owner) and
+        // adds nothing to the sentence.
+        const runsAs = ask.runAs === undefined
+          ? '' : ` — runs as ${ask.runAs ?? 'anonymous'}`;
         this.ui.approvalText.textContent =
-          `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})`;
+          `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})${runsAs}`;
       }
     }
 

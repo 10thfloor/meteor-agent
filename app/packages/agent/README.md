@@ -108,6 +108,38 @@ tools: [
 `args` is a JSON Schema — it is what the model is shown, and what its arguments
 are checked against.
 
+**`gate`** decides whether a call happens at all, and every tool kind takes it —
+inline, adopted, subagent and MCP alike, since it is read before the dispatch:
+
+```ts
+gate: 'auto'                                   // the default: just run it
+gate: 'ask'                                    // park the turn for a human
+gate: ({ userId, sessionId, name, args }) =>   // …or decide per call
+  (args.amount < 50 ? true : 'ask')            // sync or async
+```
+
+A predicate returns `true` (run it), `'ask'` (park, exactly as the literal), or
+`false` — a structured `{ error: 'denied-by-gate' }` **tool result**, not a
+park: the model reads the refusal, routes around it, and the rest of the batch
+still runs. Nobody is troubled, and no `toolCalls` budget is spent, because
+nothing was dispatched. The predicate's `userId` is the **caller's** — the
+session's owner. `runAs` is deliberately not consulted: it says what identity
+the tool *body* runs under once the call is allowed, and letting it answer the
+gate's question would be the escalation approving itself.
+
+A predicate that throws, or returns anything that is not those three values,
+**fails closed** to the denied result with one warning per failure kind: a gate
+whose own code is broken must not run the tool, and must not kill the turn
+either. A `gate` that is neither a literal nor a function throws at define time
+rather than resolving to a silently ungated tool.
+
+Gates are evaluated at **every** dispatch: approving one call of a batch says
+nothing about the next one, and a batch resumed after an approval re-gates its
+remainder. The one exception is the approved call itself, which is dispatched
+rather than re-gated — a human has already answered the question, in writing, in
+the transcript, and a predicate reading mutable state routinely gives a
+different answer by the time somebody clicks Approve.
+
 **Co-registration** defines the method and the tool at once, so your UI and the
 model call the same code through the same schema:
 
@@ -477,12 +509,35 @@ Agent.hook('beforeProviderRequest', (req, ctx) => {
 });
 ```
 
-Registration is **global**, not per agent: a hook is installed into the process,
-exactly as a Pi extension is, and threading a hook list through `RunConfig`
-would mean every entry into a turn (a send, watcher recovery, `ask`, a
-subagent's child run) had to remember to carry it — and one that forgot would
-silently skip your redaction. Every `ctx` carries the agent's name, so a
-per-agent hook is one `if` away; per-agent *registration* is a v3 candidate.
+Registration comes in two scopes. `Agent.hook(...)` is **global** — a hook is
+installed into the process, exactly as a Pi extension is — and
+`agentInstance.hook(...)` is that agent's own:
+
+```ts
+Support.hook('beforeProviderRequest', (req) => ({
+  ...req, system: `${req.system}\n\n${supportPlaybook()}`,
+}));
+```
+
+Same seams, same three rules, same failure handling; the only difference is
+scope. It runs when the session's agent is this one — and a **child** session
+reports the child's agent, so a subagent's hooks are the subagent's, not its
+parent's. The agent need not be `define()`d yet: hooks are matched by name at
+run time, so the order your server files happen to load does not matter.
+
+**Order: every global hook first, in registration order, then that agent's, in
+registration order.** Specificity, not privilege — the same rule CSS uses: the
+per-agent hook refines the process-wide policy and gets the last word, exactly
+as a later global hook refines an earlier one. It is not a security boundary in
+either direction (a global hook could always be overruled by a second global
+hook registered after it), so a redaction that must hold everywhere belongs in
+one place, not in two chains arguing.
+
+Neither scope touches `RunConfig`: threading a hook list through it would mean
+every entry into a turn (a send, watcher recovery, `ask`, a subagent's child
+run) had to remember to carry it — and the one that forgot would silently skip
+your redaction. `Agent.clearHooks()` clears **both** scopes;
+`agentInstance.clearHooks()` clears only that agent's.
 
 ## Use it from the client
 
@@ -514,6 +569,14 @@ if (ask) await Support.approve(sessionId);
 // …or refuse, with a reason the model gets to see:
 await Support.deny(sessionId, 'too large');
 ```
+
+`pending` also carries **`runAs`** when the parked tool has one (`null` = the
+anonymous service context), because an approver is authorizing an identity as
+well as an action: a call that runs as `service-account` is not the same request
+as one that runs as them. The key is **absent** when the tool runs as the
+session's own owner, so test it with `'runAs' in ask`, never for truthiness.
+`<agent-chat>` appends "— runs as \<id|anonymous\>" to the approval bar, and the
+`kind: 'approval'` note records it so the audit row says *what* was authorized.
 
 Nothing waits server-side while a session is parked — no process, no timer — so
 the request survives a deploy, and the verdict is what resumes the turn (give
@@ -583,6 +646,13 @@ framework never re-renders it.
 | `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
 | `placeholder` | Composer hint. |
 
+Re-pointing the element usually takes two attribute writes
+(`removeAttribute('session-id')`, then `setAttribute('agent', …)`), and
+attributes arrive one at a time. The teardown is immediate but the **re-attach
+is coalesced into one microtask**, so a run of synchronous writes re-subscribes
+exactly once, against the attributes as they finally stand — the intermediate
+combination never gets far enough to auto-start a session nothing will render.
+
 ### Auto-start, and remembering the session
 
 With no `session-id`, the element calls `start()` when it connects and then
@@ -603,8 +673,12 @@ exactly this, in `app/client/main.js`.
 A method rejection — a rate limit, a dropped connection, a session the server
 no longer has — is shown as an error note in the transcript *and* emitted as
 **`agent-chat:error`** (`detail: { error, message }`), which is how the demo
-knows to forget a stale saved id. Text that failed to send is put back in the
-composer rather than swallowed.
+knows to forget a stale saved id. Branch on the **code** when you do that:
+`detail.error` is the raw rejection, so the demo forgets its saved session only
+on `detail.error.error === 'no-session'` — forgetting it on every rejection
+throws away a live conversation the moment somebody clicks Send twice too
+quickly. Text that failed to send is put back in the composer rather than
+swallowed.
 
 ### Theming
 

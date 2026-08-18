@@ -65,6 +65,10 @@ new Agent(GATED, {
     name: 'refund',
     description: 'Refund an order.',
     gate: 'ask',
+    // The escalation the approval bar has to announce: the browser half asserts
+    // the rendered "runs as" line, which is the only end-to-end proof that
+    // `pending.runAs` survives the park, the publication and the render.
+    runAs: 'refund-service',
     args: { type: 'object', properties: {} },
     run: async () => ({ refunded: true, amount: 42 }),
   }],
@@ -80,5 +84,20 @@ Meteor.methods({
     await AgentSessions.removeAsync({});
     await AgentMessages.removeAsync({});
     await AgentDeltas.removeAsync({});
+  },
+  /**
+   * How many sessions exist, per agent — the probe the element's
+   * attribute-churn test counts starts with.
+   *
+   * An ORPHANED auto-start is invisible from the client: the element's
+   * generation guard drops the resolved session id, so the only evidence that a
+   * session was created at all is on the server. Hence a probe rather than an
+   * assertion on the element.
+   */
+  async 'itest.sessionCounts'() {
+    const rows = await AgentSessions.find({}, { fields: { agent: 1 } }).fetchAsync();
+    const counts: Record<string, number> = {};
+    for (const s of rows) counts[s.agent] = (counts[s.agent] ?? 0) + 1;
+    return counts;
   },
 });

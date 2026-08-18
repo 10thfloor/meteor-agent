@@ -7,7 +7,8 @@ import {
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
 import {
-  expandMcpTools, resolveTools, runTool, toolSchemas, withSkillTool,
+  evaluateGate, expandMcpTools, gateDeniedResult, resolveTools, runTool, toolSchemas,
+  withSkillTool,
   type ResolvedTool, type Skill, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
 import { runSubagent, type SubagentDispatch } from './subagent';
@@ -1091,12 +1092,17 @@ interface TurnAnchor {
 
 /**
  * Dispatch tool calls for one committed assistant, in order, answering each
- * with a `tool` row — or parking the turn on the first `gate: 'ask'` call.
+ * with a `tool` row — or parking the turn on the first call whose gate asks.
  *
  * Shared by the streaming path and the resume path so a call is gated by the
  * SAME rule wherever it is reached: approving one call says nothing about the
  * next one, and a batch resumed after an approval must re-gate its remainder
  * rather than inherit the verdict.
+ *
+ * Every gate form is decided here and only here — the literal `'auto'`/`'ask'`
+ * and the predicate alike (`evaluateGate`). A predicate that refuses answers the
+ * call with a structured `denied-by-gate` row and the batch carries on; only an
+ * `'ask'` parks.
  */
 async function dispatchCalls(
   sessionId: string,
@@ -1114,6 +1120,37 @@ async function dispatchCalls(
     agent: turn.agent, sessionId, userId: turn.userId,
   };
 
+  /**
+   * Answer a call that was REFUSED before dispatch — a `canUse` backstop or a
+   * predicate gate that said no.
+   *
+   * One helper for both because the write is subtle in the same three ways
+   * every time and a second copy would drift on all three: the refusal goes
+   * through `afterToolResult` (a row entering a published transcript is exactly
+   * what that seam is for), the seq allocation carries NO `toolCalls` charge
+   * (nothing was dispatched, so nothing was spent), and the row's `error` comes
+   * back from the serializer rather than from the refusal we started with — a
+   * hook may have turned it into a success.
+   *
+   * Returns false when the seq could not be allocated, i.e. the turn is gone.
+   */
+  const refuse = async (
+    call: { id: string; name: string; args: unknown }, refusal: ToolResult,
+  ): Promise<boolean> => {
+    const result = await runAfterToolResult(refusal, call, hookCtx);
+    const seq = await allocateSeq(sessionId);
+    if (seq === null) return false;
+    const row = toolResultContent(result, limits.maxResultChars);
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq, role: 'tool',
+      toolCallId: call.id,
+      content: row.content,
+      error: row.error,
+      createdAt: new Date(),
+    } as any);
+    return true;
+  };
+
   for (const call of calls) {
     // §7's backstop, BEFORE the gate: a tool the agent may not use must never
     // park either — asking a human to approve a call the config forbids is a
@@ -1121,27 +1158,10 @@ async function dispatchCalls(
     // nothing dispatched), and the model routes around it.
     if (limits.canUse
       && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
-      // Through the hook like every other row: a refusal is still something
-      // entering a published transcript, and `afterToolResult`'s contract is
-      // that nothing reaches a row unseen.
-      const denied: ToolResult = await runAfterToolResult({
+      if (!(await refuse(call, {
         ok: false,
         error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
-      }, call, hookCtx);
-      const deniedSeq = await allocateSeq(sessionId);
-      if (deniedSeq === null) return abandon();
-      // `error` comes back from the serializer with the content: a hook may
-      // turn this refusal into a SUCCESS (`ToolResult` carries `error` only on
-      // the failing arm, but a hook is app code and hands back what it likes),
-      // and a result that cannot be serialized at all carries its own.
-      const deniedRow = toolResultContent(denied, limits.maxResultChars);
-      await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
-        toolCallId: call.id,
-        content: deniedRow.content,
-        error: deniedRow.error,
-        createdAt: new Date(),
-      } as any);
+      }))) return abandon();
       continue;
     }
     // Ownership is checked BEFORE dispatch, not after. Adopted tools are real
@@ -1185,7 +1205,38 @@ async function dispatchCalls(
 
     const tool = tools.find((t) => t.name === call.name);
 
-    if ((tool?.gate ?? 'auto') === 'ask') {
+    /**
+     * THE gate site — the only place in the package where a gate is read.
+     *
+     * Two dispatch paths reach it (the streaming batch, and a resumed park's
+     * re-dispatch of the calls it never got to), which is what makes "approving
+     * one call says nothing about the next" true by construction rather than by
+     * two implementations agreeing. The APPROVED call's own resume deliberately
+     * does not come through here: see `resumeParkedTurn`.
+     *
+     * `turn.userId` is the session's owner — the caller. A `runAs` tool's
+     * escalated identity is not consulted, on purpose: the gate decides whether
+     * the call happens at all, and letting the escalation answer that question
+     * would be the escalation approving itself (see the GATES note in tools.ts).
+     *
+     * A predicate that throws lands here as `'denied'`, never as an exception:
+     * a broken gate must not run the tool, and must not kill the turn either.
+     */
+    const decision = await evaluateGate(tool, {
+      userId: turn.userId, sessionId, name: call.name, args: call.args,
+    });
+
+    if (decision === 'denied') {
+      // A RESULT, not a park and not an abandonment. The model reads
+      // `denied-by-gate`, routes around it, and the rest of the batch runs —
+      // exactly the `canUse` shape above, and for the same reason: a refusal
+      // nobody may overturn has no business waiting on a human. No `toolCalls`
+      // budget is spent; nothing was dispatched.
+      if (!(await refuse(call, gateDeniedResult(call.name)))) return abandon();
+      continue;
+    }
+
+    if (decision === 'ask') {
       // Park by EXITING: no process waits here, no timer runs, nothing is
       // held. The committed assistant plus this marker plus `phase:
       // 'awaiting'` ARE the parked state, so it survives a deploy, a crash and
@@ -1215,6 +1266,18 @@ async function dispatchCalls(
               // no key at all.
               ...(tool?.kind === 'mcp' && tool.mcp?.server
                 ? { mcpServer: tool.mcp.server } : {}),
+              // WHO the tool will run as, in front of the person deciding.
+              // An approver being asked to authorize `billing.credit` is
+              // entitled to know it will run as `service-account` and not as
+              // them — that is the difference between approving a request and
+              // approving an escalation.
+              //
+              // `!== undefined`, never truthiness: `runAs: null` is the
+              // ANONYMOUS service context, a deliberate value, and a `null`
+              // written here is exactly what tells a UI to render "anonymous"
+              // rather than nothing at all. Absent means the tool runs as the
+              // session's own user, which needs no announcement.
+              ...(tool?.runAs !== undefined ? { runAs: tool.runAs } : {}),
             },
             updatedAt: new Date(),
           },
@@ -1415,6 +1478,17 @@ async function resumeParkedTurn(
       // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
       // approved by a human opens its child session here exactly as an
       // ungated one would have opened it there.
+      //
+      // THE GATE IS NOT RE-EVALUATED HERE, deliberately, and this is the one
+      // place in the package where that is true. The gate's question is "may
+      // this call happen?"; a human has just answered it, in writing, in the
+      // transcript. Asking a predicate again would let it overturn an explicit
+      // authorization — and a predicate that reads mutable state (a balance, a
+      // shift roster, the clock) routinely gives a different answer minutes
+      // later, which is exactly how long an approval sits on someone's screen.
+      // The remainder of the batch is a different matter and IS re-gated: it
+      // goes back through `dispatchCalls` below, where nobody has approved
+      // anything.
       ({ result, childSessionId } = await dispatchTool(tool, call.args, {
         userId, sessionId, toolCallId: call.id,
       }));

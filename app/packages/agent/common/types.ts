@@ -63,6 +63,22 @@ export interface AgentSession {
      */
     mcpServer?: string;
     /**
+     * WHO the parked tool will run as, put in front of the person deciding.
+     *
+     * Present only when the tool's spec carries `runAs` — and `null` is a real
+     * value there (the ANONYMOUS service context), which is why every check on
+     * this field is `!== undefined` and never truthiness. ABSENT means the tool
+     * runs as the session's own owner, which needs no announcement.
+     *
+     * An approver being asked to authorize `billing.credit` is entitled to know
+     * it will run as `service-account` rather than as them: that is the
+     * difference between approving a request and approving an escalation.
+     * `<agent-chat>` renders it as "— runs as <id|anonymous>" in the approval
+     * bar, and the `kind: 'approval'` note records it so the audit row says what
+     * was authorized and not merely that something was.
+     */
+    runAs?: string | null;
+    /**
      * IDENTITY for the wake this verdict schedules, stamped by `writeVerdict`
      * in the same atomic write as the verdict itself.
      *
@@ -183,6 +199,14 @@ export interface AgentMessage {
    *  transcript history a UI renders and an audit reads, not a sentence. */
   approved?: boolean;
   by?: string | null;
+  /** `kind: 'approval'` notes only, and only when the parked tool carried a
+   *  `runAs`: the identity the approved call runs under (`null` = the anonymous
+   *  service context). Copied from `pending.runAs` so the audit row records WHAT
+   *  was authorized, not merely that someone said yes — an approval of a call
+   *  that runs as `service-account` is a different fact from an approval of one
+   *  that runs as the approver. Absent when the tool runs as the session's
+   *  owner. */
+  runAs?: string | null;
   /** A structured TOKEN, not a sentence: `'approval timed out'` on a timeout
    *  row, `'recovered'` on an `orphan-child` note. A UI renders its own prose
    *  from it. */

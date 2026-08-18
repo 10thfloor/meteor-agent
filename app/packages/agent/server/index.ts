@@ -19,6 +19,9 @@ export {
   type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
   type ArgsValidator, type TypeboxValue, type Skill, type ToolResult,
+  // The gate surface. `Gate` is what a spec's `gate` accepts; `GateContext` is
+  // what an app's predicate is handed, and is the one type it has to name.
+  type Gate, type GateContext, type GatePredicate,
 } from './tools';
 export type {
   HookName, HookMap, HookPurpose, HookToolCall,

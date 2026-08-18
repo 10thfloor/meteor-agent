@@ -825,4 +825,94 @@ describe('hooks', () => {
     });
   });
 
+  /**
+   * PER-AGENT hooks (v3). Same two seams, scoped by `ctx.agent` — which is read
+   * off the SESSION document, so a child session reports the child's agent and
+   * a subagent's hooks are the subagent's.
+   */
+  it('a per-agent hook runs only for its own agent, and clears on its own', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: string | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req.system;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    const run = (sessionId: string) => runTurn(sessionId, {
+      model: 'mock', system: 'base', tools: [], provider: capturing,
+    });
+
+    const mine = new Agent('hk-mine');
+    try {
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+GLOBAL` }));
+      mine.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+MINE` }));
+
+      await seed('hk-scoped-mine', 'hi', 'hk-mine');
+      await run('hk-scoped-mine');
+      assert.equal(seen, 'base+GLOBAL+MINE');
+
+      // A DIFFERENT agent, same process, same global hook: the per-agent one
+      // must not follow it. This is the assertion the whole feature is for —
+      // without it, `agentInstance.hook` would just be `Agent.hook` with extra
+      // syntax.
+      await seed('hk-scoped-other', 'hi', 'hk-other');
+      await run('hk-scoped-other');
+      assert.equal(seen, 'base+GLOBAL', "another agent must not see hk-mine's hook");
+
+      // The narrow half of the test seam: one agent's hooks go, the global ones
+      // stay. (`Agent.clearHooks()` clears both — the `finally` below relies on
+      // exactly that, and every other test in this file already did.)
+      mine.clearHooks();
+      await seed('hk-scoped-cleared', 'hi', 'hk-mine');
+      await run('hk-scoped-cleared');
+      assert.equal(seen, 'base+GLOBAL', 'instance clearHooks() clears only that agent');
+    } finally {
+      Agent.clearHooks();
+    }
+  });
+
+  it('runs every global hook first, then the agent\'s own, each in registration order', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: string | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req.system;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    const ordered = new Agent('hk-ordered');
+    await seed('hk-order-session', 'hi', 'hk-ordered');
+    try {
+      // Registered INTERLEAVED — agent, global, agent, global — so the assertion
+      // below can only pass if the order comes from the SCOPE and not from the
+      // sequence of `hook()` calls. Each hook appends its own tag, so the
+      // composition is the whole chain, in order, in one string.
+      ordered.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+A1` }));
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+G1` }));
+      ordered.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+A2` }));
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+G2` }));
+
+      await runTurn('hk-order-session', {
+        model: 'mock', system: 'base', tools: [], provider: capturing,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    // Globals first (in their own registration order), then the agent's (in
+    // theirs). The agent's hook sees the global chain's output and gets the
+    // last word — specificity, exactly as the README documents it.
+    assert.equal(seen, 'base+G1+G2+A1+A2');
+  });
+
 });

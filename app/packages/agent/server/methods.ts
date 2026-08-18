@@ -120,10 +120,23 @@ async function writeVerdict(
     { returnDocument: 'before' },
   );
   if (before) {
+    // The parked marker as it stood a moment ago — `before` is the document
+    // BEFORE this seq allocation, which is after the verdict write, so
+    // `pending` is still there with everything the park recorded.
+    const parked = (before as any).pending as { runAs?: string | null } | undefined;
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq: (before as any).nextSeq,
       role: 'note', kind: 'approval',
       approved: verdict === 'approved', by, reason,
+      // AUDIT COMPLETENESS: what was authorized, not merely that someone said
+      // yes. A call that runs as `service-account` is a different fact from one
+      // that runs as the approver, and the tool spec (the only other place that
+      // knows) can be edited or deleted long before anyone reads this row.
+      //
+      // Presence, not truthiness: `runAs: null` is the anonymous service
+      // context, and a spread keeps the key ABSENT for the ordinary case rather
+      // than writing an explicit undefined.
+      ...(parked && 'runAs' in parked ? { runAs: parked.runAs } : {}),
       // `undefined` is not a field write, so a human verdict carries no
       // `timedOut` key at all rather than an explicit false. A UI that
       // distinguishes "denied by someone" from "nobody answered in time" must

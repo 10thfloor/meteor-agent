@@ -10,7 +10,10 @@ import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';
 import { registerMcpServer, type McpServerDef } from './mcp/client';
-import { clearHooks, registerHook, type HookMap, type HookName } from './hooks';
+import {
+  clearAgentHooks, clearHooks, registerAgentHook, registerHook,
+  type HookMap, type HookName,
+} from './hooks';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -222,6 +225,40 @@ export class Agent {
   }
 
   /**
+   * Register a hook for THIS AGENT only — the per-agent half of the extension
+   * surface (server/hooks.ts owns the whole contract).
+   *
+   *   Support.hook('beforeProviderRequest', (req) => ({
+   *     ...req, system: `${req.system}\n\n${supportPlaybook()}`,
+   *   }));
+   *
+   * Identical seams, identical failure handling; the only difference is scope.
+   * It runs when the session's agent is this one — a CHILD session reports the
+   * CHILD's agent, so a subagent's hooks are the subagent's, not its parent's.
+   *
+   * ORDER: every `Agent.hook` (global) runs first, in registration order, then
+   * every hook registered here, in registration order. Specificity, not
+   * privilege: an agent's own hook refines the process-wide policy and gets the
+   * last word, exactly as a later global hook refines an earlier one.
+   *
+   * The agent need not be `define()`d yet — hooks are matched by name at run
+   * time, so registration order across server files does not matter.
+   */
+  hook<N extends HookName>(name: N, fn: HookMap[N]): this {
+    registerAgentHook(this.name, name, fn);
+    return this;
+  }
+
+  /**
+   * Remove THIS agent's hooks, leaving the global ones and every other agent's
+   * alone. The narrow counterpart of `Agent.clearHooks()`, and a test seam for
+   * the same reason.
+   */
+  clearHooks(): void {
+    clearAgentHooks(this.name);
+  }
+
+  /**
    * §6. Register a Meteor method and get a tool handle for it in one
    * definition — see `defineAgentMethod`. STATIC because a co-registered method
    * belongs to the app, not to one agent: any number of agents may list the
@@ -293,9 +330,9 @@ export class Agent {
    *   Agent.hook('afterToolResult', (result) => redact(result));
    *
    * STATIC and GLOBAL, like `Agent.method` and `Agent.mcpServer`: a hook is
-   * installed into the process, not into one agent. Every hook's `ctx` carries
-   * the agent name, so a per-agent hook is one `if` away — and per-agent
-   * REGISTRATION is a v3 candidate, not an omission.
+   * installed into the process, not into one agent. For one agent's own hooks
+   * use the INSTANCE form, `agentInstance.hook(name, fn)` — every global hook
+   * runs first, then that agent's.
    *
    * Hooks run in registration order, each seeing the previous one's output.
    * Returning nothing keeps the value; returning a replacement swaps it. A hook
@@ -308,10 +345,12 @@ export class Agent {
   }
 
   /**
-   * Remove every registered hook. A TEST SEAM: hooks are global and registered
-   * once at startup in an app, so the only caller with a reason to clear them
-   * is a test that must not leak one into the next test's turn (call it in a
-   * `finally`).
+   * Remove every registered hook — GLOBAL AND PER-AGENT. A TEST SEAM: hooks are
+   * registered once at startup in an app, so the only caller with a reason to
+   * clear them is a test that must not leak one into the next test's turn (call
+   * it in a `finally`). It clears both scopes so that "no hook survives this
+   * call" keeps meaning exactly that; `agentInstance.clearHooks()` is the narrow
+   * form that clears one agent's.
    */
   static clearHooks(): void {
     clearHooks();

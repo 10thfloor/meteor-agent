@@ -233,6 +233,49 @@ describe('resolveTools validation', () => {
     assert.equal(inlineObject.name, 'inline-ok');
     assert.equal(typeof inlineObject.run, 'function');
   });
+
+  it('carries a PREDICATE gate through on every tool kind, and defaults a missing one', async () => {
+    const { resolveTools } = await import('../server/tools');
+    const predicate = () => true;
+    const [inline, adopted, subagent, mcp, bare] = resolveTools([
+      { name: 'i', description: 'x', args: {}, run: async () => 'ok', gate: predicate },
+      { method: 'test.echo', description: 'x', args: {}, gate: predicate },
+      { subagent: 'researcher', description: 'x', gate: predicate },
+      { mcp: { server: 'docs', tool: 'search' }, gate: predicate },
+      'test.usesUnblock',
+    ] as any);
+    // The same function object, not a copy or a wrapper: the dispatch site
+    // calls exactly what the app wrote.
+    for (const tool of [inline, adopted, subagent, mcp]) {
+      assert.strictEqual(tool.gate, predicate, `${tool.kind} must carry the predicate through`);
+    }
+    assert.equal(bare.gate, 'auto', 'a spec with no gate still defaults to auto');
+  });
+
+  it('refuses a gate that is neither a literal nor a function', async () => {
+    const { resolveTools } = await import('../server/tools');
+    // The failure this guard exists for: a gate is read once per dispatch, deep
+    // inside a turn, so a typo would otherwise surface as a silently UNGATED
+    // tool — the wrong direction to be wrong in. Refused at resolve time, where
+    // it is a startup error naming the tool.
+    for (const bad of ['Ask', 'auto ', true, 0, null, {}]) {
+      assert.throws(
+        () => resolveTools([
+          { name: 'typo', description: 'x', args: {}, run: async () => 'ok', gate: bad },
+        ] as any),
+        /invalid "gate"/,
+        `gate: ${JSON.stringify(bad)} must be refused`,
+      );
+    }
+    // …but an omitted gate is not a typo, and `null` is not a legal way to say
+    // "no gate" — `undefined` is, and it is the only one that resolves.
+    assert.equal(
+      resolveTools([
+        { name: 'fine', description: 'x', args: {}, run: async () => 'ok', gate: undefined },
+      ] as any)[0].gate,
+      'auto',
+    );
+  });
 });
 
 describe('validateToolArgs', () => {

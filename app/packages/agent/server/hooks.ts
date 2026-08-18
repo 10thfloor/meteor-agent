@@ -11,16 +11,30 @@ import type { ToolResult } from './tools';
  * points where an app can change what the harness does without reimplementing
  * it: what goes OUT to the provider, and what comes BACK from a tool.
  *
- * Registration is GLOBAL (package-level), not per agent. That matches Pi's
- * extension model — an extension is installed into the process, not into one
- * assistant — and it keeps `RunConfig` out of it entirely: the loop imports
- * these runners directly rather than threading a hook list through four call
- * paths that would each have to remember it. Per-agent hooks are a v3
- * candidate; the ctx every hook receives carries the agent's name, so a hook
- * that wants to be per-agent is one `if` away, and an app can build the map
- * itself.
+ * Registration comes in two scopes, and NEITHER touches `RunConfig`: the loop
+ * imports these runners directly rather than threading a hook list through the
+ * four call paths (a send, watcher recovery, `ask`, a subagent's child run)
+ * that would each have to remember to carry it — and the one that forgot would
+ * silently skip an app's redaction. Both scopes are resolved from the ctx the
+ * runner already has.
  *
- * Three rules hold for both seams:
+ *  - `Agent.hook(name, fn)` — GLOBAL, the Pi extension model: installed into
+ *    the process, runs for every agent.
+ *  - `agentInstance.hook(name, fn)` — PER AGENT, keyed on the agent's registry
+ *    name and matched against `ctx.agent`, which a CHILD session reports as the
+ *    child's own agent (so a subagent's hooks are the subagent's).
+ *
+ * ORDER: every global hook first, in registration order, then every per-agent
+ * hook, in registration order. The rationale is specificity, not privilege —
+ * the same rule CSS uses. A global hook is the process's blanket policy and a
+ * per-agent hook is one agent's refinement of it, so the refinement sees the
+ * policy's output and gets the last word, exactly as a later global hook sees
+ * (and may overrule) an earlier one. It is NOT a security boundary in either
+ * direction: hooks are all app code, and a global hook could already be
+ * overruled by a second global hook registered after it. A redaction that must
+ * hold everywhere belongs in ONE place, not in two chains arguing.
+ *
+ * Three rules hold for both seams, and for both scopes:
  *  - hooks run in REGISTRATION ORDER, each seeing the previous one's output;
  *  - returning `undefined` keeps the current value — a hook that only observes
  *    needs no return statement at all;
@@ -79,10 +93,33 @@ export type HookName = keyof HookMap;
 
 const HOOK_NAMES: HookName[] = ['beforeProviderRequest', 'afterToolResult'];
 
-const registered: {
+interface HookLists {
   beforeProviderRequest: BeforeProviderRequestHook[];
   afterToolResult: AfterToolResultHook[];
-} = { beforeProviderRequest: [], afterToolResult: [] };
+}
+
+const emptyLists = (): HookLists => ({ beforeProviderRequest: [], afterToolResult: [] });
+
+const registered: HookLists = emptyLists();
+
+/** Per-agent hooks, keyed on the agent's REGISTRY NAME — the same string
+ *  `ctx.agent` carries, read off the session document. A map rather than a
+ *  field on the agent config for two reasons: hooks are registered against an
+ *  `Agent` instance that may be constructed before (or without) `define()`, and
+ *  the runners must resolve them from a name alone, having only the ctx. */
+const perAgent = new Map<string, HookLists>();
+
+/** The hooks that run for one seam, in order: global first, then the agent's
+ *  own. See THE EXTENSION SURFACE above for why that order. */
+function chain<N extends HookName>(name: N, agent: string): Array<HookMap[N]> {
+  const mine = perAgent.get(agent);
+  // Copied, never the live arrays: a hook that registers another hook must not
+  // extend the list it is being iterated from.
+  return [
+    ...(registered[name] as Array<HookMap[N]>),
+    ...((mine?.[name] ?? []) as Array<HookMap[N]>),
+  ];
+}
 
 /**
  * One warn per DISTINCT FAILURE KIND, keyed `<hook name>:<what went wrong>`.
@@ -108,6 +145,30 @@ function warnHook(key: string, message: string): void {
  * until it noticed its redaction had not happened.
  */
 export function registerHook<N extends HookName>(name: N, fn: HookMap[N]): void {
+  checkHook(name, fn, 'Agent.hook');
+  (registered[name] as unknown[]).push(fn);
+}
+
+/**
+ * Register a hook for ONE agent — the instance form, `agentInstance.hook(…)`.
+ *
+ * Same seams, same contract, same failure handling; the only difference is that
+ * it runs when `ctx.agent` is this name, and it runs AFTER every global hook.
+ * The agent need not be defined yet: hooks are matched by name at run time, and
+ * requiring `define()` first would make correctness depend on the order server
+ * files happen to load — the same reason a `{ subagent }` spec resolves its name
+ * at dispatch rather than at resolve.
+ */
+export function registerAgentHook<N extends HookName>(
+  agent: string, name: N, fn: HookMap[N],
+): void {
+  checkHook(name, fn, 'agent.hook');
+  let lists = perAgent.get(agent);
+  if (!lists) { lists = emptyLists(); perAgent.set(agent, lists); }
+  (lists[name] as unknown[]).push(fn);
+}
+
+function checkHook(name: HookName, fn: unknown, label: string): void {
   if (!HOOK_NAMES.includes(name)) {
     throw new Error(
       `[10thfloor:agent] Unknown hook "${String(name)}". The hooks are: `
@@ -115,22 +176,34 @@ export function registerHook<N extends HookName>(name: N, fn: HookMap[N]): void 
     );
   }
   if (typeof fn !== 'function') {
-    throw new Error(`[10thfloor:agent] Agent.hook('${name}', fn) needs a function.`);
+    throw new Error(`[10thfloor:agent] ${label}('${name}', fn) needs a function.`);
   }
-  (registered[name] as unknown[]).push(fn);
 }
 
 /**
- * Drop every registered hook. A TEST SEAM, and documented as one: hooks are
- * global and permanent by design (an app registers them at startup and never
- * unregisters), so the only caller with a reason to remove them is a test that
- * must not leak one into the next test's turn. Also resets the warn latches, so
- * each test can observe the warning it expects.
+ * Drop every registered hook, GLOBAL AND PER-AGENT. A TEST SEAM, and documented
+ * as one: hooks are permanent by design (an app registers them at startup and
+ * never unregisters), so the only caller with a reason to remove them is a test
+ * that must not leak one into the next test's turn. Also resets the warn
+ * latches, so each test can observe the warning it expects.
+ *
+ * It clears BOTH scopes deliberately, which keeps `Agent.clearHooks()` meaning
+ * exactly what it meant before per-agent hooks existed: "no hook registered
+ * anywhere survives this call". A seam that cleaned only half of them would
+ * leak the half nobody remembered, which is the one bug the seam exists to
+ * prevent.
  */
 export function clearHooks(): void {
   registered.beforeProviderRequest = [];
   registered.afterToolResult = [];
+  perAgent.clear();
   warned.clear();
+}
+
+/** Drop one agent's hooks, leaving the global ones and every other agent's
+ *  alone — `agentInstance.clearHooks()`. The narrow half of the test seam. */
+export function clearAgentHooks(agent: string): void {
+  perAgent.delete(agent);
 }
 
 /** Minimal shape check for a REPLACEMENT request. Not a schema: the point is
@@ -177,9 +250,8 @@ export async function runBeforeProviderRequest(
   req: ProviderRequest, ctx: ProviderRequestHookContext,
 ): Promise<ProviderRequest> {
   let current = req;
-  // Snapshot: a hook that registers another hook must not extend the list it
-  // is being iterated from.
-  for (const fn of [...registered.beforeProviderRequest]) {
+  // Global hooks first, then `ctx.agent`'s own — see THE EXTENSION SURFACE.
+  for (const fn of chain('beforeProviderRequest', ctx.agent)) {
     try {
       // eslint-disable-next-line no-await-in-loop
       const next = await fn(current, ctx);
@@ -223,7 +295,7 @@ export async function runAfterToolResult(
   result: ToolResult, call: HookToolCall, ctx: ToolResultHookContext,
 ): Promise<ToolResult> {
   let current = result;
-  for (const fn of [...registered.afterToolResult]) {
+  for (const fn of chain('afterToolResult', ctx.agent)) {
     try {
       // eslint-disable-next-line no-await-in-loop
       const next = await fn(current, call, ctx);

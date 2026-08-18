@@ -8,6 +8,62 @@ import {
   callMcpTool, discoverMcpTools, warnMcp, type McpToolInfo,
 } from './mcp/client';
 
+/* ---------------------------------------------------------------------------
+ * GATES (§7).
+ *
+ * `'auto'` runs the call, `'ask'` parks the turn in front of a human, and a
+ * PREDICATE decides per call — which is the whole point of the third form: the
+ * interesting authorization questions are about the ARGUMENTS ("refunds under
+ * $50 are automatic"), and a literal cannot see them.
+ *
+ * `ctx.userId` is the CALLER's — the session's owner. `runAs` deliberately does
+ * NOT apply here: `runAs` says what identity the tool BODY runs under once the
+ * call is allowed to happen, and the gate is the thing deciding whether it
+ * happens at all. Evaluating the gate as the escalated identity would let a
+ * `runAs: 'admin'` spec answer its own authorization question — the escalation
+ * approving itself. A predicate that wants to know about the escalation reads it
+ * off the spec it is written next to.
+ *
+ * The three verdicts:
+ *   `true`   -> run it, exactly as `'auto'`.
+ *   `false`  -> a structured `denied-by-gate` tool RESULT. The model reads it
+ *               and routes around it; nothing parks, no human is troubled, and
+ *               the turn carries on. That is the difference between a gate that
+ *               says no and one that asks.
+ *   `'ask'`  -> park, exactly as the literal `'ask'`.
+ *
+ * A predicate that THROWS (or returns something that is none of the three)
+ * fails CLOSED to the denied result, with one warning per failure kind. A gate
+ * whose own code is broken must not run the tool — and must not kill the turn
+ * either, which is the same bargain hooks.ts strikes.
+ *
+ * WHERE it is evaluated: at every dispatch site that honors a literal gate,
+ * which is exactly one — `dispatchCalls` in server/loop.ts, shared by the
+ * streaming path and by the re-dispatch of a resumed batch's remainder. The
+ * approved call's own resume does NOT re-evaluate: a human already answered the
+ * question the gate asks, and re-asking it could refuse work that was
+ * explicitly authorized. See `resumeParkedTurn`.
+ * ------------------------------------------------------------------------ */
+
+/** What a predicate gate is handed. The CALLER's identity, never `runAs`. */
+export interface GateContext {
+  /** The session's owner — the human (or `null`, an anonymous capability-URL
+   *  holder) on whose behalf the model is asking. */
+  userId: string | null;
+  sessionId: string;
+  /** The tool's name as the model called it. */
+  name: string;
+  /** The model's arguments, unvalidated: a gate runs BEFORE dispatch, so this
+   *  is exactly what the model emitted. Treat it as untrusted input. */
+  args: unknown;
+}
+
+export type GatePredicate =
+  (ctx: GateContext) => boolean | 'ask' | Promise<boolean | 'ask'>;
+
+/** `'auto'` | `'ask'` | a predicate — see the GATES note above. */
+export type Gate = 'auto' | 'ask' | GatePredicate;
+
 export interface ToolContext {
   /** Who this tool runs AS. Normally the session's owner; a spec with `runAs`
    *  replaces it for that one tool — see `RUNAS_NOTE` and `runTool`. */
@@ -52,7 +108,7 @@ export type InlineTool = {
   description: string;
   args: unknown;
   run: (args: any, ctx: ToolContext) => Promise<unknown>;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
   /** Run this tool as a FIXED user instead of the session's owner (`null` =
    *  anonymous service context). Privilege escalation by construction —
    *  read THE `runAs` NOTE above before using it. */
@@ -64,7 +120,7 @@ export type AdoptedTool = {
   description: string;
   args: unknown;
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
   /** The method's `this.userId` for calls the MODEL makes through this listing
    *  (your UI's own `Meteor.callAsync` is unaffected). Privilege escalation by
    *  construction — read `RUNAS_NOTE` above before using it. */
@@ -91,7 +147,7 @@ export type SubagentTool = {
    *  child's first user message. */
   args?: unknown;
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 };
 
 /** The default subagent argument schema: one string, the child's first user
@@ -124,7 +180,7 @@ export type McpTool = {
   args?: unknown;
   /** Single-tool form only: expose it to the model under a different name. */
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 };
 
 export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | McpTool | string;
@@ -133,7 +189,9 @@ export interface ResolvedTool {
   name: string;
   description: string;
   args: unknown;
-  gate: 'auto' | 'ask';
+  /** Never undefined here: `resolveTools` defaults a missing gate to `'auto'`
+   *  and refuses anything that is not a literal or a function. */
+  gate: Gate;
   kind: 'inline' | 'adopted' | 'subagent' | 'mcp';
   method?: string;
   run?: (args: any, ctx: ToolContext) => Promise<unknown>;
@@ -599,6 +657,107 @@ export function withInvocation<T>(userId: string | null, fn: () => Promise<T>): 
   return (DDP as any)._CurrentMethodInvocation.withValue(invocation, fn);
 }
 
+/**
+ * A spec's `gate`, defaulted and CHECKED — the only place a gate becomes a
+ * `ResolvedTool.gate`.
+ *
+ * The typeof check is what makes the predicate form safe to add: a gate is read
+ * once per dispatch and dispatch is deep inside a turn, so a typo (`gate:
+ * 'Ask'`, `gate: true`, a promise someone forgot to resolve at define time)
+ * would otherwise be discovered as a silently-ungated tool — the failure mode
+ * that grants MORE access than was written. Refused at resolve time instead,
+ * naming the tool and what was given.
+ */
+function normalizeGate(gate: unknown, label: string): Gate {
+  if (gate === undefined) return 'auto';
+  if (gate === 'auto' || gate === 'ask') return gate;
+  if (typeof gate === 'function') return gate as GatePredicate;
+  throw new Error(
+    `[10thfloor:agent] Tool "${label}" has an invalid "gate": it must be 'auto', 'ask', or a `
+    + `function (ctx) => boolean | 'ask'; got ${typeof gate === 'string' ? JSON.stringify(gate) : typeof gate}.`,
+  );
+}
+
+/** What a gate decided for one call. `'run'` covers both `'auto'` and a
+ *  predicate that returned `true` — the dispatch site should not have to care
+ *  which said so. */
+export type GateDecision = 'run' | 'ask' | 'denied';
+
+/** The result a `false` (or broken) predicate produces. Structured like every
+ *  other harness-authored refusal, so the model reads it and routes around
+ *  it — the row is the answer to the call, not the end of the turn. The reason
+ *  names the tool and nothing else: it is published, and a gate's own logic is
+ *  not something to narrate into a transcript. */
+export function gateDeniedResult(name: string): ToolResult {
+  return {
+    ok: false,
+    error: {
+      error: 'denied-by-gate',
+      reason: `The "${name}" tool refused this call.`,
+    },
+  };
+}
+
+/** One warn per FAILURE KIND (`threw` / `shape`), the same latch and the same
+ *  reasoning as the validator's and hooks': a broken gate is broken on every
+ *  call, and a line per tool call would bury the notice that matters. */
+const warnedGateKinds = new Set<string>();
+
+function warnGate(kind: string, message: string): void {
+  if (warnedGateKinds.has(kind)) return;
+  warnedGateKinds.add(kind);
+  console.warn(`[10thfloor:agent] ${message}`);
+}
+
+/** TEST SEAM, not public API: the latch above is per process, so a test that
+ *  asserts on a gate warning has to be able to arm it. Not re-exported from
+ *  server/index.ts. */
+export function _resetGateWarnings(): void {
+  warnedGateKinds.clear();
+}
+
+/**
+ * Decide one call's gate.
+ *
+ * A missing tool (`undefined`, the unknown-tool case) is `'run'`: the dispatch
+ * site answers it with `unknown-tool`, and parking or denying a name that does
+ * not exist would tell the model something false about a typo.
+ *
+ * FAILS CLOSED. Anything the predicate does other than resolving `true`,
+ * `false` or `'ask'` — throwing, rejecting, returning a number, returning a
+ * promise of junk — is `'denied'` plus one warning. The alternative (treat a
+ * broken gate as `'auto'`) would run the tool the gate exists to guard, and
+ * treating it as `'ask'` would put a question no one can answer in front of a
+ * human on every call.
+ */
+export async function evaluateGate(
+  tool: ResolvedTool | undefined, ctx: GateContext,
+): Promise<GateDecision> {
+  const gate = tool?.gate ?? 'auto';
+  if (gate === 'ask') return 'ask';
+  if (typeof gate !== 'function') return 'run';
+  let verdict: unknown;
+  try {
+    verdict = await gate(ctx);
+  } catch (e) {
+    warnGate(
+      'threw',
+      `a gate predicate threw and the call was DENIED (a broken gate must not run the tool): `
+      + `tool "${ctx.name}": ${(e as Error)?.message}`,
+    );
+    return 'denied';
+  }
+  if (verdict === true) return 'run';
+  if (verdict === false) return 'denied';
+  if (verdict === 'ask') return 'ask';
+  warnGate(
+    'shape',
+    `a gate predicate returned ${typeof verdict === 'string' ? JSON.stringify(verdict) : typeof verdict}`
+    + `, which is not true, false or 'ask'; the call was DENIED: tool "${ctx.name}"`,
+  );
+  return 'denied';
+}
+
 export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
   return specs.map((spec) => {
     if (typeof spec === 'string') {
@@ -676,7 +835,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name: m.name ?? toolName ?? `mcp:${server}`,
         description: m.description ?? '',
         args: m.args ?? { type: 'object', properties: {} },
-        gate: m.gate ?? 'auto',
+        gate: normalizeGate(m.gate, m.name ?? toolName ?? `mcp:${server}`),
         kind: 'mcp' as const,
         mcp: { server, tool: toolName },
         mcpExplicit: { description: m.description !== undefined, args: m.args !== undefined },
@@ -702,7 +861,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name: sub.name ?? sub.subagent,
         description: sub.description,
         args: sub.args ?? SUBAGENT_ARGS,
-        gate: sub.gate ?? 'auto',
+        gate: normalizeGate(sub.gate, sub.name ?? sub.subagent),
         kind: 'subagent' as const,
         subagent: sub.subagent,
       };
@@ -719,7 +878,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name,
         description: adopted.description,
         args: adopted.args,
-        gate: adopted.gate ?? 'auto',
+        gate: normalizeGate(adopted.gate, name),
         kind: 'adopted' as const,
         method: adopted.method,
         // Spread rather than `runAs: adopted.runAs`, so a spec WITHOUT the key
@@ -744,7 +903,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       name: inline.name,
       description: inline.description,
       args: inline.args,
-      gate: inline.gate ?? 'auto',
+      gate: normalizeGate(inline.gate, inline.name),
       kind: 'inline' as const,
       run: inline.run,
       // See the adopted branch above for why this is a spread and why an
@@ -1066,7 +1225,7 @@ export interface AgentMethodOptions {
    *  `this.unblock()` behave exactly as they do in a hand-written method —
    *  including for a UI caller that never touches an agent. */
   run: (this: any, args: any) => unknown | Promise<unknown>;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 }
 
 /**
