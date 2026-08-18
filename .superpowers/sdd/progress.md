@@ -348,3 +348,72 @@ M5 Task 1 (loop robustness residuals): complete. Suite 287 (+2 pending) server +
   count and asserted the terminal state immediately. A 12-run probe caught phase=streaming +
   lease held 12/12. Fixed by a shared finished(sessionId, n) predicate (row count AND idle AND no
   lease) on all five waits. No production change. Report: .superpowers/sdd/task-1-report.md
+M5 Task 2 (lifecycle and lineage): complete (44ca698). 293 (+2 pending) server + 6 client, from
+  287. Orphan-child re-link (watcher case 4, three batched queries per sweep, derived _id for
+  cross-server idempotence) + parent-interrupt propagation down the activeChild chain.
+  Flagged for Task 4: the sweep's child-scan is a collection scan on every session ever created.
+  Report: .superpowers/sdd/task-2-report.md
+M5 Task 3 (gates, hooks, surfaced identity): complete (64af3a3). 305 (+2 pending) server + 7
+  client, from 293. Predicate gates on every tool kind (fail CLOSED, caller's identity not runAs's,
+  evaluated at the shared dispatch site so approving one call says nothing about the next);
+  per-agent hooks (globals first, then the agent's); runAs on `pending` and in the approval bar;
+  element attribute-churn batching. Report: .superpowers/sdd/task-3-report.md
+M5 Task 4 (perf debt + docs sweep): complete. Suite 315 (+2 pending) server + 7 client, from 305 —
+  +10, all in a new tests/perf.test.ts, three consecutive clean runs.
+  COMPILED VALIDATION. typebox/compile is a real exports key through the same loader seam;
+  namespace {Code, Compile, Validator, default} with default === Compile; Compile(schema) takes
+  ONE arg and accepts plain JSON Schema. The brief's open question answered: a compiled Validator
+  DOES carry Errors, returning the SAME ajv-shaped records Value.Errors does — so reasonFor needed
+  no change and the failure path does not re-run the interpreter. Errors is still feature-probed
+  with Value.Errors behind it (failure path only). WeakMap keyed on the schema OBJECT (weak so
+  rediscovered MCP schemas do not pin their predecessors; identity because a registered tool's
+  args IS stable and hashing per call gives the win back); a null entry is a NEGATIVE cache so a
+  schema the compiler throws on costs one attempt, not one per call, and its neighbours stay
+  compiled. Ladder, each rung warning once and none throwing: app validator > Compile >
+  Value.Check > structural. MEASURED: validateToolArgs x2000 = 3.3ms compiled vs 33.3ms
+  interpreted, ~10x through the public entry point (34x on the raw checkers in an isolated probe;
+  one Compile costs 0.47ms, so it pays for itself by the tenth call). The suite asserts only
+  interpreted > compiled — a correctness suite must not fail on a slow JIT — and pins that the two
+  rungs produce BYTE-IDENTICAL reasons across six rejection cases, because the reason is published.
+  TOOL_ARGS PRESSURE, and the finding: 4 parallel calls x ~20KB args in 200-byte fragments =
+  400 delta docs, 80,000 bytes. The doc count is the finding — coalescing does NOTHING for
+  tool_args, because contentIndex is part of the coalescing key (it must be, or one call's JSON
+  concatenates into another's) and parallel calls arrive INTERLEAVED, so no two consecutive
+  fragments share an index. tool_args is the one delta kind whose doc count scales with the
+  provider's fragment size rather than with the response, against a 32MiB capped collection every
+  session shares with global FIFO eviction. Clamp: maxToolArgBytes on AgentConfig -> buildRunConfig
+  -> RunConfig -> DeltaWriter, default 256KiB/turn. Checked BEFORE coalescing (a dropped chunk must
+  not sneak in by appending to the buffered run) and before seq is assigned (a gap would silently
+  truncate mergeView's backward walk); the chunk that CROSSES the ceiling is written whole, so the
+  decision is monotone. One warn per turn. DISPLAY-STREAM HYGIENE ONLY, said in every doc site:
+  text/thinking untouched, and the committed message's toolCalls never travel through DeltaWriter
+  at all, so a clamped turn calls exactly the tools with exactly the arguments it would have.
+  INDEXES (new server/indexes.ts, called from startup after ensureCapped): agent_messages
+  {sessionId, seq} — verified absent, listIndexes on a fresh collection returns _id_ only, so every
+  turn's history re-read was a COLLSCAN; agent_sessions {'parent.sessionId', createdAt} sparse —
+  Task 2's flagged sweep scan; agent_sessions {phase, 'lease.until'} — the sweep's other three
+  queries. createIndexAsync, idempotent, and failures WARN not throw (a locked-down Atlas user
+  lacking createIndex must not stop the package booting) — tested both ways, including a stubbed
+  code:13 not-authorized. Honest caveat recorded in the file: `sparse` on a COMPOUND index only
+  omits docs missing EVERY key and every session has createdAt, so it buys nothing today;
+  partialFilterExpression is the keyword that would, and it cannot be added without an index drop.
+  DOCS: root README Status now lists the nine shipped v3 items instead of a backlog line (and the
+  caveat points at the audits); package README gained maxToolArgBytes in the config surface and a
+  new ### Operations subsection (index table, the clamp with its 400-doc measurement and the
+  display-only guarantee, the validation ladder) that adopts the old standalone-Mongo note;
+  predicate gates VERIFIED already documented by Task 3, no change needed; CONTRIBUTING rule 2
+  gained the typebox/compile probe notes + the instruction to keep the four-rung ladder.
+  Report: .superpowers/sdd/task-4-report.md
+V4 SPACE (consolidated, for the audits to triage against):
+  1. Retention policy for parentless children — the sweep warns once and leaves them standing
+     forever, by design; nothing ever decides what happens to them.
+  2. A per-DELTA-DOCUMENT clamp beside the per-turn one: the turn ceiling does not bound a single
+     pathological fragment, and one 256KB tool_args chunk is written whole before it engages.
+  3. partialFilterExpression on the parent index (see the sparse caveat above) — needs a drop.
+  4. A rateLimit entry for agent.compact (carried from M4 Task 7).
+  5. Subagent idempotency residual (M5 Task 1): one call id reused across two turns of one session,
+     same agent, byte-identical args, earlier child unclaimed -> a stale answer.
+  6. tool_args fragments for one index that straddle a flush tick become two docs where one would
+     do. Minor next to the interleaving finding, which coalescing cannot help at all.
+  7. No standing guard on compiled-vs-interpreted divergence: six rejection cases are pinned,
+     nothing detects a future typebox release disagreeing on a seventh.

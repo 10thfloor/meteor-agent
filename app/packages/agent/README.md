@@ -52,6 +52,8 @@ Support.define({
              keep: 6 },                      // compaction; omit to disable
   maxIterations: 10,                         // model calls per turn
   maxResultChars: 8000,                      // tool results truncated past this
+  maxToolArgBytes: 262144,                   // per-turn tool_args delta ceiling
+                                             // (display only; see Operations)
   canUse: (tool, { userId }) => true,        // agent-level tool backstop
   approve: ({ userId }) => userId !== null,  // who may answer ask-gates
   provider: mockProvider(...),               // an impl, or 'name' registered
@@ -261,13 +263,70 @@ note's derived `_id` — one winner, no new coordination. Turn it off with
 `{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
 `startWatcher({ sweepMs })` yourself.
 
-One operations note: on a **standalone MongoDB** (no replica set — no oplog, no
+### Operations
+
+**Standalone MongoDB.** On a standalone server (no replica set — no oplog, no
 change streams) Meteor's observers fall back to ~10s polling. Recovery still
 works — the sweep is what carries it — but the watcher's observer path, token
 streaming, and `usage()`/`status()` reactivity all degrade to that polling
 cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
 Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
 Meteor's constraint, not this package's.
+
+**Indexes are created at startup.** Mongo creates exactly one index for you —
+`_id` — so the package creates the three its own queries need, on every boot,
+idempotently:
+
+| Collection | Key | Why |
+| --- | --- | --- |
+| `agent_messages` | `{ sessionId: 1, seq: 1 }` | every transcript read: the session publication, the history each turn re-reads, the compaction cut |
+| `agent_sessions` | `{ 'parent.sessionId': 1, createdAt: 1 }` (sparse) | the watcher's orphan-child sweep, which scans every child ever created, every 15s |
+| `agent_sessions` | `{ phase: 1, 'lease.until': 1 }` | the sweep's orphan-claim, standing-verdict and unanswered-park queries |
+
+A failure to create them **warns and continues**: a locked-down Atlas user may
+not hold the `createIndex` action, and a package that refused to boot over a
+performance index would trade a slow deployment for no deployment. If that
+warning is in your logs, create the three by hand — the queries are correct
+without them, just proportional to your whole history rather than to one
+session. Call `ensureIndexes()` yourself if you want them made under a
+different connection.
+
+**`maxToolArgBytes` — a ceiling on published argument streaming.** While a
+model streams a tool call, its partial arguments JSON is published as
+`tool_args` deltas so a UI can render the call taking shape. Those deltas live
+in `agent_deltas`, which is **capped (32 MiB) and shared by every session on
+the deployment** — eviction is global FIFO, so one model looping on a giant
+argument blob can push every other session's in-flight tokens out. Past
+`maxToolArgBytes` (default 256 KiB per turn) a turn stops publishing them and
+logs one warning.
+
+`tool_args` is the one delta kind that does not coalesce. A run of text tokens
+collapses into a single document; parallel tool calls arrive interleaved and
+each call's fragments must stay attributed to it, so every fragment is its own
+document. Measured: four parallel calls streaming ~20 KB of arguments each, in
+200-byte fragments, produce **400 documents and 80,000 bytes** — comfortably
+under the default, and the reason the default is not much higher.
+
+This is **display-stream hygiene and nothing else**. `text` and `thinking`
+deltas are unaffected; the committed assistant message's `toolCalls` — the
+parsed arguments dispatch actually runs on — never travel through the delta
+stream at all, so a clamped turn calls exactly the tools it was going to call,
+with exactly the arguments it was going to use. The only visible effect is that
+a client's `toolArgs` preview stops growing. Raise it for an agent whose tools
+genuinely take large arguments and whose UI renders them; there is no reason to
+lower it.
+
+**Argument validation is compiled.** The default checker compiles each tool's
+`args` schema once with `typebox`'s `Compile` and reuses the compiled checker
+for every later call (cached weakly, keyed on the schema object, so a
+rediscovered MCP schema does not pin its predecessors). The ladder degrades
+one rung at a time and never throws: a validator you installed with
+`setToolArgsValidator` wins over everything; otherwise the compiled checker;
+otherwise the interpreted `Value.Check` (same enforcement, slower — used when
+`typebox/compile` is unreachable, or for one schema the compiler chokes on);
+otherwise the minimal structural checker, which enforces `type`, `required` and
+nested shape only. Each step down warns once. See the probe notes at the top of
+the validation section in `server/tools.ts`.
 
 ### `runAs` — a tool with a fixed identity
 

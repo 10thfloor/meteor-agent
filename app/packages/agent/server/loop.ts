@@ -49,6 +49,10 @@ export interface RunConfig {
    *  is explicit in the content so the model knows it saw a prefix.
    *  Default 8000. */
   maxResultChars?: number;
+  /** Per-TURN ceiling on the bytes of `tool_args` deltas this turn may publish.
+   *  Default 256 KiB; see `DeltaWriter`'s constructor. Display-stream hygiene
+   *  only — the committed message's `toolCalls` are never clamped. */
+  maxToolArgBytes?: number;
   /** §7's backstop: agent-level tool authorization, checked before gates and
    *  before dispatch. A refusal is a structured result the model reads and
    *  routes around — never a park, never a throw. */
@@ -313,6 +317,27 @@ export function isRunning(sessionId: string): boolean {
   return running.has(sessionId);
 }
 
+/**
+ * The default per-turn `tool_args` delta ceiling: 256 KiB.
+ *
+ * `AgentDeltas` is a 32 MiB CAPPED collection shared by every session on the
+ * deployment, and eviction is global FIFO — so the pressure one session's
+ * argument streaming puts on it is everybody's problem.
+ *
+ * MEASURED (M5 Task 4, `tests/perf.test.ts`): a turn with four parallel tool
+ * calls streaming ~20 KB of arguments each, in 200-byte fragments, writes
+ * **400 delta documents totalling 80,000 bytes** — 0.24% of the cap. Note the
+ * document count: `tool_args` is the one kind coalescing cannot help, because
+ * parallel calls arrive INTERLEAVED and `contentIndex` is part of the
+ * coalescing key, so no two consecutive fragments ever merge. Its cost scales
+ * with the provider's fragment size, not with the response.
+ *
+ * 256 KiB is therefore a bit over three such turns' worth of headroom per
+ * turn: generous for anything real, and a hard stop for a model looping on a
+ * JSON fragment.
+ */
+export const DEFAULT_MAX_TOOL_ARG_BYTES = 256 * 1024;
+
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
 /** Exported as a TEST SEAM. The loop is its only production caller; the
@@ -327,12 +352,27 @@ export class DeltaWriter {
    *  their inserts and scramble the rendered text. */
   private flushing = false;
   private pending: Promise<void> | null = null;
+  /** Cumulative bytes of `tool_args` chunks ACCEPTED by this writer. Compared
+   *  against `maxToolArgBytes`; see `push`. */
+  private toolArgBytes = 0;
+  /** One warn per turn, not one per dropped chunk. */
+  private warnedClamp = false;
 
   constructor(
     private sessionId: string,
     private messageId: string,
     private msgSeq: number,
     flushMs: number,
+    /**
+     * Per-TURN ceiling on `tool_args` delta bytes. Display-stream hygiene and
+     * nothing more: `AgentDeltas` is a capped collection shared by every
+     * session on the deployment, so one model emitting a megabyte of arguments
+     * JSON evicts every other session's in-flight tokens. Past the ceiling this
+     * writer stops writing `tool_args` deltas; `text` and `thinking` are
+     * untouched, and the COMMITTED assistant message's `toolCalls` — the actual
+     * dispatch data — never passed through here at all. `Infinity` disables it.
+     */
+    private maxToolArgBytes: number = Infinity,
   ) {
     // The `.catch` is not decoration. A bare `void this.flush()` turns an
     // `insertAsync` rejection into an unhandled promise rejection, which is
@@ -368,6 +408,27 @@ export class DeltaWriter {
     // carried through it would split one text run into two coalescing buckets
     // and reorder nothing visibly — the worst kind of bug to find later.
     const index = kind === 'tool_args' ? contentIndex : undefined;
+
+    // The clamp. Checked BEFORE coalescing, so a dropped chunk cannot sneak in
+    // by being appended to the run already buffered. The chunk that CROSSES the
+    // ceiling is written whole (a truncated JSON fragment renders no better
+    // than a missing one) and everything after it is dropped, so the decision
+    // is monotone and a client's partial-args view simply stops growing.
+    if (kind === 'tool_args' && this.maxToolArgBytes !== Infinity) {
+      if (this.toolArgBytes >= this.maxToolArgBytes) {
+        if (!this.warnedClamp) {
+          this.warnedClamp = true;
+          console.warn(
+            `[10thfloor:agent] session ${this.sessionId}: tool_args deltas exceeded `
+            + `maxToolArgBytes (${this.maxToolArgBytes}); the rest of this turn's argument `
+            + `streaming is not published. Tool dispatch is unaffected.`,
+          );
+        }
+        return;
+      }
+      this.toolArgBytes += Buffer.byteLength(chunk, 'utf8');
+    }
+
     const last = this.buf[this.buf.length - 1];
     if (last && last.kind === kind && last.contentIndex === index) {
       last.chunk += chunk;
@@ -1546,6 +1607,10 @@ async function resumeParkedTurn(
 export async function runTurn(sessionId: string, config: RunConfig): Promise<void> {
   const maxIterations = config.maxIterations ?? 10;
   const flushMs = config.flushMs ?? 60;
+  // 256 KiB per turn. Generous by design: the largest argument payload any of
+  // this package's own tools produces is three orders of magnitude smaller, so
+  // a turn that reaches this is pathological, not merely busy.
+  const maxToolArgBytes = config.maxToolArgBytes ?? DEFAULT_MAX_TOOL_ARG_BYTES;
   const interruptCheckMs = config.interruptCheckMs ?? 250;
   // `attempts` counts the INITIAL try, so 1 means "no retry" and 0 means
   // nothing coherent at all: `attemptIndex + 1 < 0` is false on the first
@@ -1747,7 +1812,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           );
           if (streaming !== 1) return;
 
-          const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
+          const writer = new DeltaWriter(
+            sessionId, messageId, msgSeq, flushMs, maxToolArgBytes,
+          );
           text = '';
           thinking = '';
           toolCalls = undefined;

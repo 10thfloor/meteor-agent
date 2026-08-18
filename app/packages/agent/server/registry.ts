@@ -81,6 +81,19 @@ export interface AgentConfig {
    *  enter the transcript (and therefore every later model call). Explicit
    *  truncation marker; default 8000. */
   maxResultChars?: number;
+  /**
+   * Per-TURN ceiling on the bytes of `tool_args` deltas a turn may publish.
+   * Default 256 KiB (`DEFAULT_MAX_TOOL_ARG_BYTES`).
+   *
+   * DISPLAY-STREAM HYGIENE ONLY. The delta collection is capped and shared by
+   * every session on the deployment, so one model streaming a runaway argument
+   * blob evicts everyone else's in-flight tokens. Past the ceiling a turn stops
+   * publishing partial-arguments deltas; `text` and `thinking` deltas are
+   * unaffected, and the committed assistant message's real `toolCalls` — what
+   * dispatch actually reads — are never clamped. Raise it for an agent whose
+   * tools genuinely take huge arguments and whose UI renders them.
+   */
+  maxToolArgBytes?: number;
   /** §7's backstop: may this agent use this tool at all, independent of any
    *  per-tool gate? Checked before dispatch AND before parking — a forbidden
    *  tool never asks a human for approval. Refusal reaches the model as a
@@ -314,6 +327,7 @@ export function buildRunConfig(config: AgentConfig, userId: string | null): RunC
     retry: config.retry,
     context: config.context,
     maxResultChars: config.maxResultChars,
+    maxToolArgBytes: config.maxToolArgBytes,
     canUse: config.canUse,
     // Hooks are NOT threaded here, deliberately: they are registered globally
     // with `Agent.hook` and the loop imports their runners directly. Passing

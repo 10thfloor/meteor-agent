@@ -264,6 +264,42 @@ export type ArgsValidator =
  * reachable, and the minimal structural checker below when it is not. The
  * validator remains a SEAM on top of both: `setToolArgsValidator` wins over
  * either.
+ *
+ * PROBE 2 (M5 Task 4, typebox 1.3.7, read off the installed files and
+ * confirmed by a runtime probe):
+ *
+ *  - `package.json` `exports["./compile"]` -> `./build/compile/index.mjs`,
+ *    another key the same loader seam reaches (`loadTypebox('compile')`).
+ *    Its namespace is `{ Code, Compile, Validator, default }`; `default` IS
+ *    `Compile`.
+ *  - `build/compile/compile.d.mts`:
+ *    `export declare function Compile<const Type extends TSchema, Result
+ *     extends Validator = Validator<{}, Type>>(type: Type): Result;`
+ *    — one required argument (a second overload takes `(context, type)`).
+ *    It accepts PLAIN JSON Schema at run time exactly as `Value.Check` does.
+ *  - The returned `Validator` (`build/compile/validator.d.mts`) carries
+ *    `Check(value): value is Encode`, `Errors(value): TLocalizedValidationError[]`,
+ *    `IsAccelerated(): boolean`, plus Parse/Clean/Convert/Decode/Encode.
+ *    So a compiled checker DOES carry error details, and they are the SAME
+ *    ajv-shaped `{ keyword, schemaPath, instancePath, params, message }`
+ *    records `Value.Errors` returns — `reasonFor` below needed no change.
+ *    (`Errors` is still probed for before use; a release that drops it falls
+ *    back to `Value.Errors` for the failure path only.)
+ *  - `IsAccelerated()` returned `true` for every schema probed, including
+ *    `{}`, `{ type: 'bogus' }`, `oneOf`, and internal `$defs`/`$ref`.
+ *
+ * THE DEGRADE LADDER, highest wins:
+ *
+ *   1. an app validator installed with `setToolArgsValidator` — wins over
+ *      everything below, typebox-backed or not;
+ *   2. `Compile(schema).Check(args)`, one compile per schema object, cached
+ *      in a `WeakMap` keyed on that object;
+ *   3. `Value.Check(schema, args)` — the interpreted checker, used when
+ *      `typebox/compile` is unreachable or when THIS schema throws at compile
+ *      time (cached as "do not retry", per schema);
+ *   4. the minimal structural checker, when typebox is not reachable at all.
+ *
+ * Each rung down narrows what is enforced and warns once; none of them throws.
  * ------------------------------------------------------------------ */
 
 type Schema = Record<string, any>;
@@ -434,10 +470,165 @@ function reasonFor(err: TypeboxError): string {
   return `${label(path)} ${err.message ?? 'does not match the schema'}`;
 }
 
-function fullCheck(V: TypeboxValue, schema: unknown, args: unknown): ValidationResult {
+/* ------------- the compiled-schema cache (typebox `Compile`) ------------- */
+
+/** What `Compile(schema)` returns, narrowed to what this package calls.
+ *  `Errors` is optional ON PURPOSE: 1.3.7 has it (probed), and a release that
+ *  drops it must degrade to `Value.Errors` rather than crash a tool call. */
+export interface TypeboxValidator {
+  Check(value: unknown): boolean;
+  Errors?(value: unknown): Iterable<TypeboxError>;
+}
+
+/** The slice of typebox's `compile` namespace this package uses. */
+export interface TypeboxCompile {
+  Compile(schema: unknown): TypeboxValidator;
+}
+
+type CompileLoader = () => Promise<TypeboxCompile>;
+
+/** Default: typebox's `Compile` through the same loader seam `Value` uses. */
+async function defaultCompileLoader(): Promise<TypeboxCompile> {
+  const ns: any = await loadTypebox('compile');
+  // 1.3.7 exports `Compile` by name and as `default`. Prefer the name.
+  const Compile = typeof ns?.Compile === 'function'
+    ? ns.Compile
+    : (typeof ns?.default === 'function' ? ns.default : null);
+  if (!Compile) throw new Error('typebox/compile exposes no Compile');
+  return { Compile: (schema: unknown) => Compile(schema) };
+}
+
+let compileLoader: CompileLoader | null = defaultCompileLoader;
+let compileModule: TypeboxCompile | null = null;
+let compilePromise: Promise<TypeboxCompile | null> | null = null;
+/** `Compile` was tried and failed; rung 3 (`Value.Check`) stands in. */
+let compileDegraded = false;
+
+/**
+ * One compiled checker per SCHEMA OBJECT, for the life of that object.
+ *
+ * Weak, not a `Map`: a tool spec's `args` object is what a compiled checker
+ * belongs to, and an MCP server's rediscovered schemas (a fresh object per
+ * expansion) would otherwise pin every generation of every schema for the life
+ * of the process. Keyed on identity rather than on a serialization because a
+ * registered tool's `args` IS a stable object — one compile per tool per
+ * process is the whole win, and hashing a schema on every call would give a
+ * chunk of it straight back.
+ *
+ * A `null` value is a NEGATIVE entry: this schema threw at compile time and
+ * must not be retried on every call.
+ */
+let compiledCache = new WeakMap<object, TypeboxValidator | null>();
+
+/** The compile module, or null once it is known to be unreachable. Same lazy/
+ *  cached/latched shape as `fullChecker` — see the note there about `finally`. */
+async function compileChecker(): Promise<TypeboxCompile | null> {
+  if (compileModule) return compileModule;
+  if (compileDegraded || !compileLoader) return null;
+  if (!compilePromise) {
+    const loader = compileLoader;
+    compilePromise = loader()
+      .then((C) => { compileModule = C; return C; })
+      .catch((e) => {
+        compileDegraded = true;
+        warnUnavailable(
+          'the compiled JSON-Schema checker (typebox/compile) could not be loaded; validation '
+          + `still runs, interpreted, through Value.Check: ${(e as Error)?.message}`,
+        );
+        return null;
+      })
+      .finally(() => { compilePromise = null; });
+  }
+  return compilePromise;
+}
+
+/**
+ * The compiled checker for one schema, or null when this schema must go
+ * through `Value.Check` instead. Never throws: every failure is a rung down.
+ */
+async function compiledFor(schema: object): Promise<TypeboxValidator | null> {
+  const hit = compiledCache.get(schema);
+  if (hit !== undefined) return hit;
+  const C = await compileChecker();
+  if (!C) return null;
+  try {
+    const compiled = C.Compile(schema);
+    if (typeof compiled?.Check !== 'function') {
+      throw new Error('Compile returned no Check');
+    }
+    compiledCache.set(schema, compiled);
+    return compiled;
+  } catch (e) {
+    // THIS schema, not the process: a compiler that chokes on one tool's
+    // schema leaves every other tool compiled. Negative-cached so the throw
+    // costs one attempt rather than one per call.
+    compiledCache.set(schema, null);
+    warnUnavailable(
+      'a tool schema could not be compiled; the interpreted checker (Value.Check) stands in '
+      + `for it: ${(e as Error)?.message}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Replace (or, with `null`, remove) the route to the compiled checker.
+ *
+ * The seam the compiled-path tests use: forcing a rejecting loader is the only
+ * way to exercise rung 3 of the ladder without uninstalling a package. The
+ * compiled cache is REPLACED (a WeakMap cannot be cleared) so a test never
+ * sees a checker the previous loader built.
+ */
+export function setTypeboxCompileLoader(next: CompileLoader | null): () => void {
+  const previous = compileLoader;
+  const previousModule = compileModule;
+  const previousDegraded = compileDegraded;
+  const previouslyWarned = warnedUnavailable;
+  compileLoader = next;
+  compileModule = null;
+  compilePromise = null;
+  compileDegraded = false;
+  compiledCache = new WeakMap();
+  warnedUnavailable = false;
+  warnedKinds.clear();
+  return () => {
+    compileLoader = previous;
+    compileModule = previousModule;
+    compilePromise = null;
+    compileDegraded = previousDegraded;
+    compiledCache = new WeakMap();
+    warnedUnavailable = previouslyWarned;
+  };
+}
+
+/** TEST SEAM: is `schema` already compiled in this process? The compile-once
+ *  claim is otherwise unobservable — a cache hit and a miss return the same
+ *  verdict, which is the point. */
+export function _isSchemaCompiled(schema: object): boolean {
+  return compiledCache.get(schema) != null;
+}
+
+async function fullCheck(
+  V: TypeboxValue, schema: unknown, args: unknown,
+): Promise<ValidationResult> {
   // `Value.Check` throws on a non-object schema (`Cannot use 'in' operator`).
   // Nothing to enforce there anyway — the structural checker accepts it too.
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { ok: true };
+
+  const compiled = await compiledFor(schema as object);
+  if (compiled) {
+    if (compiled.Check(args)) return { ok: true };
+    // A compiled Validator carries its own `Errors` (probed), returning the
+    // same ajv-shaped records `Value.Errors` does. Fall back to the
+    // interpreted `Errors` only if a future release drops it — the failure
+    // path only, and a rejection is already established at this point.
+    if (typeof compiled.Errors === 'function') {
+      for (const err of compiled.Errors(args)) return { ok: false, reason: reasonFor(err) };
+    }
+    for (const err of V.Errors(schema, args)) return { ok: false, reason: reasonFor(err) };
+    return { ok: false, reason: 'arguments do not match the tool schema' };
+  }
+
   if (V.Check(schema, args)) return { ok: true };
   for (const err of V.Errors(schema, args)) return { ok: false, reason: reasonFor(err) };
   // Check said no and Errors said nothing — report the disagreement rather
@@ -543,16 +734,18 @@ export function fullValidationAvailable(): boolean {
 }
 
 /**
- * The shipped default: full JSON Schema when typebox is reachable, the minimal
- * structural check when it is not. Falling back rather than throwing is the
- * whole point — a checker that cannot load must narrow what is enforced, never
- * take every tool call down with it.
+ * The shipped default, and rungs 2-4 of the degrade ladder documented at the
+ * top of this section: a compiled checker per schema when `typebox/compile` is
+ * reachable, the interpreted `Value.Check` when it is not, the minimal
+ * structural check when typebox is absent entirely. Falling back rather than
+ * throwing is the whole point — a checker that cannot load must narrow what is
+ * enforced, never take every tool call down with it.
  */
 const defaultValidator: ArgsValidator = async (schema, args) => {
   const V = await fullChecker();
   if (!V) return structuralValidator(schema, args);
   try {
-    return fullCheck(V, schema, args);
+    return await fullCheck(V, schema, args);
   } catch (e) {
     // A schema typebox itself chokes on. Degrade THIS call rather than the
     // process: the structural checker still catches the shape errors.

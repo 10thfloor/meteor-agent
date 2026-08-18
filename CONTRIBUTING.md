@@ -51,6 +51,17 @@ weekly. The package survives both because of three rules — keep them:
    import-only map), so a bare `require.resolve` succeeds where it throws for
    pi-ai — that still does not make a plain import work under Meteor, whose
    resolver cannot follow an `exports` map at all. The seam stays.
+   Second recorded finding: typebox is reached through **two** of its exports
+   keys now, `./value` and `./compile`, and each is cached separately by
+   `loadPackage`. `typebox/compile`'s namespace is
+   `{ Code, Compile, Validator, default }` (`default` IS `Compile`);
+   `Compile(schema)` takes plain JSON Schema and returns a `Validator` whose
+   `Check(value)` and `Errors(value)` produce the SAME ajv-shaped records
+   `Value.Check`/`Value.Errors` do — which is why one `reasonFor` serves both
+   and why the compiled path was a drop-in. A bump that reshapes either key
+   must keep the four-rung degrade ladder in `server/tools.ts` intact: an app
+   validator, then compiled, then interpreted, then structural, each rung
+   warning once and none of them throwing.
 3. **A version bump is a verification event, not a routine update.** After
    `meteor npm install @earendil-works/pi-ai@<new>` or
    `meteor npm install @modelcontextprotocol/sdk@<new>`:

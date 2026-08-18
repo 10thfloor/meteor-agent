@@ -1,5 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import { ensureCapped } from './capped';
+import { ensureIndexes } from './indexes';
 import { registerPublications } from './publications';
 import { registerMethods } from './methods';
 import { applyRateLimits } from './rate-limits';
@@ -15,10 +16,12 @@ export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
-  fullValidationAvailable, setTypeboxValueLoader, SUBAGENT_ARGS, SKILL_TOOL_NAME,
+  fullValidationAvailable, setTypeboxValueLoader, setTypeboxCompileLoader,
+  _isSchemaCompiled, SUBAGENT_ARGS, SKILL_TOOL_NAME,
   type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
-  type ArgsValidator, type TypeboxValue, type Skill, type ToolResult,
+  type ArgsValidator, type TypeboxValue, type TypeboxCompile,
+  type TypeboxValidator, type Skill, type ToolResult,
   // The gate surface. `Gate` is what a spec's `gate` accepts; `GateContext` is
   // what an app's predicate is handed, and is the one type it has to name.
   type Gate, type GateContext, type GatePredicate,
@@ -40,6 +43,8 @@ export type {
   Provider, ProviderChunk, ProviderRequest, ProviderMessage,
 } from './providers/types';
 export { startWatcher, type Watcher, type WatcherOptions } from './watcher';
+export { ensureIndexes } from './indexes';
+export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 
 /**
  * This process's boot watcher, or null when the settings or the environment
@@ -70,6 +75,9 @@ const UNDER_TEST = Meteor.isTest || Meteor.isAppTest || Meteor.isPackageTest;
 
 Meteor.startup(async () => {
   await ensureCapped();
+  // After ensureCapped and before anything serves: the watcher's sweeps and
+  // every transcript read depend on these. Non-fatal by design — see the file.
+  await ensureIndexes();
   registerPublications();
   registerMethods();
   // `Meteor.settings.packages` is undefined whenever no `--settings` file was
