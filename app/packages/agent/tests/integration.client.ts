@@ -79,14 +79,15 @@ describe('live DDP round trip', () => {
 
     const rows = support.messages(sessionId).fetch();
     const assistant = rows.find((m: any) => m.role === 'assistant' && !m.streaming);
+    assert.ok(assistant, 'the committed assistant row must exist');
 
-    assert.equal(assistant.content, 'live streamed reply');
+    assert.equal(assistant!.content, 'live streamed reply');
     assert.equal(rows[0].role, 'user');
     assert.equal(rows[0].content, 'hello');
     assert.isTrue(rows.every((m: any) => typeof m.seq === 'number'));
 
     assert.isNotNull(streamed, 'no in-flight row was ever observed — deltas never crossed DDP');
-    assert.equal(streamed.seq, assistant.seq, 'the in-flight row must carry the future msgSeq');
+    assert.equal(streamed.seq, assistant!.seq, 'the in-flight row must carry the future msgSeq');
     // Non-empty first: `startsWith('')` is vacuously true, so an in-flight row
     // that never carried any text would otherwise pass the prefix check.
     assert.isAbove(streamed.content.length, 0, 'in-flight row never carried any text');

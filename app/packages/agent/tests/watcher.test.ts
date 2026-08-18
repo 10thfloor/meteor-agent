@@ -17,6 +17,34 @@ const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 20000) 
 
 const settle = (ms: number) => new Promise((r) => { setTimeout(r, ms); });
 
+/**
+ * The turn is FINISHED — not merely visible.
+ *
+ * A committed assistant row is not the end of a turn. The loop still removes
+ * the message's deltas, checks for a user message that interjected mid-stream,
+ * and only THEN, in its `finally`, writes `phase: 'idle'` and releases the
+ * lease: four Mongo round trips separate "the answer is in the transcript" from
+ * "the session is back at rest". A wait that ends at the first and then asserts
+ * the second is asserting on state that has not been written yet.
+ *
+ * That is the one-run flake two agents saw here and neither could pin. It is a
+ * TEST race, not a watcher one — measured with a sampler that read the session
+ * the instant the row appeared: `streaming`, lease held, twelve times out of
+ * twelve. The 25ms poll below usually lands outside the window and occasionally
+ * lands inside it, which is exactly the reported shape (one run in many, always
+ * on an orphan-claim path, never reproducible on demand).
+ *
+ * So every wait ends on the TERMINAL state, and the assertions that follow
+ * re-state what was waited for rather than racing it.
+ */
+const finished = async (sessionId: string, assistants: number): Promise<boolean> => {
+  const { AgentSessions, AgentMessages } = await import('../common/collections');
+  const n = await AgentMessages.find({ sessionId, role: 'assistant' }).countAsync();
+  if (n !== assistants) return false;
+  const doc = await AgentSessions.findOneAsync(sessionId);
+  return !!doc && doc.phase === 'idle' && !doc.lease;
+};
+
 const reset = async () => {
   const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
   await AgentSessions.removeAsync({});
@@ -41,6 +69,36 @@ const seedSession = async (
     _id: `${sessionId}-u`, sessionId, seq: 0, role: 'user',
     content: 'refund please', createdAt: new Date(),
   } as any);
+};
+
+/**
+ * A CHILD session, as a subagent dispatch leaves one: lineage on the document
+ * and nothing else. Backdated by default, because the sweep deliberately
+ * ignores a child younger than one grace period (a live dispatch writes the
+ * child before it writes the parent's `activeChild` marker).
+ */
+const seedChild = async (
+  childId: string, parentId: string, agent: string,
+  overrides: Record<string, unknown> = {},
+) => {
+  const { AgentSessions } = await import('../common/collections');
+  await AgentSessions.insertAsync({
+    _id: childId, agent, userId: 'u1', phase: 'idle', model: 'mock',
+    nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+    budgetSpent: { turns: 0, toolCalls: 0 },
+    parent: { sessionId: parentId, toolCallId: 'tc1' },
+    depth: 1,
+    createdAt: new Date(Date.now() - 60_000), updatedAt: new Date(),
+    ...overrides,
+  } as any);
+};
+
+/** How many `orphan-child` notes a parent transcript carries. */
+const noteCount = async (parentId: string): Promise<number> => {
+  const { AgentMessages } = await import('../common/collections');
+  return AgentMessages.find(
+    { sessionId: parentId, role: 'note', kind: 'orphan-child' } as any,
+  ).countAsync();
 };
 
 /**
@@ -115,8 +173,7 @@ describe('orphan-claim watcher', () => {
       // Generous: with no oplog available the live query degrades to
       // poll-and-diff, whose default interval is 10s.
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-obs', role: 'assistant' }).countAsync()) === 1,
+        () => finished('s-obs', 1),
         'the observer to claim the orphan and finish its turn',
         40000,
       );
@@ -155,8 +212,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 120 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-sweep', role: 'assistant' }).countAsync()) === 1,
+        () => finished('s-sweep', 1),
         'the sweep to notice the expired lease',
       );
       const msg = await AgentMessages.findOneAsync({ sessionId: 's-sweep', role: 'assistant' });
@@ -203,8 +259,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-timeout', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-timeout', 2),
         'the timed-out turn to resume and finish',
       );
 
@@ -313,8 +368,7 @@ describe('orphan-claim watcher', () => {
     const b = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-race-timeout', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-race-timeout', 2),
         'the timed-out turn to resume and finish',
       );
       await settle(400);
@@ -412,8 +466,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60, verdictGraceMs: 1000 });
     try {
       await waitFor(
-        async () => (await AgentMessages
-          .find({ sessionId: 's-standing', role: 'assistant' }).countAsync()) === 2,
+        () => finished('s-standing', 2),
         'the sweep to pick up the dropped wake',
       );
       assert.deepEqual(state.ran, ['refund'], 'the approved tool must finally run — once');
@@ -430,3 +483,217 @@ describe('orphan-claim watcher', () => {
     }
   });
 });
+
+/**
+ * §4.3 case 4. A subagent dispatch abandoned between creating the child and
+ * committing its result leaves a real session — with a transcript, a cost and
+ * possibly an answer — that NO published document points at. The parent's tool
+ * row is the only durable handle and it never landed; `activeChild` was the
+ * live one and the dispatch cleared it (or the process that held it died).
+ *
+ * The repair is a pointer, not a turn: one structured note in the PARENT
+ * transcript, which is published, so a client holding the conversation can find
+ * and subscribe to the child again.
+ */
+describe('orphaned-child re-link', () => {
+  it('re-links an orphaned child into the parent transcript, exactly once', async function () {
+    this.timeout(40000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { startWatcher } = await import('../server/watcher');
+
+    await reset();
+    await seedSession('p-orphan', 'relink-parent');
+    await seedChild('c-orphan', 'p-orphan', 'relink-child');
+
+    const w = startWatcher({ sweepMs: 60, relinkGraceMs: 50 });
+    try {
+      await waitFor(
+        async () => (await noteCount('p-orphan')) === 1,
+        'the sweep to re-link the orphaned child',
+      );
+      // Many more sweeps run in here. The note is its own idempotence guard —
+      // it carries `childSessionId`, which is exactly what the sweep reads to
+      // decide the child is already reachable.
+      await settle(400);
+      assert.equal(await noteCount('p-orphan'), 1, 'a later sweep must not write a second note');
+
+      const note = (await AgentMessages.findOneAsync({
+        sessionId: 'p-orphan', kind: 'orphan-child',
+      } as any))!;
+      assert.equal(note.role, 'note');
+      assert.equal(note.childSessionId, 'c-orphan', 'the note IS the handle');
+      assert.equal(note.childAgent, 'relink-child', 'and a subscription needs the agent name too');
+      assert.equal(note.reason, 'recovered');
+      assert.isUndefined(note.toolCallId, 'a note answers no tool call');
+      // Seq allocation is the atomic one: the parent's user message holds 0,
+      // this takes 1, and `nextSeq` moved with it.
+      assert.equal(note.seq, 1);
+      assert.equal((await AgentSessions.findOneAsync('p-orphan'))!.nextSeq, 2);
+
+      const child = await AgentSessions.findOneAsync('c-orphan');
+      assert.isDefined(child, 'the sweep repairs reachability and touches nothing else');
+      assert.equal(child!.phase, 'idle');
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it('leaves a claimed child alone', async function () {
+    this.timeout(40000);
+    const { AgentMessages } = await import('../common/collections');
+    const { startWatcher } = await import('../server/watcher');
+
+    await reset();
+    await seedSession('p-claimed', 'relink-parent');
+    await seedChild('c-claimed', 'p-claimed', 'relink-child');
+    // The row a completed dispatch commits. The child is reachable from the
+    // transcript already, so a note would be a duplicate pointer in a
+    // conversation a person reads.
+    await AgentMessages.insertAsync({
+      _id: 'claim-row', sessionId: 'p-claimed', seq: 1, role: 'tool',
+      toolCallId: 'tc1', content: 'the child answered',
+      childSessionId: 'c-claimed', createdAt: new Date(),
+    } as any);
+
+    // The CONTROL orphan: its note is how this test knows a sweep actually ran.
+    // Asserting the absence of something without proving the thing that would
+    // have written it executed is how a green test hides a broken feature.
+    await seedSession('p-control', 'relink-parent');
+    await seedChild('c-control', 'p-control', 'relink-child');
+
+    const w = startWatcher({ sweepMs: 60, relinkGraceMs: 50 });
+    try {
+      await waitFor(
+        async () => (await noteCount('p-control')) === 1,
+        'the sweep to re-link the control orphan',
+      );
+      await settle(300);
+      assert.equal(await noteCount('p-claimed'), 0, 'a claimed child needs no pointer');
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it('does not re-link a child whose dispatch is still in flight', async function () {
+    this.timeout(40000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { startWatcher } = await import('../server/watcher');
+
+    await reset();
+    // Again a control orphan, because the interesting assertion is a negative
+    // one and it has to be made WHILE the live child is unclaimed — after the
+    // dispatch returns, the tool row would explain the absence by itself.
+    await seedSession('p-control-live', 'relink-parent');
+    await seedChild('c-control-live', 'p-control-live', 'relink-child');
+
+    let notesDuring: number | null = null;
+    new Agent('relink-slow', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: {
+        async *stream() {
+          yield { kind: 'text', chunk: 'thinking ' };
+          // Hold the dispatch open until a sweep has demonstrably COMPLETED
+          // (the control note is the receipt), by which time this child is
+          // older than the grace period and carries no tool row — a candidate
+          // in every respect except the parent's `activeChild` marker.
+          const deadline = Date.now() + 15000;
+          for (;;) {
+            // eslint-disable-next-line no-await-in-loop
+            if (await noteCount('p-control-live') === 1) break;
+            if (Date.now() > deadline) break;
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 25); });
+          }
+          notesDuring = await noteCount('p-live');
+          yield { kind: 'text', chunk: 'done' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      },
+    } as any);
+    await seedSession('p-live', 'relink-parent');
+
+    const w = startWatcher({ sweepMs: 60, relinkGraceMs: 50 });
+    try {
+      await runTurn('p-live', {
+        model: 'mock',
+        system: '',
+        tools: [{ subagent: 'relink-slow', description: 'slow child' }],
+        provider: mockProvider((req) => (
+          req.messages.some((m) => m.role === 'tool')
+            ? { text: 'ok' }
+            : { toolCalls: [{ id: 'lc1', name: 'relink-slow', args: { prompt: 'think' } }] }
+        )),
+      });
+
+      assert.equal(notesDuring, 0, 'a child the parent is actively dispatching is not orphaned');
+      await settle(300);
+      assert.equal(await noteCount('p-live'), 0, 'and the tool row is its durable pointer');
+      const row = (await AgentMessages.findOneAsync(
+        { sessionId: 'p-live', role: 'tool' } as any,
+      ))!;
+      assert.isDefined(row.childSessionId);
+      assert.isUndefined(
+        (await AgentSessions.findOneAsync('p-live'))!.activeChild,
+        'the live marker does not outlive the dispatch',
+      );
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it('warns about a child whose parent is gone, and leaves the child standing', async function () {
+    this.timeout(40000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { startWatcher } = await import('../server/watcher');
+
+    await reset();
+    // Nothing in the harness produces this today (see `warnParentlessOnce`),
+    // but a sweep must not throw on it and must not decide, on its own
+    // authority, that unreachable data is garbage.
+    await seedChild('c-no-parent', 'p-vanished', 'relink-child');
+    await seedSession('p-control-gone', 'relink-parent');
+    await seedChild('c-control-gone', 'p-control-gone', 'relink-child');
+
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+    const w = startWatcher({ sweepMs: 60, relinkGraceMs: 50 });
+    try {
+      await waitFor(
+        async () => warnings.some((m) => m.includes('c-no-parent')),
+        'a warning naming the parentless child',
+      );
+      await waitFor(
+        async () => (await noteCount('p-control-gone')) === 1,
+        'the same sweep to keep re-linking everything else',
+      );
+      await settle(300);
+      assert.isDefined(
+        await AgentSessions.findOneAsync('c-no-parent'),
+        'a sweep never deletes session data',
+      );
+      assert.equal(
+        await AgentMessages.find({ kind: 'orphan-child', childSessionId: 'c-no-parent' } as any)
+          .countAsync(),
+        0, 'and there is no transcript to write the pointer into',
+      );
+      assert.equal(
+        warnings.filter((m) => m.includes('c-no-parent')).length, 1,
+        'one warning per process, not one per sweep',
+      );
+      assert.isTrue(
+        warnings.some((m) => m.includes('p-vanished')),
+        'the warning names the parent an operator would go looking for',
+      );
+    } finally {
+      console.warn = originalWarn;
+      await w.stop();
+    }
+  });
+});
+

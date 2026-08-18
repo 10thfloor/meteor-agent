@@ -115,7 +115,7 @@ Support.define({ model: 'mock', instructions: '…',
   provider: mockProvider(() => ({ text: 'hi' })) });
 ```
 
-The package's own 288-test suite runs entirely network-free.
+The package's own 322-test suite runs entirely network-free.
 
 ## Requirements
 
@@ -136,12 +136,14 @@ send() ─▶ method (authorize, atomic seq) ─▶ lease claim ─▶ turn loop
                      └──done──▶ [messages]  (committed at boundaries only)
 ```
 
-Five documents' worth of design reasoning — the lease model, the repair
-invariants, the approval-gate semantics, why the merge walks backward — live
-in [`docs/superpowers/specs/`](docs/superpowers/specs/), and every mechanism
-was built against failure-injection tests (lease steals mid-stream, crashes
-between a tool call and its result, racing approvers, jittered retries). The
-review history that shaped the invariants is preserved in the milestone plans
+The design reasoning — the lease model, the repair invariants, the
+approval-gate semantics, why the merge walks backward — lives in the design
+spec ([`docs/superpowers/specs/`](docs/superpowers/specs/)), and the five
+milestone plans that built on it are in
+[`docs/superpowers/plans/`](docs/superpowers/plans/). Every mechanism was built
+against failure-injection tests (lease steals mid-stream, crashes between a tool
+call and its result, racing approvers, jittered retries), and the review
+history that shaped the invariants is preserved in those milestone plans
 alongside the spec.
 
 ## Project layout
@@ -159,16 +161,36 @@ Development workflow, the test command, and the npm-dependency policy
 
 ## Status
 
-Four milestones shipped: the spec's v1 (streaming, tools, gates, budgets,
-compaction, recovery) and the v2 features (subagents, forking, MCP, skills,
-hooks, the element). CI runs the full suite plus a production-bundle
-verification on every push.
+Five milestones shipped: the spec's v1 (streaming, tools, gates, budgets,
+compaction, recovery), the v2 features (subagents, forking, MCP, skills,
+hooks, the element), and the v3 backlog:
+
+- **predicate gates** — `gate` may be a function, so authorization can read
+  the arguments and the caller instead of only the tool's name;
+- **per-agent hooks** — `agentInstance.hook(...)` beside the global
+  `Agent.hook(...)`, globals first;
+- **idempotent subagent dispatch** — a recovered parent turn reuses the child
+  it already created instead of running a second one;
+- **orphan re-link** — the sweep writes a pointer into the parent transcript
+  when a dispatch died before committing its result, so no child is stranded;
+- **interrupt propagation** — Stop walks the `activeChild` chain and stops the
+  work the user can actually see;
+- **wake tokens** — a deferred wake proceeds only if the verdict it captured
+  still stands;
+- **compiled argument validation** — one compiled JSON-Schema checker per tool
+  schema, cached for the process, with a documented degrade ladder;
+- **startup indexes** — the transcript read and the watcher's sweeps stopped
+  being collection scans;
+- **a `tool_args` delta clamp** — one runaway argument stream can no longer
+  evict every other session's tokens from the capped delta collection.
+
+CI runs the full suite plus a production-bundle verification on every push.
 
 Honest caveats: the package is **not yet published to Atmosphere** (install
 from this repo until then), and the live-provider smoke test is the one test
-that needs a real API key — everything else is verified network-free. The
-v3 backlog (idempotency keys for subagent dispatch, per-agent hooks, and
-other accepted debt) is tracked in the repo.
+that needs a real API key — everything else is verified network-free. A whole-
+repo code review and a dedicated security review close the milestone; their
+findings and the remaining v4 candidates are tracked in the repo.
 
 ## License
 

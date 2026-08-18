@@ -460,6 +460,135 @@ describe('hooks', () => {
     });
   });
 
+  it('skips a replacement request that drops `system`, and sends the original', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: ProviderRequest | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req;
+        yield { kind: 'text', chunk: 'answered' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    await seed('hk-nosystem', 'hello', 'support');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      // The shape a hook that rebuilds the request from scratch produces: model
+      // and messages, no system prompt. Accepting it would send the model no
+      // instructions, no skills listing and no tool guidance — an agent
+      // answering as a bare chat model, with nothing in the transcript to say
+      // why. `system` is not optional on `ProviderRequest`; the check now says so.
+      Agent.hook('beforeProviderRequest', (req) => ({
+        model: req.model, messages: req.messages,
+      } as any));
+      await runTurn('hk-nosystem', {
+        model: 'mock', system: 'be helpful', tools: [], provider: capturing,
+      });
+    } finally {
+      console.warn = originalWarn;
+      Agent.clearHooks();
+    }
+
+    const req = seen! as ProviderRequest;
+    assert.equal(req.system, 'be helpful', 'the request the harness built must stand');
+    assert.isArray(req.tools, 'and stand whole — not half-replaced');
+    assert.lengthOf(warnings, 1);
+    assert.include(warnings[0], 'not a provider request');
+    assert.include(
+      warnings[0], '`model`, `system` and `messages`',
+      'the warning must name what was missing',
+    );
+  });
+
+  it('records a structured error for a result that cannot be serialized, and finishes the turn', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let calls = 0;
+    const scripted: Provider = {
+      async *stream() {
+        calls += 1;
+        if (calls === 1) {
+          // TWO calls in the batch: the warn latch is per KIND, not per
+          // occurrence, so two unserializable results must produce one warning.
+          yield {
+            kind: 'done',
+            toolCalls: [
+              { id: 'c1', name: 'lookup', args: {} },
+              { id: 'c2', name: 'lookup', args: {} },
+            ],
+            usage: { input: 1, output: 1 },
+          };
+          return;
+        }
+        yield { kind: 'text', chunk: 'carried on' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    await seed('hk-circular', 'look it up', 'support');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      // A hook is app code and hands back what it likes. `JSON.stringify` throws
+      // on a circular value (and on a BigInt), and that throw used to escape the
+      // dispatch loop and abandon a turn that had already done all of its work.
+      Agent.hook('afterToolResult', () => {
+        const circular: any = { note: 'cannot be JSON' };
+        circular.self = circular;
+        return { ok: true, value: circular };
+      });
+      await runTurn('hk-circular', {
+        model: 'mock',
+        system: '',
+        tools: [{
+          name: 'lookup',
+          description: 'x',
+          args: { type: 'object', properties: {} },
+          run: async () => ({ fine: true }),
+        }],
+        provider: scripted,
+      });
+    } finally {
+      console.warn = originalWarn;
+      Agent.clearHooks();
+    }
+
+    const rows = await AgentMessages
+      .find({ sessionId: 'hk-circular', role: 'tool' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(rows, 2, 'both calls must still be answered — an unanswered tool_use 400s');
+    for (const row of rows) {
+      assert.equal((row as any).error?.error, 'unserializable-result');
+      assert.equal(
+        (row as any).content,
+        JSON.stringify({
+          error: 'unserializable-result',
+          reason: 'The tool result could not be serialized.',
+        }),
+        'the row carries the structured substitute, never a half-written string',
+      );
+    }
+
+    const reply = await AgentMessages.findOneAsync(
+      { sessionId: 'hk-circular', role: 'assistant', content: 'carried on' } as any,
+    );
+    assert.isDefined(reply, 'the turn must complete — a bad value is the app\'s mistake, not ours');
+    assert.equal((await AgentSessions.findOneAsync('hk-circular'))!.phase, 'idle');
+    assert.lengthOf(
+      warnings.filter((m) => m.includes('could not be serialized')), 1,
+      'one warn per kind, not one per occurrence',
+    );
+  });
+
   it('a hook that throws — or returns junk — is skipped with one warn per kind, and the turn completes', async function () {
     this.timeout(30000);
     const { AgentMessages, AgentSessions } = await import('../common/collections');
@@ -694,6 +823,96 @@ describe('hooks', () => {
     assert.deepEqual(observed[0].ctx, {
       agent: 'hk-gate', sessionId: 'hk-gate-session', userId: 'u1',
     });
+  });
+
+  /**
+   * PER-AGENT hooks (v3). Same two seams, scoped by `ctx.agent` — which is read
+   * off the SESSION document, so a child session reports the child's agent and
+   * a subagent's hooks are the subagent's.
+   */
+  it('a per-agent hook runs only for its own agent, and clears on its own', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: string | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req.system;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+    const run = (sessionId: string) => runTurn(sessionId, {
+      model: 'mock', system: 'base', tools: [], provider: capturing,
+    });
+
+    const mine = new Agent('hk-mine');
+    try {
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+GLOBAL` }));
+      mine.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+MINE` }));
+
+      await seed('hk-scoped-mine', 'hi', 'hk-mine');
+      await run('hk-scoped-mine');
+      assert.equal(seen, 'base+GLOBAL+MINE');
+
+      // A DIFFERENT agent, same process, same global hook: the per-agent one
+      // must not follow it. This is the assertion the whole feature is for —
+      // without it, `agentInstance.hook` would just be `Agent.hook` with extra
+      // syntax.
+      await seed('hk-scoped-other', 'hi', 'hk-other');
+      await run('hk-scoped-other');
+      assert.equal(seen, 'base+GLOBAL', "another agent must not see hk-mine's hook");
+
+      // The narrow half of the test seam: one agent's hooks go, the global ones
+      // stay. (`Agent.clearHooks()` clears both — the `finally` below relies on
+      // exactly that, and every other test in this file already did.)
+      mine.clearHooks();
+      await seed('hk-scoped-cleared', 'hi', 'hk-mine');
+      await run('hk-scoped-cleared');
+      assert.equal(seen, 'base+GLOBAL', 'instance clearHooks() clears only that agent');
+    } finally {
+      Agent.clearHooks();
+    }
+  });
+
+  it('runs every global hook first, then the agent\'s own, each in registration order', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: string | null = null;
+    const capturing: Provider = {
+      async *stream(req) {
+        seen = req.system;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    };
+
+    const ordered = new Agent('hk-ordered');
+    await seed('hk-order-session', 'hi', 'hk-ordered');
+    try {
+      // Registered INTERLEAVED — agent, global, agent, global — so the assertion
+      // below can only pass if the order comes from the SCOPE and not from the
+      // sequence of `hook()` calls. Each hook appends its own tag, so the
+      // composition is the whole chain, in order, in one string.
+      ordered.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+A1` }));
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+G1` }));
+      ordered.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+A2` }));
+      Agent.hook('beforeProviderRequest', (req) => ({ ...req, system: `${req.system}+G2` }));
+
+      await runTurn('hk-order-session', {
+        model: 'mock', system: 'base', tools: [], provider: capturing,
+      });
+    } finally {
+      Agent.clearHooks();
+    }
+
+    // Globals first (in their own registration order), then the agent's (in
+    // theirs). The agent's hook sees the global chain's output and gets the
+    // last word — specificity, exactly as the README documents it.
+    assert.equal(seen, 'base+G1+G2+A1+A2');
   });
 
 });

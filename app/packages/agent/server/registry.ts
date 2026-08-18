@@ -81,6 +81,19 @@ export interface AgentConfig {
    *  enter the transcript (and therefore every later model call). Explicit
    *  truncation marker; default 8000. */
   maxResultChars?: number;
+  /**
+   * Per-TURN ceiling on the bytes of `tool_args` deltas a turn may publish.
+   * Default 256 KiB (`DEFAULT_MAX_TOOL_ARG_BYTES`).
+   *
+   * DISPLAY-STREAM HYGIENE ONLY. The delta collection is capped and shared by
+   * every session on the deployment, so one model streaming a runaway argument
+   * blob evicts everyone else's in-flight tokens. Past the ceiling a turn stops
+   * publishing partial-arguments deltas; `text` and `thinking` deltas are
+   * unaffected, and the committed assistant message's real `toolCalls` — what
+   * dispatch actually reads — are never clamped. Raise it for an agent whose
+   * tools genuinely take huge arguments and whose UI renders them.
+   */
+  maxToolArgBytes?: number;
   /** §7's backstop: may this agent use this tool at all, independent of any
    *  per-tool gate? Checked before dispatch AND before parking — a forbidden
    *  tool never asks a human for approval. Refusal reaches the model as a
@@ -95,6 +108,22 @@ export interface AgentConfig {
    * the caller gets `Meteor.Error('not-allowed')` and the run stays parked.
    */
   approve?: (ctx: { userId: string | null }) => boolean | Promise<boolean>;
+  /**
+   * May `agent.start` (and `agent.fork`) open a session for this agent directly?
+   *
+   * Undefined (the default) means YES — every agent is a startable endpoint, the
+   * behavior that predates this flag. Set it to `false` for a SPECIALIST that
+   * should only ever be reached as a subagent or an `Agent.ask` target: those
+   * paths do not go through `agent.start`, so a `startable: false` agent still
+   * runs as a child session and still answers a headless one-shot, but a client
+   * can no longer independently start it and bypass the parent's gates.
+   *
+   * This is coarse — an on/off switch on the public start method. For finer
+   * control (start it only for certain callers, or only from a certain parent)
+   * write a `canUse` on the PARENT that inspects `ctx` and keep the child
+   * ungated. See the README's Subagents section.
+   */
+  startable?: boolean;
 }
 
 /** `budget` with `spend` reduced to a plain dollar number — what the loop and
@@ -284,6 +313,18 @@ export function getAgent(name: string): AgentConfig | undefined {
 }
 
 /**
+ * Every registered agent as `[name, config]` pairs, in registration order.
+ *
+ * The registry is otherwise keyed lookup only; startup needs to WALK it to warn
+ * about agents shipped with no spend ceiling (see `server/index.ts`), and a host
+ * that builds its own admin surface may want the same. A fresh array each call —
+ * the internal Map is not handed out.
+ */
+export function listAgents(): Array<[string, AgentConfig]> {
+  return [...registry.entries()];
+}
+
+/**
  * The registry config as the LOOP consumes it — the one assembly every entry
  * into a turn goes through.
  *
@@ -314,6 +355,7 @@ export function buildRunConfig(config: AgentConfig, userId: string | null): RunC
     retry: config.retry,
     context: config.context,
     maxResultChars: config.maxResultChars,
+    maxToolArgBytes: config.maxToolArgBytes,
     canUse: config.canUse,
     // Hooks are NOT threaded here, deliberately: they are registered globally
     // with `Agent.hook` and the loop imports their runners directly. Passing

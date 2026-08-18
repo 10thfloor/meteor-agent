@@ -1404,7 +1404,7 @@ describe('approval gates', () => {
     // turn, and the loop must exit still parked rather than re-streaming over
     // an unanswered tool_use.
     await runTurn('s-park-repair', {
-      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider as Provider,
     });
 
     const msgs = await AgentMessages
@@ -1909,6 +1909,102 @@ describe('approval gates', () => {
     assert.deepEqual(state!.ran, [], 'nothing was approved any more, so nothing runs');
   });
 
+  it('a wake refuses a verdict that is not the one it captured', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // The residual the boolean re-check could not see. "Is a verdict standing?"
+    // is a boolean answer to an IDENTITY question: verdict A can be consumed,
+    // the batch re-park on its NEXT gate, and a second verdict B be recorded —
+    // with its own resume already deferred — before the first timer fires.
+    // Three writes later the boolean still says yes, and the stale callback
+    // runs a turn behind the resume that legitimately owns B.
+    //
+    // Forced here through the wind-down read itself: the moment the self-check
+    // snapshots a session carrying verdict A with the lease already released,
+    // `pending` is replaced wholesale with a DIFFERENT verdict under a
+    // different token — exactly the document B's resume would have left.
+    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    let superseded = false;
+    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
+      const doc = await original(...args);
+      if (!superseded && doc?._id === 's-wake-token' && doc.pending?.verdict && !doc.lease) {
+        superseded = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token' } as any,
+          {
+            $set: {
+              pending: {
+                toolCallId: 'g2', name: 'refund', args: {},
+                verdict: 'approved', by: 'u1', wakeToken: 'TOKEN-B',
+              },
+            },
+          } as any,
+        );
+      }
+      return doc;
+    };
+
+    // Verdict A, stamped with its own token, injected on the park write with no
+    // defer of its own — so the winding-down run's self-check is the only thing
+    // that can act on it, exactly as the two tests above arrange.
+    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      const n = await originalUpdate(sel, mod, ...rest);
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token' } as any,
+          {
+            $set: {
+              'pending.verdict': 'approved',
+              'pending.by': 'u1',
+              'pending.wakeToken': 'TOKEN-A',
+              phase: 'idle',
+            },
+          } as any,
+        );
+      }
+      return n;
+    };
+
+    let state: { ran: string[]; providerCalls: number } | null = null;
+    try {
+      state = await buildFixture('s-wake-token', 'gate-wake-token', [
+        { id: 'g1', name: 'refund', gate: 'ask' },
+      ]);
+    } finally {
+      if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
+      else delete (AgentSessions as any).updateAsync;
+      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
+      else delete (AgentSessions as any).findOneAsync;
+    }
+    assert.isTrue(injected, 'verdict A must have landed on the park write');
+    assert.isTrue(superseded, 'verdict B must have replaced it inside the wake window');
+
+    // The deferred re-run fires on a zero timer; give it room to misbehave.
+    await new Promise((r) => { setTimeout(r, 400); });
+
+    assert.equal(
+      state!.providerCalls, 1,
+      'the wake must not run: the verdict standing is not the one it captured, and B '
+      + 'already has a resume of its own',
+    );
+    assert.lengthOf(
+      await AgentMessages
+        .find({ sessionId: 's-wake-token', role: 'assistant' }).fetchAsync(), 1,
+      'no extra assistant row may appear',
+    );
+    assert.deepEqual(state!.ran, [], 'and no tool may run for a verdict this wake never saw');
+    // B is left exactly as found — untouched, for the resume that owns it.
+    const doc = (await AgentSessions.findOneAsync('s-wake-token'))!;
+    assert.equal(doc.pending?.wakeToken, 'TOKEN-B');
+    assert.equal(doc.pending?.verdict, 'approved');
+  });
+
   it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -1935,7 +2031,7 @@ describe('approval gates', () => {
     } as any);
 
     await runTurn('s-stop-verdict', {
-      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider!,
+      model: 'mock', system: '', tools: config.tools ?? [], provider: config.provider as Provider,
     });
 
     assert.deepEqual(state.ran, [], 'a stop must cancel an approved tool that has not run yet');
@@ -2093,6 +2189,93 @@ describe('approval gates', () => {
       unansweredToolUses(msgs), [], 'the abandoned batch must take its tool_use with it',
     );
     assert.equal(msgs[msgs.length - 1].role, 'user', 'transcript must stay resumable');
+  });
+
+  it('re-checks canUse on approval-resume: a revoked entitlement stops the parked call (M-CANUSE)', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // canUse is TRUE at park time — the call has to reach `awaiting` for the
+    // resume path to be what's under test — then flipped FALSE before the human
+    // approves, modelling a kill-switch or a revoked entitlement.
+    let allow = true;
+    const state = await buildFixture('s-canuse-resume', 'gate-canuse-resume', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ], { canUse: async () => allow });
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-canuse-resume'))!.phase, 'awaiting',
+      'the fixture must actually park before the entitlement is revoked',
+    );
+
+    allow = false;
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1' }, 'gate-canuse-resume', 's-canuse-resume');
+
+    // The turn still finishes — the model sees the refusal and routes around it —
+    // but the tool never ran.
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-canuse-resume', role: 'assistant' }).countAsync()) === 2,
+      'the resumed turn to finish after the canUse refusal',
+    );
+    assert.deepEqual(state.ran, [], 'a canUse refusal at resume must NOT dispatch the tool');
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-canuse-resume' }, { sort: { seq: 1 } }).fetchAsync();
+    const row = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'g1')!;
+    assert.isDefined(row, 'the approved-but-forbidden call must still be answered');
+    assert.equal(row.error!.error, 'not-allowed', 'the row carries the structured refusal');
+    assert.deepEqual(unansweredToolUses(msgs), [], 'no tool_use may be left stranded');
+
+    // A refused call costs no tool budget — same accounting a denial gets.
+    const doc = (await AgentSessions.findOneAsync('s-canuse-resume'))!;
+    assert.equal(
+      (doc.budgetSpent as any).toolCalls, 0,
+      'a call that never dispatched must not be billed a tool call',
+    );
+    assert.isUndefined(doc.pending, 'the marker clears once resolved');
+  });
+
+  it('clamps a committed row error.reason to maxResultChars (L-ERRREASON)', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // A denial's reason is caller-controlled (typed into `agent.deny`) and rides
+    // as its OWN `error.reason` field, which the content clamp does not bound —
+    // so it must be clamped the same way `content` is, or a megabyte reason
+    // reaches every later model call and the published transcript.
+    await buildFixture('s-errreason', 'gate-errreason', [
+      { id: 'g1', name: 'refund', gate: 'ask' },
+    ], { maxResultChars: 50 });
+    assert.equal((await AgentSessions.findOneAsync('s-errreason'))!.phase, 'awaiting');
+
+    const hugeReason = 'X'.repeat(500);
+    const deny = (Meteor.server as any).method_handlers[NAMES.mDeny];
+    await deny.call({ userId: 'u1' }, 'gate-errreason', 's-errreason', hugeReason);
+
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync(
+        { sessionId: 's-errreason', role: 'tool', toolCallId: 'g1' } as any,
+      )),
+      'the denied tool row to commit',
+    );
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-errreason', role: 'tool', toolCallId: 'g1' } as any,
+    ))!;
+    assert.equal(row.error!.error, 'denied');
+    assert.isBelow(
+      row.error!.reason!.length, hugeReason.length,
+      'the reason must be truncated, not stored whole',
+    );
+    assert.include(row.error!.reason!, 'truncated', 'and it must say it was truncated');
+    assert.isTrue(
+      row.error!.reason!.startsWith('X'.repeat(50)),
+      'the first maxResultChars characters survive, the rest are dropped',
+    );
   });
 });
 
@@ -2836,5 +3019,474 @@ describe('canUse backstop and maxResultChars (§5.2/§7)', () => {
     ))!;
     assert.isBelow(row.content!.length, 120, 'content must be truncated');
     assert.include(row.content!, 'truncated');
+  });
+});
+
+/**
+ * §7's third gate form, specced for v1 and shipped in v3: `gate` may be a
+ * PREDICATE, because the interesting authorization questions are about the
+ * arguments ("refunds under $50 are automatic") and a literal cannot see them.
+ *
+ * The four verdicts are asserted where they are DECIDED — in the dispatch
+ * loop — rather than against `evaluateGate` alone: the point of the feature is
+ * what the transcript and the phase end up saying, and a unit test of the
+ * evaluator would pass just as well if nobody called it.
+ */
+describe('predicate gates', () => {
+  it('a predicate that returns true runs the tool, and is handed the caller ctx', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await seed('s-gate-true', 'refund 5');
+    const seen: any[] = [];
+    let ran = false;
+    let call = 0;
+    await runTurn('s-gate-true', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'refund',
+        description: 'x',
+        args: { type: 'object', properties: {} },
+        // The shape the feature exists for: a decision made from the
+        // ARGUMENTS, which the literal gates cannot see at all.
+        gate: (ctx) => { seen.push(ctx); return (ctx.args as any).amt < 50; },
+        run: async () => { ran = true; return 'refunded'; },
+      }],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5 } }] }
+          : { text: 'done' };
+      }),
+    });
+
+    assert.isTrue(ran, 'a true predicate must run the tool exactly as gate: auto does');
+    assert.lengthOf(seen, 1, 'the predicate is consulted once per dispatch');
+    // The CALLER's identity, the session, the name the model used and the raw
+    // arguments — and nothing else, so a predicate cannot come to depend on a
+    // field the contract does not promise.
+    assert.deepEqual(seen[0], {
+      userId: 'u1', sessionId: 's-gate-true', name: 'refund', args: { amt: 5 },
+    });
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-true', role: 'tool', toolCallId: 'g1' } as any,
+    ))!;
+    assert.include(row.content!, 'refunded');
+    assert.isUndefined(row.error);
+  });
+
+  it('a predicate that returns false answers denied-by-gate, without parking', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await seed('s-gate-false', 'refund 5000');
+    let ran = false;
+    let deniedRan = false;
+    let call = 0;
+    await runTurn('s-gate-false', {
+      model: 'mock', system: '',
+      tools: [
+        { name: 'refund', description: 'x', args: { type: 'object', properties: {} },
+          gate: (ctx) => (ctx.args as any).amt < 50,
+          run: async () => { deniedRan = true; return 'refunded'; } },
+        // A SIBLING in the same batch: a refusal answers one call, it does not
+        // stop the batch, which is the whole difference from a park.
+        { name: 'note', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { ran = true; return 'noted'; } },
+      ],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? { toolCalls: [
+            { id: 'g1', name: 'refund', args: { amt: 5000 } },
+            { id: 'g2', name: 'note', args: {} },
+          ] }
+          : { text: 'understood' };
+      }),
+    });
+
+    assert.isFalse(deniedRan, 'a false predicate must not run the tool');
+    assert.isTrue(ran, 'and must not stop the rest of the batch either');
+    const doc = (await AgentSessions.findOneAsync('s-gate-false'))!;
+    assert.notEqual(doc.phase, 'awaiting', 'a refusal is not a question for a human');
+    assert.isUndefined(doc.pending, 'and parks nothing');
+    assert.equal(doc.phase, 'idle');
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-false', role: 'tool', toolCallId: 'g1' } as any,
+    ))!;
+    assert.equal(row.error!.error, 'denied-by-gate');
+    assert.include(row.error!.reason!, 'refund');
+    // The model read the refusal and carried on — the point of answering with a
+    // result rather than abandoning the turn.
+    const final = await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-false', role: 'assistant', content: 'understood' } as any,
+    );
+    assert.isDefined(final);
+    // A refusal dispatches nothing, so it costs no tool budget — the same rule
+    // `canUse` follows, and the reason a batch cannot be made expensive by
+    // asking for things it may not have.
+    assert.equal(doc.budgetSpent.toolCalls, 1, 'only the sibling that RAN is charged');
+  });
+
+  it("a predicate that returns 'ask' parks exactly like the literal", async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await seed('s-gate-ask', 'refund 5000');
+    let ran = false;
+    await runTurn('s-gate-ask', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'refund', description: 'x', args: { type: 'object', properties: {} },
+        gate: async (ctx) => ((ctx.args as any).amt < 50 ? true : 'ask'),
+        run: async () => { ran = true; return 'refunded'; },
+      }],
+      provider: mockProvider(() => (
+        { toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5000 } }] })),
+    });
+
+    assert.isFalse(ran);
+    const doc = (await AgentSessions.findOneAsync('s-gate-ask'))!;
+    assert.equal(doc.phase, 'awaiting');
+    assert.deepInclude(doc.pending as any, { toolCallId: 'g1', name: 'refund' });
+    assert.isUndefined(doc.lease, 'a parked run holds no lease');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-gate-ask', role: 'tool' }).countAsync(), 0,
+      'the batch is deliberately unanswered while parked',
+    );
+  });
+
+  it('a throwing predicate fails CLOSED to denied, warns once, and the turn survives', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { _resetGateWarnings } = await import('../server/tools');
+
+    await seed('s-gate-throw', 'refund');
+    let ran = false;
+    let call = 0;
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    _resetGateWarnings();
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    try {
+      await runTurn('s-gate-throw', {
+        model: 'mock', system: '',
+        tools: [{
+          name: 'refund', description: 'x', args: { type: 'object', properties: {} },
+          gate: () => { throw new Error('the roster service is down'); },
+          run: async () => { ran = true; return 'refunded'; },
+        }],
+        provider: mockProvider(() => {
+          call += 1;
+          // TWO calls in the batch: the warn latch is per KIND, so a gate that
+          // is broken for every call must still produce one line.
+          return call === 1
+            ? { toolCalls: [
+              { id: 'g1', name: 'refund', args: {} },
+              { id: 'g2', name: 'refund', args: {} },
+            ] }
+            : { text: 'understood' };
+        }),
+      });
+    } finally {
+      console.warn = originalWarn;
+      _resetGateWarnings();
+    }
+
+    assert.isFalse(ran, 'a gate whose own code is broken must not run the tool');
+    const rows = await AgentMessages
+      .find({ sessionId: 's-gate-throw', role: 'tool' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.lengthOf(rows, 2);
+    assert.isTrue(rows.every((m) => m.error?.error === 'denied-by-gate'));
+    assert.lengthOf(warnings, 1, 'one warn per failure kind, not one per call');
+    assert.include(warnings[0], 'gate predicate threw');
+    assert.include(warnings[0], 'DENIED');
+    assert.notInclude(
+      rows.map((m) => m.content).join(''), 'the roster service is down',
+      "the gate's own failure is a server log line, never a published row",
+    );
+    const doc = (await AgentSessions.findOneAsync('s-gate-throw'))!;
+    assert.equal(doc.phase, 'idle', 'a broken gate must not kill the turn');
+    const final = await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-throw', role: 'assistant', content: 'understood' } as any,
+    );
+    assert.isDefined(final);
+  });
+
+  it('does NOT re-evaluate the predicate for the call a human approved', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent, buildRunConfig } = await import('../server/registry');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // A STATEFUL predicate, which is what a real one is: it reads a balance, a
+    // roster, the clock. It says 'ask' once — the park — and then flips to
+    // false, exactly as the world can change while a request sits on somebody's
+    // screen. The approved call must still run: a human answered the question
+    // the gate asks, in writing, in the transcript, and re-asking it would let
+    // the predicate overturn an explicit authorization.
+    const asked: string[] = [];
+    let allowed = true;
+    let ran = 0;
+    let call = 0;
+    const provider = mockProvider(() => {
+      call += 1;
+      return call === 1
+        ? { toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5000 } }] }
+        : { text: 'all done' };
+    });
+    const tools = [{
+      name: 'refund',
+      description: 'x',
+      args: { type: 'object', properties: {} },
+      gate: (ctx: any) => { asked.push(ctx.name); return allowed ? 'ask' as const : false; },
+      run: async () => { ran += 1; return 'refunded'; },
+    }];
+    new Agent('gate-predicate', { model: 'mock', instructions: '', tools, provider } as any);
+    await seed('s-gate-approved', 'refund please', 'gate-predicate');
+    await runTurn('s-gate-approved', buildRunConfig(getAgent('gate-predicate')!, 'u1'));
+
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-gate-approved'))!.phase, 'awaiting',
+      'the fixture must actually park',
+    );
+    assert.lengthOf(asked, 1);
+
+    // The world changes while the request waits.
+    allowed = false;
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1', unblock() {} }, 'gate-predicate', 's-gate-approved');
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync(
+        { sessionId: 's-gate-approved', role: 'tool', toolCallId: 'g1' } as any,
+      )),
+      'the approved call to be answered',
+    );
+
+    assert.equal(ran, 1, 'the approved call runs, once');
+    assert.lengthOf(
+      asked, 1,
+      'and the predicate is NOT consulted again — approval already answered it',
+    );
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-approved', role: 'tool', toolCallId: 'g1' } as any,
+    ))!;
+    assert.include(row.content!, 'refunded');
+    assert.isUndefined(row.error, 'a re-gated approval would have written denied-by-gate');
+  });
+
+  it('re-gates the REMAINDER of a resumed batch through the predicate', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent, buildRunConfig } = await import('../server/registry');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // The SECOND dispatch site. The streaming pass parks at call 1 and never
+    // reaches calls 2 and 3, so every gate they are ever given is given by the
+    // resume's re-dispatch — which is the whole claim the shared `dispatchCalls`
+    // exists to make true: approving `refund` says nothing about what follows
+    // it, and a predicate is honored there exactly as a literal is.
+    const seen: Array<{ name: string; userId: string | null; args: unknown }> = [];
+    const ran: string[] = [];
+    let providerCalls = 0;
+    const provider = mockProvider(() => {
+      providerCalls += 1;
+      return providerCalls === 1
+        ? {
+          toolCalls: [
+            { id: 'g1', name: 'refund', args: { amt: 5 } },
+            { id: 'g2', name: 'escalate', args: { amt: 900 } },
+            { id: 'g3', name: 'notify', args: { who: 'ops' } },
+          ],
+        }
+        : { text: 'all done' };
+    });
+    const watch = (verdict: false | 'ask') => (ctx: any) => {
+      seen.push({ name: ctx.name, userId: ctx.userId, args: ctx.args });
+      return verdict;
+    };
+    const tools = [
+      // A LITERAL park, so the predicates below are untouched by the streaming
+      // pass and their first evaluation can only come from the resume.
+      { name: 'refund', description: 'x', gate: 'ask' as const,
+        args: { type: 'object', properties: {} },
+        run: async () => { ran.push('refund'); return 'refunded'; } },
+      { name: 'escalate', description: 'x', gate: watch(false),
+        args: { type: 'object', properties: {} },
+        run: async () => { ran.push('escalate'); return 'escalated'; } },
+      { name: 'notify', description: 'x', gate: watch('ask'),
+        args: { type: 'object', properties: {} },
+        run: async () => { ran.push('notify'); return 'notified'; } },
+    ];
+    new Agent('gate-remainder', { model: 'mock', instructions: '', tools, provider } as any);
+    await seed('s-gate-remainder', 'refund please', 'gate-remainder');
+    await runTurn('s-gate-remainder', buildRunConfig(getAgent('gate-remainder')!, 'u1'));
+
+    assert.equal((await AgentSessions.findOneAsync('s-gate-remainder'))!.phase, 'awaiting');
+    assert.lengthOf(seen, 0, 'the park precedes every gate after it in the batch');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1', unblock() {} }, 'gate-remainder', 's-gate-remainder');
+    await waitFor(
+      async () => (await AgentSessions
+        .findOneAsync('s-gate-remainder'))?.pending?.toolCallId === 'g3',
+      'the remainder to be re-gated and park again on the third call',
+    );
+
+    assert.deepEqual(ran, ['refund'], 'only the approved call ran');
+    // Both predicate forms, decided on the resume path: one refused with a
+    // result the model can route around, one asked and re-parked the turn.
+    assert.deepEqual(seen, [
+      { name: 'escalate', userId: 'u1', args: { amt: 900 } },
+      { name: 'notify', userId: 'u1', args: { who: 'ops' } },
+    ], 'each remaining call is gated once, with the CALLER ctx');
+    const denied = (await AgentMessages.findOneAsync(
+      { sessionId: 's-gate-remainder', role: 'tool', toolCallId: 'g2' } as any,
+    ))!;
+    assert.equal(denied.error!.error, 'denied-by-gate');
+    const doc = (await AgentSessions.findOneAsync('s-gate-remainder'))!;
+    assert.equal(doc.phase, 'awaiting');
+    assert.isUndefined((doc.pending as any).verdict, 'the re-park carries no verdict');
+    assert.isUndefined(doc.lease, 'and holds no lease');
+    const parkedMsgs = await AgentMessages
+      .find({ sessionId: 's-gate-remainder' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(
+      unansweredToolUses(parkedMsgs), ['g3'],
+      'the refusal ANSWERED g2 — only the newly parked call may stand unanswered',
+    );
+
+    // And the second verdict finishes it, without asking `notify`'s predicate
+    // again: an approved call is dispatched, never re-gated.
+    await approve.call({ userId: 'u1', unblock() {} }, 'gate-remainder', 's-gate-remainder');
+    await waitFor(
+      async () => (await AgentMessages
+        .find({ sessionId: 's-gate-remainder', role: 'assistant' }).countAsync()) === 2,
+      'the second approval to finish the batch and continue the turn',
+    );
+    assert.deepEqual(ran, ['refund', 'notify']);
+    assert.lengthOf(seen, 2, "the approved call's own predicate is not consulted again");
+    const finished = await AgentMessages
+      .find({ sessionId: 's-gate-remainder' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.deepEqual(unansweredToolUses(finished), [], 'no stranded tool_use at any exit');
+  });
+});
+
+/**
+ * `runAs` in front of the person deciding (v3).
+ *
+ * An approver is authorizing an IDENTITY as well as an action: a call that runs
+ * as `service-account` is not the same request as one that runs as them. The
+ * park writes it, the approval note records it, and `<agent-chat>` renders it —
+ * the element half is asserted in the browser suite.
+ */
+describe('runAs surfaced to approvers', () => {
+  it('the parked marker carries runAs — including null, and nothing when there is none', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    const park = async (sessionId: string, spec: Record<string, unknown>) => {
+      await seed(sessionId, 'do it');
+      await runTurn(sessionId, {
+        model: 'mock', system: '',
+        tools: [{
+          name: 'credit', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => 'credited',
+          ...spec,
+        }],
+        provider: mockProvider(() => (
+          { toolCalls: [{ id: 'r1', name: 'credit', args: {} }] })),
+      });
+      const doc = (await AgentSessions.findOneAsync(sessionId))!;
+      assert.equal(doc.phase, 'awaiting', 'the fixture must park');
+      return doc.pending!;
+    };
+
+    const escalated = await park('s-runas-user', { runAs: 'service-account' });
+    assert.equal(escalated.runAs, 'service-account');
+
+    // `null` is the ANONYMOUS service context, a deliberate value — and the one
+    // an approver most needs told, since "nobody" is not the same as "you".
+    // Present-and-null, never confused with absent.
+    const anonymous = await park('s-runas-null', { runAs: null });
+    assert.isTrue('runAs' in anonymous, 'runAs: null must be WRITTEN, not dropped');
+    assert.isNull(anonymous.runAs);
+
+    // The ordinary case runs as the session's owner and says nothing: an
+    // approval bar that announced an identity on every request would train
+    // people to ignore the line that matters.
+    const plain = await park('s-runas-none', {});
+    assert.isFalse('runAs' in plain, 'a tool with no runAs must write no key at all');
+  });
+
+  it('the approval note records the identity the approved call runs as', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { runTurn } = await import('../server/loop');
+    const { getAgent, buildRunConfig } = await import('../server/registry');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    let sawUserId: string | null | undefined;
+    let call = 0;
+    const provider = mockProvider(() => {
+      call += 1;
+      return call === 1
+        ? { toolCalls: [{ id: 'r1', name: 'credit', args: {} }] }
+        : { text: 'all done' };
+    });
+    const tools = [{
+      name: 'credit', description: 'x', gate: 'ask' as const, runAs: 'service-account',
+      args: { type: 'object', properties: {} },
+      run: async (_args: unknown, ctx: any) => { sawUserId = ctx.userId; return 'credited'; },
+    }];
+    new Agent('gate-runas', { model: 'mock', instructions: '', tools, provider } as any);
+    await seed('s-runas-note', 'credit them', 'gate-runas');
+    await runTurn('s-runas-note', buildRunConfig(getAgent('gate-runas')!, 'u1'));
+    assert.equal((await AgentSessions.findOneAsync('s-runas-note'))!.phase, 'awaiting');
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    await approve.call({ userId: 'u1', unblock() {} }, 'gate-runas', 's-runas-note');
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync(
+        { sessionId: 's-runas-note', role: 'tool', toolCallId: 'r1' } as any,
+      )),
+      'the approved call to be answered',
+    );
+
+    const note = (await AgentMessages.findOneAsync(
+      { sessionId: 's-runas-note', role: 'note', kind: 'approval' } as any,
+    ))!;
+    assert.isTrue(note.approved);
+    assert.equal(note.by, 'u1', 'who decided');
+    assert.equal(
+      (note as any).runAs, 'service-account',
+      'and WHAT they authorized — the audit row must say more than "someone said yes"',
+    );
+    // The escalation itself still works exactly as it did: the note is a record
+    // of it, not a replacement for it.
+    assert.equal(sawUserId, 'service-account');
   });
 });

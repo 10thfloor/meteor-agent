@@ -4,8 +4,10 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { getAgent, buildRunConfig, type AgentConfig } from './registry';
-import { COMPACT_REFUSALS, compactSession, runTurn } from './loop';
+import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession, runTurn } from './loop';
 import { forkSession } from './fork';
+import { MAX_SUBAGENT_DEPTH } from './subagent';
+import { ACTIVE_PHASES, type SessionInc } from '../common/types';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -81,6 +83,13 @@ async function writeVerdict(
   const $set: Record<string, unknown> = {
     'pending.verdict': verdict,
     'pending.by': by,
+    // The wake's IDENTITY, written in the same atomic write as the verdict it
+    // identifies — never separately, or a deferred resume could capture a
+    // token for a verdict that is not yet there. The loop's wind-down
+    // self-check captures it and re-checks it inside its deferred callback:
+    // "is a verdict standing" is a boolean answer to the question "is it still
+    // MY verdict standing". See `AgentSession.pending.wakeToken`.
+    'pending.wakeToken': Random.id(),
     phase: 'idle',
     updatedAt: new Date(),
   };
@@ -107,14 +116,27 @@ async function writeVerdict(
   // with a running turn.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     { _id: sessionId },
-    { $inc: { nextSeq: 1 }, $set: { updatedAt: new Date() } },
+    { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
     { returnDocument: 'before' },
   );
   if (before) {
+    // The parked marker as it stood a moment ago — `before` is the document
+    // BEFORE this seq allocation, which is after the verdict write, so
+    // `pending` is still there with everything the park recorded.
+    const parked = (before as any).pending as { runAs?: string | null } | undefined;
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq: (before as any).nextSeq,
       role: 'note', kind: 'approval',
       approved: verdict === 'approved', by, reason,
+      // AUDIT COMPLETENESS: what was authorized, not merely that someone said
+      // yes. A call that runs as `service-account` is a different fact from one
+      // that runs as the approver, and the tool spec (the only other place that
+      // knows) can be edited or deleted long before anyone reads this row.
+      //
+      // Presence, not truthiness: `runAs: null` is the anonymous service
+      // context, and a spread keeps the key ABSENT for the ordinary case rather
+      // than writing an explicit undefined.
+      ...(parked && 'runAs' in parked ? { runAs: parked.runAs } : {}),
       // `undefined` is not a field write, so a human verdict carries no
       // `timedOut` key at all rather than an explicit false. A UI that
       // distinguishes "denied by someone" from "nobody answered in time" must
@@ -171,6 +193,67 @@ export async function recordTimeoutVerdict(sessionId: string): Promise<boolean> 
 }
 
 /**
+ * Stop the RUNNING DESCENDANTS of an interrupted session.
+ *
+ * Stop must stop the work the user can see. A parent that delegates spends most
+ * of its turn inside `runSubagent`, and stopping only the parent left the child
+ * streaming to completion on the parent's clock — tokens billed, a transcript
+ * growing, and a Stop button that had visibly done nothing. The chain is walked
+ * through `activeChild`, which is the live handle and is set for exactly as long
+ * as a dispatch is in flight (a child may itself be dispatching, hence a walk
+ * rather than a single hop).
+ *
+ * TWO THINGS IT WILL NOT DO.
+ *
+ * It will not touch a PARKED descendant. A child sitting in `awaiting` is a
+ * question in front of a human, and the parent's turn already gave up on it:
+ * `subagent-parked` told the model so, and the whole design of that answer is
+ * that the child stays open and answerable through `agent.approve` afterwards.
+ * Stopping it would cancel a decision the parent's interrupt was never about,
+ * and (because a stop is durable until the next `agent.send`) would strand a
+ * request nobody can ever answer — a parked child has no `send` path a UI
+ * offers. The phase filter is what encodes this: only `ACTIVE_PHASES` match,
+ * so `awaiting`, `idle`, `error` and an already-`stopped` descendant are all
+ * left exactly as they are.
+ *
+ * It will not recurse without a bound. `MAX_SUBAGENT_DEPTH` hops is the whole
+ * legal chain, so the cap is not a heuristic; it is also what keeps a stale or
+ * cyclic `activeChild` (a marker left behind by a lease steal mid-dispatch —
+ * the field's own docs call it a hint, not a contract) from turning a Stop into
+ * an unbounded walk.
+ *
+ * The writes are plain, unguarded `$set`s, exactly like the interrupt's own —
+ * and for the identical reason. There is no lease to hold: the interrupting
+ * CALLER owns no session, and the process driving the descendant is precisely
+ * the one this write is trying to reach. `stopped` is a terminal state every
+ * writer in the loop already defends (the commit, the park and the retry
+ * branch are all conditional on `phase: { $ne: 'stopped' }`, and the outer
+ * `finally` preserves it), so the worst a racing write can do is arrive at a
+ * session that has already finished — which the phase filter then declines to
+ * stop. The walk is a best-effort read of hints, so it neither retries nor
+ * reports: what makes the stop authoritative is the descendant's own mid-stream
+ * check, not this write's return value.
+ */
+async function stopRunningDescendants(sessionId: string): Promise<void> {
+  let current = await AgentSessions.findOneAsync(sessionId);
+  for (let hop = 0; hop < MAX_SUBAGENT_DEPTH; hop += 1) {
+    const next = current?.activeChild?.sessionId;
+    if (!next) return;
+    // eslint-disable-next-line no-await-in-loop
+    await AgentSessions.updateAsync(
+      { _id: next, phase: { $in: ACTIVE_PHASES } } as any,
+      { $set: { phase: 'stopped', updatedAt: new Date() } } as any,
+    );
+    // Re-read rather than trusting the write: the walk continues past a
+    // descendant it did NOT stop (a parked one, or one that finished a
+    // microsecond ago) because that descendant's own children — if it somehow
+    // has any in flight — are still the user's work.
+    // eslint-disable-next-line no-await-in-loop
+    current = await AgentSessions.findOneAsync(next);
+  }
+}
+
+/**
  * The shared body of `agent.approve` and `agent.deny`: authorize, decide once,
  * record the verdict in the transcript, and wake the parked run.
  *
@@ -220,12 +303,27 @@ export function registerMethods(): void {
   Meteor.methods({
     async [NAMES.mStart](this: any, agent: string, opts?: { title?: string }) {
       check(agent, String);
+      // Read the title BEFORE the `check` assertion: @types/meteor's
+      // `check(x, Match.Maybe({...}))` narrows `x` to a type whose object
+      // fields resolve to `never`, so `opts?.title` read afterwards fails to
+      // type-check even though the value is a plain `string | undefined`.
+      const title = opts?.title;
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      // §7. A `startable: false` agent is a specialist meant to be reached only
+      // as a subagent or an `Agent.ask` target — neither of which comes through
+      // here — so refuse a direct start. Without this a caller could open a
+      // session on a child agent and drive it independently, bypassing the gates
+      // its parent applies before delegating. `=== false` only: undefined is the
+      // compat default (every agent startable), and the check must never turn a
+      // config that simply omitted the flag into a dead endpoint.
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be started directly');
+      }
       const _id = Random.id();
       await AgentSessions.insertAsync({
-        _id, agent, userId: this.userId ?? null, title: opts?.title,
+        _id, agent, userId: this.userId ?? null, title,
         phase: 'idle', model: config.model, nextSeq: 0,
         usage: { input: 0, output: 0, cost: 0 },
         budgetSpent: { turns: 0, toolCalls: 0 },
@@ -241,6 +339,19 @@ export function registerMethods(): void {
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
       await requireSession(agent, sessionId, this.userId ?? null);
+
+      // `startable: false` closes `agent.start`/`agent.fork`; it must close
+      // `agent.send` too, or the flag is a fiction. A subagent child is a real
+      // session of the specialist, and its id rides the parent's published
+      // tool row — so without this an owner could `agent.send` fresh turns
+      // straight to the specialist, driving it outside the parent's
+      // orchestration, which is exactly what the flag promises to prevent.
+      // Unconditional (no child exception): a `startable: false` agent has no
+      // user-facing conversation to send to, and a parked child a human
+      // answers resumes through `agent.approve`/`deny` → `runTurn`, never here.
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be driven directly');
+      }
 
       // §9: the turn budget, enforced INSIDE the atomic allocation below, not
       // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
@@ -271,7 +382,7 @@ export function registerMethods(): void {
       const before = await AgentSessions.rawCollection().findOneAndUpdate(
         turnFilter,
         {
-          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 },
+          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc,
           $set: { updatedAt: new Date() },
         },
         { returnDocument: 'before' },
@@ -323,6 +434,20 @@ export function registerMethods(): void {
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
       } as any);
+
+      // The named session first, its running descendants second. Order is not
+      // cosmetic: a subagent chain is driven from the top, so stopping the
+      // parent before the child means the parent cannot start ANOTHER child
+      // between the two writes (its next dispatch reads a stopped phase and
+      // abandons the batch). The reverse order leaves exactly that hole.
+      //
+      // Authorization is the parent's, and needs no addition: a child inherits
+      // its parent's `userId`, so anyone entitled to stop the parent is
+      // entitled to stop the work the parent started. There is no path from
+      // here to a session outside that lineage — `activeChild` is written only
+      // by a dispatch, only on the dispatching session, and only ever naming
+      // the child it just created.
+      await stopRunningDescendants(sessionId);
     },
 
     /**
@@ -344,15 +469,27 @@ export function registerMethods(): void {
       check(agent, String);
       check(sessionId, String);
       check(atSeq, Match.Maybe(Match.Integer));
+      // Read before the assertion — see mStart: @types/meteor narrows `opts`
+      // to a `never`-fielded type after this `check`.
+      const title = opts?.title;
       check(opts, Match.Maybe({ title: Match.Maybe(String) }));
       // The registry check mirrors mStart/mSend: forking into an agent this
       // server does not define would produce a session nothing can ever run.
-      if (!getAgent(agent)) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      // §7. A fork opens a new, independently-drivable session for this agent —
+      // the very thing `startable: false` forbids — so refuse it here the same
+      // way mStart does. The registry/README doc names `agent.start` AND
+      // `agent.fork` as the two doors this flag shuts. `=== false` only, for the
+      // compat default (see mStart).
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be started directly');
+      }
       const source = await requireSession(agent, sessionId, this.userId ?? null);
       // `Match.Maybe` accepts null as well as undefined, and DDP turns a
       // trailing `undefined` argument into null on the wire — so normalize
       // rather than letting a null `atSeq` reach the arithmetic downstream.
-      return forkSession(source, { atSeq: atSeq ?? undefined, title: opts?.title });
+      return forkSession(source, { atSeq: atSeq ?? undefined, title });
     },
 
     /**
@@ -385,6 +522,12 @@ export function registerMethods(): void {
       const outcome = await compactSession(
         sessionId, buildRunConfig(config, session.userId),
       );
+      // A session over its spend budget is refused compaction with its OWN code
+      // — a compaction bills like a turn, so `budget-exhausted` is the honest
+      // answer, not `busy`. Checked before the `busy` family below.
+      if (outcome === 'over-budget') {
+        throw new Meteor.Error('budget-exhausted', COMPACT_OVER_BUDGET);
+      }
       // One code, three reasons — `busy` also covers a session parked on an
       // approval and one sitting in `error`. See `COMPACT_REFUSALS`.
       const refusal = COMPACT_REFUSALS[outcome];

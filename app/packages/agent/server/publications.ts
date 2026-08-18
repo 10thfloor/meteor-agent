@@ -39,7 +39,15 @@ export function registerPublications(): void {
       // run, see server/lease.ts) — never wire hygiene the client needs, and
       // not something any client code reads (status()/usage()/pending() in
       // client/agent.ts only touch phase/usage/pending).
-      AgentSessions.find({ _id: sessionId }, { fields: { lease: 0 } }),
+      //
+      // `pending.wakeToken` is excluded for the same reason: it is the identity
+      // of a scheduled wake, joined to `lease` as pure server-internal
+      // bookkeeping (see `AgentSession.pending.wakeToken`), and a client that
+      // could read it learns nothing but could echo it back to confuse the
+      // wind-down self-check.
+      AgentSessions.find(
+        { _id: sessionId }, { fields: { lease: 0, 'pending.wakeToken': 0 } },
+      ),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
     ];
@@ -65,8 +73,13 @@ export function registerPublications(): void {
     // `agent.session`, which serves children without a special case.
     return AgentSessions.find(
       { agent, userId: this.userId, parent: { $exists: false } },
-      // `lease` omitted here too — see the matching comment on `pubSession`.
-      { sort: { updatedAt: -1 }, limit: 100, fields: { lease: 0 } },
+      // `lease` and `pending.wakeToken` omitted here too — see the matching
+      // comment on `pubSession`.
+      {
+        sort: { updatedAt: -1 },
+        limit: 100,
+        fields: { lease: 0, 'pending.wakeToken': 0 },
+      },
     );
   });
 }

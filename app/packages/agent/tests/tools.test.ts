@@ -94,9 +94,12 @@ describe('tool dispatch', () => {
     await withInvocation('u9', async () => {
       const current = (DDP as any)._CurrentMethodInvocation.get();
       assert.instanceOf(current, (DDPCommon as any).MethodInvocation);
-      assert.equal(typeof current.unblock, 'function');
-      assert.equal(typeof current.setUserId, 'function');
-      assert.equal(current.userId, 'u9');
+      // `assert.instanceOf` narrows `current` to `unknown` (its second arg is
+      // `any`), so read through an explicitly-`any` alias afterwards.
+      const inv: any = current;
+      assert.equal(typeof inv.unblock, 'function');
+      assert.equal(typeof inv.setUserId, 'function');
+      assert.equal(inv.userId, 'u9');
     });
 
     // Part 2: prove the failure mode this guards against is real. Reach a
@@ -232,6 +235,49 @@ describe('resolveTools validation', () => {
     assert.equal(inlineObject.kind, 'inline');
     assert.equal(inlineObject.name, 'inline-ok');
     assert.equal(typeof inlineObject.run, 'function');
+  });
+
+  it('carries a PREDICATE gate through on every tool kind, and defaults a missing one', async () => {
+    const { resolveTools } = await import('../server/tools');
+    const predicate = () => true;
+    const [inline, adopted, subagent, mcp, bare] = resolveTools([
+      { name: 'i', description: 'x', args: {}, run: async () => 'ok', gate: predicate },
+      { method: 'test.echo', description: 'x', args: {}, gate: predicate },
+      { subagent: 'researcher', description: 'x', gate: predicate },
+      { mcp: { server: 'docs', tool: 'search' }, gate: predicate },
+      'test.usesUnblock',
+    ] as any);
+    // The same function object, not a copy or a wrapper: the dispatch site
+    // calls exactly what the app wrote.
+    for (const tool of [inline, adopted, subagent, mcp]) {
+      assert.strictEqual(tool.gate, predicate, `${tool.kind} must carry the predicate through`);
+    }
+    assert.equal(bare.gate, 'auto', 'a spec with no gate still defaults to auto');
+  });
+
+  it('refuses a gate that is neither a literal nor a function', async () => {
+    const { resolveTools } = await import('../server/tools');
+    // The failure this guard exists for: a gate is read once per dispatch, deep
+    // inside a turn, so a typo would otherwise surface as a silently UNGATED
+    // tool — the wrong direction to be wrong in. Refused at resolve time, where
+    // it is a startup error naming the tool.
+    for (const bad of ['Ask', 'auto ', true, 0, null, {}]) {
+      assert.throws(
+        () => resolveTools([
+          { name: 'typo', description: 'x', args: {}, run: async () => 'ok', gate: bad },
+        ] as any),
+        /invalid "gate"/,
+        `gate: ${JSON.stringify(bad)} must be refused`,
+      );
+    }
+    // …but an omitted gate is not a typo, and `null` is not a legal way to say
+    // "no gate" — `undefined` is, and it is the only one that resolves.
+    assert.equal(
+      resolveTools([
+        { name: 'fine', description: 'x', args: {}, run: async () => 'ok', gate: undefined },
+      ] as any)[0].gate,
+      'auto',
+    );
   });
 });
 
@@ -373,6 +419,28 @@ describe('validateToolArgs — the full checker (typebox Value.Check)', () => {
     assert.isFalse(extra.ok, 'additionalProperties: false must be enforced');
     assert.include((extra as any).reason, 'sneak');
     assert.notInclude((extra as any).reason, 'SECRET');
+  });
+
+  it('ENFORCES `format` — a non-URI is rejected where the schema names format: uri', async () => {
+    // The README claims `format` is enforced, not treated as a decorative
+    // annotation. typebox 1.x ships its string formats registered by default,
+    // so the compiled DEFAULT checker rejects a malformed value with no
+    // FormatRegistry setup of our own — this pins that behaviour so a typebox
+    // bump that reverts to annotation-only fails here rather than silently
+    // letting bad `format: 'uri'` arguments through. Inline (not MCP-discovered)
+    // schema on purpose: the claim is about the checker, not tool discovery.
+    const { validateToolArgs, fullValidationAvailable } = await import('../server/tools');
+    assert.isTrue(fullValidationAvailable(), 'the full checker must be in force for this claim');
+    const schema = {
+      type: 'object',
+      properties: { u: { type: 'string', format: 'uri' } },
+      required: ['u'],
+    };
+    assert.isTrue((await validateToolArgs(schema, { u: 'https://example.com/x' })).ok,
+      'a well-formed URI must pass');
+    const bad = await validateToolArgs(schema, { u: 'not a uri' });
+    assert.isFalse(bad.ok, 'format: uri must reject a non-URI, not treat it as annotation');
+    assert.include((bad as any).reason, 'u', 'the reason must name the field');
   });
 
   it('keeps the structural checker\'s reason vocabulary for paths and required', async () => {

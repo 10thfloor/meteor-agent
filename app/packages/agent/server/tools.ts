@@ -5,8 +5,64 @@ import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
 import {
-  callMcpTool, discoverMcpTools, warnMcp, type McpToolInfo,
+  callMcpTool, discoverMcpTools, sanitizeMcpReason, warnMcp, type McpToolInfo,
 } from './mcp/client';
+
+/* ---------------------------------------------------------------------------
+ * GATES (§7).
+ *
+ * `'auto'` runs the call, `'ask'` parks the turn in front of a human, and a
+ * PREDICATE decides per call — which is the whole point of the third form: the
+ * interesting authorization questions are about the ARGUMENTS ("refunds under
+ * $50 are automatic"), and a literal cannot see them.
+ *
+ * `ctx.userId` is the CALLER's — the session's owner. `runAs` deliberately does
+ * NOT apply here: `runAs` says what identity the tool BODY runs under once the
+ * call is allowed to happen, and the gate is the thing deciding whether it
+ * happens at all. Evaluating the gate as the escalated identity would let a
+ * `runAs: 'admin'` spec answer its own authorization question — the escalation
+ * approving itself. A predicate that wants to know about the escalation reads it
+ * off the spec it is written next to.
+ *
+ * The three verdicts:
+ *   `true`   -> run it, exactly as `'auto'`.
+ *   `false`  -> a structured `denied-by-gate` tool RESULT. The model reads it
+ *               and routes around it; nothing parks, no human is troubled, and
+ *               the turn carries on. That is the difference between a gate that
+ *               says no and one that asks.
+ *   `'ask'`  -> park, exactly as the literal `'ask'`.
+ *
+ * A predicate that THROWS (or returns something that is none of the three)
+ * fails CLOSED to the denied result, with one warning per failure kind. A gate
+ * whose own code is broken must not run the tool — and must not kill the turn
+ * either, which is the same bargain hooks.ts strikes.
+ *
+ * WHERE it is evaluated: at every dispatch site that honors a literal gate,
+ * which is exactly one — `dispatchCalls` in server/loop.ts, shared by the
+ * streaming path and by the re-dispatch of a resumed batch's remainder. The
+ * approved call's own resume does NOT re-evaluate: a human already answered the
+ * question the gate asks, and re-asking it could refuse work that was
+ * explicitly authorized. See `resumeParkedTurn`.
+ * ------------------------------------------------------------------------ */
+
+/** What a predicate gate is handed. The CALLER's identity, never `runAs`. */
+export interface GateContext {
+  /** The session's owner — the human (or `null`, an anonymous capability-URL
+   *  holder) on whose behalf the model is asking. */
+  userId: string | null;
+  sessionId: string;
+  /** The tool's name as the model called it. */
+  name: string;
+  /** The model's arguments, unvalidated: a gate runs BEFORE dispatch, so this
+   *  is exactly what the model emitted. Treat it as untrusted input. */
+  args: unknown;
+}
+
+export type GatePredicate =
+  (ctx: GateContext) => boolean | 'ask' | Promise<boolean | 'ask'>;
+
+/** `'auto'` | `'ask'` | a predicate — see the GATES note above. */
+export type Gate = 'auto' | 'ask' | GatePredicate;
 
 export interface ToolContext {
   /** Who this tool runs AS. Normally the session's owner; a spec with `runAs`
@@ -52,7 +108,7 @@ export type InlineTool = {
   description: string;
   args: unknown;
   run: (args: any, ctx: ToolContext) => Promise<unknown>;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
   /** Run this tool as a FIXED user instead of the session's owner (`null` =
    *  anonymous service context). Privilege escalation by construction —
    *  read THE `runAs` NOTE above before using it. */
@@ -64,7 +120,7 @@ export type AdoptedTool = {
   description: string;
   args: unknown;
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
   /** The method's `this.userId` for calls the MODEL makes through this listing
    *  (your UI's own `Meteor.callAsync` is unaffected). Privilege escalation by
    *  construction — read `RUNAS_NOTE` above before using it. */
@@ -91,7 +147,7 @@ export type SubagentTool = {
    *  child's first user message. */
   args?: unknown;
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 };
 
 /** The default subagent argument schema: one string, the child's first user
@@ -124,7 +180,7 @@ export type McpTool = {
   args?: unknown;
   /** Single-tool form only: expose it to the model under a different name. */
   name?: string;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 };
 
 export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | McpTool | string;
@@ -133,7 +189,9 @@ export interface ResolvedTool {
   name: string;
   description: string;
   args: unknown;
-  gate: 'auto' | 'ask';
+  /** Never undefined here: `resolveTools` defaults a missing gate to `'auto'`
+   *  and refuses anything that is not a literal or a function. */
+  gate: Gate;
   kind: 'inline' | 'adopted' | 'subagent' | 'mcp';
   method?: string;
   run?: (args: any, ctx: ToolContext) => Promise<unknown>;
@@ -206,6 +264,42 @@ export type ArgsValidator =
  * reachable, and the minimal structural checker below when it is not. The
  * validator remains a SEAM on top of both: `setToolArgsValidator` wins over
  * either.
+ *
+ * PROBE 2 (M5 Task 4, typebox 1.3.7, read off the installed files and
+ * confirmed by a runtime probe):
+ *
+ *  - `package.json` `exports["./compile"]` -> `./build/compile/index.mjs`,
+ *    another key the same loader seam reaches (`loadTypebox('compile')`).
+ *    Its namespace is `{ Code, Compile, Validator, default }`; `default` IS
+ *    `Compile`.
+ *  - `build/compile/compile.d.mts`:
+ *    `export declare function Compile<const Type extends TSchema, Result
+ *     extends Validator = Validator<{}, Type>>(type: Type): Result;`
+ *    — one required argument (a second overload takes `(context, type)`).
+ *    It accepts PLAIN JSON Schema at run time exactly as `Value.Check` does.
+ *  - The returned `Validator` (`build/compile/validator.d.mts`) carries
+ *    `Check(value): value is Encode`, `Errors(value): TLocalizedValidationError[]`,
+ *    `IsAccelerated(): boolean`, plus Parse/Clean/Convert/Decode/Encode.
+ *    So a compiled checker DOES carry error details, and they are the SAME
+ *    ajv-shaped `{ keyword, schemaPath, instancePath, params, message }`
+ *    records `Value.Errors` returns — `reasonFor` below needed no change.
+ *    (`Errors` is still probed for before use; a release that drops it falls
+ *    back to `Value.Errors` for the failure path only.)
+ *  - `IsAccelerated()` returned `true` for every schema probed, including
+ *    `{}`, `{ type: 'bogus' }`, `oneOf`, and internal `$defs`/`$ref`.
+ *
+ * THE DEGRADE LADDER, highest wins:
+ *
+ *   1. an app validator installed with `setToolArgsValidator` — wins over
+ *      everything below, typebox-backed or not;
+ *   2. `Compile(schema).Check(args)`, one compile per schema object, cached
+ *      in a `WeakMap` keyed on that object;
+ *   3. `Value.Check(schema, args)` — the interpreted checker, used when
+ *      `typebox/compile` is unreachable or when THIS schema throws at compile
+ *      time (cached as "do not retry", per schema);
+ *   4. the minimal structural checker, when typebox is not reachable at all.
+ *
+ * Each rung down narrows what is enforced and warns once; none of them throws.
  * ------------------------------------------------------------------ */
 
 type Schema = Record<string, any>;
@@ -376,10 +470,165 @@ function reasonFor(err: TypeboxError): string {
   return `${label(path)} ${err.message ?? 'does not match the schema'}`;
 }
 
-function fullCheck(V: TypeboxValue, schema: unknown, args: unknown): ValidationResult {
+/* ------------- the compiled-schema cache (typebox `Compile`) ------------- */
+
+/** What `Compile(schema)` returns, narrowed to what this package calls.
+ *  `Errors` is optional ON PURPOSE: 1.3.7 has it (probed), and a release that
+ *  drops it must degrade to `Value.Errors` rather than crash a tool call. */
+export interface TypeboxValidator {
+  Check(value: unknown): boolean;
+  Errors?(value: unknown): Iterable<TypeboxError>;
+}
+
+/** The slice of typebox's `compile` namespace this package uses. */
+export interface TypeboxCompile {
+  Compile(schema: unknown): TypeboxValidator;
+}
+
+type CompileLoader = () => Promise<TypeboxCompile>;
+
+/** Default: typebox's `Compile` through the same loader seam `Value` uses. */
+async function defaultCompileLoader(): Promise<TypeboxCompile> {
+  const ns: any = await loadTypebox('compile');
+  // 1.3.7 exports `Compile` by name and as `default`. Prefer the name.
+  const Compile = typeof ns?.Compile === 'function'
+    ? ns.Compile
+    : (typeof ns?.default === 'function' ? ns.default : null);
+  if (!Compile) throw new Error('typebox/compile exposes no Compile');
+  return { Compile: (schema: unknown) => Compile(schema) };
+}
+
+let compileLoader: CompileLoader | null = defaultCompileLoader;
+let compileModule: TypeboxCompile | null = null;
+let compilePromise: Promise<TypeboxCompile | null> | null = null;
+/** `Compile` was tried and failed; rung 3 (`Value.Check`) stands in. */
+let compileDegraded = false;
+
+/**
+ * One compiled checker per SCHEMA OBJECT, for the life of that object.
+ *
+ * Weak, not a `Map`: a tool spec's `args` object is what a compiled checker
+ * belongs to, and an MCP server's rediscovered schemas (a fresh object per
+ * expansion) would otherwise pin every generation of every schema for the life
+ * of the process. Keyed on identity rather than on a serialization because a
+ * registered tool's `args` IS a stable object — one compile per tool per
+ * process is the whole win, and hashing a schema on every call would give a
+ * chunk of it straight back.
+ *
+ * A `null` value is a NEGATIVE entry: this schema threw at compile time and
+ * must not be retried on every call.
+ */
+let compiledCache = new WeakMap<object, TypeboxValidator | null>();
+
+/** The compile module, or null once it is known to be unreachable. Same lazy/
+ *  cached/latched shape as `fullChecker` — see the note there about `finally`. */
+async function compileChecker(): Promise<TypeboxCompile | null> {
+  if (compileModule) return compileModule;
+  if (compileDegraded || !compileLoader) return null;
+  if (!compilePromise) {
+    const loader = compileLoader;
+    compilePromise = loader()
+      .then((C) => { compileModule = C; return C; })
+      .catch((e) => {
+        compileDegraded = true;
+        warnUnavailable(
+          'the compiled JSON-Schema checker (typebox/compile) could not be loaded; validation '
+          + `still runs, interpreted, through Value.Check: ${(e as Error)?.message}`,
+        );
+        return null;
+      })
+      .finally(() => { compilePromise = null; });
+  }
+  return compilePromise;
+}
+
+/**
+ * The compiled checker for one schema, or null when this schema must go
+ * through `Value.Check` instead. Never throws: every failure is a rung down.
+ */
+async function compiledFor(schema: object): Promise<TypeboxValidator | null> {
+  const hit = compiledCache.get(schema);
+  if (hit !== undefined) return hit;
+  const C = await compileChecker();
+  if (!C) return null;
+  try {
+    const compiled = C.Compile(schema);
+    if (typeof compiled?.Check !== 'function') {
+      throw new Error('Compile returned no Check');
+    }
+    compiledCache.set(schema, compiled);
+    return compiled;
+  } catch (e) {
+    // THIS schema, not the process: a compiler that chokes on one tool's
+    // schema leaves every other tool compiled. Negative-cached so the throw
+    // costs one attempt rather than one per call.
+    compiledCache.set(schema, null);
+    warnUnavailable(
+      'a tool schema could not be compiled; the interpreted checker (Value.Check) stands in '
+      + `for it: ${(e as Error)?.message}`,
+    );
+    return null;
+  }
+}
+
+/**
+ * Replace (or, with `null`, remove) the route to the compiled checker.
+ *
+ * The seam the compiled-path tests use: forcing a rejecting loader is the only
+ * way to exercise rung 3 of the ladder without uninstalling a package. The
+ * compiled cache is REPLACED (a WeakMap cannot be cleared) so a test never
+ * sees a checker the previous loader built.
+ */
+export function setTypeboxCompileLoader(next: CompileLoader | null): () => void {
+  const previous = compileLoader;
+  const previousModule = compileModule;
+  const previousDegraded = compileDegraded;
+  const previouslyWarned = warnedUnavailable;
+  compileLoader = next;
+  compileModule = null;
+  compilePromise = null;
+  compileDegraded = false;
+  compiledCache = new WeakMap();
+  warnedUnavailable = false;
+  warnedKinds.clear();
+  return () => {
+    compileLoader = previous;
+    compileModule = previousModule;
+    compilePromise = null;
+    compileDegraded = previousDegraded;
+    compiledCache = new WeakMap();
+    warnedUnavailable = previouslyWarned;
+  };
+}
+
+/** TEST SEAM: is `schema` already compiled in this process? The compile-once
+ *  claim is otherwise unobservable — a cache hit and a miss return the same
+ *  verdict, which is the point. */
+export function _isSchemaCompiled(schema: object): boolean {
+  return compiledCache.get(schema) != null;
+}
+
+async function fullCheck(
+  V: TypeboxValue, schema: unknown, args: unknown,
+): Promise<ValidationResult> {
   // `Value.Check` throws on a non-object schema (`Cannot use 'in' operator`).
   // Nothing to enforce there anyway — the structural checker accepts it too.
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { ok: true };
+
+  const compiled = await compiledFor(schema as object);
+  if (compiled) {
+    if (compiled.Check(args)) return { ok: true };
+    // A compiled Validator carries its own `Errors` (probed), returning the
+    // same ajv-shaped records `Value.Errors` does. Fall back to the
+    // interpreted `Errors` only if a future release drops it — the failure
+    // path only, and a rejection is already established at this point.
+    if (typeof compiled.Errors === 'function') {
+      for (const err of compiled.Errors(args)) return { ok: false, reason: reasonFor(err) };
+    }
+    for (const err of V.Errors(schema, args)) return { ok: false, reason: reasonFor(err) };
+    return { ok: false, reason: 'arguments do not match the tool schema' };
+  }
+
   if (V.Check(schema, args)) return { ok: true };
   for (const err of V.Errors(schema, args)) return { ok: false, reason: reasonFor(err) };
   // Check said no and Errors said nothing — report the disagreement rather
@@ -485,16 +734,18 @@ export function fullValidationAvailable(): boolean {
 }
 
 /**
- * The shipped default: full JSON Schema when typebox is reachable, the minimal
- * structural check when it is not. Falling back rather than throwing is the
- * whole point — a checker that cannot load must narrow what is enforced, never
- * take every tool call down with it.
+ * The shipped default, and rungs 2-4 of the degrade ladder documented at the
+ * top of this section: a compiled checker per schema when `typebox/compile` is
+ * reachable, the interpreted `Value.Check` when it is not, the minimal
+ * structural check when typebox is absent entirely. Falling back rather than
+ * throwing is the whole point — a checker that cannot load must narrow what is
+ * enforced, never take every tool call down with it.
  */
 const defaultValidator: ArgsValidator = async (schema, args) => {
   const V = await fullChecker();
   if (!V) return structuralValidator(schema, args);
   try {
-    return fullCheck(V, schema, args);
+    return await fullCheck(V, schema, args);
   } catch (e) {
     // A schema typebox itself chokes on. Degrade THIS call rather than the
     // process: the structural checker still catches the shape errors.
@@ -599,6 +850,107 @@ export function withInvocation<T>(userId: string | null, fn: () => Promise<T>): 
   return (DDP as any)._CurrentMethodInvocation.withValue(invocation, fn);
 }
 
+/**
+ * A spec's `gate`, defaulted and CHECKED — the only place a gate becomes a
+ * `ResolvedTool.gate`.
+ *
+ * The typeof check is what makes the predicate form safe to add: a gate is read
+ * once per dispatch and dispatch is deep inside a turn, so a typo (`gate:
+ * 'Ask'`, `gate: true`, a promise someone forgot to resolve at define time)
+ * would otherwise be discovered as a silently-ungated tool — the failure mode
+ * that grants MORE access than was written. Refused at resolve time instead,
+ * naming the tool and what was given.
+ */
+function normalizeGate(gate: unknown, label: string): Gate {
+  if (gate === undefined) return 'auto';
+  if (gate === 'auto' || gate === 'ask') return gate;
+  if (typeof gate === 'function') return gate as GatePredicate;
+  throw new Error(
+    `[10thfloor:agent] Tool "${label}" has an invalid "gate": it must be 'auto', 'ask', or a `
+    + `function (ctx) => boolean | 'ask'; got ${typeof gate === 'string' ? JSON.stringify(gate) : typeof gate}.`,
+  );
+}
+
+/** What a gate decided for one call. `'run'` covers both `'auto'` and a
+ *  predicate that returned `true` — the dispatch site should not have to care
+ *  which said so. */
+export type GateDecision = 'run' | 'ask' | 'denied';
+
+/** The result a `false` (or broken) predicate produces. Structured like every
+ *  other harness-authored refusal, so the model reads it and routes around
+ *  it — the row is the answer to the call, not the end of the turn. The reason
+ *  names the tool and nothing else: it is published, and a gate's own logic is
+ *  not something to narrate into a transcript. */
+export function gateDeniedResult(name: string): ToolResult {
+  return {
+    ok: false,
+    error: {
+      error: 'denied-by-gate',
+      reason: `The "${name}" tool refused this call.`,
+    },
+  };
+}
+
+/** One warn per FAILURE KIND (`threw` / `shape`), the same latch and the same
+ *  reasoning as the validator's and hooks': a broken gate is broken on every
+ *  call, and a line per tool call would bury the notice that matters. */
+const warnedGateKinds = new Set<string>();
+
+function warnGate(kind: string, message: string): void {
+  if (warnedGateKinds.has(kind)) return;
+  warnedGateKinds.add(kind);
+  console.warn(`[10thfloor:agent] ${message}`);
+}
+
+/** TEST SEAM, not public API: the latch above is per process, so a test that
+ *  asserts on a gate warning has to be able to arm it. Not re-exported from
+ *  server/index.ts. */
+export function _resetGateWarnings(): void {
+  warnedGateKinds.clear();
+}
+
+/**
+ * Decide one call's gate.
+ *
+ * A missing tool (`undefined`, the unknown-tool case) is `'run'`: the dispatch
+ * site answers it with `unknown-tool`, and parking or denying a name that does
+ * not exist would tell the model something false about a typo.
+ *
+ * FAILS CLOSED. Anything the predicate does other than resolving `true`,
+ * `false` or `'ask'` — throwing, rejecting, returning a number, returning a
+ * promise of junk — is `'denied'` plus one warning. The alternative (treat a
+ * broken gate as `'auto'`) would run the tool the gate exists to guard, and
+ * treating it as `'ask'` would put a question no one can answer in front of a
+ * human on every call.
+ */
+export async function evaluateGate(
+  tool: ResolvedTool | undefined, ctx: GateContext,
+): Promise<GateDecision> {
+  const gate = tool?.gate ?? 'auto';
+  if (gate === 'ask') return 'ask';
+  if (typeof gate !== 'function') return 'run';
+  let verdict: unknown;
+  try {
+    verdict = await gate(ctx);
+  } catch (e) {
+    warnGate(
+      'threw',
+      `a gate predicate threw and the call was DENIED (a broken gate must not run the tool): `
+      + `tool "${ctx.name}": ${(e as Error)?.message}`,
+    );
+    return 'denied';
+  }
+  if (verdict === true) return 'run';
+  if (verdict === false) return 'denied';
+  if (verdict === 'ask') return 'ask';
+  warnGate(
+    'shape',
+    `a gate predicate returned ${typeof verdict === 'string' ? JSON.stringify(verdict) : typeof verdict}`
+    + `, which is not true, false or 'ask'; the call was DENIED: tool "${ctx.name}"`,
+  );
+  return 'denied';
+}
+
 export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
   return specs.map((spec) => {
     if (typeof spec === 'string') {
@@ -676,7 +1028,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name: m.name ?? toolName ?? `mcp:${server}`,
         description: m.description ?? '',
         args: m.args ?? { type: 'object', properties: {} },
-        gate: m.gate ?? 'auto',
+        gate: normalizeGate(m.gate, m.name ?? toolName ?? `mcp:${server}`),
         kind: 'mcp' as const,
         mcp: { server, tool: toolName },
         mcpExplicit: { description: m.description !== undefined, args: m.args !== undefined },
@@ -702,7 +1054,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name: sub.name ?? sub.subagent,
         description: sub.description,
         args: sub.args ?? SUBAGENT_ARGS,
-        gate: sub.gate ?? 'auto',
+        gate: normalizeGate(sub.gate, sub.name ?? sub.subagent),
         kind: 'subagent' as const,
         subagent: sub.subagent,
       };
@@ -719,7 +1071,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         name,
         description: adopted.description,
         args: adopted.args,
-        gate: adopted.gate ?? 'auto',
+        gate: normalizeGate(adopted.gate, name),
         kind: 'adopted' as const,
         method: adopted.method,
         // Spread rather than `runAs: adopted.runAs`, so a spec WITHOUT the key
@@ -744,7 +1096,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       name: inline.name,
       description: inline.description,
       args: inline.args,
-      gate: inline.gate ?? 'auto',
+      gate: normalizeGate(inline.gate, inline.name),
       kind: 'inline' as const,
       run: inline.run,
       // See the adopted branch above for why this is a spread and why an
@@ -762,6 +1114,50 @@ function mcpFallbackDescription(server: string, tool: string): string {
     + 'loaded, so call it only if its name clearly fits.';
 }
 
+/**
+ * Recursively strip regex-bearing KEYWORDS from a DISCOVERED MCP schema before
+ * it becomes a tool's `args`.
+ *
+ * `pattern`, `format` and `patternProperties` are all attacker-influenced-regex
+ * hazards on the single-threaded event loop: `pattern` is compiled and run as a
+ * RegExp against the model's arguments by `Value.Check`/`Compile`, and a
+ * catastrophically-backtracking pattern from an untrusted server is a ReDoS
+ * that stalls every session on the process; `format` (`email`, `uri`,
+ * `date-time`, …) is enforced by regexes too, some historically ReDoS-prone;
+ * and `patternProperties` KEYS are themselves regexes. An app-authored schema
+ * is trusted and keeps them (this runs only on the discovered branch); a
+ * discovered one loses them and is validated on structure alone.
+ *
+ * Position-aware, and that is the whole subtlety: `pattern`/`format` are the
+ * hazard only AS KEYWORDS on a schema object. Inside `properties`/`$defs`/
+ * `definitions` the keys are user-chosen property NAMES, so a discovered tool
+ * whose input has a property literally named `format` or `pattern` must keep
+ * it — we recurse into the values there and never strip the map's own keys.
+ * A fresh object is returned; the server's catalog object is never mutated.
+ */
+const SCHEMA_SUBMAPS = new Set(['properties', '$defs', 'definitions']);
+function stripUntrustedSchemaKeywords(schema: unknown): unknown {
+  if (Array.isArray(schema)) return schema.map(stripUntrustedSchemaKeywords);
+  if (!schema || typeof schema !== 'object') return schema;
+  const out: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
+    // Regex-bearing keywords, dropped at keyword position. `patternProperties`
+    // goes wholesale because its own KEYS are the regexes.
+    if (k === 'pattern' || k === 'format' || k === 'patternProperties') continue;
+    if (SCHEMA_SUBMAPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      // A map of {propertyName: subschema}: recurse the VALUES, keep the NAMES.
+      const map: Record<string, unknown> = {};
+      for (const [name, sub] of Object.entries(v as Record<string, unknown>)) {
+        map[name] = stripUntrustedSchemaKeywords(sub);
+      }
+      out[k] = map;
+    } else {
+      out[k] = stripUntrustedSchemaKeywords(v);
+    }
+  }
+  return out;
+}
+
 /** Discovered metadata folded into a resolved MCP tool. An EXPLICIT value from
  *  the spec always wins — that is the whole contract of the override. */
 function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): ResolvedTool {
@@ -774,7 +1170,11 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
       : (info?.description ?? mcpFallbackDescription(server, name ?? tool.name)),
     args: explicit.args
       ? tool.args
-      : (info?.inputSchema ?? { type: 'object', properties: {} }),
+      // The discovered schema is third-party; strip its regex-bearing keywords
+      // before it is ever run against model arguments. See the function above.
+      : (info?.inputSchema
+        ? stripUntrustedSchemaKeywords(info.inputSchema)
+        : { type: 'object', properties: {} }),
   };
 }
 
@@ -803,9 +1203,15 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
  *    server log — there is nothing to name, and inventing a name for a tool
  *    nobody has described would be worse than being briefly absent.
  *
- * Name collisions: first definition wins and the loser is dropped with one
- * warning. Providers reject a tool list with duplicate names outright, so
- * shipping the collision would break the whole turn rather than one tool.
+ * Name collisions: an APP-AUTHORED tool (inline/adopted/subagent) always wins
+ * over a discovered MCP name regardless of list order, and a colliding MCP name
+ * is dropped with a LOUD warning — a discovered tool silently capturing an app
+ * tool's name would inherit its gate and its place in the model's mind, which is
+ * the whole shadowing hazard. The built-in `skill` tool name is reserved the
+ * same way. Between two MCP tools (or two app tools) the first definition wins
+ * and the loser is dropped with the latched warning. Providers reject a tool
+ * list with duplicate names outright, so shipping any collision would break the
+ * whole turn rather than one tool.
  *
  * Servers are discovered CONCURRENTLY. Every discovery has its own deadline
  * (`MCP_DISCOVERY_TIMEOUT_MS`), and awaiting them one after another made the
@@ -833,6 +1239,30 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
     out.push(tool);
   };
 
+  // App-authored tool names (inline/adopted/subagent) — everything that is NOT
+  // itself an MCP entry. A discovered MCP name colliding with one of these, or
+  // with the reserved built-in `skill` name, must never win: it would capture
+  // the app tool's gate and identity. Precomputed so the rule holds regardless
+  // of whether the MCP spec is listed before or after the app tool.
+  const appNames = new Set(
+    tools.filter((t) => t.kind !== 'mcp').map((t) => t.name),
+  );
+  const pushMcp = (tool: ResolvedTool): void => {
+    if (appNames.has(tool.name) || tool.name === SKILL_TOOL_NAME) {
+      // LOUD, not the latched `warnMcp`: an MCP server quietly shadowing an app
+      // tool (or the skill loader) is a security-relevant event an operator
+      // must see every time it happens, not once per process.
+      console.warn(
+        `[10thfloor:agent] a discovered MCP tool named "${tool.name}" collides with `
+        + `${tool.name === SKILL_TOOL_NAME ? 'the reserved built-in "skill" tool'
+          : 'an app-defined tool'} and was DROPPED — the app tool keeps the name and its `
+        + 'gate. Give the MCP tool an explicit "name" if you need both.',
+      );
+      return;
+    }
+    push(tool);
+  };
+
   // One connect per SERVER per process even when several specs name the same
   // one: dedupe first, then discover every distinct server at once.
   const names = [...new Set(
@@ -847,7 +1277,7 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
     const { server, tool: named } = tool.mcp!;
     const found = discovered.get(server)!;
     if (!found.ok) {
-      if (named) push(withMcpMetadata(tool, undefined));
+      if (named) pushMcp(withMcpMetadata(tool, undefined));
       else {
         warnMcp(
           `the MCP server "${server}" could not be listed, so none of its tools are `
@@ -873,11 +1303,11 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
           + '"mcp.tool" against the server\'s tools/list.',
         );
       }
-      push(withMcpMetadata(tool, info));
+      pushMcp(withMcpMetadata(tool, info));
       continue;
     }
     for (const info of found.tools) {
-      push(withMcpMetadata(
+      pushMcp(withMcpMetadata(
         { ...tool, name: info.name, mcp: { server, tool: info.name } },
         info,
       ));
@@ -1066,7 +1496,7 @@ export interface AgentMethodOptions {
    *  `this.unblock()` behave exactly as they do in a hand-written method —
    *  including for a UI caller that never touches an agent. */
   run: (this: any, args: any) => unknown | Promise<unknown>;
-  gate?: 'auto' | 'ask';
+  gate?: Gate;
 }
 
 /**
@@ -1235,9 +1665,23 @@ export async function runTool(
     // same reason an inline tool's arguments are: the model gets `invalid-args`
     // naming the field, and usually fixes it — cheaper and clearer than a round
     // trip to a subprocess that answers with prose.
+    //
+    // The reason is SANITIZED here and nowhere else in the tool paths, because
+    // an MCP tool's `args` schema is third-party: `reasonFor` interpolates the
+    // validator's schema-derived `err.message`, which for a discovered schema is
+    // unbounded text this package did not write, on its way into a published
+    // row. The same clamp `mcp-tool-failed` reasons go through drops anything
+    // stack- or secret-shaped and caps the length. An inline/adopted tool's
+    // schema is app-authored and needs no such treatment.
     const verdict = await validateToolArgs(tool.args, args);
     if (!verdict.ok) {
-      return { ok: false, error: { error: 'invalid-args', reason: verdict.reason } };
+      return {
+        ok: false,
+        error: {
+          error: 'invalid-args',
+          reason: sanitizeMcpReason(verdict.reason, 'the arguments do not match the tool schema'),
+        },
+      };
     }
     // No `withInvocation`: there is no Meteor method here and no `this` for a
     // handler to read. `ctx.userId` still governs the call through `canUse` and

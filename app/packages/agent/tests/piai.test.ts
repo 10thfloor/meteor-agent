@@ -312,7 +312,7 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
       for await (const _c of provider.stream(streamReq)) { /* drain */ }
     } catch (e) { threw = e; }
     assert.instanceOf(threw, Error);
-    assert.strictEqual(threw.retryable, 'abandon');
+    assert.strictEqual((threw as any).retryable, 'abandon');
   });
 
   it('marks a transient provider error event retryable via isRetryableAssistantError', async function () {
@@ -328,7 +328,7 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
       for await (const _c of provider.stream(streamReq)) { /* drain */ }
     } catch (e) { threw = e; }
     assert.instanceOf(threw, Error);
-    assert.strictEqual(threw.retryable, true, 'a 503 should carry an explicit retryable hint');
+    assert.strictEqual((threw as any).retryable, true, 'a 503 should carry an explicit retryable hint');
   });
 });
 

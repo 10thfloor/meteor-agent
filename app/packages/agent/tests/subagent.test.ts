@@ -672,4 +672,480 @@ describe('subagents: budgets and the live handle', () => {
     assert.equal((row as any).childSessionId, seenDuring.sessionId,
       'the durable handle and the live handle must name the same child');
   });
+
+  /**
+   * IDEMPOTENCY. A parent turn abandoned mid-batch is recovered by discarding
+   * its assistant row and running the turn again, so the same subagent call is
+   * DISPATCHED TWICE — and used to open a whole second child.
+   *
+   * Both tests below drive that through the lease-steal-mid-batch idiom the loop
+   * suite uses: a two-call batch whose SECOND call steals the lease from inside
+   * its own `run`, after the subagent's result row has already landed. The
+   * abandonment discards the assistant and the whole batch's rows; the child
+   * session survives, unclaimed, which is exactly the state the lookup exists
+   * to recognize.
+   */
+  const stealOnce = (sessionId: string, state: { steals: number }) => ({
+    name: 'thief',
+    description: 'x',
+    args: { type: 'object', properties: {} },
+    run: async () => {
+      const { AgentSessions } = await import('../common/collections');
+      state.steals += 1;
+      // ONCE. The second dispatch must be allowed to finish, or the recovery
+      // this test is about would never commit anything.
+      if (state.steals === 1) {
+        await AgentSessions.updateAsync(sessionId, {
+          $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60_000) } },
+        } as any);
+      }
+      return { stole: state.steals };
+    },
+  });
+
+  /** The parent's script: one batch of [subagent, thief], then a plain answer
+   *  once the batch is answered. Branches on HISTORY, so the re-dispatch after
+   *  a discard re-emits the identical batch — including the identical call ids,
+   *  which is what a provider that reuses ids does and what the lookup keys on. */
+  const batchProvider = async (childTool: string, state: { calls: number }) => {
+    const { mockProvider } = await import('../server/providers/mock');
+    return mockProvider((req) => {
+      state.calls += 1;
+      return req.messages.some((m) => m.role === 'tool')
+        ? { text: 'wrapped up' }
+        : {
+          toolCalls: [
+            { id: 'c1', name: childTool, args: { prompt: 'look it up' } },
+            { id: 'c2', name: 'thief', args: {} },
+          ],
+        };
+    });
+  };
+
+  it('reuses the finished child when recovery re-dispatches an abandoned batch', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    const child = { calls: 0 };
+    new Agent('sub-idem', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: mockProvider(() => { child.calls += 1; return { text: 'the answer' }; }),
+    });
+
+    await seedRoot('s-idem', 'sub-idem-parent');
+    const thief = { steals: 0 };
+    const parent = { calls: 0 };
+    const config = {
+      model: 'mock',
+      system: '',
+      tools: [
+        { subagent: 'sub-idem', description: 'ask the child' },
+        stealOnce('s-idem', thief),
+      ],
+      provider: await batchProvider('sub-idem', parent),
+    };
+
+    await runTurn('s-idem', config as any);
+
+    // The abandonment: nothing of the turn survives except the child itself.
+    assert.equal(thief.steals, 1, 'the steal must actually have fired');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-idem', role: 'assistant' }).countAsync(), 0,
+      'the abandoned assistant row must be discarded',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-idem', role: 'tool' }).countAsync(), 0,
+      "and the batch's already-landed result with it — which is what makes the child unclaimed",
+    );
+    const firstChild = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-idem' } as any,
+    ))!;
+    assert.isDefined(firstChild, 'the child session outlives the turn that opened it');
+    assert.equal(child.calls, 1, 'the child ran exactly once');
+
+    // Recovery. The stolen lease is released (the steal is what drove the
+    // abandonment, not a claim this test means to keep contesting) and the turn
+    // is simply run again — recovery is calling `runTurn` again, nothing more.
+    await AgentSessions.updateAsync('s-idem', { $unset: { lease: 1 } } as any);
+    await runTurn('s-idem', config as any);
+
+    assert.equal(
+      await AgentSessions.find({ 'parent.sessionId': 's-idem' } as any).countAsync(), 1,
+      'a re-dispatched subagent call must NOT open a second child session',
+    );
+    assert.equal(
+      child.calls, 1,
+      'and must not call the provider again — the finished child already has the answer',
+    );
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-idem', role: 'tool', toolCallId: 'c1' } as any,
+    ))!;
+    assert.isDefined(row, 'the recovered turn answers the subagent call');
+    assert.isUndefined(row.error, 'a reused finished child answers exactly as a fresh one would');
+    assert.equal(row.content, JSON.stringify('the answer'));
+    assert.equal(row.childSessionId, firstChild._id, 'and names the child that actually ran');
+    const last = await AgentMessages.findOneAsync(
+      { sessionId: 's-idem', role: 'assistant' } as any, { sort: { seq: -1 } },
+    );
+    assert.equal((last as any).content, 'wrapped up', 'the recovered turn runs to completion');
+    assert.equal(
+      parent.calls, 3,
+      'the PARENT still pays for its own turns (one abandoned batch, one re-dispatched batch, '
+      + 'one wrap-up) — idempotency is about the child, not about free model calls',
+    );
+  });
+
+  it('reuses a PARKED child on re-dispatch, naming the session already open', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    const child = { calls: 0, ran: [] as string[] };
+    new Agent('sub-idem-park', {
+      model: 'mock',
+      instructions: '',
+      tools: [{
+        name: 'refund',
+        description: 'x',
+        gate: 'ask' as const,
+        args: { type: 'object', properties: {} },
+        run: async () => { child.ran.push('refund'); return { did: 'refund' }; },
+      }],
+      provider: mockProvider(() => {
+        child.calls += 1;
+        return { toolCalls: [{ id: 'g1', name: 'refund', args: { amt: 5 } }] };
+      }),
+    });
+
+    await seedRoot('s-idem-park', 'sub-idem-park-parent');
+    const thief = { steals: 0 };
+    const parent = { calls: 0 };
+    const config = {
+      model: 'mock',
+      system: '',
+      tools: [
+        { subagent: 'sub-idem-park', description: 'ask the child' },
+        stealOnce('s-idem-park', thief),
+      ],
+      provider: await batchProvider('sub-idem-park', parent),
+    };
+
+    await runTurn('s-idem-park', config as any);
+    const parked = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-idem-park' } as any,
+    ))!;
+    assert.equal(parked.phase, 'awaiting', 'the child parked on its ask-gate');
+    assert.equal(child.calls, 1);
+
+    await AgentSessions.updateAsync('s-idem-park', { $unset: { lease: 1 } } as any);
+    await runTurn('s-idem-park', config as any);
+
+    assert.equal(
+      await AgentSessions.find({ 'parent.sessionId': 's-idem-park' } as any).countAsync(), 1,
+      'a re-dispatch must not open a SECOND session parked on the same question',
+    );
+    assert.equal(child.calls, 1, 'and must not re-run the child to re-discover the park');
+    assert.deepEqual(child.ran, [], 'the gated tool is still waiting for a human');
+
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-idem-park', role: 'tool', toolCallId: 'c1' } as any,
+    ))!;
+    assert.equal(row.error?.error, 'subagent-parked');
+    assert.equal(
+      row.childSessionId, parked._id,
+      'the parent must be pointed at the child that is ALREADY open — approving that one '
+      + 'is what completes the call',
+    );
+    const stillParked = (await AgentSessions.findOneAsync(parked._id))!;
+    assert.equal(stillParked.phase, 'awaiting', 'reuse must not disturb the parked child');
+  });
+
+  /**
+   * STOP MUST STOP THE WORK THE USER SEES.
+   *
+   * A parent that delegates spends its turn inside the child's stream, so an
+   * interrupt that stopped only the parent left the child streaming to
+   * completion — tokens billed, a transcript growing, and a Stop button that
+   * had visibly done nothing. `mInterrupt` now walks `activeChild` and stops
+   * every RUNNING descendant.
+   */
+  it('a parent interrupt stops the running child, and the parent records why', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    let chunksAfterStop = 0;
+    new Agent('int-child', {
+      model: 'mock',
+      instructions: '',
+      tools: [],
+      provider: {
+        async *stream() {
+          yield { kind: 'text', chunk: 'half a thought' };
+          // The user presses Stop on the PARENT, mid-child-stream. Through the
+          // real method, because the propagation walk lives in it.
+          const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+          await interrupt.call({ userId: 'u1' }, 'int-parent', 's-interrupt-parent');
+          // Keep streaming: nothing here ends the turn. The CHILD's own
+          // mid-stream phase check is what has to notice, exactly as it would
+          // for an interrupt aimed at the child directly.
+          for (let i = 0; i < 400; i += 1) {
+            chunksAfterStop += 1;
+            yield { kind: 'text', chunk: '.' };
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 20); });
+          }
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      },
+    } as any);
+
+    await seedRoot('s-interrupt-parent', 'int-parent');
+    await runTurn('s-interrupt-parent', {
+      model: 'mock',
+      system: '',
+      tools: [{ subagent: 'int-child', description: 'the child that gets stopped' }],
+      provider: mockProvider((req) => (
+        req.messages.some((m) => m.role === 'tool')
+          ? { text: 'never reached' }
+          : { toolCalls: [{ id: 'ic1', name: 'int-child', args: { prompt: 'think hard' } }] }
+      )),
+    });
+
+    const child = (await AgentSessions.findOneAsync(
+      { 'parent.sessionId': 's-interrupt-parent' } as any,
+    ))!;
+    assert.isDefined(child, 'the child session persists — a stop is not a delete');
+    assert.equal(child.phase, 'stopped', 'the interrupt reached the descendant');
+    assert.isBelow(
+      chunksAfterStop, 400,
+      'the child stopped consuming its stream rather than running it to the end',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: child._id, role: 'assistant' }).countAsync(), 0,
+      'an interrupted turn commits no assistant row',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: child._id, kind: 'orphan-child' } as any).countAsync(),
+      0,
+    );
+
+    // The parent still holds its lease through the wind-down, so the tool row
+    // lands: the batch is ANSWERED, which is what keeps the transcript legal
+    // for the provider on the next send.
+    const row = (await AgentMessages.findOneAsync(
+      { sessionId: 's-interrupt-parent', role: 'tool' } as any,
+    ))!;
+    assert.isDefined(row, 'a stopped child still answers the parent call it was dispatched for');
+    assert.equal(row.toolCallId, 'ic1');
+    assert.equal(row.error?.error, 'subagent-failed');
+    assert.include(
+      row.error!.reason!, 'interrupted',
+      'the reason must say the user stopped it, not that the child mysteriously failed',
+    );
+    assert.equal(row.childSessionId, child._id, 'and still points at the child to inspect');
+
+    const parent = (await AgentSessions.findOneAsync('s-interrupt-parent'))!;
+    assert.equal(parent.phase, 'stopped');
+    assert.isUndefined(parent.activeChild, 'the live marker is cleared on every exit');
+    const assistants = await AgentMessages
+      .find({ sessionId: 's-interrupt-parent', role: 'assistant' } as any).fetchAsync();
+    assert.lengthOf(assistants, 1, 'the interrupted parent asked the model exactly once');
+    assert.deepEqual(
+      (assistants[0].toolCalls ?? []).map((c) => c.id), ['ic1'],
+      'and its one tool_use has the matching tool_result above — the transcript is resumable',
+    );
+  });
+
+  it('a parent interrupt does not stop a PARKED descendant', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    const { row } = await parkFixture('s-interrupt-parked', 'int-parked-child');
+    const childId = row.childSessionId!;
+    assert.equal(
+      (await AgentSessions.findOneAsync(childId))!.phase, 'awaiting',
+      'the fixture leaves a child waiting on a human',
+    );
+
+    // The stale marker the field's own docs warn about: a dispatch that lost
+    // its lease cannot clear `activeChild`, so a parked child CAN still be
+    // named by one. That is the only way the walk ever reaches a parked
+    // session, and it is exactly the case the phase filter exists for.
+    await AgentSessions.updateAsync('s-interrupt-parked', {
+      $set: { activeChild: { sessionId: childId, toolCallId: 'g1' } },
+    } as any);
+
+    const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
+    await interrupt.call({ userId: 'u1' }, 'park-parent', 's-interrupt-parked');
+
+    assert.equal(
+      (await AgentSessions.findOneAsync('s-interrupt-parked'))!.phase, 'stopped',
+      'the named session is stopped as always',
+    );
+    const child = (await AgentSessions.findOneAsync(childId))!;
+    assert.equal(
+      child.phase, 'awaiting',
+      'a parked child is a question in front of a human: the parent already gave up on it '
+      + '(subagent-parked) and stopping it would strand a request nobody can answer',
+    );
+    assert.isDefined(child.pending, 'and the request itself is untouched');
+    assert.isUndefined(child.pending!.verdict);
+  });
+});
+
+/**
+ * H-STARTABLE. `startable: false` closes the public `agent.start`/`agent.fork`
+ * door on a specialist while leaving the two paths that do NOT go through those
+ * methods — subagent dispatch and `Agent.ask` — fully working. That asymmetry is
+ * the whole point: a child that a parent gates before delegating must not be
+ * independently reachable, yet must still run as a child and as a headless
+ * one-shot.
+ */
+describe('subagents: startable:false (H-STARTABLE)', () => {
+  it('refuses a direct agent.start, and agent.fork, on a startable:false agent', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('specialist-locked', {
+      model: 'mock', instructions: 'you are a subagent only',
+      provider: mockProvider(() => ({ text: 'x' })),
+      startable: false,
+    });
+
+    const start = (Meteor.server as any).method_handlers[NAMES.mStart];
+    let threw: any;
+    try {
+      await start.call({ userId: 'u1' }, 'specialist-locked');
+    } catch (e) { threw = e; }
+    assert.isDefined(threw, 'a startable:false agent must refuse a direct start');
+    assert.equal(threw.error, 'not-startable');
+
+    // A fork opens another independently-drivable session, so it is shut too.
+    const fork = (Meteor.server as any).method_handlers[NAMES.mFork];
+    let forkThrew: any;
+    try {
+      await fork.call({ userId: 'u1' }, 'specialist-locked', 'some-session');
+    } catch (e) { forkThrew = e; }
+    assert.isDefined(forkThrew, 'fork of a startable:false agent must refuse too');
+    assert.equal(forkThrew.error, 'not-startable');
+  });
+
+  it('an undefined startable still starts — the compat default is unchanged', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    new Agent('specialist-open', {
+      model: 'mock', instructions: 'ordinary agent',
+      provider: mockProvider(() => ({ text: 'x' })),
+    });
+
+    const start = (Meteor.server as any).method_handlers[NAMES.mStart];
+    const id = await start.call({ userId: 'u1' }, 'specialist-open');
+    assert.isString(id, 'an agent that omits startable is a normal endpoint');
+    assert.isDefined(await AgentSessions.findOneAsync(id));
+  });
+
+  it('refuses agent.send to a startable:false agent, even to its own child', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+
+    // The exploit the guard closes: a subagent child is a real session of the
+    // specialist whose id rides the parent's published tool row, so an owner
+    // could send fresh turns straight to it. Seed exactly that shape — a child
+    // session of a startable:false agent — and confirm send is refused.
+    new Agent('specialist-locked', {
+      model: 'mock', instructions: 'subagent only', startable: false,
+      provider: mockProvider(() => ({ text: 'x' })),
+    });
+    await AgentSessions.insertAsync({
+      _id: 'locked-child', agent: 'specialist-locked', userId: 'u1', phase: 'idle',
+      model: 'mock', nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      parent: { sessionId: 'p1', toolCallId: 't1' },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    let threw: any;
+    try { await send.call({ userId: 'u1' }, 'specialist-locked', 'locked-child', 'drive it'); }
+    catch (e) { threw = e; }
+    assert.isDefined(threw, 'send to a startable:false agent must be refused');
+    assert.equal(threw.error, 'not-startable');
+    // And nothing was committed — the refusal is before any write.
+    assert.equal(
+      await AgentMessages.find({ sessionId: 'locked-child', role: 'user' }).countAsync(), 0,
+    );
+  });
+
+  it('still runs as a subagent even though it cannot be started', async function () {
+    this.timeout(30000);
+    const { AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    new Agent('sub-locked-child', {
+      model: 'mock', instructions: '',
+      provider: mockProvider(() => ({ text: 'Ottawa' })),
+      startable: false,
+    });
+
+    await seedRoot('s-locked-sub', 'sub-locked-parent', 'capital?');
+    await runTurn('s-locked-sub', {
+      model: 'mock', system: '',
+      tools: [{ subagent: 'sub-locked-child', description: 'ask the specialist' }],
+      provider: await delegating('sub-locked-child', { prompt: 'capital' }),
+    });
+
+    const parentMsgs = await AgentMessages
+      .find({ sessionId: 's-locked-sub' }, { sort: { seq: 1 } }).fetchAsync();
+    const row = parentMsgs.find((m) => m.role === 'tool')!;
+    assert.isDefined(row, 'the subagent dispatch does not go through agent.start');
+    assert.isUndefined(row.error, 'a startable:false child runs as a child');
+    assert.equal(row.content, JSON.stringify('Ottawa'));
+    assert.isString(row.childSessionId);
+  });
+
+  it('still answers a headless Agent.ask even though it cannot be started', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    const oneshot = new Agent('ask-locked', {
+      model: 'mock', instructions: 'answer directly',
+      provider: mockProvider(() => ({ text: 'the answer' })),
+      startable: false,
+    });
+
+    const answer = await oneshot.ask('the question', { userId: 'u1' });
+    assert.equal(answer, 'the answer', 'ask() does not go through agent.start either');
+  });
 });

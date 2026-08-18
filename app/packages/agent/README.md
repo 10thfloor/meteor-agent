@@ -5,10 +5,27 @@ streaming tokens are a capped collection, and tools are Meteor methods.
 
 ## Install
 
+The package is **not yet published to Atmosphere**. Vendor it into your app's
+`packages/` directory (or add it as a git submodule / `METEOR_PACKAGE_DIRS`
+entry) so that `meteor add 10thfloor:agent` resolves it locally:
+
 ```bash
 meteor add 10thfloor:agent
-meteor npm install --save @earendil-works/pi-ai
+meteor npm install --save @earendil-works/pi-ai typebox
 ```
+
+`typebox` powers full argument validation. It happens to be a transitive
+dependency of `@earendil-works/pi-ai` today, but install it directly so a pi-ai
+bump or a hoisting change cannot remove it — see CONTRIBUTING's dependency
+policy.
+
+**Remove `insecure` and `autopublish`** from your app (`meteor remove insecure
+autopublish`) — the defaults Meteor ships in every new app. `autopublish` would
+push transcripts to every client, and `insecure` grants clients direct write
+access to collections, which voids the method-and-publication auth model
+wholesale. The package registers a blanket client-write `deny` on its three
+collections at startup as a backstop against `insecure`, but removing it is the
+correct fix.
 
 ## Define an agent
 
@@ -52,6 +69,8 @@ Support.define({
              keep: 6 },                      // compaction; omit to disable
   maxIterations: 10,                         // model calls per turn
   maxResultChars: 8000,                      // tool results truncated past this
+  maxToolArgBytes: 262144,                   // per-turn tool_args delta ceiling
+                                             // (display only; see Operations)
   canUse: (tool, { userId }) => true,        // agent-level tool backstop
   approve: ({ userId }) => userId !== null,  // who may answer ask-gates
   provider: mockProvider(...),               // an impl, or 'name' registered
@@ -108,6 +127,38 @@ tools: [
 `args` is a JSON Schema — it is what the model is shown, and what its arguments
 are checked against.
 
+**`gate`** decides whether a call happens at all, and every tool kind takes it —
+inline, adopted, subagent and MCP alike, since it is read before the dispatch:
+
+```ts
+gate: 'auto'                                   // the default: just run it
+gate: 'ask'                                    // park the turn for a human
+gate: ({ userId, sessionId, name, args }) =>   // …or decide per call
+  (args.amount < 50 ? true : 'ask')            // sync or async
+```
+
+A predicate returns `true` (run it), `'ask'` (park, exactly as the literal), or
+`false` — a structured `{ error: 'denied-by-gate' }` **tool result**, not a
+park: the model reads the refusal, routes around it, and the rest of the batch
+still runs. Nobody is troubled, and no `toolCalls` budget is spent, because
+nothing was dispatched. The predicate's `userId` is the **caller's** — the
+session's owner. `runAs` is deliberately not consulted: it says what identity
+the tool *body* runs under once the call is allowed, and letting it answer the
+gate's question would be the escalation approving itself.
+
+A predicate that throws, or returns anything that is not those three values,
+**fails closed** to the denied result with one warning per failure kind: a gate
+whose own code is broken must not run the tool, and must not kill the turn
+either. A `gate` that is neither a literal nor a function throws at define time
+rather than resolving to a silently ungated tool.
+
+Gates are evaluated at **every** dispatch: approving one call of a batch says
+nothing about the next one, and a batch resumed after an approval re-gates its
+remainder. The one exception is the approved call itself, which is dispatched
+rather than re-gated — a human has already answered the question, in writing, in
+the transcript, and a predicate reading mutable state routinely gives a
+different answer by the time somebody clicks Approve.
+
 **Co-registration** defines the method and the tool at once, so your UI and the
 model call the same code through the same schema:
 
@@ -135,13 +186,22 @@ next call, since a bad argument answers the call rather than failing the turn.
 Inline tools are checked the same way, against the **whole** JSON Schema —
 `enum`, `const`, numeric and length bounds, `pattern`, `format`, `minItems`,
 `oneOf`/`anyOf`, `additionalProperties: false`, internal `$ref`, and nested
-`properties`/`items` are all enforced. The checker is typebox's `Value.Check`,
-loaded lazily through the same seam the pi-ai provider uses; typebox already
-ships as a dependency of `@earendil-works/pi-ai`, so nothing new to install.
-One upgrade note: `format` is now ENFORCED (`format: 'uri'` rejects a
-non-URI), where JSON Schema treats it as annotation by default — a schema that
-used `format` decoratively will start rejecting arguments that never matched
-it. Unknown format names are still tolerated.
+`properties`/`items` are all enforced. The default checker compiles each
+schema once with typebox's `Compile` and reuses the compiled checker for every
+later call (`Compile(schema).Check`, cached weakly on the schema object);
+typebox's interpreted `Value.Check` is the fallback rung, used only when the
+compiler is unreachable. Both are loaded lazily through the same seam the pi-ai
+provider uses. typebox is a direct dependency of the demo app (`meteor npm
+install typebox`) — see the dependency policy in CONTRIBUTING. The full ladder
+is documented under Operations.
+
+`format` is ENFORCED, not treated as a decorative annotation: `format: 'uri'`
+rejects a non-URI, where bare JSON Schema treats `format` as an annotation by
+default. typebox 1.x ships its string formats registered, so this needs no
+setup of your own; a schema that used `format` decoratively will reject
+arguments that never matched it. Unknown format names are still tolerated. The
+tools suite pins this (`ENFORCES \`format\`` in `tests/tools.test.ts`) so a
+typebox bump that reverted to annotation-only would fail loudly.
 
 If typebox cannot be loaded, the package logs **one** warning and falls back to
 a minimal structural checker — `type`, object `required`/`properties`, array
@@ -180,8 +240,11 @@ continues. Omit it and a parked request waits forever.
 **Provider failures** retry with exponential backoff under `phase:'retrying'`;
 auth/request errors fail immediately. Either terminal failure writes a
 `kind:'error'` note and sets `phase:'error'`; the next `send` clears it and
-tries again. Your transcript UI should render three note kinds: `error`,
-`budget`, and `approval`.
+tries again. Your transcript UI should render five note kinds: `error`,
+`budget`, `approval`, `compaction` (an earlier stretch of the conversation was
+summarized — see *Compaction*), and `orphan-child` (a recovered subagent
+session — see *Recovery runs itself*; it carries `childSessionId` and
+`childAgent` rather than prose).
 
 **Rate limits** come from settings — this shape in `settings.json`:
 
@@ -212,20 +275,85 @@ turn budget applies to it, so an unlimited one is a cheaper `send` with
 sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
 mid-turn) and re-runs the turn, which repairs its own transcript on entry. A
 15s sweep backs the observer up, because a lease can expire without any document
-change to observe, and the same sweep enforces `budget.approval` and picks up a
-verdict whose resume died before consuming it. Two servers racing on one session
-resolve through the lease and the verdict's conditional write — one winner, no
-new coordination. Turn it off with
+change to observe, and the same sweep enforces `budget.approval`, picks up a
+verdict whose resume died before consuming it, and **re-links orphaned
+children**: a subagent dispatch that died between creating the child session and
+committing its result leaves a real child that no published document points at,
+so the sweep writes a `role: 'note', kind: 'orphan-child'` row into the *parent*
+transcript carrying `childSessionId` and `childAgent` — the handle a client
+needs to find it again. One note per child, and never for a child the parent is
+actively dispatching. It writes a pointer and nothing else: a sweep never
+deletes session data, so a child whose parent document is gone entirely is
+warned about once per process and left standing. Two servers racing on one
+session resolve through the lease, the verdict's conditional write, and the
+note's derived `_id` — one winner, no new coordination. Turn it off with
 `{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
 `startWatcher({ sweepMs })` yourself.
 
-One operations note: on a **standalone MongoDB** (no replica set — no oplog, no
+### Operations
+
+**Standalone MongoDB.** On a standalone server (no replica set — no oplog, no
 change streams) Meteor's observers fall back to ~10s polling. Recovery still
 works — the sweep is what carries it — but the watcher's observer path, token
 streaming, and `usage()`/`status()` reactivity all degrade to that polling
 cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
 Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
 Meteor's constraint, not this package's.
+
+**Indexes are created at startup.** Mongo creates exactly one index for you —
+`_id` — so the package creates the three its own queries need, on every boot,
+idempotently:
+
+| Collection | Key | Why |
+| --- | --- | --- |
+| `agent_messages` | `{ sessionId: 1, seq: 1 }` | every transcript read: the session publication, the history each turn re-reads, the compaction cut |
+| `agent_sessions` | `{ 'parent.sessionId': 1, createdAt: 1 }` (sparse) | the watcher's orphan-child sweep, which scans every child ever created, every 15s |
+| `agent_sessions` | `{ phase: 1, 'lease.until': 1 }` | the sweep's orphan-claim, standing-verdict and unanswered-park queries |
+
+A failure to create them **warns and continues**: a locked-down Atlas user may
+not hold the `createIndex` action, and a package that refused to boot over a
+performance index would trade a slow deployment for no deployment. If that
+warning is in your logs, create the three by hand — the queries are correct
+without them, just proportional to your whole history rather than to one
+session. Call `ensureIndexes()` yourself if you want them made under a
+different connection.
+
+**`maxToolArgBytes` — a ceiling on published argument streaming.** While a
+model streams a tool call, its partial arguments JSON is published as
+`tool_args` deltas so a UI can render the call taking shape. Those deltas live
+in `agent_deltas`, which is **capped (32 MiB) and shared by every session on
+the deployment** — eviction is global FIFO, so one model looping on a giant
+argument blob can push every other session's in-flight tokens out. Past
+`maxToolArgBytes` (default 256 KiB per turn) a turn stops publishing them and
+logs one warning.
+
+`tool_args` is the one delta kind that does not coalesce. A run of text tokens
+collapses into a single document; parallel tool calls arrive interleaved and
+each call's fragments must stay attributed to it, so every fragment is its own
+document. Measured: four parallel calls streaming ~20 KB of arguments each, in
+200-byte fragments, produce **400 documents and 80,000 bytes** — comfortably
+under the default, and the reason the default is not much higher.
+
+This is **display-stream hygiene and nothing else**. `text` and `thinking`
+deltas are unaffected; the committed assistant message's `toolCalls` — the
+parsed arguments dispatch actually runs on — never travel through the delta
+stream at all, so a clamped turn calls exactly the tools it was going to call,
+with exactly the arguments it was going to use. The only visible effect is that
+a client's `toolArgs` preview stops growing. Raise it for an agent whose tools
+genuinely take large arguments and whose UI renders them; there is no reason to
+lower it.
+
+**Argument validation is compiled.** The default checker compiles each tool's
+`args` schema once with `typebox`'s `Compile` and reuses the compiled checker
+for every later call (cached weakly, keyed on the schema object, so a
+rediscovered MCP schema does not pin its predecessors). The ladder degrades
+one rung at a time and never throws: a validator you installed with
+`setToolArgsValidator` wins over everything; otherwise the compiled checker;
+otherwise the interpreted `Value.Check` (same enforcement, slower — used when
+`typebox/compile` is unreachable, or for one schema the compiler chokes on);
+otherwise the minimal structural checker, which enforces `type`, `required` and
+nested shape only. Each step down warns once. See the probe notes at the top of
+the validation section in `server/tools.ts`.
 
 ### `runAs` — a tool with a fixed identity
 
@@ -325,9 +453,15 @@ caches both for the life of the process — never one connection per tool. Call
 **A server that is down never fails a turn.** A named tool stays listed (with a
 placeholder description) and answers `mcp-unavailable`, which the model reads
 and routes around; a whole-server spec contributes no tools that turn and logs
-one warning. Nothing about the failure is cached, so the next turn — or the
-next call — reconnects. The same is true mid-session: if the child dies, the
-connection is dropped and rebuilt on the next use.
+one warning. A failed open starts a **cooldown** (default 30s,
+`MCP_FAILURE_COOLDOWN_MS`): the next spawn attempt within that window is
+suppressed and answers `mcp-unavailable` immediately rather than paying the
+connect timeout again, so one dead server cannot make every turn slow. Once the
+window elapses the next turn — or the next call — reconnects. Set `cooldownMs`
+on the server spec to tune the window, or `0` to disable it and retry on every
+call. Re-registering a server clears its cooldown (no waiting out the window
+after a config fix). The same is true mid-session: if the child dies, the
+connection is dropped and rebuilt after the cooldown on the next use.
 
 **Results** map to tool rows the ordinary way: text content items concatenate,
 and anything else becomes a `[image content omitted]`-style marker rather than
@@ -440,7 +574,16 @@ Three rules for both:
 - **returning nothing keeps the value** — an observer needs no return statement;
 - a hook that **throws**, or returns the wrong shape, is skipped with one
   warning and the value it was given stands. A broken extension must not kill
-  turns.
+  turns. A replacement request needs `model`, `system` **and** `messages` — a
+  rebuilt request that drops `system` would send the model no instructions at
+  all, so it is treated as malformed rather than sent; a replacement result
+  needs a boolean `ok`.
+
+A tool result that cannot be serialized — a circular object, a `BigInt`, a
+throwing `toJSON`, whether it came from your tool or from your hook — does not
+abandon the turn. The row records a structured
+`{ error: 'unserializable-result' }`, the model is told the call produced
+nothing usable, and the turn finishes.
 
 An unknown hook name throws at registration rather than silently never running.
 `Agent.clearHooks()` removes them all; it is a **test seam** (call it in a
@@ -458,12 +601,35 @@ Agent.hook('beforeProviderRequest', (req, ctx) => {
 });
 ```
 
-Registration is **global**, not per agent: a hook is installed into the process,
-exactly as a Pi extension is, and threading a hook list through `RunConfig`
-would mean every entry into a turn (a send, watcher recovery, `ask`, a
-subagent's child run) had to remember to carry it — and one that forgot would
-silently skip your redaction. Every `ctx` carries the agent's name, so a
-per-agent hook is one `if` away; per-agent *registration* is a v3 candidate.
+Registration comes in two scopes. `Agent.hook(...)` is **global** — a hook is
+installed into the process, exactly as a Pi extension is — and
+`agentInstance.hook(...)` is that agent's own:
+
+```ts
+Support.hook('beforeProviderRequest', (req) => ({
+  ...req, system: `${req.system}\n\n${supportPlaybook()}`,
+}));
+```
+
+Same seams, same three rules, same failure handling; the only difference is
+scope. It runs when the session's agent is this one — and a **child** session
+reports the child's agent, so a subagent's hooks are the subagent's, not its
+parent's. The agent need not be `define()`d yet: hooks are matched by name at
+run time, so the order your server files happen to load does not matter.
+
+**Order: every global hook first, in registration order, then that agent's, in
+registration order.** Specificity, not privilege — the same rule CSS uses: the
+per-agent hook refines the process-wide policy and gets the last word, exactly
+as a later global hook refines an earlier one. It is not a security boundary in
+either direction (a global hook could always be overruled by a second global
+hook registered after it), so a redaction that must hold everywhere belongs in
+one place, not in two chains arguing.
+
+Neither scope touches `RunConfig`: threading a hook list through it would mean
+every entry into a turn (a send, watcher recovery, `ask`, a subagent's child
+run) had to remember to carry it — and the one that forgot would silently skip
+your redaction. `Agent.clearHooks()` clears **both** scopes;
+`agentInstance.clearHooks()` clears only that agent's.
 
 ## Use it from the client
 
@@ -495,6 +661,14 @@ if (ask) await Support.approve(sessionId);
 // …or refuse, with a reason the model gets to see:
 await Support.deny(sessionId, 'too large');
 ```
+
+`pending` also carries **`runAs`** when the parked tool has one (`null` = the
+anonymous service context), because an approver is authorizing an identity as
+well as an action: a call that runs as `service-account` is not the same request
+as one that runs as them. The key is **absent** when the tool runs as the
+session's own owner, so test it with `'runAs' in ask`, never for truthiness.
+`<agent-chat>` appends "— runs as \<id|anonymous\>" to the approval bar, and the
+`kind: 'approval'` note records it so the audit row says *what* was authorized.
 
 Nothing waits server-side while a session is parked — no process, no timer — so
 the request survives a deploy, and the verdict is what resumes the turn (give
@@ -564,6 +738,13 @@ framework never re-renders it.
 | `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
 | `placeholder` | Composer hint. |
 
+Re-pointing the element usually takes two attribute writes
+(`removeAttribute('session-id')`, then `setAttribute('agent', …)`), and
+attributes arrive one at a time. The teardown is immediate but the **re-attach
+is coalesced into one microtask**, so a run of synchronous writes re-subscribes
+exactly once, against the attributes as they finally stand — the intermediate
+combination never gets far enough to auto-start a session nothing will render.
+
 ### Auto-start, and remembering the session
 
 With no `session-id`, the element calls `start()` when it connects and then
@@ -584,8 +765,12 @@ exactly this, in `app/client/main.js`.
 A method rejection — a rate limit, a dropped connection, a session the server
 no longer has — is shown as an error note in the transcript *and* emitted as
 **`agent-chat:error`** (`detail: { error, message }`), which is how the demo
-knows to forget a stale saved id. Text that failed to send is put back in the
-composer rather than swallowed.
+knows to forget a stale saved id. Branch on the **code** when you do that:
+`detail.error` is the raw rejection, so the demo forgets its saved session only
+on `detail.error.error === 'no-session'` — forgetting it on every rejection
+throws away a live conversation the moment somebody clicks Send twice too
+quickly. Text that failed to send is put back in the composer rather than
+swallowed.
 
 ### Theming
 
@@ -630,7 +815,7 @@ The element owns one session and repaints the whole list on every delta —
 free at chat scale, and deliberately so: it buys zero diffing code. If you are
 rendering thousands of rows, or you want a layout this does not have, drop to
 `Agent` directly (["Use it from the client"](#use-it-from-the-client)) and
-render it yourself. `client/element.ts` is ~450 lines including its CSS and is
+render it yourself. `client/element.ts` is ~534 lines including its CSS and is
 meant to be read as the worked example. The pre-element version of the demo —
 the same UI with no custom element at all — is in git history at
 `git show ad0dc0b:app/client/main.js`, and remains the shortest proof that none
@@ -666,6 +851,27 @@ if you want more structure — the whole argument object is then serialized as
 JSON into that first message (declare a `prompt` string property to keep the
 plain-prose form). `name` defaults to the agent's name; `gate: 'ask'` works
 exactly as on any other tool, and gates the *opening* of the child session.
+
+**Making an agent subagent-only.** By default every defined agent is also a
+public endpoint: a client can `agent.start` it directly and drive it, bypassing
+whatever gates the parent applies before delegating. Set `startable: false` on a
+specialist to close that door — `agent.start` (and `agent.fork`) then throw
+`not-startable`, while the subagent-dispatch path and `Agent.ask` are unaffected
+(neither goes through `agent.start`), so the agent still runs as a child and
+still answers a headless one-shot.
+
+```ts
+new Agent('researcher', {
+  model, instructions: 'You look things up.', tools: [...],
+  startable: false,                 // reachable only as a subagent / Agent.ask target
+});
+```
+
+`startable: false` is a coarse on/off switch. For finer control — start the
+child only for certain callers, or only when a certain parent delegates — leave
+the child startable and put a **`canUse` on the parent** that inspects its own
+`ctx` (`userId`, `sessionId`) and refuses the subagent tool when the caller is
+not entitled; the child then runs only through a parent that allowed it.
 
 **The child persists, and streams.** WHILE the child runs, the parent
 session's `activeChild` field carries `{ sessionId, toolCallId }` — that is
@@ -725,13 +931,32 @@ subagent-heavy parent from two directions: the parent's `toolCalls` caps how
 many consultations happen, and each child agent's `spend` caps what one may
 cost.
 
-Three operational truths to design around: **interrupting the parent does not
-interrupt a running child** — the child streams to completion on its own budget
-and the parent picks up afterwards; **delivery is at-least-once at the
-subagent granularity** — a parent turn abandoned mid-batch (lease steal, crash)
-is re-dispatched by recovery, and a subagent call in that batch runs a whole
-second child; and an abandoned batch's discarded tool rows can leave a
-completed child session with no durable pointer to it from any transcript.
+Three operational truths to design around: **interrupting the parent interrupts
+its running descendants** — `agent.interrupt` walks the `activeChild` chain (to
+the same three-hop depth cap) and stops every descendant currently *running*,
+because Stop has to stop the work the user can see; the child honors it through
+the same mid-stream check an interrupt aimed at the child directly would use, so
+it commits no assistant row, and the parent's tool call is answered
+`subagent-failed` with an interrupted reason — an answered batch, so the parent
+transcript stays resumable with the next `send`. A **parked** descendant is
+deliberately *not* touched: it is a question in front of a human, the parent
+already gave up on it (`subagent-parked`) and stopping it would strand a request
+nobody could answer; **a re-dispatched subagent call reuses the
+child it already opened** — a parent turn abandoned mid-batch (lease steal,
+crash) is re-dispatched by recovery, and the lookup that runs before any child
+is created finds the earlier one by `(parent session, tool call id, agent,
+prompt)` and answers from it: a finished child's answer is reused with no new
+model call, a parked child is reported with the session id a human can already
+approve. It matches only a child that is still *unclaimed* (no tool row in the
+parent transcript names it), which is precisely the state a discard leaves
+behind. Two cases still open a second child: a provider that mints a fresh call
+id on the retry (nothing links the two dispatches), and a child that is still
+mid-run when the parent is re-dispatched (it has no outcome to report, and the
+parent may not block on work it does not own); **and a child left with no
+pointer is re-linked, not lost** — when an abandoned batch's discarded tool rows
+leave a child session that no transcript names, the watcher's sweep writes the
+`orphan-child` note described under *Recovery runs itself*, so it is reachable
+from the parent conversation again within a sweep interval.
 
 ## Forking
 
@@ -910,9 +1135,29 @@ identity**). If an agent can be reached without a login, either keep `runAs`
 off its tools, or gate them and check `ctx.callerUserId` — which is `null` for
 exactly these sessions.
 
+### Production ceilings
+
+The spend controls this package ships are all **opt-in and scoped below the
+deployment**. `budget` (`turns`/`toolCalls`/`spend`) is **per session**: it
+bounds one conversation, not the sum of all of them, and an agent defined with
+no `budget` has no brake of its own — startup logs a warning naming every such
+agent. DDP `rateLimit` entries (`sends`, `compacts`, …) are **opt-in and bucket
+per connection** for anonymous callers (per user for authenticated ones), so
+they cap one caller's rate, not the fleet's aggregate cost.
+
+None of that is a deployment-wide ceiling, and an **anonymous-reachable agent
+has no per-caller identity to bound** — a capability-URL flood is N connections,
+each with its own bucket and its own fresh session budget. So a production
+deployment that exposes an agent without a login needs a ceiling this package
+cannot provide: an **app-level per-IP or global limit** in front of `agent.send`
+/ `agent.compact` (a reverse-proxy rate limit, a gateway quota, or a global
+spend kill-switch), on top of per-session `budget` and the opt-in `rateLimit`
+knobs. Configure a `sends` rate limit and give every agent a `budget` at
+minimum; treat the aggregate ceiling as the operator's responsibility.
+
 ## Scope
 
-**This is what v2 means now: the whole list, shipped.**
+**Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**
 
 The production core (milestone 2): the pi-ai provider by default, retry with
 backoff and error surfacing, approval gates, budgets and cost accounting, DDP
@@ -942,6 +1187,27 @@ Milestone 4 finished the v2 list:
   name registry (see **Providers**), **manual `compact()`** (see **Define an
   agent**), **`runAs`** on tool specs (see **`runAs` — a tool with a fixed
   identity**), and a **rate-limit entry for approvals**.
+
+Milestone 5 (v3) shipped on top of that list:
+
+- **Predicate gates** — `gate` may be a function that reads the arguments and
+  the caller, not only the tool name (see **Tools**).
+- **Per-agent hooks** — `agentInstance.hook(...)` beside the global
+  `Agent.hook(...)`, globals running first (see **Hooks**).
+- **Idempotent subagent dispatch** — a recovered parent turn reuses the child
+  it already created rather than running a second one (see **Subagents**).
+- **Orphan re-link** — the sweep writes an `orphan-child` pointer into the
+  parent transcript when a dispatch died before committing its result, so no
+  child is stranded (see *Recovery runs itself*).
+- **Interrupt propagation** — Stop walks the `activeChild` chain and stops the
+  subagent work the user can actually see.
+- **Compiled argument validation** — the default checker compiles each schema
+  once with typebox's `Compile` and caches it, with `Value.Check` as the
+  interpreted fallback rung (see **Operations**).
+- **Startup indexes** — the transcript read and the watcher's sweeps stopped
+  being collection scans.
+- **A `tool_args` delta clamp** — one runaway argument stream can no longer
+  evict every other session's tokens from the capped delta collection.
 
 **The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
 `afterToolResult` are the two seams this package offers an app for changing what

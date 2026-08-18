@@ -2,6 +2,63 @@ export type Phase =
   | 'idle' | 'streaming' | 'calling' | 'awaiting'
   | 'compacting' | 'retrying' | 'stopped' | 'error';
 
+/**
+ * Phases in which a turn is supposed to be RUNNING.
+ *
+ * ONE definition, deliberately: the watcher asks "is this session leased by a
+ * process that should be driving it?" (a session in one of these with no live
+ * lease is an orphan) and subagent dispatch asks "is this child mid-run?"
+ * (a child in one of these has no outcome to report yet, whether it is running
+ * elsewhere or orphaned). Two lists answering the same question is how they
+ * drift; the harness has been bitten by exactly that once already (the loop's
+ * wake exclusions vs. its terminal phases).
+ */
+export const ACTIVE_PHASES: Phase[] = ['streaming', 'calling', 'retrying', 'compacting'];
+
+/**
+ * Phases in which a turn has been DECIDED and is not the harness's to wake or
+ * idle back: `stopped` is a deliberate interrupt that outranks any standing
+ * verdict until the next send, `error` is a failed turn whose note is already
+ * in the transcript, and `awaiting` is a live approval question a human still
+ * owns (idling it would strand the parked call — approve/deny only fire on that
+ * phase).
+ *
+ * ONE definition, deliberately — the same rule as `ACTIVE_PHASES` above. This
+ * exact three-element set was written out inline six times (the loop's `$nin`
+ * entry guard, its two winding-down `finally` blocks, the two wake self-checks,
+ * and the watcher's wake exclusions); those copies disagreeing about whether
+ * `error` belonged was itself a reviewed defect. A new terminal phase must be
+ * added here and nowhere else.
+ *
+ * Note the partition: `ACTIVE_PHASES` (running) and `DECIDED_PHASES` (settled)
+ * are disjoint and together cover every phase except `idle` — the only phase
+ * that is neither mid-run nor decided. The unit test asserts that split so a
+ * newly added `Phase` cannot be silently left unclassified.
+ */
+export const DECIDED_PHASES: Phase[] = ['stopped', 'error', 'awaiting'];
+
+/**
+ * The dotted session-counter paths a `$inc` may name.
+ *
+ * Mongo modifier keys are STRINGS, so `{ $inc: { 'budgetSpent.toolCall': 1 } }`
+ * — a typo for `toolCalls` — type-checks fine as a plain object and silently
+ * disables the budget it was meant to raise. That is the one bug class the
+ * type gate could not otherwise catch (the collection writes go through
+ * `rawCollection()`, whose driver types the modifier as `any`). Constraining
+ * every counter `$inc` to `SessionInc` turns that typo back into a compile
+ * error. Add a path here when you add a counter; a stray key is then rejected.
+ */
+export type SessionCounterPath =
+  | 'nextSeq'
+  | 'budgetSpent.turns'
+  | 'budgetSpent.toolCalls'
+  | 'usage.input'
+  | 'usage.output'
+  | 'usage.cost';
+
+/** A `$inc` payload over the session counters — see `SessionCounterPath`. */
+export type SessionInc = Partial<Record<SessionCounterPath, number>>;
+
 export interface Usage { input: number; output: number; cost: number }
 
 export interface AgentSession {
@@ -49,6 +106,41 @@ export interface AgentSession {
      * the old `unknown-tool` answer — a stale marker is not worth a migration.
      */
     mcpServer?: string;
+    /**
+     * WHO the parked tool will run as, put in front of the person deciding.
+     *
+     * Present only when the tool's spec carries `runAs` — and `null` is a real
+     * value there (the ANONYMOUS service context), which is why every check on
+     * this field is `!== undefined` and never truthiness. ABSENT means the tool
+     * runs as the session's own owner, which needs no announcement.
+     *
+     * An approver being asked to authorize `billing.credit` is entitled to know
+     * it will run as `service-account` rather than as them: that is the
+     * difference between approving a request and approving an escalation.
+     * `<agent-chat>` renders it as "— runs as <id|anonymous>" in the approval
+     * bar, and the `kind: 'approval'` note records it so the audit row says what
+     * was authorized and not merely that something was.
+     */
+    runAs?: string | null;
+    /**
+     * IDENTITY for the wake this verdict schedules, stamped by `writeVerdict`
+     * in the same atomic write as the verdict itself.
+     *
+     * The loop's wind-down self-check re-reads the session inside its deferred
+     * callback, because a legitimate resume can start AND finish in between.
+     * Re-checking that "a verdict still stands" is a BOOLEAN answer to an
+     * IDENTITY question: verdict A can be consumed, the batch re-park on its
+     * next gate, and a second verdict B be written and already deferred by the
+     * time the first timer fires — three writes later, the boolean still says
+     * yes. The token says WHICH verdict was seen: the deferred callback
+     * proceeds only if the token it captured is still the one on the document.
+     *
+     * A fresh park writes a whole new `pending` object, so a re-park clears it
+     * — which is the point. Absent on verdicts written before this field
+     * existed (and by tests that stamp a verdict directly), where the check
+     * degrades to the old boolean form rather than refusing to wake at all.
+     */
+    wakeToken?: string;
   };
   lease?: { serverId: string; until: Date };
   budgetSpent: { turns: number; toolCalls: number };
@@ -116,16 +208,33 @@ export interface AgentMessage {
   thinking?: string;
   toolCalls?: AgentToolCall[];
   toolCallId?: string;
-  /** `role: 'tool'` rows answering a SUBAGENT call only: the child session the
-   *  call ran. It is the handle — a client holding this transcript subscribes
-   *  to `agent.session` with the child agent's name and this id to follow the
-   *  child's own live transcript. Present even when the result is an error
-   *  (`subagent-parked`, `subagent-failed`), because the child session exists
-   *  and is exactly what a human needs to look at; absent when no child was
-   *  ever created (`subagent-depth`, an unknown agent name). */
+  /** `role: 'tool'` rows answering a SUBAGENT call, and `kind: 'orphan-child'`
+   *  notes: the child session the call ran. It is the handle — a client holding
+   *  this transcript subscribes to `agent.session` with the child agent's name
+   *  and this id to follow the child's own live transcript. Present even when
+   *  the result is an error (`subagent-parked`, `subagent-failed`), because the
+   *  child session exists and is exactly what a human needs to look at; absent
+   *  when no child was ever created (`subagent-depth`, an unknown agent name).
+   *
+   *  These two row kinds are the ONLY carriers of the field, which is what lets
+   *  the watcher ask "is this child reachable from its parent's transcript at
+   *  all" with one query over `childSessionId` and no role filter. */
   childSessionId?: string;
+  /** `kind: 'orphan-child'` notes only: which AGENT the recovered child ran.
+   *  Subscribing to a child needs its agent name as well as its id
+   *  (`agent.session` is scoped by both), and the note is the only place a
+   *  client holding the parent transcript can learn it — the child session
+   *  document itself is not published to a client that cannot already name it. */
+  childAgent?: string;
   error?: { error: string; reason?: string };
-  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval';
+  /**
+   * `orphan-child`: the watcher found a child session whose parent transcript
+   * had no row naming it — a dispatch abandoned after the child was created and
+   * before its result row landed — and wrote this pointer so the child is
+   * reachable from the conversation again (§4.3). It answers no tool call and
+   * carries no result: the child's own transcript is the record of what it did.
+   */
+  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child';
   /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say
    *  "out of tool calls" rather than "budget exhausted" and an operator can
    *  raise the right one. The human-readable half lives in `error.reason`. */
@@ -134,6 +243,17 @@ export interface AgentMessage {
    *  transcript history a UI renders and an audit reads, not a sentence. */
   approved?: boolean;
   by?: string | null;
+  /** `kind: 'approval'` notes only, and only when the parked tool carried a
+   *  `runAs`: the identity the approved call runs under (`null` = the anonymous
+   *  service context). Copied from `pending.runAs` so the audit row records WHAT
+   *  was authorized, not merely that someone said yes — an approval of a call
+   *  that runs as `service-account` is a different fact from an approval of one
+   *  that runs as the approver. Absent when the tool runs as the session's
+   *  owner. */
+  runAs?: string | null;
+  /** A structured TOKEN, not a sentence: `'approval timed out'` on a timeout
+   *  row, `'recovered'` on an `orphan-child` note. A UI renders its own prose
+   *  from it. */
   reason?: string;
   /** `kind: 'approval'` notes only, and only when true: the watcher denied this
    *  request because `budget.approval` elapsed with nobody answering (§4.3).

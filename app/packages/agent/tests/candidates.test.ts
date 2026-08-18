@@ -386,6 +386,47 @@ describe('manual compaction (Agent.compact)', () => {
     );
   });
 
+  it('refuses compaction for a session over its spend budget (M-COMPACT-BUDGET)', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+
+    // A compaction is a full provider round trip that bills like a turn, and
+    // `budget.spend` is its named backstop — so a session already at its spend
+    // cap must be refused compaction BEFORE it spends one more call.
+    await seed('s-compact-budget', 'compact-budgeted');
+    await AgentSessions.updateAsync('s-compact-budget', {
+      $set: { 'usage.cost': 5 },
+    } as any);
+
+    const { provider, requests } = recorder(() => 'BRIEF');
+    const budgeted = new Agent('compact-budgeted').define({
+      model: 'mock', instructions: 'be helpful', provider,
+      budget: { spend: '$1.00' },
+      context: { window: 1_000_000, compactAt: 0.99, keep: 2 },
+    });
+
+    let threw: any;
+    try {
+      await budgeted.compact('s-compact-budget');
+    } catch (e) { threw = e; }
+    assert.isDefined(threw, 'a session over its spend budget must refuse compaction');
+    assert.equal(threw.error, 'budget-exhausted', 'with its OWN code, not `busy`');
+
+    assert.lengthOf(requests, 0, 'and it must refuse BEFORE spending a model call');
+    assert.equal(
+      await AgentMessages.find(
+        { sessionId: 's-compact-budget', role: 'note' } as any,
+      ).countAsync(),
+      0, 'a refused compaction writes nothing',
+    );
+    // A session UNDER its cap still compacts — the guard is `>=`, not "has a budget".
+    await AgentSessions.updateAsync('s-compact-budget', { $set: { 'usage.cost': 0.5 } } as any);
+    assert.isTrue(
+      await budgeted.compact('s-compact-budget'),
+      'a session below its spend cap compacts normally',
+    );
+  });
+
   it('is reachable over DDP as agent.compact, authorized like every session method', async function () {
     this.timeout(30000);
     await seed('s-manual-ddp');

@@ -1,13 +1,14 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import type { AgentMessage, AgentSession } from '../common/types';
+import { DECIDED_PHASES, type AgentMessage, type AgentSession, type SessionInc } from '../common/types';
 import type { Provider, ProviderMessage, ToolSchema } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, holdsLease, releaseLease,
   HEARTBEAT_MS, SERVER_ID,
 } from './lease';
 import {
-  expandMcpTools, resolveTools, runTool, toolSchemas, withSkillTool,
+  evaluateGate, expandMcpTools, gateDeniedResult, resolveTools, runTool, toolSchemas,
+  withSkillTool,
   type ResolvedTool, type Skill, type ToolContext, type ToolResult, type ToolSpec,
 } from './tools';
 import { runSubagent, type SubagentDispatch } from './subagent';
@@ -48,6 +49,10 @@ export interface RunConfig {
    *  is explicit in the content so the model knows it saw a prefix.
    *  Default 8000. */
   maxResultChars?: number;
+  /** Per-TURN ceiling on the bytes of `tool_args` deltas this turn may publish.
+   *  Default 256 KiB; see `DeltaWriter`'s constructor. Display-stream hygiene
+   *  only — the committed message's `toolCalls` are never clamped. */
+  maxToolArgBytes?: number;
   /** §7's backstop: agent-level tool authorization, checked before gates and
    *  before dispatch. A refusal is a structured result the model reads and
    *  routes around — never a park, never a throw. */
@@ -89,11 +94,87 @@ async function dispatchTool(
   return { result: await runTool(tool, args, ctx) };
 }
 
-/** The transcript row content for a tool result, truncated explicitly. */
-function toolResultContent(result: ToolResult, maxChars: number): string {
-  const raw = JSON.stringify(result.ok ? result.value : result.error) ?? 'null';
-  if (raw.length <= maxChars) return raw;
-  return `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
+/**
+ * One warn per DISTINCT serialization failure kind (`TypeError` for a circular
+ * value, `TypeError` for a BigInt, whatever a throwing `toJSON` raises).
+ *
+ * The same latch pattern as hooks.ts's and the validator's, for the same
+ * reason: a tool or hook that returns an unserializable value returns one every
+ * single call, and an unlatched warning would be a log line per tool result
+ * forever. Keyed per kind rather than once ever, so one failure mode cannot
+ * permanently suppress the next.
+ */
+const warnedSerialization = new Set<string>();
+
+/** What a row says when its result could not be turned into JSON. Structured,
+ *  like every other harness-authored failure: the model can read it and route
+ *  around, and a UI can render it as an error rather than as an answer. */
+const UNSERIALIZABLE = {
+  error: 'unserializable-result',
+  reason: 'The tool result could not be serialized.',
+} as const;
+
+/**
+ * The transcript row for a tool result: its `content`, truncated explicitly,
+ * and the `error` the row must carry alongside it.
+ *
+ * `JSON.stringify` THROWS on a circular object and on a BigInt, and a tool's
+ * value is app data — a hook's replacement even more so. Unguarded, that throw
+ * escapes the dispatch loop and abandons a turn that had already done all of
+ * its work, which is a harness failure wearing an app's mistake. Guarded, the
+ * row records a structured `unserializable-result` and the turn completes: the
+ * model is told the call produced nothing usable and can try something else.
+ *
+ * Returning the error alongside the content rather than leaving it to the three
+ * call sites is deliberate — a site that wrote the substituted content but kept
+ * `result.ok`'s `undefined` error would publish a row that claims success and
+ * carries an apology.
+ */
+function toolResultContent(
+  result: ToolResult, maxChars: number,
+): { content: string; error?: { error: string; reason?: string } } {
+  let raw: string;
+  try {
+    raw = JSON.stringify(result.ok ? result.value : result.error) ?? 'null';
+  } catch (e) {
+    const kind = (e as Error)?.name ?? 'Error';
+    if (!warnedSerialization.has(kind)) {
+      warnedSerialization.add(kind);
+      console.warn(
+        '[10thfloor:agent] a tool result could not be serialized for the transcript '
+        + `(${kind}: ${(e as Error)?.message}); the row records `
+        + 'unserializable-result (warned once per kind)',
+      );
+    }
+    return { content: JSON.stringify(UNSERIALIZABLE), error: { ...UNSERIALIZABLE } };
+  }
+  const content = raw.length <= maxChars
+    ? raw
+    : `${raw.slice(0, maxChars)}…[truncated ${raw.length - maxChars} of ${raw.length} chars]`;
+  return { content, error: result.ok ? undefined : clampErrorReason(result.error, maxChars) };
+}
+
+/**
+ * Clamp a failed row's `error.reason` to `maxChars`, the same ceiling and the
+ * same explicit marker `content` gets above.
+ *
+ * `reason` reaches a published row from model- and caller-controlled strings — a
+ * denial reason typed into `agent.deny`, a subagent's composed message, an MCP
+ * server's answer — and unlike `content` it rides as its own field, so the
+ * content clamp does not bound it. A million-character reason on a published,
+ * capped-adjacent transcript is the same hazard truncation exists to prevent.
+ */
+function clampErrorReason(
+  error: { error: string; reason?: string } | undefined, maxChars: number,
+): { error: string; reason?: string } | undefined {
+  if (!error || typeof error.reason !== 'string' || error.reason.length <= maxChars) {
+    return error;
+  }
+  return {
+    ...error,
+    reason: `${error.reason.slice(0, maxChars)}…[truncated ${error.reason.length - maxChars} `
+      + `of ${error.reason.length} chars]`,
+  };
 }
 
 /**
@@ -188,7 +269,11 @@ export function _setBackoff(fn: typeof backoffDelay | null): () => void {
  */
 async function allocateSeq(
   sessionId: string,
-  inc: Record<string, number> = {},
+  // Typed to the counter-path union, not `Record<string, number>`: this is the
+  // funnel every committing turn's budget/usage `$inc` passes through, so a
+  // mistyped path here is a compile error rather than a silently-dropped
+  // increment. See `SessionInc`.
+  inc: SessionInc = {},
 ): Promise<number | null> {
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     { _id: sessionId, 'lease.serverId': SERVER_ID } as any,
@@ -259,6 +344,27 @@ export function isRunning(sessionId: string): boolean {
   return running.has(sessionId);
 }
 
+/**
+ * The default per-turn `tool_args` delta ceiling: 256 KiB.
+ *
+ * `AgentDeltas` is a 32 MiB CAPPED collection shared by every session on the
+ * deployment, and eviction is global FIFO — so the pressure one session's
+ * argument streaming puts on it is everybody's problem.
+ *
+ * MEASURED (M5 Task 4, `tests/perf.test.ts`): a turn with four parallel tool
+ * calls streaming ~20 KB of arguments each, in 200-byte fragments, writes
+ * **400 delta documents totalling 80,000 bytes** — 0.24% of the cap. Note the
+ * document count: `tool_args` is the one kind coalescing cannot help, because
+ * parallel calls arrive INTERLEAVED and `contentIndex` is part of the
+ * coalescing key, so no two consecutive fragments ever merge. Its cost scales
+ * with the provider's fragment size, not with the response.
+ *
+ * 256 KiB is therefore a bit over three such turns' worth of headroom per
+ * turn: generous for anything real, and a hard stop for a model looping on a
+ * JSON fragment.
+ */
+export const DEFAULT_MAX_TOOL_ARG_BYTES = 256 * 1024;
+
 /** Buffers deltas and flushes on an interval so a long response is O(chunk)
  *  on the wire rather than O(n²). */
 /** Exported as a TEST SEAM. The loop is its only production caller; the
@@ -273,12 +379,27 @@ export class DeltaWriter {
    *  their inserts and scramble the rendered text. */
   private flushing = false;
   private pending: Promise<void> | null = null;
+  /** Cumulative bytes of `tool_args` chunks ACCEPTED by this writer. Compared
+   *  against `maxToolArgBytes`; see `push`. */
+  private toolArgBytes = 0;
+  /** One warn per turn, not one per dropped chunk. */
+  private warnedClamp = false;
 
   constructor(
     private sessionId: string,
     private messageId: string,
     private msgSeq: number,
     flushMs: number,
+    /**
+     * Per-TURN ceiling on `tool_args` delta bytes. Display-stream hygiene and
+     * nothing more: `AgentDeltas` is a capped collection shared by every
+     * session on the deployment, so one model emitting a megabyte of arguments
+     * JSON evicts every other session's in-flight tokens. Past the ceiling this
+     * writer stops writing `tool_args` deltas; `text` and `thinking` are
+     * untouched, and the COMMITTED assistant message's `toolCalls` — the actual
+     * dispatch data — never passed through here at all. `Infinity` disables it.
+     */
+    private maxToolArgBytes: number = Infinity,
   ) {
     // The `.catch` is not decoration. A bare `void this.flush()` turns an
     // `insertAsync` rejection into an unhandled promise rejection, which is
@@ -314,6 +435,27 @@ export class DeltaWriter {
     // carried through it would split one text run into two coalescing buckets
     // and reorder nothing visibly — the worst kind of bug to find later.
     const index = kind === 'tool_args' ? contentIndex : undefined;
+
+    // The clamp. Checked BEFORE coalescing, so a dropped chunk cannot sneak in
+    // by being appended to the run already buffered. The chunk that CROSSES the
+    // ceiling is written whole (a truncated JSON fragment renders no better
+    // than a missing one) and everything after it is dropped, so the decision
+    // is monotone and a client's partial-args view simply stops growing.
+    if (kind === 'tool_args' && this.maxToolArgBytes !== Infinity) {
+      if (this.toolArgBytes >= this.maxToolArgBytes) {
+        if (!this.warnedClamp) {
+          this.warnedClamp = true;
+          console.warn(
+            `[10thfloor:agent] session ${this.sessionId}: tool_args deltas exceeded `
+            + `maxToolArgBytes (${this.maxToolArgBytes}); the rest of this turn's argument `
+            + `streaming is not published. Tool dispatch is unaffected.`,
+          );
+        }
+        return;
+      }
+      this.toolArgBytes += Buffer.byteLength(chunk, 'utf8');
+    }
+
     const last = this.buf[this.buf.length - 1];
     if (last && last.kind === kind && last.contentIndex === index) {
       last.chunk += chunk;
@@ -596,7 +738,7 @@ async function compactNow(
     {
       _id: sessionId,
       'lease.serverId': SERVER_ID,
-      phase: { $nin: ['stopped', 'awaiting', 'error'] },
+      phase: { $nin: DECIDED_PHASES },
     } as any,
     { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
   );
@@ -688,7 +830,7 @@ async function compactNow(
  * `no-session`, and the client sees those.
  */
 export type CompactOutcome =
-  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone';
+  'compacted' | 'nothing' | 'busy' | 'awaiting' | 'errored' | 'gone' | 'over-budget';
 
 /**
  * The refusing outcomes, and the `reason` each one carries.
@@ -708,6 +850,17 @@ export const COMPACT_REFUSALS: Partial<Record<CompactOutcome, string>> = {
   awaiting: 'This session is waiting on an approval; answer it before compacting.',
   errored: 'This session has failed; send to it again before compacting.',
 };
+
+/**
+ * The reason `over-budget` carries. Kept OUT of `COMPACT_REFUSALS` on purpose:
+ * that map's every entry maps to `Meteor.Error('busy')`, and this is a distinct
+ * `budget-exhausted` code — a compaction bills a provider round trip like a turn
+ * does, and a session over its `budget.spend` must be refused it, not told to
+ * "try again in a moment". The two call sites (`agent.compact`, `Agent.compact`)
+ * branch on `over-budget` before the generic `busy` lookup.
+ */
+export const COMPACT_OVER_BUDGET =
+  'This session has reached its spend budget; compaction bills like a turn.';
 
 /**
  * §9's compaction step, run ON DEMAND against an idle session — the whole point
@@ -758,6 +911,17 @@ export async function compactSession(
   // A terminal failure is STATUS a UI gates on — a banner, a retry button, an
   // alert. Compaction is bookkeeping; it must not launder one into `idle`.
   if (session.phase === 'error') return 'errored';
+  // §9. A compaction's summarization is a full provider round trip that accrues
+  // `usage.cost` like any other model call, and `budget.spend` is the README's
+  // named backstop behind it — but nothing checked it here, so a session already
+  // at its spend cap could still be made to bill one more call per compact.
+  // Refuse BEFORE claiming the lease or spending anything, exactly where the
+  // other decisions above refuse. `>=`, so a limit of N stops the call that
+  // would take it past N; `!== undefined` so a session with no spend budget is
+  // never refused on a zero it never set.
+  if (config.budget?.spend !== undefined && session.usage.cost >= config.budget.spend) {
+    return 'over-budget';
+  }
   // A live lease is another server's turn (or ours, mid-wind-down). An EXPIRED
   // one is an orphan the watcher will re-run: `claimLease` would take it, and
   // compacting an abandoned turn's half-written transcript is not this call's
@@ -794,7 +958,7 @@ export async function compactSession(
       // honors it) and an approval nobody has answered are decisions, not
       // states to tidy up.
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && !['stopped', 'error', 'awaiting'].includes(current.phase)) {
+      if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, {
           $set: { phase: 'idle', updatedAt: new Date() },
         });
@@ -1038,12 +1202,17 @@ interface TurnAnchor {
 
 /**
  * Dispatch tool calls for one committed assistant, in order, answering each
- * with a `tool` row — or parking the turn on the first `gate: 'ask'` call.
+ * with a `tool` row — or parking the turn on the first call whose gate asks.
  *
  * Shared by the streaming path and the resume path so a call is gated by the
  * SAME rule wherever it is reached: approving one call says nothing about the
  * next one, and a batch resumed after an approval must re-gate its remainder
  * rather than inherit the verdict.
+ *
+ * Every gate form is decided here and only here — the literal `'auto'`/`'ask'`
+ * and the predicate alike (`evaluateGate`). A predicate that refuses answers the
+ * call with a structured `denied-by-gate` row and the batch carries on; only an
+ * `'ask'` parks.
  */
 async function dispatchCalls(
   sessionId: string,
@@ -1061,6 +1230,37 @@ async function dispatchCalls(
     agent: turn.agent, sessionId, userId: turn.userId,
   };
 
+  /**
+   * Answer a call that was REFUSED before dispatch — a `canUse` backstop or a
+   * predicate gate that said no.
+   *
+   * One helper for both because the write is subtle in the same three ways
+   * every time and a second copy would drift on all three: the refusal goes
+   * through `afterToolResult` (a row entering a published transcript is exactly
+   * what that seam is for), the seq allocation carries NO `toolCalls` charge
+   * (nothing was dispatched, so nothing was spent), and the row's `error` comes
+   * back from the serializer rather than from the refusal we started with — a
+   * hook may have turned it into a success.
+   *
+   * Returns false when the seq could not be allocated, i.e. the turn is gone.
+   */
+  const refuse = async (
+    call: { id: string; name: string; args: unknown }, refusal: ToolResult,
+  ): Promise<boolean> => {
+    const result = await runAfterToolResult(refusal, call, hookCtx);
+    const seq = await allocateSeq(sessionId);
+    if (seq === null) return false;
+    const row = toolResultContent(result, limits.maxResultChars);
+    await AgentMessages.insertAsync({
+      _id: Random.id(), sessionId, seq, role: 'tool',
+      toolCallId: call.id,
+      content: row.content,
+      error: row.error,
+      createdAt: new Date(),
+    } as any);
+    return true;
+  };
+
   for (const call of calls) {
     // §7's backstop, BEFORE the gate: a tool the agent may not use must never
     // park either — asking a human to approve a call the config forbids is a
@@ -1068,26 +1268,10 @@ async function dispatchCalls(
     // nothing dispatched), and the model routes around it.
     if (limits.canUse
       && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
-      // Through the hook like every other row: a refusal is still something
-      // entering a published transcript, and `afterToolResult`'s contract is
-      // that nothing reaches a row unseen.
-      const denied: ToolResult = await runAfterToolResult({
+      if (!(await refuse(call, {
         ok: false,
         error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
-      }, call, hookCtx);
-      const deniedSeq = await allocateSeq(sessionId);
-      if (deniedSeq === null) return abandon();
-      await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: deniedSeq, role: 'tool',
-        toolCallId: call.id,
-        content: toolResultContent(denied, limits.maxResultChars),
-        // Guarded like the other two row writes: a hook may turn this refusal
-        // into a SUCCESS, and an unguarded write would then stamp `error` onto
-        // a row whose `ok` says otherwise (`ToolResult` carries `error` only on
-        // the failing arm, but a hook is app code and hands back what it likes).
-        error: denied.ok ? undefined : denied.error,
-        createdAt: new Date(),
-      } as any);
+      }))) return abandon();
       continue;
     }
     // Ownership is checked BEFORE dispatch, not after. Adopted tools are real
@@ -1131,7 +1315,38 @@ async function dispatchCalls(
 
     const tool = tools.find((t) => t.name === call.name);
 
-    if ((tool?.gate ?? 'auto') === 'ask') {
+    /**
+     * THE gate site — the only place in the package where a gate is read.
+     *
+     * Two dispatch paths reach it (the streaming batch, and a resumed park's
+     * re-dispatch of the calls it never got to), which is what makes "approving
+     * one call says nothing about the next" true by construction rather than by
+     * two implementations agreeing. The APPROVED call's own resume deliberately
+     * does not come through here: see `resumeParkedTurn`.
+     *
+     * `turn.userId` is the session's owner — the caller. A `runAs` tool's
+     * escalated identity is not consulted, on purpose: the gate decides whether
+     * the call happens at all, and letting the escalation answer that question
+     * would be the escalation approving itself (see the GATES note in tools.ts).
+     *
+     * A predicate that throws lands here as `'denied'`, never as an exception:
+     * a broken gate must not run the tool, and must not kill the turn either.
+     */
+    const decision = await evaluateGate(tool, {
+      userId: turn.userId, sessionId, name: call.name, args: call.args,
+    });
+
+    if (decision === 'denied') {
+      // A RESULT, not a park and not an abandonment. The model reads
+      // `denied-by-gate`, routes around it, and the rest of the batch runs —
+      // exactly the `canUse` shape above, and for the same reason: a refusal
+      // nobody may overturn has no business waiting on a human. No `toolCalls`
+      // budget is spent; nothing was dispatched.
+      if (!(await refuse(call, gateDeniedResult(call.name)))) return abandon();
+      continue;
+    }
+
+    if (decision === 'ask') {
       // Park by EXITING: no process waits here, no timer runs, nothing is
       // held. The committed assistant plus this marker plus `phase:
       // 'awaiting'` ARE the parked state, so it survives a deploy, a crash and
@@ -1161,6 +1376,18 @@ async function dispatchCalls(
               // no key at all.
               ...(tool?.kind === 'mcp' && tool.mcp?.server
                 ? { mcpServer: tool.mcp.server } : {}),
+              // WHO the tool will run as, in front of the person deciding.
+              // An approver being asked to authorize `billing.credit` is
+              // entitled to know it will run as `service-account` and not as
+              // them — that is the difference between approving a request and
+              // approving an escalation.
+              //
+              // `!== undefined`, never truthiness: `runAs: null` is the
+              // ANONYMOUS service context, a deliberate value, and a `null`
+              // written here is exactly what tells a UI to render "anonymous"
+              // rather than nothing at all. Absent means the tool runs as the
+              // session's own user, which needs no announcement.
+              ...(tool?.runAs !== undefined ? { runAs: tool.runAs } : {}),
             },
             updatedAt: new Date(),
           },
@@ -1202,11 +1429,12 @@ async function dispatchCalls(
     // be: leaving it would strand a tool_use with no tool_result.
     if (toolSeq === null) return abandon();
 
+    const row = toolResultContent(result, limits.maxResultChars);
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
       toolCallId: call.id,
-      content: toolResultContent(result, limits.maxResultChars),
-      error: result.ok ? undefined : result.error,
+      content: row.content,
+      error: row.error,
       // The handle on the child transcript. Present even for a parked or failed
       // child — that session is exactly what a human needs to open.
       childSessionId,
@@ -1323,6 +1551,10 @@ async function resumeParkedTurn(
     const tool = tools.find((t) => t.name === call.name);
     let result: ToolResult;
     let childSessionId: string | undefined;
+    // A `canUse` refusal at resume dispatched nothing, so — like a denial — it
+    // must cost no tool budget. Tracked here rather than re-derived from
+    // `result.error.error` (a hook may have rewritten it) below.
+    let refusedByCanUse = false;
     if (pending.verdict === 'denied') {
       // A denial is ANSWERED, not dropped. The model has to see the refusal in
       // the transcript to route around it; a missing result would strand the
@@ -1355,11 +1587,39 @@ async function resumeParkedTurn(
           ok: false,
           error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
         };
+    } else if (limits.canUse
+      && !(await limits.canUse(call.name, { userId, sessionId }))) {
+      // §7's backstop, re-checked at RESUME — the same `canUse` call
+      // `dispatchCalls` makes before a streaming dispatch. `registry.ts`
+      // documents `canUse` as "checked before dispatch AND before parking", but
+      // an APPROVED park resumes straight into dispatch, so without this a
+      // revoked entitlement or a kill-switch flipped while the request sat on
+      // someone's screen would not stop the already-parked call. The GATE is
+      // deliberately NOT re-evaluated here (a human answered it); `canUse` is a
+      // different question — "may this agent use this tool AT ALL" — and the
+      // answer can legitimately have changed since the park. A refusal is the
+      // structured `not-allowed` result the model reads, never a dispatch.
+      refusedByCanUse = true;
+      result = {
+        ok: false,
+        error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+      };
     } else {
       if (!(await holdsLease(sessionId))) return abandon();
       // Same `dispatchTool` the streaming path uses, so an ask-gated SUBAGENT
       // approved by a human opens its child session here exactly as an
       // ungated one would have opened it there.
+      //
+      // THE GATE IS NOT RE-EVALUATED HERE, deliberately, and this is the one
+      // place in the package where that is true. The gate's question is "may
+      // this call happen?"; a human has just answered it, in writing, in the
+      // transcript. Asking a predicate again would let it overturn an explicit
+      // authorization — and a predicate that reads mutable state (a balance, a
+      // shift roster, the clock) routinely gives a different answer minutes
+      // later, which is exactly how long an approval sits on someone's screen.
+      // The remainder of the batch is a different matter and IS re-gated: it
+      // goes back through `dispatchCalls` below, where nobody has approved
+      // anything.
       ({ result, childSessionId } = await dispatchTool(tool, call.args, {
         userId, sessionId, toolCallId: call.id,
       }));
@@ -1373,16 +1633,19 @@ async function resumeParkedTurn(
       agent, sessionId, userId,
     });
 
-    // A denied call was never dispatched, so it costs no tool budget.
+    // A denied call — or one refused by `canUse` — was never dispatched, so it
+    // costs no tool budget.
     const seq = await allocateSeq(
-      sessionId, pending.verdict === 'denied' ? {} : { 'budgetSpent.toolCalls': 1 },
+      sessionId,
+      (pending.verdict === 'denied' || refusedByCanUse) ? {} : { 'budgetSpent.toolCalls': 1 },
     );
     if (seq === null) return abandon();
 
+    const row = toolResultContent(result, limits.maxResultChars);
     await AgentMessages.insertAsync({
       _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
-      content: toolResultContent(result, limits.maxResultChars),
-      error: result.ok ? undefined : result.error,
+      content: row.content,
+      error: row.error,
       childSessionId,
       createdAt: new Date(),
     } as any);
@@ -1416,6 +1679,10 @@ async function resumeParkedTurn(
 export async function runTurn(sessionId: string, config: RunConfig): Promise<void> {
   const maxIterations = config.maxIterations ?? 10;
   const flushMs = config.flushMs ?? 60;
+  // 256 KiB per turn. Generous by design: the largest argument payload any of
+  // this package's own tools produces is three orders of magnitude smaller, so
+  // a turn that reaches this is pathological, not merely busy.
+  const maxToolArgBytes = config.maxToolArgBytes ?? DEFAULT_MAX_TOOL_ARG_BYTES;
   const interruptCheckMs = config.interruptCheckMs ?? 250;
   // `attempts` counts the INITIAL try, so 1 means "no retry" and 0 means
   // nothing coherent at all: `attemptIndex + 1 < 0` is false on the first
@@ -1617,7 +1884,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           );
           if (streaming !== 1) return;
 
-          const writer = new DeltaWriter(sessionId, messageId, msgSeq, flushMs);
+          const writer = new DeltaWriter(
+            sessionId, messageId, msgSeq, flushMs, maxToolArgBytes,
+          );
           text = '';
           thinking = '';
           toolCalls = undefined;
@@ -1838,9 +2107,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // being asked) that the phase exists to preserve. For `awaiting` the
       // damage would be worse than cosmetic: approve/deny only fire on that
       // phase, so idling it back would strand the parked call permanently.
-      const terminal = ['stopped', 'error', 'awaiting'];
       const current = await AgentSessions.findOneAsync(sessionId);
-      if (current && !terminal.includes(current.phase)) {
+      if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
       }
       await releaseLease(sessionId);
@@ -1872,8 +2140,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // the finally's terminal list: a failed turn is not ours to wake, and
       // the two lists disagreeing was itself a reviewed defect.
       if (after?.pending?.verdict
-        && after.phase !== 'awaiting' && after.phase !== 'stopped' && after.phase !== 'error'
+        && !DECIDED_PHASES.includes(after.phase)
         && !running.has(sessionId)) {
+        // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
+        // with every verdict, so this is identity where the old re-check had
+        // only a boolean: a verdict consumed, the batch re-parked on its next
+        // gate, and a SECOND verdict written (with its own deferred resume
+        // already queued) all before this timer fires is three writes that
+        // still leave "a verdict stands" true — and this callback would then
+        // run a turn nobody asked for, behind the resume that already owns it.
+        // Undefined only for a verdict written before the field existed, where
+        // the comparison degrades to the old boolean form rather than
+        // stranding the session.
+        const wakeToken = after.pending.wakeToken;
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
         // plumbing and calls in), and the only thing `defer` would add is an
@@ -1891,8 +2170,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // assistant row appended to a turn the user considered finished.
             const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
             if (!still?.pending?.verdict
-              || still.phase === 'awaiting' || still.phase === 'stopped'
-              || still.phase === 'error' || running.has(sessionId)) return;
+              || still.pending.wakeToken !== wakeToken
+              || DECIDED_PHASES.includes(still.phase) || running.has(sessionId)) return;
             await runTurn(sessionId, config);
           })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
