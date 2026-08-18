@@ -754,6 +754,10 @@ describe('MCP schema hardening (M-MCP-SCHEMA)', () => {
           // A classic catastrophic-backtracking pattern, plus a format keyword.
           s: { type: 'string', pattern: '^(a+)+$', format: 'email' },
           nested: { type: 'object', properties: { t: { type: 'string', pattern: '(x+)+y' } } },
+          // A user property literally NAMED `format`, whose own value carries a
+          // `pattern` keyword: the property name must survive (it is data, not a
+          // keyword), while the keyword inside its subschema must be stripped.
+          format: { type: 'string', pattern: 'evil' },
         },
       },
     };
@@ -761,11 +765,18 @@ describe('MCP schema hardening (M-MCP-SCHEMA)', () => {
     const restore = _setMcpClientFactory(fake.factory);
     try {
       const [tool] = await build([{ mcp: { server: 't-schema-pattern', tool: 'evil' } }]);
-      const serialized = JSON.stringify(tool.args);
-      assert.notInclude(serialized, 'pattern', 'no pattern keyword may survive into the args');
-      assert.notInclude(serialized, 'format', 'nor any format keyword');
-      // The structure itself is preserved — only the regex-bearing keywords go.
-      assert.deepNestedInclude(tool.args as any, { 'properties.s.type': 'string' });
+      const args = tool.args as any;
+      // No regex-bearing KEYWORD survives — check by position, not by substring,
+      // now that a property may legitimately be named "format".
+      assert.isUndefined(args.properties.s.pattern, 's.pattern keyword stripped');
+      assert.isUndefined(args.properties.s.format, 's.format keyword stripped');
+      assert.isUndefined(args.properties.nested.properties.t.pattern, 'nested pattern stripped');
+      // The property NAMED `format` survives; the `pattern` keyword inside it does not.
+      assert.isDefined(args.properties.format, 'a property named "format" is data, kept');
+      assert.equal(args.properties.format.type, 'string');
+      assert.isUndefined(args.properties.format.pattern, 'the keyword inside it is stripped');
+      // Structure otherwise preserved.
+      assert.deepNestedInclude(args, { 'properties.s.type': 'string' });
     } finally { restore(); }
   });
 });

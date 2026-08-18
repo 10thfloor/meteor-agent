@@ -437,3 +437,8 @@ DEFERRED to v4: loop.ts 2113-line file split (maintainability, risky post-audit)
 security Mediums M7 watcher-scan-growth (has index now, unbounded set remains), M8 hook fail-open
 opt-in, M6 length caps (partial: clamps added, no check-time text ceiling); parentless-child retention.
 Suite: 334 (+2 pending) server + 7 client.
+Final M5 review: MERGE, both non-blocking findings fixed inline (335+7, tsc clean):
+  M1 - startable:false now refuses agent.send too (the send-to-child hole was the exact exploit;
+    unconditional refusal, resume-via-approve unaffected). L1 - MCP schema strip is position-aware:
+    strips pattern/format/patternProperties as KEYWORDS, keeps a user property literally named 'format'.
+  M5 spec-v1-through-v3 + both audits complete.

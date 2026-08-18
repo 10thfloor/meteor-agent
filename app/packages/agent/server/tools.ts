@@ -1115,26 +1115,45 @@ function mcpFallbackDescription(server: string, tool: string): string {
 }
 
 /**
- * Recursively strip `pattern` and `format` from a DISCOVERED MCP schema before
+ * Recursively strip regex-bearing KEYWORDS from a DISCOVERED MCP schema before
  * it becomes a tool's `args`.
  *
- * Both are attacker-influenced-regex hazards on the single-threaded event loop:
- * a `pattern` keyword is compiled and run as a RegExp against the model's
- * arguments by `Value.Check`/`Compile`, and a catastrophically-backtracking
- * pattern from an untrusted server is a ReDoS that stalls every session on the
- * process, not just the offending turn. `format` (`email`, `uri`, `date-time`,
- * …) is enforced by regexes too, some historically ReDoS-prone. An app-authored
- * schema is trusted and keeps both (this runs only on the discovered branch
- * below); a discovered one loses them and is validated on structure alone. A
- * fresh object is returned — the server's catalog object is never mutated.
+ * `pattern`, `format` and `patternProperties` are all attacker-influenced-regex
+ * hazards on the single-threaded event loop: `pattern` is compiled and run as a
+ * RegExp against the model's arguments by `Value.Check`/`Compile`, and a
+ * catastrophically-backtracking pattern from an untrusted server is a ReDoS
+ * that stalls every session on the process; `format` (`email`, `uri`,
+ * `date-time`, …) is enforced by regexes too, some historically ReDoS-prone;
+ * and `patternProperties` KEYS are themselves regexes. An app-authored schema
+ * is trusted and keeps them (this runs only on the discovered branch); a
+ * discovered one loses them and is validated on structure alone.
+ *
+ * Position-aware, and that is the whole subtlety: `pattern`/`format` are the
+ * hazard only AS KEYWORDS on a schema object. Inside `properties`/`$defs`/
+ * `definitions` the keys are user-chosen property NAMES, so a discovered tool
+ * whose input has a property literally named `format` or `pattern` must keep
+ * it — we recurse into the values there and never strip the map's own keys.
+ * A fresh object is returned; the server's catalog object is never mutated.
  */
+const SCHEMA_SUBMAPS = new Set(['properties', '$defs', 'definitions']);
 function stripUntrustedSchemaKeywords(schema: unknown): unknown {
   if (Array.isArray(schema)) return schema.map(stripUntrustedSchemaKeywords);
   if (!schema || typeof schema !== 'object') return schema;
   const out: Record<string, unknown> = {};
   for (const [k, v] of Object.entries(schema as Record<string, unknown>)) {
-    if (k === 'pattern' || k === 'format') continue;
-    out[k] = stripUntrustedSchemaKeywords(v);
+    // Regex-bearing keywords, dropped at keyword position. `patternProperties`
+    // goes wholesale because its own KEYS are the regexes.
+    if (k === 'pattern' || k === 'format' || k === 'patternProperties') continue;
+    if (SCHEMA_SUBMAPS.has(k) && v && typeof v === 'object' && !Array.isArray(v)) {
+      // A map of {propertyName: subschema}: recurse the VALUES, keep the NAMES.
+      const map: Record<string, unknown> = {};
+      for (const [name, sub] of Object.entries(v as Record<string, unknown>)) {
+        map[name] = stripUntrustedSchemaKeywords(sub);
+      }
+      out[k] = map;
+    } else {
+      out[k] = stripUntrustedSchemaKeywords(v);
+    }
   }
   return out;
 }

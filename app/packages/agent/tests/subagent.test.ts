@@ -1067,6 +1067,44 @@ describe('subagents: startable:false (H-STARTABLE)', () => {
     assert.isDefined(await AgentSessions.findOneAsync(id));
   });
 
+  it('refuses agent.send to a startable:false agent, even to its own child', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+
+    // The exploit the guard closes: a subagent child is a real session of the
+    // specialist whose id rides the parent's published tool row, so an owner
+    // could send fresh turns straight to it. Seed exactly that shape — a child
+    // session of a startable:false agent — and confirm send is refused.
+    new Agent('specialist-locked', {
+      model: 'mock', instructions: 'subagent only', startable: false,
+      provider: mockProvider(() => ({ text: 'x' })),
+    });
+    await AgentSessions.insertAsync({
+      _id: 'locked-child', agent: 'specialist-locked', userId: 'u1', phase: 'idle',
+      model: 'mock', nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      parent: { sessionId: 'p1', toolCallId: 't1' },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+    let threw: any;
+    try { await send.call({ userId: 'u1' }, 'specialist-locked', 'locked-child', 'drive it'); }
+    catch (e) { threw = e; }
+    assert.isDefined(threw, 'send to a startable:false agent must be refused');
+    assert.equal(threw.error, 'not-startable');
+    // And nothing was committed — the refusal is before any write.
+    assert.equal(
+      await AgentMessages.find({ sessionId: 'locked-child', role: 'user' }).countAsync(), 0,
+    );
+  });
+
   it('still runs as a subagent even though it cannot be started', async function () {
     this.timeout(30000);
     const { AgentMessages } = await import('../common/collections');

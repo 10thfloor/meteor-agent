@@ -340,6 +340,19 @@ export function registerMethods(): void {
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
       await requireSession(agent, sessionId, this.userId ?? null);
 
+      // `startable: false` closes `agent.start`/`agent.fork`; it must close
+      // `agent.send` too, or the flag is a fiction. A subagent child is a real
+      // session of the specialist, and its id rides the parent's published
+      // tool row — so without this an owner could `agent.send` fresh turns
+      // straight to the specialist, driving it outside the parent's
+      // orchestration, which is exactly what the flag promises to prevent.
+      // Unconditional (no child exception): a `startable: false` agent has no
+      // user-facing conversation to send to, and a parked child a human
+      // answers resumes through `agent.approve`/`deny` → `runTurn`, never here.
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be driven directly');
+      }
+
       // §9: the turn budget, enforced INSIDE the atomic allocation below, not
       // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
       // here, but concurrent sends all reading the same pre-inc value would
