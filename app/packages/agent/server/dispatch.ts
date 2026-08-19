@@ -226,7 +226,7 @@ export async function dispatchCalls(
       content: row.content,
       error: row.error,
       createdAt: new Date(),
-    } as any);
+    });
     return true;
   };
 
@@ -332,7 +332,7 @@ export async function dispatchCalls(
       const parked = await AgentSessions.updateAsync(
         {
           _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' },
-        } as any,
+        },
         {
           $set: {
             phase: 'awaiting',
@@ -360,7 +360,7 @@ export async function dispatchCalls(
             },
             updatedAt: new Date(),
           },
-        } as any,
+        },
       );
       // Zero matched is either an interrupt or another server redoing this
       // turn. Both mean the park never became durable, so the half-answered
@@ -408,7 +408,7 @@ export async function dispatchCalls(
       // child — that session is exactly what a human needs to open.
       childSessionId,
       createdAt: new Date(),
-    } as any);
+    });
   }
 
   return 'completed';
@@ -480,8 +480,8 @@ export async function resumeParkedTurn(
     // durable until the next `agent.send` clears it, and the verdict-carrying
     // marker is what makes that send resume this batch rather than strand it.
     const proceeding = await AgentSessions.updateAsync(
-      { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
-      { $set: { phase: 'calling', updatedAt: new Date() } } as any,
+      { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } },
+      { $set: { phase: 'calling', updatedAt: new Date() } },
     );
     // 'parked' rather than 'abandoned': nothing was erased, and something
     // outside this turn (a send clearing the stop) still owes it an answer.
@@ -587,7 +587,7 @@ export async function resumeParkedTurn(
       error: row.error,
       childSessionId,
       createdAt: new Date(),
-    } as any);
+    });
   }
 
   // The verdict is spent the moment its call is answered. Clearing the marker

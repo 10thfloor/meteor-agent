@@ -31,7 +31,7 @@ export function latestCompaction(
   msgs: AgentMessage[],
 ): { seq: number; summary: string; upto: number } | null {
   for (let i = msgs.length - 1; i >= 0; i -= 1) {
-    const m = msgs[i] as any;
+    const m = msgs[i];
     if (m.role === 'note' && m.kind === 'compaction' && typeof m.upto === 'number') {
       return { seq: m.seq, summary: m.summary ?? '', upto: m.upto };
     }
@@ -168,8 +168,8 @@ async function compactNow(
       _id: sessionId,
       'lease.serverId': SERVER_ID,
       phase: { $nin: DECIDED_PHASES },
-    } as any,
-    { $set: { phase: 'compacting', updatedAt: new Date() } } as any,
+    },
+    { $set: { phase: 'compacting', updatedAt: new Date() } },
   );
   if (entered !== 1) return false;
 
@@ -248,7 +248,7 @@ async function compactNow(
   await AgentMessages.insertAsync({
     _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'compaction',
     summary, upto, usage, createdAt: new Date(),
-  } as any);
+  });
   return true;
 }
 

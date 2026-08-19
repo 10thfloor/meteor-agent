@@ -226,7 +226,7 @@ export function registerProvider(name: string, impl: Provider): void {
   if (typeof name !== 'string' || name === '') {
     throw new Error('[10thfloor:agent] Agent.provider(name, impl) needs a non-empty name');
   }
-  if (!impl || typeof (impl as any).stream !== 'function') {
+  if (!impl || typeof impl.stream !== 'function') {
     throw new Error(
       `[10thfloor:agent] Agent.provider("${name}", impl): impl must have a `
       + 'stream(request) method returning an async iterable of chunks',

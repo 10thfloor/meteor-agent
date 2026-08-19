@@ -1,6 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import type { SessionInc } from '../common/types';
+import type { AgentSession, SessionInc } from '../common/types';
 import { guardedUpdate, SERVER_ID } from './lease';
 
 /**
@@ -86,12 +86,18 @@ export async function allocateSeq(
   // increment. See `SessionInc`.
   inc: SessionInc = {},
 ): Promise<number | null> {
+  // The driver's declared return is `ModifyResult<AgentSession>`, but with the
+  // v5+ default (`includeResultMetadata: false`) `findOneAndUpdate` resolves to
+  // the pre-image DOCUMENT (or null), not that wrapper — so the result is read
+  // back through `AgentSession` via `unknown`. The value is worth the double
+  // cast: `before.nextSeqq` is now a compile error instead of a silent
+  // `undefined` the way `(before as any).nextSeq` was.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
-    { _id: sessionId, 'lease.serverId': SERVER_ID } as any,
-    { $inc: { nextSeq: 1, ...inc }, $set: { updatedAt: new Date() } },
+    { _id: sessionId, 'lease.serverId': SERVER_ID },
+    { $inc: { nextSeq: 1, ...inc } satisfies SessionInc, $set: { updatedAt: new Date() } },
     { returnDocument: 'before' },
-  );
-  return before ? (before as any).nextSeq : null;
+  ) as unknown as AgentSession | null;
+  return before ? before.nextSeq : null;
 }
 
 /** Which limit tripped, and the sentence a UI shows for it. */
@@ -128,7 +134,7 @@ export async function commitBudgetNote(
     _id: Random.id(), sessionId, seq, role: 'note', kind: 'budget', budget,
     error: { error: 'budget-exhausted', reason: BUDGET_REASONS[budget] },
     createdAt: new Date(),
-  } as any);
+  });
   await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'stopped' } });
 }
 

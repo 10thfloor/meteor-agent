@@ -472,3 +472,28 @@ VERIFIED 3 ways: (1) tsc --noEmit clean after every extraction; (2) suite 335 se
 (3) deterministic comm-diff of stripped code lines (main loop.ts vs the 6 files) shows ONLY the
 intended changes (import reformatting + runTurn threading), proving every moved body byte-identical.
 STILL DEFERRED: as-any burndown; M7/M8/M6 security Mediums; parentless-child retention.
+
+== V4 (branch as-any-burndown) — the as-any burndown (user chose "maximal strip") ==
+99 source `as any` -> 7, and the 7 left are genuine @types-gap boundaries, NOT laziness.
+NEW `common/db.ts`: a typed facade over the 3 collections. The driver types selector as loose
+`Mongo.Selector<T>` and modifier as a bag that accepts `{ $set: { phasee } }` — so a field typo
+type-checks and silently disables the write, and every dotted-path selector needs `as any`. db.ts
+replaces both. Key trick: a query/modifier is a mapped type over `keyof T` (field-value-checked)
+INTERSECTED with pattern template-literal index sigs (`` `lease.${string}` ``) for the nested paths —
+so a top-level typo matches neither and is an excess-property error, while `'lease.until'` is allowed.
+No broad `[k:string]` (that would re-open the hole). SessionSet is the `$set` twin of SessionInc.
+`TypedCollection<T,Sel,Mod>` = `Omit<Mongo.Collection<T>, find|findOne|findOneAsync|updateAsync|
+removeAsync>` re-adding those with typed selectors; insertAsync/rawCollection/cursor inherited. The
+3 exports in collections.ts are `as unknown as …Collection` — the ONE cast per collection.
+guardedUpdate's modifier param is now `SessionModifier` (the $set funnel gets teeth for free). Raw
+`findOneAndUpdate` reads typed `as unknown as AgentSession | null` (driver DECLARES ModifyResult but
+returns the doc at v5+ default — that mismatch is why `(before as any).nextSeq` existed); `.nextSeq`
+is now checked. DeltaWriter.push typed `DeltaKind`. allocateSeq's inline `$inc` got the `satisfies
+SessionInc` its four siblings already had (closed the one typo the battery still missed).
+TEETH (battery of injected typos, all now TS errors): $set field, $set bad value, insert field,
+selector field, $inc counter, raw-read field. 6/6.
+IRREDUCIBLE 7 (kept, documented — external/framework @types gaps): Meteor.settings; DDP
+`_CurrentMethodInvocation`; two dynamic-ESM MCP imports; pi-ai model.api; native createIndexAsync;
+deny() over the heterogeneous collection union. Removing these would move the `any`, not the risk.
+tsconfig comment updated: the gate now catches the whole $set/$inc/selector/insert typo class, not
+just $inc. STILL DEFERRED: M7/M8/M6 security Mediums; parentless-child retention.

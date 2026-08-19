@@ -205,10 +205,10 @@ export async function discardTurn(
         // THAT turn's `tool_use` instead — self-healing on the next repair,
         // but at the cost of a 400'd turn in between.
         seq: { $gt: turnSeq, $lt: upperBoundSeq },
-      } as any);
+      });
     }
-    await AgentDeltas.removeAsync({ messageId } as any);
-    await AgentMessages.removeAsync({ _id: messageId } as any);
+    await AgentDeltas.removeAsync({ messageId });
+    await AgentMessages.removeAsync({ _id: messageId });
   } catch { /* cleanup is best-effort by design */ }
 }
 
@@ -257,7 +257,7 @@ export async function repairUnansweredToolUse(sessionId: string): Promise<boolea
   const committedIds = msgs.map((m) => m._id);
   await AgentDeltas.removeAsync({
     sessionId, messageId: { $nin: committedIds },
-  } as any);
+  });
 
   // A toolCall counts as answered only by a `tool` row inside ITS OWN turn's
   // window — see `turnWindows`, which both this and `locateBatch` share so the

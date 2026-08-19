@@ -8,7 +8,8 @@ import { runTurn } from './loop';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
 import { forkSession } from './fork';
 import { MAX_SUBAGENT_DEPTH } from './subagent';
-import { ACTIVE_PHASES, type SessionInc } from '../common/types';
+import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import type { SessionSet } from '../common/db';
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -24,7 +25,7 @@ import { ACTIVE_PHASES, type SessionInc } from '../common/types';
  * distinguishing them would confirm the existence of another user's session id.
  */
 async function requireSession(agent: string, sessionId: string, userId: string | null) {
-  const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, userId } as any);
+  const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, userId });
   if (!session) throw new Meteor.Error('no-session', 'Session not found');
   return session;
 }
@@ -81,7 +82,7 @@ async function writeVerdict(
   reason: string | undefined,
   timedOut = false,
 ): Promise<boolean> {
-  const $set: Record<string, unknown> = {
+  const $set: SessionSet = {
     'pending.verdict': verdict,
     'pending.by': by,
     // The wake's IDENTITY, written in the same atomic write as the verdict it
@@ -102,8 +103,8 @@ async function writeVerdict(
       _id: sessionId,
       phase: 'awaiting',
       'pending.verdict': { $exists: false },
-    } as any,
-    { $set } as any,
+    },
+    { $set },
   );
   // Zero matched means someone else answered between our read and our write.
   if (won !== 1) return false;
@@ -119,14 +120,14 @@ async function writeVerdict(
     { _id: sessionId },
     { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
     { returnDocument: 'before' },
-  );
+  ) as unknown as AgentSession | null;
   if (before) {
     // The parked marker as it stood a moment ago — `before` is the document
     // BEFORE this seq allocation, which is after the verdict write, so
     // `pending` is still there with everything the park recorded.
-    const parked = (before as any).pending as { runAs?: string | null } | undefined;
+    const parked = before.pending;
     await AgentMessages.insertAsync({
-      _id: Random.id(), sessionId, seq: (before as any).nextSeq,
+      _id: Random.id(), sessionId, seq: before.nextSeq,
       role: 'note', kind: 'approval',
       approved: verdict === 'approved', by, reason,
       // AUDIT COMPLETENESS: what was authorized, not merely that someone said
@@ -144,7 +145,7 @@ async function writeVerdict(
       // be able to tell them apart from the row alone.
       timedOut: timedOut || undefined,
       createdAt: new Date(),
-    } as any);
+    });
   } else {
     // No seq means the session vanished between the verdict write and here.
     // The verdict itself is already durable and the tool may well execute, so
@@ -242,8 +243,8 @@ async function stopRunningDescendants(sessionId: string): Promise<void> {
     if (!next) return;
     // eslint-disable-next-line no-await-in-loop
     await AgentSessions.updateAsync(
-      { _id: next, phase: { $in: ACTIVE_PHASES } } as any,
-      { $set: { phase: 'stopped', updatedAt: new Date() } } as any,
+      { _id: next, phase: { $in: ACTIVE_PHASES } },
+      { $set: { phase: 'stopped', updatedAt: new Date() } },
     );
     // Re-read rather than trusting the write: the walk continues past a
     // descendant it did NOT stop (a parked one, or one that finished a
@@ -329,7 +330,7 @@ export function registerMethods(): void {
         usage: { input: 0, output: 0, cost: 0 },
         budgetSpent: { turns: 0, toolCalls: 0 },
         createdAt: new Date(), updatedAt: new Date(),
-      } as any);
+      });
       return _id;
     },
 
@@ -387,7 +388,7 @@ export function registerMethods(): void {
           $set: { updatedAt: new Date() },
         },
         { returnDocument: 'before' },
-      );
+      ) as unknown as AgentSession | null;
       if (!before) {
         // requireSession above proved the session exists and is the caller's,
         // so a non-match here can only be the budget filter.
@@ -400,9 +401,9 @@ export function registerMethods(): void {
       }
 
       await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: (before as any).nextSeq, role: 'user',
+        _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
         content: text, createdAt: new Date(),
-      } as any);
+      });
 
       // A new message is the resume signal after an interrupt OR a provider
       // failure: both `stopped` and `error` are durable (the loop refuses to
@@ -411,8 +412,8 @@ export function registerMethods(): void {
       // recovers" philosophy for `error`. Conditional on the current phase so
       // a send during a live turn does not stomp `streaming`.
       await AgentSessions.updateAsync(
-        { _id: sessionId, phase: { $in: ['stopped', 'error'] } } as any,
-        { $set: { phase: 'idle' } } as any,
+        { _id: sessionId, phase: { $in: ['stopped', 'error'] } },
+        { $set: { phase: 'idle' } },
       );
 
       deferTurn(sessionId, config, this.userId ?? null);
@@ -434,7 +435,7 @@ export function registerMethods(): void {
       // than leaving its `tool_use` unanswered.
       await AgentSessions.updateAsync(sessionId, {
         $set: { phase: 'stopped', updatedAt: new Date() },
-      } as any);
+      });
 
       // The named session first, its running descendants second. Order is not
       // cosmetic: a subagent chain is driven from the top, so stopping the

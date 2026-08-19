@@ -330,8 +330,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // Zero matched (stop OR lost lease) → return; the finally preserves
           // a stop.
           const streaming = await AgentSessions.updateAsync(
-            { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } } as any,
-            { $set: { phase: 'streaming', updatedAt: new Date() } } as any,
+            { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } },
+            { $set: { phase: 'streaming', updatedAt: new Date() } },
           );
           if (streaming !== 1) return;
 
@@ -421,7 +421,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           if (providerError) {
             // Per-attempt cleanup: this attempt's partial never commits, so
             // its deltas must not linger as a streaming ghost row either.
-            await AgentDeltas.removeAsync({ messageId } as any);
+            await AgentDeltas.removeAsync({ messageId });
 
             // A stop outranks BOTH the retry and the error note. Re-read the
             // session once here because this branch is otherwise blind to an
@@ -468,7 +468,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'error',
                 error: { error: 'provider-failed', reason: 'The model request failed.' },
                 createdAt: new Date(),
-              } as any);
+              });
               await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'error' } });
             } else {
               // The only silent exit in this structure: the lease went to
@@ -489,7 +489,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         if (interrupted) {
           // Nothing committed yet: the partial exists only as deltas. Remove
           // them or they render as a streaming ghost row forever.
-          await AgentDeltas.removeAsync({ messageId } as any);
+          await AgentDeltas.removeAsync({ messageId });
           return;
         }
 
@@ -511,7 +511,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           _id: messageId, sessionId, seq: commitSeq, role: 'assistant',
           content: text, thinking: thinking || undefined,
           toolCalls, usage, createdAt: new Date(),
-        } as any);
+        });
 
         // The committed message supersedes its deltas; remove them now rather
         // than letting them accumulate. Without this, subscribing to an old
@@ -519,7 +519,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // re-merges the full delta history on every flush of the NEXT turn.
         // Ordering is safe: the client receives the committed message first,
         // and mergeView already suppresses deltas by committed id.
-        await AgentDeltas.removeAsync({ messageId } as any);
+        await AgentDeltas.removeAsync({ messageId });
 
         if (!toolCalls || toolCalls.length === 0) {
           // A send that landed mid-stream committed a user message this turn
@@ -528,7 +528,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // sends AGAIN — so loop instead, still bounded by maxIterations.
           const interjected = await AgentMessages.findOneAsync({
             sessionId, role: 'user', seq: { $gt: historyMaxSeq },
-          } as any);
+          });
           if (interjected) continue;
           return;
         }

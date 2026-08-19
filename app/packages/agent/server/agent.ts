@@ -1,4 +1,5 @@
-import type { SessionInc } from '../common/types';
+import type { AgentSession, SessionInc } from '../common/types';
+import type { SessionQuery } from '../common/db';
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
@@ -76,7 +77,7 @@ export class Agent {
       usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
       createdAt: new Date(), updatedAt: new Date(),
-    } as any);
+    });
 
     try {
       // Atomic seq allocation, exactly as `agent.send` does it — one
@@ -94,13 +95,13 @@ export class Agent {
         { _id: sessionId },
         { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
         { returnDocument: 'before' },
-      );
+      ) as unknown as AgentSession | null;
       if (!before) throw new Meteor.Error('ask-failed', 'The throwaway session vanished.');
 
       await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: (before as any).nextSeq, role: 'user',
+        _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
         content: text, createdAt: new Date(),
-      } as any);
+      });
 
       // The identical `RunConfig` `deferTurn` assembles — same registry config,
       // same pi-ai fallback resolved at run time rather than at define() time,
@@ -209,9 +210,9 @@ export class Agent {
   ): Promise<boolean> {
     const config = getAgent(this.name);
     if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${this.name}`);
-    const selector: Record<string, unknown> = { _id: sessionId, agent: this.name };
+    const selector: SessionQuery = { _id: sessionId, agent: this.name };
     if (opts && 'userId' in opts) selector.userId = opts.userId ?? null;
-    const session = await AgentSessions.findOneAsync(selector as any);
+    const session = await AgentSessions.findOneAsync(selector);
     if (!session) throw new Meteor.Error('no-session', 'Session not found');
 
     // The session's OWN owner, not the caller's scope: a compaction runs the

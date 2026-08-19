@@ -5,6 +5,7 @@ import { NAMES } from '../common/names';
 import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 import { mergeView } from '../common/merge';
 import type { Phase, ViewMessage } from '../common/types';
+import type { SessionQuery } from '../common/db';
 
 /**
  * Client-side handle on one agent.
@@ -96,8 +97,8 @@ export class Agent {
   private startMerging(sessionId: string) {
     if (this.computation) this.computation.stop();
     this.computation = Tracker.autorun(() => {
-      const committed = AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetch() as any[];
-      const deltas = AgentDeltas.find({ sessionId }).fetch() as any[];
+      const committed = AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetch();
+      const deltas = AgentDeltas.find({ sessionId }).fetch();
       const merged = mergeView(committed, deltas);
 
       // Writes are nonreactive so this computation depends only on what it
@@ -113,7 +114,7 @@ export class Agent {
           // stale in-flight fields (`truncatedHead`, `deltaCount`, a partial
           // `thinking`) on the row after the real message commits without
           // them.
-          this.view.upsert(m._id, m as any);
+          this.view.upsert(m._id, m);
         }
       });
     });
@@ -128,11 +129,11 @@ export class Agent {
   }
 
   status(sessionId: string): Phase {
-    return (this.session(sessionId) as any)?.phase ?? 'idle';
+    return this.session(sessionId)?.phase ?? 'idle';
   }
 
   usage(sessionId: string) {
-    return (this.session(sessionId) as any)?.usage ?? { input: 0, output: 0, cost: 0 };
+    return this.session(sessionId)?.usage ?? { input: 0, output: 0, cost: 0 };
   }
 
   /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name). */
@@ -140,9 +141,9 @@ export class Agent {
     return Meteor.subscribe(NAMES.pubSessions, this.name);
   }
 
-  sessions(selector: Record<string, unknown> = {}) {
+  sessions(selector: SessionQuery = {}) {
     return AgentSessions.find(
-      { ...selector, agent: this.name } as any,
+      { ...selector, agent: this.name },
       { sort: { updatedAt: -1 } },
     );
   }
@@ -197,7 +198,7 @@ export class Agent {
    * 'awaiting'` to show what is being asked, then call `approve`/`deny`.
    */
   pending(sessionId: string) {
-    return (this.session(sessionId) as any)?.pending;
+    return this.session(sessionId)?.pending;
   }
 
   approve(sessionId: string): Promise<void> {

@@ -2,6 +2,7 @@ import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import type { AgentMessage, AgentSession } from '../common/types';
+import type { SessionQuery } from '../common/db';
 import { batchSafeBoundary } from './transcript';
 
 /** How many copied message documents go in one `insertMany`. Big enough that a
@@ -132,7 +133,7 @@ export async function forkSession(
   for (let i = 0; i < docs.length; i += COPY_CHUNK) {
     // eslint-disable-next-line no-await-in-loop
     await AgentMessages.rawCollection().insertMany(
-      docs.slice(i, i + COPY_CHUNK) as any[],
+      docs.slice(i, i + COPY_CHUNK),
       { ordered: true },
     );
   }
@@ -165,7 +166,7 @@ export async function forkSession(
       forkedFrom: { sessionId: source._id, seq: cut },
       createdAt: new Date(),
       updatedAt: new Date(),
-    } as any);
+    });
   } catch (e) {
     // The session document is written LAST so nothing can observe a
     // half-copied transcript: with no session there is no publication
@@ -173,7 +174,7 @@ export async function forkSession(
     // (`requireSession` finds nothing), so the copied rows are unreachable
     // rather than visibly corrupt. If the session insert fails they are also
     // garbage, so take them with it.
-    await AgentMessages.removeAsync({ sessionId: forkId } as any).catch(() => {});
+    await AgentMessages.removeAsync({ sessionId: forkId }).catch(() => {});
     throw e;
   }
 
@@ -200,9 +201,9 @@ export async function forkSessionById(
   sessionId: string,
   opts?: { atSeq?: number; title?: string; userId?: string | null },
 ): Promise<string> {
-  const selector: Record<string, unknown> = { _id: sessionId, agent };
+  const selector: SessionQuery = { _id: sessionId, agent };
   if (opts && 'userId' in opts) selector.userId = opts.userId ?? null;
-  const source = await AgentSessions.findOneAsync(selector as any);
+  const source = await AgentSessions.findOneAsync(selector);
   if (!source) throw new Meteor.Error('no-session', 'Session not found');
   return forkSession(source, opts);
 }
