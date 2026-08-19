@@ -2,10 +2,14 @@
   // Type-check-ONLY config (never emits): Meteor transpiles by stripping types,
   // so nothing here compiles the app — `tsc --noEmit` exists purely to catch the
   // one class of bug Meteor's build silently ships, a mistyped field name in a
-  // `$set`/`$inc` (e.g. `budgetSpent.toolCall`) that quietly disables a budget.
-  // The goal is catching typos, NOT a zero-`any` codebase: the package leans on
-  // Mongo's loosely-typed modifiers and Meteor globals, so `strict` is on but the
-  // known-residual surface is documented in .superpowers/sdd/audit-fix-code.md.
+  // `$set`/`$inc`/selector/insert (e.g. `budgetSpent.toolCall`) that quietly
+  // disables a budget or misses a row. The `common/db.ts` typed-collection facade
+  // now catches that WHOLE class: selectors and modifiers are field-name-checked
+  // (a top-level typo is a compile error) while dotted paths stay legal via
+  // template-literal index signatures. The residual `as any` is down to ~7 genuine
+  // @types-gap boundaries (Meteor.settings, DDP/DDPCommon internals, dynamic MCP
+  // ESM imports, a pi-ai model field, native driver methods) — documented, not
+  // laziness. `strict` is on; the burndown is recorded in .superpowers/sdd/progress.md.
   "compilerOptions": {
     "noEmit": true,
     "strict": true,

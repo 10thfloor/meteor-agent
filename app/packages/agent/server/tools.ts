@@ -841,7 +841,7 @@ function warnUnavailable(message: string): void {
  * `this.unblock`/`this.setUserId` to exist.
  */
 export function withInvocation<T>(userId: string | null, fn: () => Promise<T>): Promise<T> {
-  const invocation = new (DDPCommon as any).MethodInvocation({
+  const invocation = new DDPCommon.MethodInvocation({
     isSimulation: false,
     userId,
     connection: null,
@@ -961,8 +961,8 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
     }
     const hasMethod = 'method' in spec && spec.method !== undefined;
     const hasRun = 'run' in spec && spec.run !== undefined;
-    const hasSubagent = 'subagent' in spec && (spec as any).subagent !== undefined;
-    const hasMcp = 'mcp' in spec && (spec as any).mcp !== undefined;
+    const hasSubagent = 'subagent' in spec && spec.subagent !== undefined;
+    const hasMcp = 'mcp' in spec && spec.mcp !== undefined;
     // `in`, not a truthiness or `!== undefined` test: `runAs: null` is the
     // ANONYMOUS service context, a deliberate value, and reading it as "unset"
     // would silently run the tool as the session's user instead — the opposite
@@ -970,15 +970,18 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
     const hasRunAs = 'runAs' in spec;
     const chosen = [hasMethod, hasRun, hasSubagent, hasMcp].filter(Boolean).length;
     if (chosen > 1) {
-      const label = (spec as any).name ?? (spec as any).method
-        ?? (spec as any).subagent ?? (spec as any).mcp?.server ?? '(unnamed)';
+      const label = ('name' in spec ? spec.name : undefined)
+        ?? ('method' in spec ? spec.method : undefined)
+        ?? ('subagent' in spec ? spec.subagent : undefined)
+        ?? ('mcp' in spec ? spec.mcp?.server : undefined)
+        ?? '(unnamed)';
       throw new Error(
         `[10thfloor:agent] Tool spec has more than one of "method", "run", `
         + `"subagent" and "mcp" — pick one: ${label}`,
       );
     }
     if (chosen === 0) {
-      const label = (spec as any).name ?? '(unnamed)';
+      const label = ('name' in spec ? spec.name : undefined) ?? '(unnamed)';
       throw new Error(
         `[10thfloor:agent] Tool spec has none of "method", "run", "subagent" and `
         + `"mcp" — pick one: ${label}`,
@@ -1368,7 +1371,7 @@ export function validateSkills(skills: unknown): void {
     if (!s || typeof s !== 'object' || typeof s.name !== 'string' || !SKILL_NAME.test(s.name)) {
       throw new Error(
         '[10thfloor:agent] A skill\'s "name" must be 1-64 letters, digits or hyphens; '
-        + `got ${JSON.stringify((s as any)?.name)}`,
+        + `got ${JSON.stringify(s?.name)}`,
       );
     }
     for (const field of ['description', 'content'] as const) {

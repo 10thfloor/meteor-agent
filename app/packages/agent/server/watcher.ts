@@ -1,5 +1,6 @@
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, DECIDED_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import type { SessionQuery } from '../common/db';
 import { getAgent } from './registry';
 import { deferTurn, recordTimeoutVerdict } from './methods';
 import { isRunning } from './turn-state';
@@ -106,7 +107,7 @@ export interface Watcher {
  *  `claimLease`'s own `$or` exactly — the watcher must consider claimable
  *  precisely what `claimLease` will claim, or it either skips real orphans or
  *  queues wake-ups that can only fail the claim. */
-function noLiveLease(now: Date): Record<string, unknown> {
+function noLiveLease(now: Date): SessionQuery {
   return {
     $or: [
       { lease: { $exists: false } },
@@ -215,7 +216,7 @@ function wake(session: AgentSession, why: string): void {
  */
 async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Promise<void> {
   const children = await AgentSessions.find(
-    { 'parent.sessionId': { $exists: true }, createdAt: { $lt: cutoff } } as any,
+    { 'parent.sessionId': { $exists: true }, createdAt: { $lt: cutoff } },
     { fields: { agent: 1, parent: 1 } },
   ).fetchAsync();
   if (children.length === 0) return;
@@ -223,7 +224,7 @@ async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Pro
   const parentIds = [...new Set(children.map((c) => c.parent!.sessionId))];
   const parents = new Map(
     (await AgentSessions.find(
-      { _id: { $in: parentIds } } as any, { fields: { activeChild: 1 } },
+      { _id: { $in: parentIds } }, { fields: { activeChild: 1 } },
     ).fetchAsync()).map((p) => [p._id, p] as [string, AgentSession]),
   );
   const reachable = new Set(
@@ -231,7 +232,7 @@ async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Pro
       {
         sessionId: { $in: parentIds },
         childSessionId: { $in: children.map((c) => c._id) },
-      } as any,
+      },
       { fields: { childSessionId: 1 } },
     ).fetchAsync()).map((m) => m.childSessionId),
   );
@@ -256,7 +257,7 @@ async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Pro
       { _id: parentId },
       { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
       { returnDocument: 'before' },
-    );
+    ) as unknown as AgentSession | null;
     // The parent went away between the two reads. Next sweep warns.
     if (!before) continue;
 
@@ -271,14 +272,14 @@ async function relinkOrphanChildren(cutoff: Date, isStopped: () => boolean): Pro
       await AgentMessages.insertAsync({
         _id: `orphan-child-${child._id}`,
         sessionId: parentId,
-        seq: (before as any).nextSeq,
+        seq: before.nextSeq,
         role: 'note',
         kind: 'orphan-child',
         childSessionId: child._id,
         childAgent: child.agent,
         reason: 'recovered',
         createdAt: new Date(),
-      } as any);
+      });
     } catch (e: any) {
       // 11000 is the duplicate key another server's sweep just won (matched on
       // the message too, because what wraps a driver error on the way through
@@ -315,7 +316,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
     const orphans = await AgentSessions.find({
       phase: { $in: ACTIVE_PHASES },
       ...noLiveLease(now),
-    } as any).fetchAsync();
+    }).fetchAsync();
     for (const session of orphans) {
       if (!isRunning(session._id)) toWake.set(session._id, { session, why: 'orphan claim' });
     }
@@ -330,7 +331,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       phase: { $nin: WAKE_EXCLUDED },
       updatedAt: { $lt: new Date(now.getTime() - verdictGraceMs) },
       ...noLiveLease(now),
-    } as any).fetchAsync();
+    }).fetchAsync();
     for (const session of stale) {
       if (!isRunning(session._id) && !toWake.has(session._id)) {
         toWake.set(session._id, { session, why: 'standing verdict' });
@@ -353,7 +354,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       phase: 'awaiting',
       'pending.verdict': { $exists: false },
       'pending.requestedAt': { $exists: true },
-    } as any).fetchAsync();
+    }).fetchAsync();
     for (const session of parked) {
       if (stopped) return;
       const config = getAgent(session.agent);
@@ -435,7 +436,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
   };
 
   const observing = AgentSessions.find(
-    { phase: { $in: ACTIVE_PHASES } } as any,
+    { phase: { $in: ACTIVE_PHASES } },
     { fields: { agent: 1, userId: 1, phase: 1, lease: 1 } },
   ).observeChangesAsync({
     added(id: string) { notice(id); },

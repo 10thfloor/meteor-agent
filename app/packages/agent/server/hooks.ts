@@ -212,7 +212,7 @@ export function clearAgentHooks(agent: string): void {
  *  handed) must not take the turn down with a TypeError deep inside a
  *  provider. */
 function isProviderRequest(value: unknown): value is ProviderRequest {
-  const v = value as any;
+  const v = value as Record<string, unknown>;
   return !!v && typeof v === 'object'
     && typeof v.model === 'string'
     // `system` is not optional on `ProviderRequest`, and a hook that rebuilt the
@@ -230,7 +230,7 @@ function isProviderRequest(value: unknown): value is ProviderRequest {
  *  branches on, and an undefined `ok` would write a row that claims success and
  *  carries an error object. */
 function isToolResult(value: unknown): value is ToolResult {
-  const v = value as any;
+  const v = value as Record<string, unknown>;
   return !!v && typeof v === 'object' && typeof v.ok === 'boolean';
 }
 

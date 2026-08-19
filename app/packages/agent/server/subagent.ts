@@ -59,7 +59,7 @@ export async function readTurnOutcome(sessionId: string): Promise<TurnOutcome> {
     // `kind: 'budget'` for a stop, `kind: 'error'` for a provider failure —
     // read the last note either way.
     const note = await AgentMessages.findOneAsync(
-      { sessionId, role: 'note', kind: { $in: ['budget', 'error'] } } as any,
+      { sessionId, role: 'note', kind: { $in: ['budget', 'error'] } },
       { sort: { seq: -1 } },
     );
     return {
@@ -75,7 +75,7 @@ export async function readTurnOutcome(sessionId: string): Promise<TurnOutcome> {
       // reader looking for a failure when the answer is "you pressed Stop".
       // A BUDGET stop still reports its own note, which is more specific
       // still, so this fallback never shadows one.
-      reason: (note as any)?.error?.reason
+      reason: note?.error?.reason
         ?? (session.phase === 'stopped'
           ? 'The turn was interrupted.'
           : 'The turn did not complete.'),
@@ -88,7 +88,7 @@ export async function readTurnOutcome(sessionId: string): Promise<TurnOutcome> {
   // model that emitted only tool calls) has no answer to give. Returning ''
   // would look like one.
   const reply = await AgentMessages.findOneAsync(
-    { sessionId, role: 'assistant' } as any,
+    { sessionId, role: 'assistant' },
     { sort: { seq: -1 } },
   );
   if (!reply?.content) return { ok: false, kind: 'failed', reason: 'The turn produced no reply.' };
@@ -212,7 +212,7 @@ async function findReusableChild(
       'parent.sessionId': parentSessionId,
       'parent.toolCallId': toolCallId,
       agent,
-    } as any,
+    },
     // Newest first: a dispatch that already gave up on an orphaned child and
     // created a fresh one must find the FRESH one next time, not the orphan.
     { sort: { createdAt: -1 } },
@@ -221,7 +221,7 @@ async function findReusableChild(
   for (const child of candidates) {
     // eslint-disable-next-line no-await-in-loop
     const claimed = await AgentMessages.findOneAsync(
-      { sessionId: parentSessionId, role: 'tool', childSessionId: child._id } as any,
+      { sessionId: parentSessionId, role: 'tool', childSessionId: child._id },
     );
     if (claimed) continue;
     // The child's own first message, at the seq its creation allocated (0 on a
@@ -230,7 +230,7 @@ async function findReusableChild(
     // child is the fail-safe direction, and the stray empty session is inert.
     // eslint-disable-next-line no-await-in-loop
     const first = await AgentMessages.findOneAsync(
-      { sessionId: child._id, seq: 0 } as any,
+      { sessionId: child._id, seq: 0 },
     );
     if (first?.content !== prompt) continue;
     return child;
@@ -367,7 +367,7 @@ export async function runSubagent(
     depth,
     createdAt: new Date(),
     updatedAt: new Date(),
-  } as any);
+  });
 
   // Announce the child on the PARENT session BEFORE it runs — this is the only
   // client-reachable route to a child that is still streaming. The tool row
@@ -393,7 +393,7 @@ export async function runSubagent(
       { _id: childSessionId },
       { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
       { returnDocument: 'before' },
-    );
+    ) as unknown as AgentSession | null;
     if (!before) {
       return {
         result: failure('subagent-failed', 'The child session vanished before it could start.'),
@@ -404,11 +404,11 @@ export async function runSubagent(
     await AgentMessages.insertAsync({
       _id: Random.id(),
       sessionId: childSessionId,
-      seq: (before as any).nextSeq,
+      seq: before.nextSeq,
       role: 'user',
       content: prompt,
       createdAt: new Date(),
-    } as any);
+    });
 
     await runTurn(childSessionId, buildRunConfig(config, userId));
   } catch (e) {

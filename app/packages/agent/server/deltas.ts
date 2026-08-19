@@ -1,5 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas } from '../common/collections';
+import type { DeltaKind } from '../common/types';
 
 /**
  * The default per-turn `tool_args` delta ceiling: 256 KiB.
@@ -28,7 +29,7 @@ export const DEFAULT_MAX_TOOL_ARG_BYTES = 256 * 1024;
  *  attribution tests drive it directly because a committed turn deletes its
  *  own deltas, so nothing survives a full run to assert on. */
 export class DeltaWriter {
-  private buf: Array<{ kind: string; chunk: string; seq: number; contentIndex?: number }> = [];
+  private buf: Array<{ kind: DeltaKind; chunk: string; seq: number; contentIndex?: number }> = [];
   private seq = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
   /** Non-reentrancy: the interval fires on a wall clock regardless of whether
@@ -84,7 +85,7 @@ export class DeltaWriter {
    * call's JSON into the other's and lose the boundary permanently — the
    * delta document is the only place the attribution can still be recorded.
    */
-  push(kind: string, chunk: string, contentIndex?: number) {
+  push(kind: DeltaKind, chunk: string, contentIndex?: number) {
     // `contentIndex` is meaningful for `tool_args` and nothing else — `mergeView`
     // only accumulates per index there. A stray one (a third-party Provider
     // stamping it on a text chunk) is DROPPED rather than thrown: deltas are
@@ -145,11 +146,11 @@ export class DeltaWriter {
               messageId: this.messageId,
               msgSeq: this.msgSeq,
               seq: item.seq,
-              kind: item.kind as any,
+              kind: item.kind,
               chunk: item.chunk,
               ...(item.contentIndex === undefined ? {} : { contentIndex: item.contentIndex }),
               at: new Date(),
-            } as any);
+            });
           } catch (e) {
             // A throw here must not drop the UNWRITTEN remainder: `batch` was
             // already detached from `this.buf` above, so items after `i` —

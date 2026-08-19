@@ -1,5 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentSessions } from '../common/collections';
+import type { SessionModifier } from '../common/db';
 
 /** Identity of this app server process, regenerated on every boot. */
 export const SERVER_ID: string = Random.id();
@@ -37,7 +38,7 @@ export async function claimLease(sessionId: string, serverId = SERVER_ID): Promi
         { 'lease.until': { $lt: now } },
         { 'lease.serverId': serverId },
       ],
-    } as any,
+    },
     { $set: { lease: { serverId, until: new Date(now.getTime() + LEASE_MS) } } },
   );
   return n === 1;
@@ -45,7 +46,7 @@ export async function claimLease(sessionId: string, serverId = SERVER_ID): Promi
 
 export async function heartbeat(sessionId: string, serverId = SERVER_ID): Promise<boolean> {
   const n = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': serverId } as any,
+    { _id: sessionId, 'lease.serverId': serverId },
     { $set: { 'lease.until': new Date(Date.now() + LEASE_MS) } },
   );
   return n === 1;
@@ -53,14 +54,14 @@ export async function heartbeat(sessionId: string, serverId = SERVER_ID): Promis
 
 export async function releaseLease(sessionId: string, serverId = SERVER_ID): Promise<void> {
   await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': serverId } as any,
+    { _id: sessionId, 'lease.serverId': serverId },
     { $unset: { lease: 1 } },
   );
 }
 
 export async function holdsLease(sessionId: string, serverId = SERVER_ID): Promise<boolean> {
   const doc = await AgentSessions.findOneAsync(
-    { _id: sessionId, 'lease.serverId': serverId } as any,
+    { _id: sessionId, 'lease.serverId': serverId },
   );
   return !!doc;
 }
@@ -68,11 +69,11 @@ export async function holdsLease(sessionId: string, serverId = SERVER_ID): Promi
 /** Every write during a turn goes through this. A server that lost the lease
  *  fails the guard and must abandon rather than write. */
 export async function guardedUpdate(
-  sessionId: string, serverId: string, modifier: Record<string, unknown>,
+  sessionId: string, serverId: string, modifier: SessionModifier,
 ): Promise<boolean> {
   const n = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': serverId } as any,
-    modifier as any,
+    { _id: sessionId, 'lease.serverId': serverId },
+    modifier,
   );
   return n === 1;
 }
