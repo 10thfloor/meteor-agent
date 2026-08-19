@@ -6,7 +6,8 @@ import {
   defineAgent, getAgent, buildRunConfig, registerProvider, type AgentConfig,
 } from './registry';
 import type { Provider } from './providers/types';
-import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession, runTurn } from './loop';
+import { runTurn } from './loop';
+import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
 import { forkSessionById } from './fork';
 import { readTurnOutcome } from './subagent';
 import { defineAgentMethod, type AdoptedTool, type AgentMethodOptions } from './tools';

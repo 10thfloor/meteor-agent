@@ -2,7 +2,7 @@ import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import type { AgentMessage, AgentSession } from '../common/types';
-import { batchSafeBoundary } from './loop';
+import { batchSafeBoundary } from './transcript';
 
 /** How many copied message documents go in one `insertMany`. Big enough that a
  *  long transcript costs a handful of round trips, small enough that one

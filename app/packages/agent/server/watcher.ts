@@ -2,7 +2,7 @@ import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, DECIDED_PHASES, type AgentSession, type SessionInc } from '../common/types';
 import { getAgent } from './registry';
 import { deferTurn, recordTimeoutVerdict } from './methods';
-import { isRunning } from './loop';
+import { isRunning } from './turn-state';
 
 /**
  * §4.3. Recovery with nobody present.

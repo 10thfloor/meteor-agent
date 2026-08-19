@@ -433,12 +433,42 @@ CONTROLLER FIX on the Critical: the delivered type gate did NOT catch the audit'
 SessionCounterPath/SessionInc union; narrowed allocateSeq + `satisfies SessionInc` on 5 raw
 findOneAndUpdate sites. VERIFIED: the exact typo is now TS2353. CI comment corrected to state the
 real reach (counter paths yes; arbitrary string modifier paths still unchecked = the as-any burndown).
-DEFERRED to v4: loop.ts 2113-line file split (maintainability, risky post-audit); the as-any burndown;
-security Mediums M7 watcher-scan-growth (has index now, unbounded set remains), M8 hook fail-open
-opt-in, M6 length caps (partial: clamps added, no check-time text ceiling); parentless-child retention.
+DEFERRED to v4: loop.ts 2113-line file split (maintainability, risky post-audit) — DONE, see V4 below;
+the as-any burndown; security Mediums M7 watcher-scan-growth (has index now, unbounded set remains),
+M8 hook fail-open opt-in, M6 length caps (partial: clamps added, no check-time text ceiling);
+parentless-child retention.
 Suite: 334 (+2 pending) server + 7 client.
 Final M5 review: MERGE, both non-blocking findings fixed inline (335+7, tsc clean):
   M1 - startable:false now refuses agent.send too (the send-to-child hole was the exact exploit;
     unconditional refusal, resume-via-approve unaffected). L1 - MCP schema strip is position-aware:
     strips pattern/format/patternProperties as KEYWORDS, keeps a user property literally named 'format'.
   M5 spec-v1-through-v3 + both audits complete.
+
+== V4 (branch refactor-loop-split) — loop.ts split (audit code-High H2) ==
+loop.ts 2183 -> 634 lines, into 5 focused modules. Pure code-motion, ZERO behavior change.
+  turn-state.ts (156): running Set, isRunning, allocateSeq, accruedCost, classifyProviderError,
+    commitBudgetNote/BUDGET_REASONS. The shared leaf — accruedCost+classifyProviderError moved here
+    (not left in loop) precisely because compaction+dispatch call them at runtime; leaving them in
+    loop would have made compaction->loop a runtime cycle.
+  deltas.ts (184): DeltaWriter + DEFAULT_MAX_TOOL_ARG_BYTES.
+  transcript.ts (320): toProviderMessages, discardTurn, TurnWindow/turnWindows (private),
+    repairUnansweredToolUse, locateBatch, batchSafeBoundary.
+  compaction.ts (400): latestCompaction, assembleContext, estimateContext, findCompactionCut,
+    maybeCompact, compactNow, CompactOutcome/COMPACT_REFUSALS/COMPACT_OVER_BUDGET, compactSession.
+  dispatch.ts (608): dispatchTool, toolResultContent/clampErrorReason, DispatchLimits, DispatchOutcome,
+    TurnAnchor, dispatchCalls, resumeParkedTurn. runTurn is INJECTED as a `RunTurn` param through
+    dispatchTool->dispatchCalls/resumeParkedTurn (same idiom as runSubagent) so dispatch->loop stays
+    type-only, no value cycle.
+  loop.ts (634): RunConfig, sleep/backoffDelay/backoff/_setBackoff, runTurn.
+GRAPH: loop is the root; every other module imports RunConfig from loop as `import type` only (erased),
+so the runtime graph is a DAG. compaction/dispatch/registry/subagent all use `import type RunConfig`.
+TEST TRANSPARENCY: loop.ts re-exports the 7 test-visible moved symbols (classifyProviderError,
+DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES, toProviderMessages, assembleContext, estimateContext,
+findCompactionCut) so ZERO test files changed. Production consumers re-pointed to honest sources:
+fork->transcript (batchSafeBoundary), watcher->turn-state (isRunning), agent+methods->compaction
+(compactSession/COMPACT_*), index keeps DEFAULT_MAX_TOOL_ARG_BYTES via loop's re-export chain.
+VERIFIED 3 ways: (1) tsc --noEmit clean after every extraction; (2) suite 335 server + 7 client, 0 fail
+(the pre-refactor baseline showed 2 timeout-flakes at load-avg 33 — env, not code; gone at load 4);
+(3) deterministic comm-diff of stripped code lines (main loop.ts vs the 6 files) shows ONLY the
+intended changes (import reformatting + runTurn threading), proving every moved body byte-identical.
+STILL DEFERRED: as-any burndown; M7/M8/M6 security Mediums; parentless-child retention.
