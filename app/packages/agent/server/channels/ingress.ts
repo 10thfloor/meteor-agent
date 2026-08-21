@@ -326,7 +326,10 @@ export function mountChannelRoutes(webAppHandlers: {
       void (async () => {
         try {
           const rawBody = await readRawBody(req);
-          const out = await handleInbound(kind, { headers: req.headers ?? {}, rawBody });
+          const out = await handleInbound(kind, {
+            headers: req.headers ?? {}, rawBody,
+            ...(req.url ? { url: req.url } : {}),
+          });
           res.writeHead(out.status, { 'content-type': 'text/plain' });
           res.end(out.body ?? '');
         } catch (e) {

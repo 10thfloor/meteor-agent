@@ -26,3 +26,6 @@ meteortesting:mocha
 10thfloor:agent
 10thfloor:agent-channel-slack
 accounts-password
+10thfloor:agent-channel-telegram
+10thfloor:agent-channel-whatsapp
+10thfloor:agent-channel-sms

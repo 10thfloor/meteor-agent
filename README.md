@@ -502,6 +502,14 @@ committed reply to every surface bound to the session. One conversation can be
 live in Slack, mirrored over SMS, and open in the web app at once — each
 surface tracks its own cursor, so a downed gateway delays only itself.
 
+Four surfaces ship today, each a package of exactly one lens, one transport,
+and one profile — **Slack** (threads, buttons, mrkdwn), **Telegram** (inline
+keyboards, secret-token webhooks), **WhatsApp** (reply buttons, the signed
+Cloud API, the 24-hour window handled honestly), and **SMS via Twilio** (the
+reply-menu grammar: "Reply YES to approve"). The same parked approval renders
+as buttons on three of them and as reply words on the fourth, and any surface
+decides it — first answer wins.
+
 What you inherit without writing it: **exactly-once admission** (a provider
 retry never runs a second turn), **effectively-once delivery** (a three-phase
 receipt log — a redeploy re-sends nothing), **approvals over any surface**
@@ -556,11 +564,14 @@ milestone plans that built on it are in
 ## Project layout
 
 ```
-app/packages/agent/                the package (this is what ships)
-app/packages/agent-channel-slack/  Slack surface: one lens, one transport
-app/                               host app: test harness + the demo chat
-docs/superpowers/                  design spec + per-milestone implementation plans
-scripts/verify-build.sh            proves the loader against a real production bundle
+app/packages/agent/                   the package (this is what ships)
+app/packages/agent-channel-slack/     Slack surface     ┐
+app/packages/agent-channel-telegram/  Telegram surface  │ one lens, one
+app/packages/agent-channel-whatsapp/  WhatsApp surface  │ transport each
+app/packages/agent-channel-sms/       SMS (Twilio)      ┘
+app/                                  host app: test harness + the demo chat
+docs/superpowers/                     design spec + per-milestone implementation plans
+scripts/verify-build.sh               proves the loader against a real production bundle
 ```
 
 Development workflow, the test command, and the npm-dependency policy are in
@@ -596,11 +607,14 @@ The sixth addition is **channels** — multi-surface delivery per the
 the lens contract with its round-trip test, the watcher-shaped egress worker,
 the generic webhook pipeline, exactly-once admission, receipt-backed delivery,
 and account linking. Server-side `agent.send/approve/deny({ userId })` landed
-with it. The core takes no provider SDK dependency; the first concrete surface
-is **[`10thfloor:agent-channel-slack`](app/packages/agent-channel-slack/README.md)**
-— DMs and mentions in, threaded replies and Approve/Deny buttons out, zero
-npm dependencies (Slack's Web API over `fetch`). Twilio/SMS is the natural
-second, to prove the lens contract across the `menu` grammar.
+with it. The core takes no provider SDK dependency; four surface packages
+prove the contract, each one lens + one transport + zero npm dependencies:
+**[Slack](app/packages/agent-channel-slack/README.md)**,
+**[Telegram](app/packages/agent-channel-telegram/README.md)**,
+**[WhatsApp](app/packages/agent-channel-whatsapp/README.md)**, and
+**[SMS/Twilio](app/packages/agent-channel-sms/README.md)** — the last being
+the design's stress test (no buttons, no threads: approvals ride the
+receipt-registered "Reply YES/NO" grammar).
 
 CI runs the full suite plus a production-bundle verification on every push.
 

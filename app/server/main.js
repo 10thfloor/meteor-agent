@@ -4,6 +4,9 @@ import {
   Agent, AgentSessions, mockProvider, redeemLinkToken,
 } from 'meteor/10thfloor:agent';
 import { slack } from 'meteor/10thfloor:agent-channel-slack';
+import { telegram } from 'meteor/10thfloor:agent-channel-telegram';
+import { whatsapp } from 'meteor/10thfloor:agent-channel-whatsapp';
+import { sms } from 'meteor/10thfloor:agent-channel-sms';
 
 /**
  * The demo agent behind the chat UI in `client/`.
@@ -74,25 +77,59 @@ new Agent('demo', {
 });
 
 /**
- * Slack as a second surface for the SAME demo agent (channels spec): DM the
- * bot or @-mention it, and "refund…" parks an approval that arrives in Slack
- * as Approve/Deny buttons. Registered only when settings carry the app's
- * credentials — see settings.example.json and the channel package's README
- * for the Slack-side setup — so a plain `meteor run` stays exactly as it was.
+ * Every surface the demo can speak — Slack, Telegram, WhatsApp, SMS — each
+ * registered only when settings carry its credentials, so a plain
+ * `meteor run` stays exactly as it was. Same agent behind all of them; a
+ * "refund…" parks ONE approval that renders as buttons on Slack/Telegram/
+ * WhatsApp and as "Reply YES/NO" over SMS, and any surface (or the web)
+ * decides it — first answer wins.
+ *
+ * The linking gesture is shared: the bare word "link" on any surface answers
+ * with /link/<token>, which the web client redeems from the SIGNED-IN side
+ * (spec §12). Per-channel setup walkthroughs live in each package's README.
  */
-const slackCfg = Meteor.settings?.packages?.['10thfloor:agent']?.slack;
-const slackReady = !!(slackCfg?.botToken && slackCfg?.signingSecret);
-if (slackReady) {
+const channelCfg = Meteor.settings?.packages?.['10thfloor:agent'] ?? {};
+const linkUrl = (token) => Meteor.absoluteUrl(`link/${token}`);
+const registeredChannels = [];
+
+if (channelCfg.slack?.botToken && channelCfg.slack?.signingSecret) {
   Agent.channel('slack', slack({
     agent: 'demo',
-    botToken: slackCfg.botToken,
-    signingSecret: slackCfg.signingSecret,
-    // The account-linking loop (spec §12): DM the bare word "link" to the bot
-    // and it answers with this one-time URL; the web client recognizes the
-    // /link/<token> path and redeems it through the method below — from the
-    // SIGNED-IN side, which is the direction linking must run.
-    linkUrl: (token) => Meteor.absoluteUrl(`link/${token}`),
+    botToken: channelCfg.slack.botToken,
+    signingSecret: channelCfg.slack.signingSecret,
+    linkUrl,
   }));
+  registeredChannels.push('slack');
+}
+if (channelCfg.telegram?.botToken && channelCfg.telegram?.webhookSecret) {
+  Agent.channel('telegram', telegram({
+    agent: 'demo',
+    botToken: channelCfg.telegram.botToken,
+    webhookSecret: channelCfg.telegram.webhookSecret,
+    linkUrl,
+  }));
+  registeredChannels.push('telegram');
+}
+if (channelCfg.whatsapp?.accessToken && channelCfg.whatsapp?.appSecret
+  && channelCfg.whatsapp?.verifyToken) {
+  Agent.channel('whatsapp', whatsapp({
+    agent: 'demo',
+    accessToken: channelCfg.whatsapp.accessToken,
+    appSecret: channelCfg.whatsapp.appSecret,
+    verifyToken: channelCfg.whatsapp.verifyToken,
+    linkUrl,
+  }));
+  registeredChannels.push('whatsapp');
+}
+if (channelCfg.sms?.accountSid && channelCfg.sms?.authToken && channelCfg.sms?.webhookUrl) {
+  Agent.channel('sms', sms({
+    agent: 'demo',
+    accountSid: channelCfg.sms.accountSid,
+    authToken: channelCfg.sms.authToken,
+    webhookUrl: channelCfg.sms.webhookUrl,
+    linkUrl,
+  }));
+  registeredChannels.push('sms');
 }
 
 Meteor.methods({
@@ -150,9 +187,15 @@ Meteor.startup(() => {
   console.log(
     `[demo] agent ready (${live ? 'LIVE provider via pi-ai' : 'scripted mock — set ANTHROPIC_API_KEY for live'})`,
   );
-  if (slackReady) {
-    console.log('[demo] slack channel registered — webhook at /agent/channels/slack');
+  if (registeredChannels.length > 0) {
+    console.log(
+      `[demo] channels registered: ${registeredChannels.join(', ')} — `
+      + 'webhooks at /agent/channels/<kind>',
+    );
   } else {
-    console.log('[demo] slack channel not configured (add slack credentials to settings — see settings.example.json)');
+    console.log(
+      '[demo] no channels configured (add slack/telegram/whatsapp/sms credentials '
+      + 'to settings — see settings.example.json and each package\'s README)',
+    );
   }
 });

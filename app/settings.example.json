@@ -4,6 +4,20 @@
       "slack": {
         "botToken": "xoxb-YOUR-BOT-TOKEN",
         "signingSecret": "YOUR-SIGNING-SECRET"
+      },
+      "telegram": {
+        "botToken": "123456:YOUR-BOTFATHER-TOKEN",
+        "webhookSecret": "A-LONG-RANDOM-SECRET-YOU-INVENT"
+      },
+      "whatsapp": {
+        "accessToken": "EAAB-YOUR-GRAPH-TOKEN",
+        "appSecret": "YOUR-META-APP-SECRET",
+        "verifyToken": "A-VERIFY-TOKEN-YOU-INVENT"
+      },
+      "sms": {
+        "accountSid": "AC-YOUR-TWILIO-SID",
+        "authToken": "YOUR-TWILIO-AUTH-TOKEN",
+        "webhookUrl": "https://YOUR-TUNNEL/agent/channels/sms"
       }
     }
   }

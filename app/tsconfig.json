@@ -33,12 +33,18 @@
       // channel packages type-check against the same module id they import at
       // runtime — see client/index.ts.
       "meteor/10thfloor:agent": ["./packages/agent/client/index.ts"],
-      "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/server/index.ts"]
+      "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/server/index.ts"],
+      "meteor/10thfloor:agent-channel-telegram": ["./packages/agent-channel-telegram/server/index.ts"],
+      "meteor/10thfloor:agent-channel-whatsapp": ["./packages/agent-channel-whatsapp/server/index.ts"],
+      "meteor/10thfloor:agent-channel-sms": ["./packages/agent-channel-sms/server/index.ts"]
     }
   },
   "include": [
     "packages/agent/**/*.ts",
     "packages/agent-channel-slack/**/*.ts",
+    "packages/agent-channel-telegram/**/*.ts",
+    "packages/agent-channel-whatsapp/**/*.ts",
+    "packages/agent-channel-sms/**/*.ts",
     "types/**/*.d.ts"
   ],
   "exclude": [

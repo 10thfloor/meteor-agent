@@ -16,10 +16,15 @@ import type { ChannelProfile, ChannelTransport, Lens } from './contract';
 /** The raw material the webhook hands a channel's `verify`/`parse`: headers
  *  lower-cased the Node way, and the UNPARSED body, because signature schemes
  *  (Slack's v0 HMAC, Twilio's) sign the raw bytes and a re-serialized JSON
- *  body would never verify. */
+ *  body would never verify. `url` is the request's path+query as Node saw it —
+ *  some providers put protocol material there (WhatsApp's GET subscription
+ *  handshake carries `hub.challenge` in the query; Twilio's signature covers
+ *  the full webhook URL). Absent when a caller has no HTTP request (tests
+ *  driving `handleInbound` directly). */
 export interface RawInbound {
   headers: Record<string, string | string[] | undefined>;
   rawBody: string;
+  url?: string;
 }
 
 export interface ChannelDef {
