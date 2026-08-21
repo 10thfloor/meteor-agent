@@ -50,8 +50,10 @@ export interface FieldExpr<V> {
 export type Cond<V> = V | null | FieldExpr<V>;
 
 /** Every own field of T as an optional condition — the value-checked core of a
- *  query, and what makes a top-level field typo a compile error. */
-type Fields<T> = { [K in keyof T]?: Cond<T[K]> };
+ *  query, and what makes a top-level field typo a compile error. Exported for
+ *  the channel collections (`server/channels/collections.ts`), which build
+ *  their own facade types from the same core. */
+export type Fields<T> = { [K in keyof T]?: Cond<T[K]> };
 
 // ---- AgentSessions ---------------------------------------------------------
 
@@ -72,6 +74,7 @@ export type SessionQuery =
   & { [k: `forkedFrom.${string}`]:unknown }
   & { [k: `usage.${string}`]:unknown }
   & { [k: `budgetSpent.${string}`]:unknown }
+  & { [k: `channel.${string}`]:unknown }
   & {
     $or?: SessionQuery[];
     $and?: SessionQuery[];
@@ -93,6 +96,7 @@ export type SessionSet =
   & { [K in keyof AgentSession]?: AgentSession[K] }
   & { [k: `lease.${string}`]:unknown }
   & { [k: `pending.${string}`]:unknown }
+  & { [k: `channel.${string}`]:unknown }
   & { [k: `usage.${string}`]:number }
   & { [k: `budgetSpent.${string}`]:number };
 

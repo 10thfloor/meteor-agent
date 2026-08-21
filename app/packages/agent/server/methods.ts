@@ -24,7 +24,7 @@ import type { SessionSet } from '../common/db';
  * The error is deliberately identical for "no such session" and "not yours":
  * distinguishing them would confirm the existence of another user's session id.
  */
-async function requireSession(agent: string, sessionId: string, userId: string | null) {
+export async function requireSession(agent: string, sessionId: string, userId: string | null) {
   const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, userId });
   if (!session) throw new Meteor.Error('no-session', 'Session not found');
   return session;
@@ -268,7 +268,7 @@ async function stopRunningDescendants(sessionId: string): Promise<void> {
  * loser is told `no-pending` rather than being handed a silent success for a
  * tool it never authorized.
  */
-async function recordVerdict(
+export async function recordVerdict(
   ctx: { userId: string | null },
   agent: string,
   sessionId: string,
@@ -299,6 +299,68 @@ async function recordVerdict(
   }
 
   deferTurn(sessionId, config, ctx.userId);
+}
+
+/**
+ * The CORE of `agent.send`, with identity as a plain parameter — the same
+ * extract-with-`userId` refactor `ask`/`fork`/`compact` already had (channels
+ * spec §5.1). The DDP method below is a cap over this: checks, the
+ * `startable` refusal (a PUBLIC-surface rule — a server-side caller is app
+ * code, exactly as `Agent.ask` already reaches non-startable specialists), and
+ * then this core with `this.userId`.
+ *
+ * Nothing here is new machinery: `requireSession` is the same always-3-field
+ * authorization every method uses (an omitted userId scopes to the ANONYMOUS
+ * owner, never to "all sessions"), the seq allocation is the same atomic
+ * `findOneAndUpdate` with the budget `$lt` folded in — so any caller of the
+ * core inherits the turn budget — and the wake is the one `deferTurn` path.
+ */
+export async function sendToSession(
+  agent: string, sessionId: string, text: string, userId: string | null,
+): Promise<string> {
+  const config = getAgent(agent);
+  if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+  await requireSession(agent, sessionId, userId);
+
+  // §9: the turn budget, enforced INSIDE the atomic allocation — see the DDP
+  // method's original comment; the semantics are unchanged by the extraction.
+  const turnFilter: Record<string, unknown> = { _id: sessionId };
+  if (config.budget?.turns !== undefined) {
+    turnFilter['budgetSpent.turns'] = { $lt: config.budget.turns };
+  }
+
+  const before = await AgentSessions.rawCollection().findOneAndUpdate(
+    turnFilter,
+    {
+      $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc,
+      $set: { updatedAt: new Date() },
+    },
+    { returnDocument: 'before' },
+  ) as unknown as AgentSession | null;
+  if (!before) {
+    // requireSession above proved the session exists and is the caller's, so a
+    // non-match here can only be the budget filter.
+    if (config.budget?.turns !== undefined) {
+      throw new Meteor.Error('budget-exhausted', 'This session has used its turn budget.');
+    }
+    throw new Meteor.Error('no-session', 'Session not found');
+  }
+
+  await AgentMessages.insertAsync({
+    _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
+    content: text, createdAt: new Date(),
+  });
+
+  // A new message is the resume signal after an interrupt OR a provider
+  // failure — the send clears both durable phases, conditionally, so a send
+  // during a live turn does not stomp `streaming`.
+  await AgentSessions.updateAsync(
+    { _id: sessionId, phase: { $in: ['stopped', 'error'] } },
+    { $set: { phase: 'idle' } },
+  );
+
+  deferTurn(sessionId, config, userId);
+  return sessionId;
 }
 
 export function registerMethods(): void {
@@ -340,7 +402,6 @@ export function registerMethods(): void {
       check(text, String);
       const config = getAgent(agent);
       if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
-      await requireSession(agent, sessionId, this.userId ?? null);
 
       // `startable: false` closes `agent.start`/`agent.fork`; it must close
       // `agent.send` too, or the flag is a fiction. A subagent child is a real
@@ -351,73 +412,19 @@ export function registerMethods(): void {
       // Unconditional (no child exception): a `startable: false` agent has no
       // user-facing conversation to send to, and a parked child a human
       // answers resumes through `agent.approve`/`deny` → `runTurn`, never here.
+      //
+      // The check lives on the DDP cap, NOT in `sendToSession`: the flag
+      // governs the PUBLIC surface, and a server-side caller (a channel
+      // webhook, a cron job) is app code — the same standing `Agent.ask`
+      // already has with non-startable specialists.
       if (config.startable === false) {
         throw new Meteor.Error('not-startable', 'This agent cannot be driven directly');
       }
 
-      // §9: the turn budget, enforced INSIDE the atomic allocation below, not
-      // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
-      // here, but concurrent sends all reading the same pre-inc value would
-      // each pass a separate check — with capability-URL sessions the caller
-      // count is unbounded, so the overshoot would be too. Folding
-      // `$lt: limit` into the filter makes check-and-spend one operation: a
-      // budget of N permits exactly N sends under any concurrency.
-      //
-      // A refusal, not a stop. The other two budgets trip inside a running
-      // loop, where the only way to say no is a transcript note; here there is
-      // a caller on the other end of a method, so tell them — and write
-      // nothing at all, so a refused send costs neither a seq nor a message
-      // nor the budget it was refused for. Asking again is refused identically
-      // until an operator raises the limit.
-      const turnFilter: Record<string, unknown> = { _id: sessionId };
-      if (config.budget?.turns !== undefined) {
-        // Matches when under budget. Sessions seeded before this field existed
-        // have budgetSpent.turns set by mStart, so $lt sees a number.
-        turnFilter['budgetSpent.turns'] = { $lt: config.budget.turns };
-      }
-
-      // Seq allocation is ATOMIC (single findOneAndUpdate), not read-then-
-      // insert. A read-then-insert here races the in-flight turn loop: both
-      // read the same nextSeq and the user message lands on the same seq the
-      // assistant is about to commit at, making transcript order
-      // non-deterministic. The loop allocates its seqs the same way.
-      const before = await AgentSessions.rawCollection().findOneAndUpdate(
-        turnFilter,
-        {
-          $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc,
-          $set: { updatedAt: new Date() },
-        },
-        { returnDocument: 'before' },
-      ) as unknown as AgentSession | null;
-      if (!before) {
-        // requireSession above proved the session exists and is the caller's,
-        // so a non-match here can only be the budget filter.
-        if (config.budget?.turns !== undefined) {
-          throw new Meteor.Error(
-            'budget-exhausted', 'This session has used its turn budget.',
-          );
-        }
-        throw new Meteor.Error('no-session', 'Session not found');
-      }
-
-      await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
-        content: text, createdAt: new Date(),
-      });
-
-      // A new message is the resume signal after an interrupt OR a provider
-      // failure: both `stopped` and `error` are durable (the loop refuses to
-      // run while either stands, and its `finally` preserves both), so the
-      // send is what clears them — matching §10's "the model usually
-      // recovers" philosophy for `error`. Conditional on the current phase so
-      // a send during a live turn does not stomp `streaming`.
-      await AgentSessions.updateAsync(
-        { _id: sessionId, phase: { $in: ['stopped', 'error'] } },
-        { $set: { phase: 'idle' } },
-      );
-
-      deferTurn(sessionId, config, this.userId ?? null);
-      return sessionId;
+      // The core carries the rest — authorization, the budget-folded atomic
+      // seq allocation, the message insert, the stopped/error clear, and the
+      // wake. See `sendToSession` (channels spec §5.1): one body, two callers.
+      return sendToSession(agent, sessionId, text, this.userId ?? null);
     },
 
     async [NAMES.mInterrupt](this: any, agent: string, sessionId: string) {

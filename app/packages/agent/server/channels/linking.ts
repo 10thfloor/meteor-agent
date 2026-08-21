@@ -1,0 +1,226 @@
+import { Random } from 'meteor/random';
+import { AgentSessions } from '../../common/collections';
+import { recordVerdict } from '../methods';
+import {
+  ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
+  isDuplicateKey, type ChannelIdentity,
+} from './collections';
+
+/**
+ * Account linking (channels spec §12). An external user ID is IDENTIFICATION,
+ * not authentication — turning it into an app account requires proof, and the
+ * proof always completes from the AUTHENTICATED side: an unauthenticated
+ * inbound message can request a link; it can never assert one.
+ *
+ * Two proofs, two assurance levels:
+ *   `oidc` — the app ran a full OAuth round-trip (Sign in with Slack and kin)
+ *            and calls `linkIdentity` directly with what it proved.
+ *   `link` — a one-time token: `issueLinkToken` mints it (the channel sends it
+ *            to the external identity), the signed-in web user presents it,
+ *            `redeemLinkToken` burns it atomically and links.
+ *
+ * What is deliberately NOT here, because each is an account-takeover
+ * primitive: auto-linking on a matching email address, trusting a phone number
+ * for anything privileged, or trusting the external ID by itself.
+ */
+
+const DEFAULT_TOKEN_TTL_MS = 10 * 60_000;
+
+/** The identity row for one external sender, or null — null means UNLINKED,
+ *  which is a legal state (an anonymous capability-owned session), never an
+ *  error. The reverse lookup is a primary-key read on the derived id. */
+export async function resolveIdentity(
+  kind: string, externalUserId: string,
+): Promise<ChannelIdentity | null> {
+  const row = await ChannelIdentities.findOneAsync(`${kind}:${externalUserId}`);
+  return row ?? null;
+}
+
+/**
+ * Mint a single-use, short-lived token bound to ONE external identity. The
+ * caller (typically a lens answering a `link-request` intent) delivers it to
+ * that identity's surface — proving, when it comes back through a signed-in
+ * session, that the presenter controls both sides.
+ */
+export async function issueLinkToken(
+  kind: string, externalUserId: string, opts: { ttlMs?: number } = {},
+): Promise<string> {
+  const _id = Random.secret();
+  await ChannelLinkTokens.insertAsync({
+    _id,
+    kind,
+    externalUserId,
+    expiresAt: new Date(Date.now() + (opts.ttlMs ?? DEFAULT_TOKEN_TTL_MS)),
+    createdAt: new Date(),
+  });
+  return _id;
+}
+
+/**
+ * Burn a token and link its identity to `userId` — called from the app's own
+ * authenticated surface (a method or route that already knows who the web user
+ * is; that authentication is the app's, not this module's).
+ *
+ * `findOneAndDelete` is the single-winner point: of two racing redeems exactly
+ * one gets the document, so a token is spent at most once even across
+ * servers. Expiry is checked on the way out — a TTL index also reaps expired
+ * rows (indexes.ts), but Mongo's TTL sweep runs on its own schedule and a
+ * token must be dead the millisecond it expires, not within a minute of it.
+ *
+ * Returns the identity row on success, null on an unknown, spent, or expired
+ * token — one indistinguishable null, deliberately, so a probe learns nothing
+ * about which.
+ */
+export async function redeemLinkToken(
+  token: string, userId: string,
+): Promise<ChannelIdentity | null> {
+  const doc = await ChannelLinkTokens.rawCollection().findOneAndDelete(
+    { _id: token },
+  ) as unknown as { kind: string; externalUserId: string; expiresAt: Date } | null;
+  if (!doc) return null;
+  if (doc.expiresAt.getTime() < Date.now()) return null;
+  return linkIdentity(doc.kind, doc.externalUserId, userId, 'link');
+}
+
+/**
+ * Write the identity row and CLAIM HISTORY (§12): sessions the external
+ * identity created before linking are anonymous (`userId: null`), and the
+ * moment their owner proves who they are, those sessions become theirs — the
+ * alternative is silently losing a user's history the moment they sign in.
+ *
+ * The rewrite is GUARDED: only rows still owned by `null` and still naming
+ * this exact external conversation are touched, so an already-owned session —
+ * whatever owns it — is never reassigned. Bindings first, then their sessions,
+ * each conditional, so a crash between the two leaves only un-claimed rows the
+ * next redeem (idempotent — same derived id, same guards) finishes.
+ *
+ * OIDC callers use this directly with `assurance: 'oidc'` after their own
+ * round-trip proved both sides.
+ */
+export async function linkIdentity(
+  kind: string, externalUserId: string, userId: string,
+  assurance: 'link' | 'oidc',
+): Promise<ChannelIdentity> {
+  const _id = `${kind}:${externalUserId}`;
+  const row: ChannelIdentity = {
+    _id, kind, externalUserId, userId, assurance, linkedAt: new Date(),
+  };
+  try {
+    await ChannelIdentities.insertAsync(row);
+  } catch (e) {
+    if (!isDuplicateKey(e)) throw e;
+    // Re-linking (a second surface session, or an assurance upgrade): take the
+    // stronger proof, never downgrade — an `oidc` row stays `oidc` even when a
+    // later link-token flow re-proves the weaker way.
+    const existing = await ChannelIdentities.findOneAsync(_id);
+    const keepOidc = existing?.assurance === 'oidc';
+    await ChannelIdentities.updateAsync(_id, {
+      $set: {
+        userId,
+        assurance: keepOidc ? 'oidc' : assurance,
+        linkedAt: new Date(),
+      },
+    });
+  }
+
+  // Claim history: every binding this external identity opened anonymously,
+  // and each binding's session — guarded on the anonymous owner both times.
+  // Matched on the binding's RECORDED opener, not on `conversationRef`: the
+  // ref names a conversation (a Slack thread), not a person, and only for
+  // person-keyed surfaces like SMS do the two coincide.
+  const orphaned = await ChannelBindings.find({
+    kind, externalUserId, userId: null,
+  }).fetchAsync();
+  for (const binding of orphaned) {
+    // eslint-disable-next-line no-await-in-loop
+    await ChannelBindings.updateAsync(
+      { _id: binding._id, userId: null },
+      { $set: { userId, updatedAt: new Date() } },
+    );
+    // eslint-disable-next-line no-await-in-loop
+    await AgentSessions.updateAsync(
+      { _id: binding.sessionId, userId: null },
+      {
+        $set: {
+          userId,
+          'channel.assurance': assurance,
+          updatedAt: new Date(),
+        },
+      },
+    );
+  }
+
+  const linked = await ChannelIdentities.findOneAsync(_id);
+  return linked ?? row;
+}
+
+// ---- Verdict tokens — the `link` interaction grammar (§8.4) ----------------
+
+const DEFAULT_VERDICT_TTL_MS = 24 * 60 * 60_000;
+
+/**
+ * Mint the approval capability for ONE choice of one delivered prompt — the
+ * `link` grammar's affordance. The egress worker calls this when a
+ * link-interact channel delivers a prompt; the app's route hands the token to
+ * `redeemVerdictToken`. Longer-lived than a linking token by default (a day,
+ * not ten minutes): an email approval is read on the reader's schedule, and
+ * the real staleness guard is the `toolCallId` check at redemption, not the
+ * clock.
+ */
+export async function issueVerdictToken(
+  agent: string, sessionId: string, toolCallId: string,
+  verdict: 'approved' | 'denied', opts: { ttlMs?: number } = {},
+): Promise<string> {
+  const _id = Random.secret();
+  await ChannelVerdictTokens.insertAsync({
+    _id, agent, sessionId, toolCallId, verdict,
+    expiresAt: new Date(Date.now() + (opts.ttlMs ?? DEFAULT_VERDICT_TTL_MS)),
+    createdAt: new Date(),
+  });
+  return _id;
+}
+
+/**
+ * Burn a verdict token and record its verdict. The token IS the authorization
+ * — a capability addressed to the person the prompt was delivered to — so the
+ * verdict is recorded AS the session's owner, exactly the identity an
+ * anonymous capability-URL approval already uses. The agent's own `approve`
+ * predicate is still consulted (it sees that owner), and the single-winner
+ * verdict write still applies, so a racing human click and token click
+ * produce exactly one verdict.
+ *
+ * Two staleness guards, layered: the token must name the CURRENTLY parked
+ * call (`toolCallId` — a yes aimed at last week's ask cannot decide today's),
+ * and beneath that the conditional verdict write remains the final authority.
+ *
+ * Returns true when this redemption decided the ask; false on an unknown,
+ * spent, expired, or stale token — one indistinguishable false, so a probe
+ * learns nothing.
+ */
+export async function redeemVerdictToken(token: string): Promise<boolean> {
+  const doc = await ChannelVerdictTokens.rawCollection().findOneAndDelete(
+    { _id: token },
+  ) as unknown as {
+    agent: string; sessionId: string; toolCallId: string;
+    verdict: 'approved' | 'denied'; expiresAt: Date;
+  } | null;
+  if (!doc) return false;
+  if (doc.expiresAt.getTime() < Date.now()) return false;
+
+  const session = await AgentSessions.findOneAsync(doc.sessionId);
+  if (!session) return false;
+  if (session.pending?.toolCallId !== doc.toolCallId || session.pending.verdict) {
+    return false;   // a different ask is parked now, or none — the token is stale
+  }
+  try {
+    await recordVerdict(
+      { userId: session.userId }, doc.agent, doc.sessionId, doc.verdict,
+      doc.verdict === 'denied' ? 'denied via approval link' : undefined,
+    );
+    return true;
+  } catch {
+    // `no-pending` (someone answered first) or `not-allowed` (the agent's
+    // approve predicate refused the owner): the ask was not decided by us.
+    return false;
+  }
+}

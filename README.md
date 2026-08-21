@@ -477,6 +477,48 @@ Session persistence, error recovery, and the approval prompt are built in.
 Drop to `Agent` directly for layouts it does not have or two sessions side by
 side.
 
+## Channels
+
+The same agent, reachable from Slack, SMS, or email. A channel is two adapters
+over the machinery above — a verified webhook in, a delivery worker out — plus
+a **lens**: one object that renders outbound items into the surface's native
+form and interprets inbound events back into a fixed set of meanings.
+
+```ts
+// server
+Agent.channel('sms', {
+  agent: 'support',
+  transport: twilioTransport({ from: '+15559990000' }),
+  lens: smsLens,                              // { out, in } — two halves, one object
+  profile: { interact: 'menu', limit: 1600 }, // choices render as "Reply YES / NO"
+  verify: (raw) => twilioSignatureOk(raw),
+  parse: (raw) => parseTwilioForm(raw.rawBody),
+  statuses: ['error'],
+});
+```
+
+The webhook mounts at `/agent/channels/sms`; the worker delivers every
+committed reply to every surface bound to the session. One conversation can be
+live in Slack, mirrored over SMS, and open in the web app at once — each
+surface tracks its own cursor, so a downed gateway delays only itself.
+
+What you inherit without writing it: **exactly-once admission** (a provider
+retry never runs a second turn), **effectively-once delivery** (a three-phase
+receipt log — a redeploy re-sends nothing), **approvals over any surface**
+(buttons where the surface has them, "Reply YES to approve" where it doesn't,
+signed one-time links where replies are awkward — same single-winner verdict
+either way), and **account linking with assurance levels**, so a gate can say
+"auto-approve for OAuth-proven users, ask otherwise" in one line:
+
+```ts
+gate: (ctx) => ctx.session.channel?.assurance === 'oidc' ? 'auto' : 'ask'
+```
+
+A new surface is a few dozen lines — two functions and one shipped property
+test (`assertLensRoundTrip`) that proves every affordance you render reads
+back as the meaning you meant. The design is
+[`2026-08-20-channels-multi-surface-delivery.md`](docs/superpowers/specs/2026-08-20-channels-multi-surface-delivery.md).
+
 ## Further reading
 
 The **[package README](app/packages/agent/README.md)** is the full API
@@ -547,6 +589,15 @@ hooks, the element), and the v3 backlog:
   being collection scans;
 - **a `tool_args` delta clamp** — one runaway argument stream can no longer
   evict every other session's tokens from the capped delta collection.
+
+The sixth addition is **channels** — multi-surface delivery per the
+[channels spec](docs/superpowers/specs/2026-08-20-channels-multi-surface-delivery.md):
+the lens contract with its round-trip test, the watcher-shaped egress worker,
+the generic webhook pipeline, exactly-once admission, receipt-backed delivery,
+and account linking. Server-side `agent.send/approve/deny({ userId })` landed
+with it. No concrete provider transports ship in the package (it takes no
+provider SDK dependency) — a Slack/Twilio channel package is the natural next
+milestone.
 
 CI runs the full suite plus a production-bundle verification on every push.
 

@@ -17,6 +17,8 @@ import {
   clearAgentHooks, clearHooks, registerAgentHook, registerHook,
   type HookMap, type HookName,
 } from './hooks';
+import { recordVerdict, sendToSession } from './methods';
+import { registerChannel, type ChannelDef } from './channels/registry';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -156,6 +158,51 @@ export class Agent {
   }
 
   /**
+   * Send a message into an EXISTING session and wake a turn — the server-side
+   * form of `agent.send` (channels spec §5.1), the same extract-with-`userId`
+   * refactor `ask`/`fork`/`compact` already had. A channel webhook, a cron
+   * job, or another agent calls this with a RESOLVED identity; the DDP method
+   * is a cap over the identical core, so both run on the same terms —
+   * authorization, the budget folded into the atomic seq allocation, and the
+   * one `deferTurn` wake path.
+   *
+   * `userId` scopes the lookup, always three-field (`{_id, agent, userId}`):
+   * an omitted one defaults to null and scopes to the ANONYMOUS owner — never
+   * to "all sessions" — so the fail-closed guarantee needs no presence test
+   * here. `userId: null` is a real owner (the capability-URL session), not
+   * "denied".
+   *
+   * Note the DDP rate limiter does not see this path (its rules match method
+   * names); the session budget does — it is enforced inside the core. A
+   * server-side caller reachable from outside traffic must bring its own
+   * throttle, as the channel webhook does (§9).
+   */
+  send(
+    sessionId: string, text: string, opts?: { userId?: string | null },
+  ): Promise<string> {
+    return sendToSession(this.name, sessionId, text, opts?.userId ?? null);
+  }
+
+  /**
+   * Answer a parked approval — the server-side form of `agent.approve`
+   * (channels spec §5.1). The same core the DDP method caps: ownership check,
+   * the agent's own `approve` predicate, the single-winner verdict write, the
+   * audit note, and the wake. Two answerers racing — a webhook and a human,
+   * two webhooks — produce exactly one verdict; the loser gets `no-pending`.
+   */
+  async approve(sessionId: string, opts?: { userId?: string | null }): Promise<void> {
+    await recordVerdict({ userId: opts?.userId ?? null }, this.name, sessionId, 'approved');
+  }
+
+  /** The deny half of `approve` — same core, same guarantees; `reason`
+   *  reaches the model as the denied tool result. */
+  async deny(
+    sessionId: string, reason?: string, opts?: { userId?: string | null },
+  ): Promise<void> {
+    await recordVerdict({ userId: opts?.userId ?? null }, this.name, sessionId, 'denied', reason);
+  }
+
+  /**
    * Branch a session into a new one that shares its history up to a point, and
    * diverges from there. Returns the NEW session's id.
    *
@@ -277,6 +324,32 @@ export class Agent {
    */
   static method(name: string, options: AgentMethodOptions): AdoptedTool {
     return defineAgentMethod(name, options);
+  }
+
+  /**
+   * Register a CHANNEL — an external surface (Slack, SMS, email) as an adapter
+   * over the existing machinery (channels spec §10). STATIC and GLOBAL like
+   * `Agent.provider`, and the same registry contract: validated cheaply here,
+   * overwrite-with-warning on re-registration so a dev hot reload does not
+   * throw.
+   *
+   *   Agent.channel('sms', {
+   *     agent: 'support',
+   *     transport: twilioTransport({ from: '+15559990000' }),
+   *     lens: smsLens,                          // { out, in } — the two halves
+   *     profile: { interact: 'menu', limit: 1600 },
+   *     verify: (raw) => twilioSignatureOk(raw),
+   *     parse: (raw) => parseTwilioForm(raw.rawBody),
+   *     statuses: ['error'],
+   *   });
+   *
+   * Registration is inert by itself: the boot wiring (server/index.ts) mounts
+   * the webhook at `/agent/channels/<kind>` and starts the egress worker,
+   * gated per kind by `settings.channels.<kind> !== false` and skipped under
+   * test — exactly the watcher's boot contract.
+   */
+  static channel(kind: string, def: ChannelDef): void {
+    registerChannel(kind, def);
   }
 
   /**

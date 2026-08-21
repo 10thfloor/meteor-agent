@@ -1,4 +1,8 @@
 import { AgentMessages, AgentSessions } from '../common/collections';
+import {
+  ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
+  DeliveryReceipts, InboundSubmissions,
+} from './channels/collections';
 import { NAMES } from '../common/names';
 
 /**
@@ -41,7 +45,7 @@ import { NAMES } from '../common/names';
  */
 export async function ensureIndexes(): Promise<void> {
   const specs: Array<{
-    collection: typeof AgentSessions | typeof AgentMessages;
+    collection: { createIndexAsync?: unknown };
     name: string;
     keys: Record<string, 1 | -1>;
     options?: Record<string, unknown>;
@@ -61,6 +65,57 @@ export async function ensureIndexes(): Promise<void> {
       collection: AgentSessions,
       name: NAMES.sessions,
       keys: { phase: 1, 'lease.until': 1 },
+    },
+    // ---- Channels (channels spec §6) ----------------------------------------
+    // The bindings' reverse lookup is by DERIVED `_id`, so this compound key's
+    // day job is the egress sweep's `find({ kind })` slice (kind prefix) and
+    // the linking pass's `{ kind, externalUserId }` — hence two keys, not one.
+    {
+      collection: ChannelBindings,
+      name: NAMES.channelBindings,
+      keys: { kind: 1, conversationRef: 1 },
+    },
+    // The fan-out lookup: a committed row → every binding of its session
+    // (the egress observer runs it per insert), and the notify-tool shape.
+    {
+      collection: ChannelBindings,
+      name: NAMES.channelBindings,
+      keys: { sessionId: 1 },
+    },
+    // The linking claim-history pass (`{ kind, externalUserId, userId: null }`).
+    {
+      collection: ChannelBindings,
+      name: NAMES.channelBindings,
+      keys: { kind: 1, externalUserId: 1 },
+      options: { sparse: true },
+    },
+    {
+      collection: DeliveryReceipts,
+      name: NAMES.deliveryReceipts,
+      keys: { bindingId: 1 },
+    },
+    // TTL reapers. Admissions outlive every provider's retry schedule by a
+    // wide margin (48h); tokens carry their own expiry and the TTL is only the
+    // janitor — redemption checks `expiresAt` itself, because Mongo's TTL
+    // sweep runs on its own schedule and a token must be dead the millisecond
+    // it expires, not within a minute of it.
+    {
+      collection: InboundSubmissions,
+      name: NAMES.inboundSubmissions,
+      keys: { at: 1 },
+      options: { expireAfterSeconds: 48 * 60 * 60 },
+    },
+    {
+      collection: ChannelLinkTokens,
+      name: NAMES.channelLinkTokens,
+      keys: { expiresAt: 1 },
+      options: { expireAfterSeconds: 0 },
+    },
+    {
+      collection: ChannelVerdictTokens,
+      name: NAMES.channelVerdictTokens,
+      keys: { expiresAt: 1 },
+      options: { expireAfterSeconds: 0 },
     },
   ];
 

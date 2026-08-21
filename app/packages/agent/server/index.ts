@@ -1,4 +1,5 @@
 import { Meteor } from 'meteor/meteor';
+import { WebApp } from 'meteor/webapp';
 import { ensureCapped } from './capped';
 import { ensureIndexes } from './indexes';
 import { registerPublications } from './publications';
@@ -7,6 +8,13 @@ import { applyRateLimits } from './rate-limits';
 import { listAgents } from './registry';
 import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 import { startWatcher, type Watcher } from './watcher';
+import {
+  ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
+  DeliveryReceipts, InboundSubmissions,
+} from './channels/collections';
+import { listChannels } from './channels/registry';
+import { mountChannelRoutes } from './channels/ingress';
+import { startEgress, type EgressWorker } from './channels/egress';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
@@ -48,12 +56,55 @@ export { startWatcher, type Watcher, type WatcherOptions } from './watcher';
 export { ensureIndexes } from './indexes';
 export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 
+// ---- Channels (channels spec) ----------------------------------------------
+// The lens contract and its test helper, the planner, the worker, the
+// pipeline, linking, and the collections — the whole §8.7 ladder: install a
+// channel package (it calls `Agent.channel`), override one item of its lens,
+// or author a new surface against these types and prove it with
+// `assertLensRoundTrip`.
+export {
+  assertLensRoundTrip, exemplarItems, matchExpectation, DELIVERY_ITEM_KINDS,
+  type ChannelProfile, type ChannelTransport, type DeliveryItem,
+  type InboundIntent, type InboundReading, type Lens, type PromptChoice,
+  type RoundTripOptions,
+} from './channels/contract';
+export {
+  expectationsFor, planItems, promptItem, MENU_MATCHES,
+  type PlanOptions, type PlannedRow,
+} from './channels/plan';
+export { type ChannelDef, type RawInbound, listChannels } from './channels/registry';
+export {
+  startEgress, deliverBinding, deliverOnce, claimBinding, advanceCursor,
+  type EgressOptions, type EgressWorker,
+} from './channels/egress';
+export { handleInbound, mountChannelRoutes } from './channels/ingress';
+export {
+  issueLinkToken, redeemLinkToken, linkIdentity, resolveIdentity,
+  issueVerdictToken, redeemVerdictToken,
+} from './channels/linking';
+export {
+  ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
+  DeliveryReceipts, InboundSubmissions,
+  type ChannelBinding, type ChannelIdentity, type ChannelLinkToken,
+  type ChannelVerdictToken, type DeliveryReceipt, type InboundSubmission,
+  type ReceiptExpectation,
+} from './channels/collections';
+
 /**
  * This process's boot watcher, or null when the settings or the environment
  * disabled it. Exposed so a host app can stop it (a graceful shutdown, or a
  * process that wants to hand recovery to a single designated instance).
  */
 export let watcher: Watcher | null = null;
+
+/**
+ * This process's boot egress workers, one per enabled channel kind — the
+ * watcher's contract, per kind. Exposed for the same reason `watcher` is: a
+ * host that wires a real SIGTERM handler stops these too, and one that runs
+ * delivery on a designated instance disables kinds via
+ * `settings.channels.<kind> = false` and reads this to verify.
+ */
+export const egress = new Map<string, EgressWorker>();
 
 /**
  * True in EVERY test mode Meteor has.
@@ -92,7 +143,14 @@ const UNDER_TEST = Meteor.isTest || Meteor.isAppTest || Meteor.isPackageTest;
  */
 function denyAllClientWrites(): void {
   const deny = { insert: () => true, update: () => true, remove: () => true };
-  for (const c of [AgentSessions, AgentMessages, AgentDeltas]) {
+  for (const c of [
+    AgentSessions, AgentMessages, AgentDeltas,
+    // The channel collections are server-declared (no client stub), but a DDP
+    // client can invoke a collection's low-level mutation methods BY NAME
+    // without one — so the belt covers them identically.
+    ChannelIdentities, ChannelBindings, DeliveryReceipts,
+    InboundSubmissions, ChannelLinkTokens, ChannelVerdictTokens,
+  ]) {
     (c as any).deny(deny);
   }
 }
@@ -160,5 +218,24 @@ Meteor.startup(async () => {
   // `finally`; a boot watcher would fight every one of them — see `UNDER_TEST`.
   if (settings?.watcher !== false && !UNDER_TEST) {
     watcher = startWatcher();
+  }
+
+  // Channels (channels spec §9/§6.4). By this point every app-file
+  // `Agent.channel(...)` has run — startup callbacks fire after all code
+  // loads — so the registry is complete.
+  //
+  // The WEBHOOKS mount on every instance and unconditionally: inbound HTTP is
+  // load-balanced and an unmounted route is a provider retry storm. The
+  // EGRESS worker follows the watcher's boot contract instead — on by
+  // default, disabled per kind via `settings.channels.<kind> = false` for
+  // deployments that run delivery on one designated instance, and never under
+  // test: a boot worker would deliver every test's hand-seeded transcripts to
+  // a transport nobody mocked.
+  if (!UNDER_TEST && listChannels().length > 0) {
+    mountChannelRoutes((WebApp as any).handlers);
+    for (const [kind] of listChannels()) {
+      if (settings?.channels?.[kind] === false) continue;
+      egress.set(kind, startEgress(kind));
+    }
   }
 });

@@ -13,5 +13,6 @@ import './skills.test';
 import './fork.test';
 import './candidates.test';
 import './watcher.test';
+import './channels.test';
 import './perf.test';
 import './integration.server';

@@ -8,14 +8,14 @@ Package.describe({
 Package.onUse((api) => {
   api.versionsFrom('3.5');
   api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random', 'tracker']);
-  api.use(['ddp-common', 'ddp-rate-limiter'], 'server');
+  api.use(['ddp-common', 'ddp-rate-limiter', 'webapp'], 'server');
   api.mainModule('server/index.ts', 'server');
   api.mainModule('client/index.ts', 'client');
 });
 
 Package.onTest((api) => {
   api.use(['ecmascript', 'typescript', 'mongo', 'ddp', 'check', 'random', 'tracker']);
-  api.use(['ddp-common', 'ddp-rate-limiter'], 'server');
+  api.use(['ddp-common', 'ddp-rate-limiter', 'webapp'], 'server');
   api.use('meteortesting:mocha');
   api.use('10thfloor:agent');
   // Split by architecture: server tests must never reach the client bundle.
