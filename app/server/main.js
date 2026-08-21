@@ -1,6 +1,8 @@
 import { Meteor } from 'meteor/meteor';
 import { check } from 'meteor/check';
-import { Agent, mockProvider, redeemLinkToken } from 'meteor/10thfloor:agent';
+import {
+  Agent, AgentSessions, mockProvider, redeemLinkToken,
+} from 'meteor/10thfloor:agent';
 import { slack } from 'meteor/10thfloor:agent-channel-slack';
 
 /**
@@ -101,6 +103,35 @@ Meteor.methods({
    * the token atomically, writes the identity row, and claims the anonymous
    * conversations that identity created. Returns what the UI needs to say.
    */
+  /**
+   * Adopt the anonymous conversation this browser already holds, at sign-in.
+   *
+   * Consistent with the capability model rather than a loosening of it: for an
+   * anonymous session, KNOWING THE ID is full ownership (send, read, approve),
+   * so converting possession into durable ownership for the signed-in holder
+   * grants nothing the caller lacked — it makes it survive localStorage. The
+   * update is guarded on `userId: null`, so a session someone already owns can
+   * never be taken; and claiming ends the id's shared-capability life, which
+   * is the point of claiming.
+   *
+   * Returns 'claimed' (adopted just now), 'yours' (already this account's —
+   * a re-login), or 'no' (unknown, or owned by someone else — the two are
+   * deliberately indistinguishable).
+   */
+  async 'demo.claimSession'(sessionId) {
+    check(sessionId, String);
+    if (!this.userId) {
+      throw new Meteor.Error('not-signed-in', 'Sign in first.');
+    }
+    const claimed = await AgentSessions.updateAsync(
+      { _id: sessionId, userId: null },
+      { $set: { userId: this.userId, updatedAt: new Date() } },
+    );
+    if (claimed === 1) return 'claimed';
+    const mine = await AgentSessions.findOneAsync({ _id: sessionId, userId: this.userId });
+    return mine ? 'yours' : 'no';
+  },
+
   async 'demo.linkChannel'(token) {
     check(token, String);
     if (!this.userId) {

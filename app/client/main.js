@@ -156,8 +156,44 @@ Meteor.startup(() => {
       renderSignedOut();
     }
     if (previousUser !== undefined && previousUser !== userId) {
-      localStorage.removeItem(SESSION_KEY);
-      startFresh();
+      if (userId) {
+        // Sign-IN: adopt the conversation this browser already holds instead
+        // of discarding it — possession of an anonymous session IS ownership
+        // (see demo.claimSession), so signing in keeps the thread and makes
+        // it durable. Only when there is nothing claimable (no held session,
+        // db wiped, someone else's) does the account start clean.
+        const held = localStorage.getItem(SESSION_KEY) ?? '';
+        Meteor.callAsync('demo.claimSession', held).then((outcome) => {
+          if (outcome === 'no') {
+            localStorage.removeItem(SESSION_KEY);
+            startFresh();
+            return;
+          }
+          if (outcome === 'claimed') {
+            // The login re-ran the element's subscription BEFORE the claim
+            // landed — authorized as the new user against a still-anonymous
+            // session, it published nothing, and publications do not re-run
+            // when data changes. Remounting is the element's public reset
+            // seam ("tears down on disconnect, re-mounts clean"): it
+            // re-subscribes as the owner the session now has, and the
+            // transcript comes back.
+            const parent = chat.parentNode;
+            const next = chat.nextSibling;
+            chat.remove();
+            parent.insertBefore(chat, next);
+          }
+          // 'yours' (a re-login): the re-run subscription already authorized
+          // correctly — nothing to do.
+        }).catch(() => {
+          localStorage.removeItem(SESSION_KEY);
+          startFresh();
+        });
+      } else {
+        // Sign-OUT: the account's sessions are not anonymous-reachable, so a
+        // clean anonymous conversation is the only honest continuation.
+        localStorage.removeItem(SESSION_KEY);
+        startFresh();
+      }
     }
     previousUser = userId;
   });
