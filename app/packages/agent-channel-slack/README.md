@@ -104,6 +104,18 @@ integration on the Meteor side.
    Approve/Deny buttons, and either button (or the web UI — first click wins)
    decides it.
 
+## Account linking
+
+DM the bot the bare word **`link`** and it answers with a one-time URL
+(minted through the core's linking tokens, delivered on the same surface).
+Open it while signed in to the web app: the Slack identity is linked to that
+account, the anonymous conversations it created are claimed, and from the next
+message the agent runs as you on both surfaces. Wiring on the app side is a
+`linkUrl` option plus one method that calls `redeemLinkToken` — the demo app's
+`server/main.js` and `client/main.js` are the reference. Only the exact word
+triggers it; "link my account please" reaches the agent as an ordinary
+message.
+
 ## What the lens answers, and what it never does
 
 - **DMs**: every message. **Channels**: only when @-mentioned — un-mentioned

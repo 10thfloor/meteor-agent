@@ -336,6 +336,29 @@ describe('channels', () => {
       assert.equal(await InboundSubmissions.find({}).countAsync(), 0);
     });
 
+    it('answers a link request with a one-time URL whose redemption claims the conversation', async () => {
+      const { transport } = await registerTestChannel({
+        linkUrl: (token: string) => `https://app.test/link/${token}`,
+      });
+      const { handleInbound } = await import('../server/channels/ingress');
+      // The sender talks first (anonymous session), then asks to link.
+      await handleInbound('test', raw({ type: 'msg', text: 'hi', id: 'e1', user: 'ext-9', convo: 'c-9' }));
+      await handleInbound('test', raw({ type: 'link', id: 'e2', user: 'ext-9', convo: 'c-9' }));
+
+      const { ChannelLinkTokens, ChannelBindings } = await import('../server/channels/collections');
+      const tokens = await ChannelLinkTokens.find({}).fetchAsync();
+      assert.equal(tokens.length, 1);
+      assert.equal(tokens[0].externalUserId, 'ext-9', 'the token is bound to the asker');
+      const offer = transport.posts.find((p) => String(p.payload.text).includes(`/link/${tokens[0]._id}`));
+      assert.isDefined(offer, 'the URL was delivered back on the same surface');
+
+      const { redeemLinkToken } = await import('../server/channels/linking');
+      const identity = (await redeemLinkToken(tokens[0]._id, 'web-user'))!;
+      assert.equal(identity.userId, 'web-user');
+      const binding = (await ChannelBindings.findOneAsync('test:c-9'))!;
+      assert.equal(binding.userId, 'web-user', 'redeeming from the signed-in side claimed the conversation');
+    });
+
     it('echoes a noop respond as the 200 body — the URL-verification shape', async () => {
       const { def } = await registerTestChannel();
       const base = def.lens.in.bind(def.lens);

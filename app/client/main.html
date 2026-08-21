@@ -4,8 +4,24 @@
 </head>
 
 <body>
-  <agent-chat agent="demo"
-              placeholder='Try "what time is it?" or "refund my order"'>
-    <h1 slot="header">10thfloor:agent</h1>
-  </agent-chat>
+  <div class="demo-shell">
+    <aside class="demo-side">
+      <section id="account-box" aria-label="Account"></section>
+      <section id="link-box" hidden aria-label="Link a channel"></section>
+      <section id="sessions-box" aria-label="Conversations">
+        <header class="sessions-header">
+          <h2>Conversations</h2>
+          <button id="new-chat" type="button" title="Start a new conversation">New</button>
+        </header>
+        <p id="sessions-empty">Sign in to see your conversations across surfaces.</p>
+        <ul id="sessions-list"></ul>
+      </section>
+    </aside>
+    <main class="demo-main">
+      <agent-chat agent="demo"
+                  placeholder='Try "what time is it?" or "refund my order"'>
+        <h1 slot="header">10thfloor:agent</h1>
+      </agent-chat>
+    </main>
+  </div>
 </body>

@@ -1,3 +1,7 @@
 node_modules/
 .meteor/local/
 .DS_Store
+
+# Local credentials (Slack tokens etc.) — never committed; copy settings.example.json
+app/settings.json
+settings.json

@@ -1,5 +1,6 @@
 import { Meteor } from 'meteor/meteor';
-import { Agent, mockProvider } from 'meteor/10thfloor:agent';
+import { check } from 'meteor/check';
+import { Agent, mockProvider, redeemLinkToken } from 'meteor/10thfloor:agent';
 import { slack } from 'meteor/10thfloor:agent-channel-slack';
 
 /**
@@ -84,8 +85,35 @@ if (slackReady) {
     agent: 'demo',
     botToken: slackCfg.botToken,
     signingSecret: slackCfg.signingSecret,
+    // The account-linking loop (spec §12): DM the bare word "link" to the bot
+    // and it answers with this one-time URL; the web client recognizes the
+    // /link/<token> path and redeems it through the method below — from the
+    // SIGNED-IN side, which is the direction linking must run.
+    linkUrl: (token) => Meteor.absoluteUrl(`link/${token}`),
   }));
 }
+
+Meteor.methods({
+  /**
+   * Redeem a channel-linking token for the LOGGED-IN user. The token proves
+   * control of the external identity (only its Slack DM ever saw it); the
+   * DDP session proves the web account; the package's `redeemLinkToken` burns
+   * the token atomically, writes the identity row, and claims the anonymous
+   * conversations that identity created. Returns what the UI needs to say.
+   */
+  async 'demo.linkChannel'(token) {
+    check(token, String);
+    if (!this.userId) {
+      throw new Meteor.Error('not-signed-in', 'Sign in first — linking runs from the authenticated side.');
+    }
+    const identity = await redeemLinkToken(token, this.userId);
+    if (!identity) {
+      // Unknown, spent, or expired — one indistinguishable answer, on purpose.
+      throw new Meteor.Error('bad-token', 'That link is invalid or has expired. Ask the bot for a new one.');
+    }
+    return { kind: identity.kind, externalUserId: identity.externalUserId };
+  },
+});
 
 Meteor.startup(() => {
   console.log(

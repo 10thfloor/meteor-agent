@@ -1,7 +1,28 @@
 /* Page chrome only — the element carries its own styles, and everything below
    reaches it through the two public seams: custom properties and ::part(). */
 :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
-body { margin: 0; display: flex; justify-content: center; background: Canvas; color: CanvasText; }
+body { margin: 0; background: Canvas; color: CanvasText; }
+
+/* Sidebar (account + link + conversations) beside the chat. */
+.demo-shell {
+  display: flex;
+  justify-content: center;
+  gap: 1rem;
+  height: 100vh;
+  padding: 0 0.5rem;
+  box-sizing: border-box;
+}
+.demo-side {
+  width: 240px;
+  flex: none;
+  display: flex;
+  flex-direction: column;
+  gap: 1rem;
+  padding-top: 1rem;
+  font-size: 0.85rem;
+  overflow-y: auto;
+}
+.demo-main { display: flex; }
 
 agent-chat {
   width: min(680px, 100vw);
@@ -11,3 +32,66 @@ agent-chat {
 /* Slotted into the element's header slot, so it is ours to style: light-DOM
    children keep the page's CSS, which is the point of the slot. */
 agent-chat h1 { font-size: 1rem; margin: 0; }
+
+/* Account box */
+#account-box form { display: flex; flex-direction: column; gap: 0.4rem; }
+#account-box input {
+  padding: 0.4rem 0.5rem;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+  border-radius: 0.3rem;
+  background: Canvas;
+  color: CanvasText;
+}
+.account-actions { display: flex; gap: 0.4rem; }
+.account-note { margin: 0; color: color-mix(in srgb, CanvasText 60%, Canvas); min-height: 1em; }
+.account-who { margin: 0 0 0.4rem; font-weight: 600; }
+
+/* Link hand-off banner */
+#link-box {
+  padding: 0.6rem;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+  border-radius: 0.4rem;
+  background: color-mix(in srgb, CanvasText 6%, Canvas);
+}
+
+/* Conversations */
+.sessions-header { display: flex; align-items: baseline; justify-content: space-between; }
+.sessions-header h2 { font-size: 0.85rem; margin: 0; text-transform: uppercase; letter-spacing: 0.04em; }
+#sessions-empty { color: color-mix(in srgb, CanvasText 60%, Canvas); }
+#sessions-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.25rem; }
+.session-row {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 0.15rem;
+  padding: 0.45rem 0.5rem;
+  border: 1px solid transparent;
+  border-radius: 0.4rem;
+  background: none;
+  color: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.session-row:hover { background: color-mix(in srgb, CanvasText 8%, Canvas); }
+.session-row.current { border-color: color-mix(in srgb, CanvasText 30%, Canvas); }
+.session-title { font-weight: 600; }
+.session-meta { color: color-mix(in srgb, CanvasText 55%, Canvas); font-size: 0.75rem; }
+
+button {
+  font: inherit;
+  padding: 0.35rem 0.6rem;
+  border: 1px solid color-mix(in srgb, CanvasText 25%, Canvas);
+  border-radius: 0.3rem;
+  background: color-mix(in srgb, CanvasText 6%, Canvas);
+  color: inherit;
+  cursor: pointer;
+}
+button:hover { background: color-mix(in srgb, CanvasText 12%, Canvas); }
+
+/* Small screens: sidebar stacks above the chat. */
+@media (max-width: 760px) {
+  .demo-shell { flex-direction: column; height: auto; }
+  .demo-side { width: auto; }
+  agent-chat { height: 80vh; }
+}

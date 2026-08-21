@@ -139,6 +139,19 @@ describe('agent-channel-slack', () => {
       assert.equal(dmMention.intent.kind, 'noop', 'the DM copy is authoritative; the mention copy yields');
     });
 
+    it('reads the bare word "link" as a link request — and only the bare word', async () => {
+      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const bare = slackLens.in(parseSlackRequest({
+        headers: {}, rawBody: JSON.stringify(dmEvent({ text: '  Link ' })),
+      }));
+      assert.equal(bare.intent.kind, 'link-request');
+      assert.equal(bare.externalUserId, 'T1:U7', 'the request still carries who is asking');
+      const sentence = slackLens.in(parseSlackRequest({
+        headers: {}, rawBody: JSON.stringify(dmEvent({ text: 'link my account please' })),
+      }));
+      assert.equal(sentence.intent.kind, 'message', 'a sentence containing "link" reaches the agent');
+    });
+
     it('reads a button click as a verdict carrying the exact ask', async () => {
       const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
       const payload = {
@@ -247,8 +260,10 @@ describe('agent-channel-slack', () => {
       const def = slack({
         agent: 'demo', botToken: 'xoxb-x', signingSecret: 'shhh',
         profile: { limit: 500 },
+        linkUrl: (token) => `https://app.test/link/${token}`,
       });
       assert.equal(def.agent, 'demo');
+      assert.equal(def.linkUrl!('t1'), 'https://app.test/link/t1');
       assert.deepEqual(def.profile, { interact: 'native', limit: 500 });
       assert.deepEqual(def.statuses, ['error', 'approval']);
       assert.isTrue(await def.verify(signed('{"x":1}', 'shhh')));

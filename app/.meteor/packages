@@ -25,3 +25,4 @@ meteortesting:mocha
 
 10thfloor:agent
 10thfloor:agent-channel-slack
+accounts-password

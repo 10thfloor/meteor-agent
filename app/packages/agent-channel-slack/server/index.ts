@@ -234,6 +234,12 @@ export const slackLens: Lens = {
       const text = stripMentions(String(ev.text ?? ''));
       if (text === '') return NOOP;
       const team = envelope.team_id ?? '';
+      // The account-linking gesture (spec §12): the bare word "link" asks for
+      // a one-time URL that ties this Slack identity to a signed-in web
+      // account. A reserved word rather than a slash command so it needs no
+      // extra Slack configuration; it is an exact-word match, so "link my
+      // account please" still reaches the agent as an ordinary message.
+      const linkRequested = text.trim().toLowerCase() === 'link';
       // THE CONVERSATION KEY differs by surface shape, and getting it wrong
       // is amnesia: a DM is ONE ongoing conversation (key it by the channel —
       // keying by message ts would mint a fresh session per message), while a
@@ -242,7 +248,7 @@ export const slackLens: Lens = {
       const dm = ev.channel_type === 'im' || String(ev.channel ?? '').startsWith('D');
       const threadTs = ev.thread_ts ?? ev.ts;
       return {
-        intent: { kind: 'message', text },
+        intent: linkRequested ? { kind: 'link-request' } : { kind: 'message', text },
         eventId: envelope.event_id,
         externalUserId: `${team}:${ev.user}`,
         conversationRef: dm ? `${team}:${ev.channel}` : `${team}:${ev.channel}:${threadTs}`,
@@ -349,6 +355,9 @@ export interface SlackChannelOptions {
   statuses?: ChannelDef['statuses'];
   onUncertainDelivery?: ChannelDef['onUncertainDelivery'];
   sessionUrl?: ChannelDef['sessionUrl'];
+  /** Turns a minted linking token into the web URL a "link" DM is answered
+   *  with (spec §12). Without it, link requests are acknowledged and ignored. */
+  linkUrl?: ChannelDef['linkUrl'];
   throttle?: ChannelDef['throttle'];
   /** Override pieces of the default `{ interact: 'native', limit: 12000 }`. */
   profile?: Partial<ChannelProfile>;
@@ -370,6 +379,7 @@ export function slack(options: SlackChannelOptions): ChannelDef {
     statuses: options.statuses ?? ['error', 'approval'],
     ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
     ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),
+    ...(options.linkUrl ? { linkUrl: options.linkUrl } : {}),
     ...(options.throttle ? { throttle: options.throttle } : {}),
   };
 }
