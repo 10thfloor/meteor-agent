@@ -183,7 +183,9 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   // 2. INTERPRET — pure: raw → provider event → reading. No side effects yet.
   const reading = def.lens.in(def.parse(raw));
 
-  if (reading.intent.kind === 'noop') return { status: 200 };
+  // A noop settles immediately — and may carry a provider-mandated echo
+  // (Slack's URL-verification challenge rides `reading.respond`).
+  if (reading.intent.kind === 'noop') return { status: 200, body: reading.respond };
 
   // 3. THROTTLE — per sender, before the claim buys a write.
   const t = def.throttle ?? { limit: 30, intervalMs: 60_000 };

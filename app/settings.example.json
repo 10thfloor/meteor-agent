@@ -1,0 +1,10 @@
+{
+  "packages": {
+    "10thfloor:agent": {
+      "slack": {
+        "botToken": "xoxb-YOUR-BOT-TOKEN",
+        "signingSecret": "YOUR-SIGNING-SECRET"
+      }
+    }
+  }
+}

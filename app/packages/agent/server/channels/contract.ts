@@ -107,6 +107,10 @@ export interface InboundReading {
    *  rule reads it. Defaults to `'group'` (the safe direction) when a lens
    *  does not say. */
   audience?: 'direct' | 'group';
+  /** `noop` only: a body the provider expects echoed in the 200 — Slack's
+   *  URL-verification `challenge` is the canonical case. Ignored on routable
+   *  intents, whose 200 carries no body. */
+  respond?: string;
 }
 
 // ---- The lens itself (§8.3) ------------------------------------------------

@@ -1,5 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import { Agent, mockProvider } from 'meteor/10thfloor:agent';
+import { slack } from 'meteor/10thfloor:agent-channel-slack';
 
 /**
  * The demo agent behind the chat UI in `client/`.
@@ -69,8 +70,30 @@ new Agent('demo', {
   ...(live ? {} : { provider: mockProvider(demoScript) }),
 });
 
+/**
+ * Slack as a second surface for the SAME demo agent (channels spec): DM the
+ * bot or @-mention it, and "refund…" parks an approval that arrives in Slack
+ * as Approve/Deny buttons. Registered only when settings carry the app's
+ * credentials — see settings.example.json and the channel package's README
+ * for the Slack-side setup — so a plain `meteor run` stays exactly as it was.
+ */
+const slackCfg = Meteor.settings?.packages?.['10thfloor:agent']?.slack;
+const slackReady = !!(slackCfg?.botToken && slackCfg?.signingSecret);
+if (slackReady) {
+  Agent.channel('slack', slack({
+    agent: 'demo',
+    botToken: slackCfg.botToken,
+    signingSecret: slackCfg.signingSecret,
+  }));
+}
+
 Meteor.startup(() => {
   console.log(
     `[demo] agent ready (${live ? 'LIVE provider via pi-ai' : 'scripted mock — set ANTHROPIC_API_KEY for live'})`,
   );
+  if (slackReady) {
+    console.log('[demo] slack channel registered — webhook at /agent/channels/slack');
+  } else {
+    console.log('[demo] slack channel not configured (add slack credentials to settings — see settings.example.json)');
+  }
 });

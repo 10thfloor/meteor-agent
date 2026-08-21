@@ -556,10 +556,11 @@ milestone plans that built on it are in
 ## Project layout
 
 ```
-app/packages/agent/   the package (this is what ships)
-app/                  host app: test harness + the demo chat
-docs/superpowers/     design spec + per-milestone implementation plans
-scripts/verify-build.sh   proves the loader against a real production bundle
+app/packages/agent/                the package (this is what ships)
+app/packages/agent-channel-slack/  Slack surface: one lens, one transport
+app/                               host app: test harness + the demo chat
+docs/superpowers/                  design spec + per-milestone implementation plans
+scripts/verify-build.sh            proves the loader against a real production bundle
 ```
 
 Development workflow, the test command, and the npm-dependency policy are in
@@ -595,9 +596,11 @@ The sixth addition is **channels** — multi-surface delivery per the
 the lens contract with its round-trip test, the watcher-shaped egress worker,
 the generic webhook pipeline, exactly-once admission, receipt-backed delivery,
 and account linking. Server-side `agent.send/approve/deny({ userId })` landed
-with it. No concrete provider transports ship in the package (it takes no
-provider SDK dependency) — a Slack/Twilio channel package is the natural next
-milestone.
+with it. The core takes no provider SDK dependency; the first concrete surface
+is **[`10thfloor:agent-channel-slack`](app/packages/agent-channel-slack/README.md)**
+— DMs and mentions in, threaded replies and Approve/Deny buttons out, zero
+npm dependencies (Slack's Web API over `fetch`). Twilio/SMS is the natural
+second, to prove the lens contract across the `menu` grammar.
 
 CI runs the full suite plus a production-bundle verification on every push.
 

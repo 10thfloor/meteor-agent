@@ -335,6 +335,18 @@ describe('channels', () => {
       assert.equal(await ChannelBindings.find({}).countAsync(), 0);
       assert.equal(await InboundSubmissions.find({}).countAsync(), 0);
     });
+
+    it('echoes a noop respond as the 200 body — the URL-verification shape', async () => {
+      const { def } = await registerTestChannel();
+      const base = def.lens.in.bind(def.lens);
+      def.lens.in = (event: any) => (event.type === 'handshake'
+        ? { intent: { kind: 'noop' }, respond: event.challenge }
+        : base(event));
+      const { handleInbound } = await import('../server/channels/ingress');
+      const out = await handleInbound('test', raw({ type: 'handshake', challenge: 'c-42' }));
+      assert.equal(out.status, 200);
+      assert.equal(out.body, 'c-42');
+    });
   });
 
   // ---- Egress (§6.4 / §11) -------------------------------------------------

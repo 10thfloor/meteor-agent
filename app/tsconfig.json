@@ -28,12 +28,17 @@
     "paths": {
       // The package imports its own public surface through the Meteor namespace
       // (`meteor/10thfloor:agent`); off the Meteor build there is no such module,
-      // so point it at the client entry that re-exports that surface.
-      "meteor/10thfloor:agent": ["./packages/agent/client/index.ts"]
+      // so point it at the client entry that re-exports that surface. The client
+      // entry also re-exports the (pure, isomorphic) channel lens contract, so
+      // channel packages type-check against the same module id they import at
+      // runtime — see client/index.ts.
+      "meteor/10thfloor:agent": ["./packages/agent/client/index.ts"],
+      "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/server/index.ts"]
     }
   },
   "include": [
     "packages/agent/**/*.ts",
+    "packages/agent-channel-slack/**/*.ts",
     "types/**/*.d.ts"
   ],
   "exclude": [
