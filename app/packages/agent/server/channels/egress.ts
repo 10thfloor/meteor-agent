@@ -1,3 +1,4 @@
+import { createHash } from 'crypto';
 import { AgentMessages, AgentSessions } from '../../common/collections';
 import type { AgentSession } from '../../common/types';
 import { SERVER_ID } from '../lease';
@@ -35,6 +36,33 @@ export interface EgressOptions {
   sweepMs?: number;
   /** How long a delivery claim lasts. Renewed per row; default 30s. */
   claimMs?: number;
+  /**
+   * How far back the sweep looks: only bindings active (any inbound event,
+   * any delivery) within this window are walked. Default 24h. This is what
+   * keeps a process's per-sweep cost proportional to LIVE conversations
+   * rather than to every conversation ever bound — without it a single
+   * workspace member could mint thousands of thread bindings that every
+   * instance would then re-read every 15 seconds, forever. Fresh rows on an
+   * older binding still deliver promptly: the observer fires per committed
+   * message regardless of age, and its delivery bumps the binding back into
+   * the window.
+   */
+  sweepLookbackMs?: number;
+}
+
+/** Retry policy for a receipt found mid-`sending` (§11 `retry` tier): doubling
+ *  from one sweep interval, capped at an hour, and given up after
+ *  `MAX_DELIVERY_ATTEMPTS`. Without it a payload the provider rejects
+ *  DETERMINISTICALLY (a cut surrogate pair, a closed WhatsApp window) would be
+ *  re-posted every sweep forever and wedge the conversation behind it. */
+export const BACKOFF_BASE_MS = 15_000;
+export const BACKOFF_MAX_MS = 60 * 60_000;
+export const MAX_DELIVERY_ATTEMPTS = 48;
+
+/** Binding ids embed conversation keys — phone numbers on SMS/WhatsApp — so
+ *  log lines carry a short hash: enough to correlate, not enough to identify. */
+function redact(id: string): string {
+  return createHash('sha256').update(id).digest('hex').slice(0, 10);
 }
 
 export interface EgressWorker {
@@ -112,7 +140,7 @@ export async function deliverOnce(
   item: DeliveryItem,
   suffix: string,
   opts: { expects?: ReceiptExpectation[]; def?: ChannelDef } = {},
-): Promise<'delivered' | 'abandoned'> {
+): Promise<'delivered' | 'abandoned' | 'deferred'> {
   const def = opts.def ?? getChannel(kind);
   if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${kind}"`);
   const receiptId = `deliver:${binding._id}:${suffix}`;
@@ -159,8 +187,23 @@ export async function deliverOnce(
       }
     }
     // 'retry' (tier A: the provider collapses the repeated key; tier C: the
-    // channel DECLARED it accepts possible duplicates) — fall through to post.
-    await DeliveryReceipts.updateAsync(receiptId, { $inc: { attempts: 1 } });
+    // channel DECLARED it accepts possible duplicates) — but on a SCHEDULE.
+    // A receipt that keeps failing is given up after MAX_DELIVERY_ATTEMPTS
+    // (abandoned; the cursor moves on), and between attempts it waits a
+    // doubling backoff measured from its last attempt — so a deterministic
+    // rejection neither hammers the provider every sweep nor wedges the
+    // conversation forever. `deferred` tells the caller to stop here and
+    // leave the cursor where it is.
+    if (existing.attempts >= MAX_DELIVERY_ATTEMPTS) {
+      await DeliveryReceipts.updateAsync(
+        { _id: receiptId, state: 'sending' },
+        { $set: { state: 'abandoned', at: new Date() } },
+      );
+      return 'abandoned';
+    }
+    const wait = Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, existing.attempts - 1), BACKOFF_MAX_MS);
+    if (Date.now() - existing.at.getTime() < wait) return 'deferred';
+    await DeliveryReceipts.updateAsync(receiptId, { $inc: { attempts: 1 }, $set: { at: new Date() } });
   }
 
   // POST. A lens may return several payloads (a segmented SMS); each gets its
@@ -236,7 +279,11 @@ export async function deliverBinding(
     if (!(await claimBinding(bindingId, claimMs))) return;
     if (row.item) {
       // eslint-disable-next-line no-await-in-loop
-      await deliverOnce(kind, binding, row.item, row.message._id, { def });
+      const outcome = await deliverOnce(kind, binding, row.item, row.message._id, { def });
+      // A deferred row is in its backoff window: stop here, cursor unmoved,
+      // and let a later sweep retry it. Rows behind it wait — in-order
+      // delivery is the contract.
+      if (outcome === 'deferred') return;
     }
     // eslint-disable-next-line no-await-in-loop
     if (!(await advanceCursor(bindingId, cursor, row.message.seq))) return;
@@ -296,7 +343,7 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
     chain = chain.then(() => deliver(bindingId)).catch((e) => {
       // A failed delivery is the next sweep's business; an unhandled
       // rejection is fatal by default on Node >= 15.
-      console.error(`[10thfloor:agent] egress(${kind}): delivery failed for ${bindingId}:`, e);
+      console.error(`[10thfloor:agent] egress(${kind}): delivery failed for binding ${redact(bindingId)}:`, e);
     });
   };
 
@@ -309,14 +356,16 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
    * expired claim another server left mid-delivery.
    */
   const sweep = async (): Promise<void> => {
+    // Only bindings active within the lookback — see `sweepLookbackMs`.
+    const since = new Date(Date.now() - (opts.sweepLookbackMs ?? 24 * 60 * 60_000));
     const bindings = await ChannelBindings.find(
-      { kind }, { fields: { _id: 1 } },
+      { kind, updatedAt: { $gt: since } }, { fields: { _id: 1 } },
     ).fetchAsync();
     for (const b of bindings) {
       if (stopped) return;
       // eslint-disable-next-line no-await-in-loop
       await deliver(b._id).catch((e) => {
-        console.error(`[10thfloor:agent] egress(${kind}): sweep delivery failed for ${b._id}:`, e);
+        console.error(`[10thfloor:agent] egress(${kind}): sweep delivery failed for binding ${redact(b._id)}:`, e);
       });
     }
   };

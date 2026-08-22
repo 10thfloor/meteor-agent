@@ -1,5 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import { check } from 'meteor/check';
+import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import {
   Agent, AgentSessions, mockProvider, redeemLinkToken,
 } from 'meteor/10thfloor:agent';
@@ -132,14 +133,16 @@ if (channelCfg.sms?.accountSid && channelCfg.sms?.authToken && channelCfg.sms?.w
   registeredChannels.push('sms');
 }
 
+// The demo's own methods take a token or a session id. Both are unguessable
+// (≈256-bit / ≈98-bit), so this is hygiene rather than a hole — but a public
+// endpoint that accepts guesses should meter them anyway. Per connection for
+// anonymous callers, per user for signed-in ones (DDPRateLimiter's default).
+DDPRateLimiter.addRule(
+  { type: 'method', name: (n) => typeof n === 'string' && n.startsWith('demo.') },
+  10, 10_000,
+);
+
 Meteor.methods({
-  /**
-   * Redeem a channel-linking token for the LOGGED-IN user. The token proves
-   * control of the external identity (only its Slack DM ever saw it); the
-   * DDP session proves the web account; the package's `redeemLinkToken` burns
-   * the token atomically, writes the identity row, and claims the anonymous
-   * conversations that identity created. Returns what the UI needs to say.
-   */
   /**
    * Adopt the anonymous conversation this browser already holds, at sign-in.
    *
@@ -160,8 +163,15 @@ Meteor.methods({
     if (!this.userId) {
       throw new Meteor.Error('not-signed-in', 'Sign in first.');
     }
+    // WEB-origin sessions only (`channel` absent). A channel-origin anonymous
+    // session has a binding routing an external person's messages into it;
+    // claiming it from the web would split binding owner from session owner —
+    // the external user's next message refused while replies to the
+    // claimer's web messages keep landing on their phone. Channel sessions
+    // are claimed by LINKING (which rewrites binding and session together),
+    // never by possession of the id.
     const claimed = await AgentSessions.updateAsync(
-      { _id: sessionId, userId: null },
+      { _id: sessionId, userId: null, channel: { $exists: false } },
       { $set: { userId: this.userId, updatedAt: new Date() } },
     );
     if (claimed === 1) return 'claimed';
@@ -169,6 +179,13 @@ Meteor.methods({
     return mine ? 'yours' : 'no';
   },
 
+  /**
+   * Redeem a channel-linking token for the LOGGED-IN user. The token proves
+   * control of the external identity (only its Slack DM ever saw it); the
+   * DDP session proves the web account; the package's `redeemLinkToken` burns
+   * the token atomically, writes the identity row, and claims the anonymous
+   * conversations that identity created. Returns what the UI needs to say.
+   */
   async 'demo.linkChannel'(token) {
     check(token, String);
     if (!this.userId) {

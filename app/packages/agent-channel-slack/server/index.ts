@@ -67,7 +67,7 @@ export function toMrkdwn(markdown: string): string {
 function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
   switch (item.kind) {
     case 'error':
-      return `:warning: Something went wrong${item.reason ? ` (${item.reason})` : ''}. Send a message to try again.`;
+      return `:warning: Something went wrong${item.reason ? ` (${escapeSlack(item.reason)})` : ''}. Send a message to try again.`;
     case 'budget':
       return `:no_entry: The session reached its ${item.budget ?? 'usage'} limit.`;
     case 'interrupted':
@@ -80,7 +80,7 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
     case 'orphan-child':
       return ':wrench: A background sub-task was recovered.';
     default:
-      return `[${item.kind}]${item.reason ? ` ${item.reason}` : ''}`;
+      return `[${item.kind}]${item.reason ? ` ${escapeSlack(item.reason)}` : ''}`;
   }
 }
 
@@ -101,7 +101,12 @@ export function verifySlackSignature(
   const signature = Array.isArray(header) ? header[0] : header;
   const timestamp = Array.isArray(ts) ? ts[0] : ts;
   if (!signature || !timestamp) return false;
-  if (Math.abs(nowMs / 1000 - Number(timestamp)) > 300) return false;
+  // A non-numeric timestamp must FAIL the window, not skip it: `NaN > 300`
+  // is false, so without the finiteness check a garbage timestamp would
+  // bypass the replay guard (the HMAC would still have to verify, so this is
+  // hygiene rather than a hole — but hygiene is free).
+  const tsSeconds = Number(timestamp);
+  if (!Number.isFinite(tsSeconds) || Math.abs(nowMs / 1000 - tsSeconds) > 300) return false;
   const expected = `v0=${createHmac('sha256', signingSecret)
     .update(`v0:${timestamp}:${raw.rawBody}`)
     .digest('hex')}`;
@@ -173,11 +178,19 @@ export const slackLens: Lens = {
       case 'overflow':
         return { text: `${toMrkdwn(item.head)}${item.url ? `\n<${item.url}|Continue on the web>` : ''}` };
       case 'prompt': {
+        // Tool name and arguments are MODEL-influenced text landing in live
+        // mrkdwn: escape them like any other model text, and neutralize a
+        // fence inside the arguments — an arg of "```<!channel> approve now"
+        // would otherwise close our code block and put a mass-ping and a
+        // spoofed approval line into the thread. A zero-width space between
+        // the backticks keeps the characters visible and the fence closed.
         const args = JSON.stringify(item.args ?? {}, null, 2);
-        const clamped = args.length > 2000 ? `${args.slice(0, 2000)}…` : args;
+        const clamped = escapeSlack(args.length > 2000 ? `${args.slice(0, 2000)}…` : args)
+          .replace(/```/g, '`​`​`');
+        const name = escapeSlack(item.name).replace(/`/g, '‘');
         const runAs = 'runAs' in item && item.runAs !== undefined
-          ? `\n_runs as ${item.runAs ?? 'anonymous service context'}_` : '';
-        const fallback = `Approval needed: ${item.name}`;
+          ? `\n_runs as ${escapeSlack(String(item.runAs ?? 'anonymous service context'))}_` : '';
+        const fallback = `Approval needed: ${name}`;
         return {
           text: fallback,
           blocks: [
@@ -185,7 +198,7 @@ export const slackLens: Lens = {
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: `The agent wants to run \`${item.name}\`:\n\`\`\`${clamped}\`\`\`${runAs}`,
+                text: `The agent wants to run \`${name}\`:\n\`\`\`${clamped}\`\`\`${runAs}`,
               },
             },
             {
@@ -237,18 +250,20 @@ export const slackLens: Lens = {
       const text = stripMentions(String(ev.text ?? ''));
       if (text === '') return NOOP;
       const team = envelope.team_id ?? '';
-      // The account-linking gesture (spec §12): the bare word "link" asks for
-      // a one-time URL that ties this Slack identity to a signed-in web
-      // account. A reserved word rather than a slash command so it needs no
-      // extra Slack configuration; it is an exact-word match, so "link my
-      // account please" still reaches the agent as an ordinary message.
-      const linkRequested = text.trim().toLowerCase() === 'link';
       // THE CONVERSATION KEY differs by surface shape, and getting it wrong
       // is amnesia: a DM is ONE ongoing conversation (key it by the channel —
       // keying by message ts would mint a fresh session per message), while a
       // channel conversation is the THREAD the mention started. Replies post
       // accordingly: into the DM's main flow, into the channel's thread.
       const dm = ev.channel_type === 'im' || String(ev.channel ?? '').startsWith('D');
+      // The account-linking gesture (spec §12): the bare word "link" asks for
+      // a one-time URL that ties this Slack identity to a signed-in web
+      // account. A reserved word rather than a slash command so it needs no
+      // extra Slack configuration; it is an exact-word match, so "link my
+      // account please" still reaches the agent as an ordinary message. DMs
+      // ONLY: the URL is a credential, and the core refuses to post one into
+      // a group anyway — in a channel the word is just a message.
+      const linkRequested = dm && text.trim().toLowerCase() === 'link';
       const threadTs = ev.thread_ts ?? ev.ts;
       return {
         intent: linkRequested ? { kind: 'link-request' } : { kind: 'message', text },
@@ -266,6 +281,9 @@ export const slackLens: Lens = {
       const action = payload.actions[0];
       let value: { token?: string; toolCallId?: string } = {};
       try { value = JSON.parse(action.value ?? '{}'); } catch { return NOOP; }
+      // `JSON.parse('null')` succeeds — guard the shape before reading it, or
+      // a crafted value becomes a TypeError, a 500, and a provider retry loop.
+      if (!value || typeof value !== 'object') return NOOP;
       if (value.token !== 'approve' && value.token !== 'deny') return NOOP;
       const team = payload.user?.team_id ?? payload.team?.id ?? '';
       const channel = payload.channel?.id ?? '';
@@ -317,10 +335,17 @@ export function slackTransport(options: SlackTransportOptions): ChannelTransport
   return {
     async post(destination: unknown, payload: unknown, opts: { idempotencyKey: string }) {
       const dest = (destination ?? {}) as { channel?: string; threadTs?: string };
+      // Payload FIRST, addressing and policy LAST: a lens payload (ours, or an
+      // app's override) can never redirect a post to another channel or
+      // thread, and the rendering policy cannot be loosened from a payload.
+      // `parse: 'none'` + `link_names: false` pin Slack's defaults so a bare
+      // @channel in model text stays inert even if those defaults ever move.
       const body = {
+        ...(payload as Record<string, unknown>),
         channel: dest.channel,
         ...(dest.threadTs ? { thread_ts: dest.threadTs } : {}),
-        ...(payload as Record<string, unknown>),
+        parse: 'none',
+        link_names: false,
         unfurl_links: false,
         metadata: {
           event_type: 'agent_delivery',

@@ -150,6 +150,10 @@ export const telegramLens: Lens = {
       const cq = update.callback_query;
       let data: { t?: string; c?: string } = {};
       try { data = JSON.parse(cq.data ?? '{}'); } catch { return NOOP; }
+      // Telegram lets any client send arbitrary `data` for a bot's message,
+      // and `JSON.parse('null')` succeeds — guard the shape before reading
+      // it, or a crafted click is a TypeError, a 500, and a retry loop.
+      if (!data || typeof data !== 'object') return NOOP;
       if (data.t !== 'a' && data.t !== 'd') return NOOP;
       const chat = cq.message?.chat;
       if (!chat) return NOOP;
@@ -182,7 +186,12 @@ export const telegramLens: Lens = {
       destination: { chatId: m.chat.id },
       audience: (m.chat.type === 'private' ? 'direct' : 'group') as 'direct' | 'group',
     };
-    if (isLinkGesture(text)) return { intent: { kind: 'link-request' }, ...envelope };
+    // The linking gesture is honored in PRIVATE chats only: the URL it earns
+    // is a credential, and the core refuses to post one into a group anyway —
+    // in a group, `/link` is just a message.
+    if (isLinkGesture(text) && m.chat.type === 'private') {
+      return { intent: { kind: 'link-request' }, ...envelope };
+    }
     return { intent: { kind: 'message', text }, ...envelope };
   },
 };
@@ -209,7 +218,8 @@ export function telegramTransport(options: TelegramTransportOptions): ChannelTra
       const res = await doFetch(`https://api.telegram.org/bot${options.botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ chat_id: dest.chatId, ...(payload as Record<string, unknown>) }),
+        // Payload first, addressing last: a payload can never redirect a post.
+        body: JSON.stringify({ ...(payload as Record<string, unknown>), chat_id: dest.chatId }),
       });
       const json: any = await res.json();
       if (!json?.ok) {

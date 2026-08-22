@@ -197,6 +197,8 @@ export const whatsappLens: Lens = {
     if (m.type === 'interactive' && m.interactive?.button_reply) {
       let data: { t?: string; c?: string } = {};
       try { data = JSON.parse(m.interactive.button_reply.id ?? '{}'); } catch { return NOOP; }
+      // `JSON.parse('null')` succeeds — guard the shape before reading it.
+      if (!data || typeof data !== 'object') return NOOP;
       if (data.t !== 'approve' && data.t !== 'deny') return NOOP;
       return {
         intent: {
@@ -253,10 +255,11 @@ export function whatsappTransport(options: WhatsAppTransportOptions): ChannelTra
             authorization: `Bearer ${options.accessToken}`,
             'content-type': 'application/json',
           },
+          // Payload first, addressing last: a payload can never redirect a post.
           body: JSON.stringify({
+            ...(payload as Record<string, unknown>),
             messaging_product: 'whatsapp',
             to: dest.to,
-            ...(payload as Record<string, unknown>),
           }),
         },
       );

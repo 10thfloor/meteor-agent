@@ -104,10 +104,11 @@ Free-form messages deliver only within 24 hours of the customer's last
 message; outside it the Graph API refuses by policy (error 131047 — template
 messages are the sanctioned alternative, out of scope for v1). What this
 package does about it is deliberate: the refusal leaves the delivery receipt
-mid-`sending`, the worker's sweep keeps retrying, and **the reply delivers
-itself the next time the customer writes** and the window reopens. A late
-answer waits at the door rather than being lost — know that it works this
-way before pointing a slow agent at WhatsApp.
+mid-`sending`, the worker retries it on a backoff (doubling from one sweep,
+capped at an hour, given up after 48 attempts — about two days), and **the
+reply delivers itself within the hour after the customer writes again** and
+the window reopens. A late answer waits at the door rather than being lost —
+know that it works this way before pointing a slow agent at WhatsApp.
 
 ## Rendering
 

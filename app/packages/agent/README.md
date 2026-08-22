@@ -1143,7 +1143,13 @@ bounds one conversation, not the sum of all of them, and an agent defined with
 no `budget` has no brake of its own — startup logs a warning naming every such
 agent. DDP `rateLimit` entries (`sends`, `compacts`, …) are **opt-in and bucket
 per connection** for anonymous callers (per user for authenticated ones), so
-they cap one caller's rate, not the fleet's aggregate cost.
+they cap one caller's rate, not the fleet's aggregate cost. Note the
+startup warning names only the *spend* residual (no `budget`, no `sends`
+limit): on a default deployment, session creation (`agent.start`/`agent.fork`)
+and on-demand compaction (`agent.compact`, a provider round-trip each) are
+also unbounded per caller until you configure their `rateLimit` entries or an
+app-level gateway ceiling — the package cannot see your proxy, so it does not
+pretend to.
 
 None of that is a deployment-wide ceiling, and an **anonymous-reachable agent
 has no per-caller identity to bound** — a capability-URL flood is N connections,

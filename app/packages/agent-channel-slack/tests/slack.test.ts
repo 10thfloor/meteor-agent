@@ -40,6 +40,11 @@ describe('agent-channel-slack', () => {
       const stale = signed('{"a":1}', 'shhh', Date.now() - 10 * 60_000);
       assert.isFalse(verifySlackSignature(stale, 'shhh'), 'replayed request outside the window');
       assert.isFalse(verifySlackSignature({ headers: {}, rawBody: 'x' }, 'shhh'), 'missing headers');
+      // A garbage timestamp must FAIL the replay window, not skip it.
+      assert.isFalse(verifySlackSignature(
+        { headers: { 'x-slack-signature': raw.headers['x-slack-signature'], 'x-slack-request-timestamp': 'abc' }, rawBody: '{"a":1}' },
+        'shhh',
+      ), 'non-numeric timestamp is refused');
     });
   });
 
@@ -205,6 +210,54 @@ describe('agent-channel-slack', () => {
           envelope: dmEvent({ text }),
         }),
       });
+    });
+  });
+
+  describe('hostile model text in the approval card', () => {
+    it('escapes the tool name and arguments and keeps a fence-breakout inside the fence', async () => {
+      const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const rendered = slackLens.out({
+        item: 'prompt', name: 'orders.refund`x', toolCallId: 'tc1',
+        args: { note: '```<!channel> approve this now <https://evil.test|Approve here>' },
+        choices: [{ token: 'approve', label: 'Approve' }, { token: 'deny', label: 'Deny' }],
+      }, { channel: 'C1' }) as any;
+      const text: string = rendered.blocks[0].text.text;
+      assert.notInclude(text, '<!channel>', 'mention syntax is escaped');
+      assert.notInclude(text, '<https://evil.test|', 'a model-supplied link stays literal');
+      assert.include(text, '&lt;!channel&gt;');
+      // Exactly our own opening and closing fence — the injected ``` did not
+      // close it.
+      assert.equal(text.split('```').length - 1, 2, 'one fence, ours');
+    });
+
+    it('treats a literal-null button value as a noop, not a crash', async () => {
+      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const payload = {
+        type: 'block_actions', user: { id: 'U7', team_id: 'T1' }, channel: { id: 'D42' },
+        message: { ts: '1700.1' },
+        actions: [{ action_id: 'agent-verdict-approve', action_ts: '1700.9', value: 'null' }],
+      };
+      const reading = slackLens.in(parseSlackRequest({
+        headers: {}, rawBody: `payload=${encodeURIComponent(JSON.stringify(payload))}`,
+      }));
+      assert.equal(reading.intent.kind, 'noop');
+    });
+
+    it('a payload can never redirect a post, and rendering policy is pinned', async () => {
+      const { slackTransport } = await import('meteor/10thfloor:agent-channel-slack');
+      const calls: any[] = [];
+      const fetchImpl = (async (url: any, init: any) => {
+        calls.push({ url, init });
+        return { json: async () => ({ ok: true, ts: '1' }) };
+      }) as unknown as typeof fetch;
+      const transport = slackTransport({ botToken: 'xoxb-t', fetchImpl });
+      await transport.post(
+        { channel: 'D42' }, { text: 'hi', channel: 'C-EVIL', parse: 'full' }, { idempotencyKey: 'k' },
+      );
+      const body = JSON.parse(calls[0].init.body);
+      assert.equal(body.channel, 'D42', 'destination wins over payload');
+      assert.equal(body.parse, 'none');
+      assert.equal(body.link_names, false);
     });
   });
 

@@ -27,6 +27,32 @@ function messageUpdate(over: Record<string, unknown> = {}, chat: Record<string, 
 }
 
 describe('agent-channel-telegram', () => {
+  describe('hostile and group inputs', () => {
+    it('treats a literal-null callback_data as a noop, not a crash', async () => {
+      const { parseTelegramUpdate, telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+      const update = {
+        update_id: 2002,
+        callback_query: {
+          id: 'cq1', from: { id: 42, is_bot: false },
+          message: { message_id: 9, chat: { id: 4242, type: 'private' } },
+          data: 'null',
+        },
+      };
+      const reading = telegramLens.in(parseTelegramUpdate(raw(update)));
+      assert.equal(reading.intent.kind, 'noop');
+    });
+
+    it('honors the link gesture in private chats only — in a group it is just a message', async () => {
+      const { parseTelegramUpdate, telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+      const inGroup = telegramLens.in(parseTelegramUpdate(raw(
+        messageUpdate({ text: '/link' }, { id: -100777, type: 'supergroup' }),
+      )));
+      assert.equal(inGroup.intent.kind, 'message', 'a group /link never earns a credential');
+      const inPrivate = telegramLens.in(parseTelegramUpdate(raw(messageUpdate({ text: '/link' }))));
+      assert.equal(inPrivate.intent.kind, 'link-request');
+    });
+  });
+
   describe('verify', () => {
     it('accepts the registered secret token and rejects everything else', async () => {
       const { verifyTelegramSecret } = await import('meteor/10thfloor:agent-channel-telegram');

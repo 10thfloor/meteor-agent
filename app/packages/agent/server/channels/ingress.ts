@@ -33,19 +33,38 @@ interface InboundResponse { status: number; body?: string }
  *  BEFORE the admission claim — the throttle is a counter, the claim is a
  *  database write, and validly-signed junk must not buy an insert each. A
  *  throttled provider retry simply retries later and collides with the claim
- *  then. Keys are pruned as they empty, so the map is bounded by concurrent
- *  senders, not history. */
-const windows = new Map<string, number[]>();
+ *  then.
+ *
+ *  Bounded by CONCURRENT senders, not history: every `PRUNE_EVERY` calls the
+ *  map is swept and any key whose newest hit has aged out of its own window
+ *  is dropped, so a phone number that texted once last month does not hold
+ *  an entry forever. (Only signature-verified senders ever create a key —
+ *  the throttle runs after `verify` — so an anonymous flood cannot grow it;
+ *  the sweep is about long-lived processes, not attackers.) */
+const windows = new Map<string, { hits: number[]; intervalMs: number }>();
+const PRUNE_EVERY = 512;
+let callsSincePrune = 0;
+
+function pruneWindows(now: number): void {
+  for (const [key, w] of windows) {
+    const newest = w.hits[w.hits.length - 1];
+    if (newest === undefined || now - newest >= w.intervalMs) windows.delete(key);
+  }
+}
 
 function throttled(key: string, limit: number, intervalMs: number): boolean {
   const now = Date.now();
-  const hits = (windows.get(key) ?? []).filter((t) => now - t < intervalMs);
+  if ((callsSincePrune += 1) >= PRUNE_EVERY) {
+    callsSincePrune = 0;
+    pruneWindows(now);
+  }
+  const hits = (windows.get(key)?.hits ?? []).filter((t) => now - t < intervalMs);
   if (hits.length >= limit) {
-    windows.set(key, hits);
+    windows.set(key, { hits, intervalMs });
     return true;
   }
   hits.push(now);
-  windows.set(key, hits);
+  windows.set(key, { hits, intervalMs });
   return false;
 }
 
@@ -53,6 +72,14 @@ function throttled(key: string, limit: number, intervalMs: number): boolean {
  *  the previous test's windows. */
 export function _clearThrottle(): void {
   windows.clear();
+  callsSincePrune = 0;
+}
+
+/** TEST SEAM: how many senders the throttle is currently tracking, and a way
+ *  to force the sweep — the bound is the property under test. */
+export function _throttleStats(now = Date.now()): { tracked: number } {
+  pruneWindows(now);
+  return { tracked: windows.size };
 }
 
 // ---- Binding first, session second (§6.2 / §9) -----------------------------
@@ -89,6 +116,10 @@ async function upsertBinding(
         agent: def.agent,
         sessionId,
         userId: identity?.userId ?? null,
+        // The OPENER's proof strength, recorded at bind time so a later
+        // repair-on-entry (below) stamps the session with the owner's
+        // assurance — not that of whoever happens to trigger the repair.
+        assurance: identity?.assurance ?? 'none',
         ...(reading.externalUserId !== undefined
           ? { externalUserId: reading.externalUserId } : {}),
         deliveredSeq: 0,
@@ -101,6 +132,11 @@ async function upsertBinding(
     }
     binding = await ChannelBindings.findOneAsync(bindingId);
     if (!binding) return null;
+  } else {
+    // Activity bump: the egress sweep only walks RECENTLY active bindings
+    // (its lookback is what keeps a process's sweep cost proportional to live
+    // conversations, not history), so every inbound event marks its binding.
+    await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
   }
 
   // Repair-on-entry: create the session the binding names if it does not
@@ -111,7 +147,7 @@ async function upsertBinding(
   const config = getAgent(binding.agent);
   if (!config) {
     console.warn(
-      `[10thfloor:agent] channel "${kind}": binding ${bindingId} names `
+      `[10thfloor:agent] channel "${kind}": the binding for session ${binding.sessionId} names `
       + `unregistered agent "${binding.agent}"; dropping the event`,
     );
     return null;
@@ -128,7 +164,8 @@ async function upsertBinding(
         nextSeq: 0,
         usage: { input: 0, output: 0, cost: 0 },
         budgetSpent: { turns: 0, toolCalls: 0 },
-        channel: { origin: kind, assurance: identity?.assurance ?? 'none' },
+        // The OWNER's assurance, from the binding — not the current sender's.
+        channel: { origin: kind, assurance: binding.assurance ?? 'none' },
         createdAt: new Date(),
         updatedAt: new Date(),
       });
@@ -181,16 +218,31 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   if (!(await def.verify(raw))) return { status: 401 };
 
   // 2. INTERPRET — pure: raw → provider event → reading. No side effects yet.
-  const reading = def.lens.in(def.parse(raw));
+  // A VERIFIED event the lens cannot interpret (a user-craftable callback
+  // payload of literal `null`, a shape the provider added last week) must
+  // SETTLE, not 500: a 500 invites the provider's retry loop, and a lens bug
+  // must never become a channel-wide outage. Logged once per event, answered
+  // 200, forgotten.
+  let reading: InboundReading;
+  try {
+    reading = def.lens.in(def.parse(raw));
+  } catch (e) {
+    console.warn(`[10thfloor:agent] channel "${kind}": lens could not interpret a verified event:`, e);
+    return { status: 200 };
+  }
 
   // A noop settles immediately — and may carry a provider-mandated echo
   // (Slack's URL-verification challenge rides `reading.respond`).
   if (reading.intent.kind === 'noop') return { status: 200, body: reading.respond };
 
-  // 3. THROTTLE — per sender, before the claim buys a write.
+  // 3. THROTTLE — per sender, before the claim buys a write. Throttled events
+  // are DROPPED with a 200, not refused with a 429: providers retry non-2xx
+  // (Slack up to three times, Twilio likewise) and count failures toward
+  // disabling the integration, so a 429 would let one abusive sender degrade
+  // the whole channel. Settled and forgotten is the safe answer.
   const t = def.throttle ?? { limit: 30, intervalMs: 60_000 };
   const sender = reading.externalUserId ?? reading.conversationRef ?? 'unknown';
-  if (throttled(`${kind}:${sender}`, t.limit, t.intervalMs)) return { status: 429 };
+  if (throttled(`${kind}:${sender}`, t.limit, t.intervalMs)) return { status: 200 };
 
   // 4. CLAIM the event id — exactly-once admission (§11). A provider retry
   // collides on the derived _id and is answered 200 without running twice.
@@ -246,6 +298,21 @@ async function route(
   // is a courier, not an authority.
   const userId = identity?.userId ?? null;
 
+  // GROUP surfaces, anonymous conversation: only the OPENER may drive it.
+  // `requireSession` scopes OWNED sessions, but an anonymous (`userId: null`)
+  // session matches every unlinked caller — so on a surface where others can
+  // see the conversation, any member could send into it or press Approve on
+  // someone else's ask. The binding recorded who opened it; until someone
+  // links, that is the only party with standing. Settled silently: a refusal
+  // posted into the thread is itself a spam channel.
+  const opener = binding.externalUserId;
+  if (
+    binding.audience === 'group' && binding.userId === null
+    && opener !== undefined && reading.externalUserId !== opener
+  ) {
+    return { status: 200 };
+  }
+
   try {
     if (intent.kind === 'message') {
       // Free text answers an outstanding prompt first (§8.3), else it is a
@@ -275,10 +342,21 @@ async function route(
       return { status: 200 };
     }
 
-    // link-request: mint the one-time token and offer it on the SAME surface
-    // the request came from — idempotent per event via the receipt, like any
-    // other delivery. Without a `linkUrl` there is nothing to offer.
+    // link-request. The linking URL is a CREDENTIAL: whoever opens it while
+    // signed in becomes this external identity's account and inherits the
+    // anonymous history it created. So, exactly like the overflow URL (§8.5),
+    // it only ever travels to a `direct` destination — posted into a group it
+    // would let any member hijack the requester. On a group surface the
+    // answer is a hint, not a token. Without a `linkUrl` there is nothing to
+    // offer at all.
     if (!def.linkUrl || reading.externalUserId === undefined) return { status: 200 };
+    if (binding.audience !== 'direct') {
+      await deliverOnce(kind, binding, {
+        item: 'reply',
+        text: 'To link your account, send me the word "link" in a direct message — not here.',
+      }, `link-hint:${reading.eventId ?? reading.externalUserId}`, { def });
+      return { status: 200 };
+    }
     const token = await issueLinkToken(kind, reading.externalUserId);
     await deliverOnce(kind, binding, {
       item: 'reply',
@@ -292,8 +370,11 @@ async function route(
     // answer 200 and log; only unexpected failures propagate to the 500/
     // release path in `handleInbound`.
     if (e instanceof Meteor.Error) {
+      // The session id, never the binding id: binding ids embed the
+      // conversation key, which for SMS/WhatsApp is a phone number — PII that
+      // has no business in a log line.
       console.warn(
-        `[10thfloor:agent] channel "${kind}": ${intent.kind} for ${binding._id} `
+        `[10thfloor:agent] channel "${kind}": ${intent.kind} for session ${binding.sessionId} `
         + `refused (${String(e.error)}); the event is settled`,
       );
       return { status: 200 };

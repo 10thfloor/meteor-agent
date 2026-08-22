@@ -1,3 +1,4 @@
+import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentSessions } from '../../common/collections';
 import { recordVerdict } from '../methods';
@@ -79,7 +80,15 @@ export async function redeemLinkToken(
   ) as unknown as { kind: string; externalUserId: string; expiresAt: Date } | null;
   if (!doc) return null;
   if (doc.expiresAt.getTime() < Date.now()) return null;
-  return linkIdentity(doc.kind, doc.externalUserId, userId, 'link');
+  try {
+    return await linkIdentity(doc.kind, doc.externalUserId, userId, 'link');
+  } catch (e) {
+    // `already-linked`: the identity belongs to another account. The token
+    // is spent either way, and the answer is the same indistinguishable null
+    // every other failure gives — a probe learns nothing about which.
+    if (e instanceof Meteor.Error && e.error === 'already-linked') return null;
+    throw e;
+  }
 }
 
 /**
@@ -109,10 +118,20 @@ export async function linkIdentity(
     await ChannelIdentities.insertAsync(row);
   } catch (e) {
     if (!isDuplicateKey(e)) throw e;
-    // Re-linking (a second surface session, or an assurance upgrade): take the
-    // stronger proof, never downgrade — an `oidc` row stays `oidc` even when a
-    // later link-token flow re-proves the weaker way.
     const existing = await ChannelIdentities.findOneAsync(_id);
+    // A DIFFERENT account presenting proof for an already-linked identity is
+    // REFUSED, not re-pointed. Re-pointing would silently dispossess the
+    // current owner (their conversations stay theirs while the surface's
+    // messages start failing), and carrying the old `oidc` label across a
+    // userId change would let a weak proof inherit a strong one — a SIM-swap
+    // or a leaked token would arrive wearing OAuth's badge. Unlinking is an
+    // explicit, separate act (spec §15), never a side effect of linking.
+    if (existing && existing.userId !== userId) {
+      throw new Meteor.Error('already-linked', 'This identity is linked to a different account.');
+    }
+    // The SAME account re-proving itself (a second surface session, an
+    // assurance upgrade): keep the stronger proof, never downgrade — an
+    // `oidc` row stays `oidc` when a later link-token flow re-proves weaker.
     const keepOidc = existing?.assurance === 'oidc';
     await ChannelIdentities.updateAsync(_id, {
       $set: {

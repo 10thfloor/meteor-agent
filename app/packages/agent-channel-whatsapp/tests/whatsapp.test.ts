@@ -44,6 +44,19 @@ function textEvent(over: Record<string, unknown> = {}) {
 }
 
 describe('agent-channel-whatsapp', () => {
+  describe('hostile inputs', () => {
+    it('treats a literal-null button id as a noop, not a crash', async () => {
+      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
+      const event = textEvent({
+        type: 'interactive',
+        text: undefined,
+        interactive: { type: 'button_reply', button_reply: { id: 'null', title: 'Approve' } },
+      });
+      const reading = whatsappLens.in(parseWhatsAppRequest(signed(event)));
+      assert.equal(reading.intent.kind, 'noop');
+    });
+  });
+
   describe('verify', () => {
     it('authenticates the GET handshake by verify_token', async () => {
       const { verifyWhatsAppRequest } = await import('meteor/10thfloor:agent-channel-whatsapp');

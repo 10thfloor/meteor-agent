@@ -89,21 +89,33 @@ export async function ensureIndexes(): Promise<void> {
       keys: { kind: 1, externalUserId: 1 },
       options: { sparse: true },
     },
+    // The egress sweep's lookback slice (`{ kind, updatedAt: { $gt } }`) —
+    // what bounds per-sweep cost to live conversations (egress.ts
+    // `sweepLookbackMs`).
+    {
+      collection: ChannelBindings,
+      name: NAMES.channelBindings,
+      keys: { kind: 1, updatedAt: 1 },
+    },
     {
       collection: DeliveryReceipts,
       name: NAMES.deliveryReceipts,
       keys: { bindingId: 1 },
     },
-    // TTL reapers. Admissions outlive every provider's retry schedule by a
-    // wide margin (48h); tokens carry their own expiry and the TTL is only the
-    // janitor — redemption checks `expiresAt` itself, because Mongo's TTL
-    // sweep runs on its own schedule and a token must be dead the millisecond
-    // it expires, not within a minute of it.
+    // TTL reapers. Admissions are kept a week: that is the replay horizon for
+    // providers whose signatures carry no timestamp (Twilio; WhatsApp's
+    // message timestamp is inside the signed body but Meta legitimately
+    // redelivers old payloads after an outage, so the lens does not refuse on
+    // age) — a captured signed request can be replayed at most once it is
+    // older than this, and the rows are tiny. Tokens carry their own expiry
+    // and the TTL is only the janitor — redemption checks `expiresAt` itself,
+    // because Mongo's TTL sweep runs on its own schedule and a token must be
+    // dead the millisecond it expires, not within a minute of it.
     {
       collection: InboundSubmissions,
       name: NAMES.inboundSubmissions,
       keys: { at: 1 },
-      options: { expireAfterSeconds: 48 * 60 * 60 },
+      options: { expireAfterSeconds: 7 * 24 * 60 * 60 },
     },
     {
       collection: ChannelLinkTokens,

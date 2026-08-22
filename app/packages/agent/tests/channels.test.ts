@@ -47,7 +47,8 @@ function testLens() {
         externalUserId: event.user,
         conversationRef: event.convo,
         destination: { to: event.convo },
-        audience: 'direct' as const,
+        // `group: true` on a test event models a surface others can see.
+        audience: (event.group ? 'group' : 'direct') as 'group' | 'direct',
       };
       if (event.type === 'action') {
         return {
@@ -313,7 +314,7 @@ describe('channels', () => {
       assert.equal(users.length, 1, 'one admission, one user row');
     });
 
-    it('throttles a flood per sender without buying admission writes', async () => {
+    it('throttles a flood per sender — dropped with a 200, and without buying admission writes', async () => {
       await registerTestChannel({ throttle: { limit: 2, intervalMs: 60_000 } });
       const { handleInbound } = await import('../server/channels/ingress');
       const { InboundSubmissions } = await import('../server/channels/collections');
@@ -323,8 +324,65 @@ describe('channels', () => {
           'test', raw({ type: 'msg', text: 'x', id: `e${i}`, user: 'flooder', convo: 'c1' }),
         )).status);
       }
-      assert.deepEqual(statuses, [200, 200, 429, 429]);
+      // 200 throughout: a 429 would be a failure the provider retries and
+      // counts against the integration — throttled events are settled, not
+      // refused. The admission count is the proof they were dropped.
+      assert.deepEqual(statuses, [200, 200, 200, 200]);
       assert.equal(await InboundSubmissions.find({}).countAsync(), 2, 'throttled events bought no insert');
+    });
+
+    it('never posts a linking URL into a group — it offers a hint instead', async () => {
+      const { transport } = await registerTestChannel({
+        linkUrl: (token: string) => `https://app.test/link/${token}`,
+      });
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({ type: 'msg', text: 'hi', id: 'g1', user: 'ext-g', convo: 'room', group: true }));
+      await handleInbound('test', raw({ type: 'link', id: 'g2', user: 'ext-g', convo: 'room', group: true }));
+      const { ChannelLinkTokens } = await import('../server/channels/collections');
+      assert.equal(await ChannelLinkTokens.find({}).countAsync(), 0, 'no token was minted for a group request');
+      assert.isTrue(
+        transport.posts.some((p) => String(p.payload.text).includes('direct message')),
+        'the group got a hint, not a credential',
+      );
+      assert.isFalse(transport.posts.some((p) => String(p.payload.text).includes('/link/')), 'no URL left the server');
+    });
+
+    it('an anonymous group conversation answers only to the member who opened it', async () => {
+      await registerTestChannel();
+      const { handleInbound } = await import('../server/channels/ingress');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      await handleInbound('test', raw({ type: 'msg', text: 'opener here', id: 'o1', user: 'opener', convo: 'thread', group: true }));
+      const binding = (await ChannelBindings.findOneAsync('test:thread'))!;
+      assert.equal(binding.userId, null, 'anonymous conversation');
+      assert.equal(binding.audience, 'group');
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+
+      // A bystander sends into it — nothing enters.
+      await handleInbound('test', raw({ type: 'msg', text: 'me too', id: 'b1', user: 'bystander', convo: 'thread', group: true }));
+      assert.equal(await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync(), before);
+
+      // A bystander clicks Approve on the opener's parked ask — nothing decided.
+      await AgentSessions.updateAsync(binding.sessionId, {
+        $set: { phase: 'awaiting', pending: { toolCallId: 'tc-g', name: 'refund', args: {} } },
+      });
+      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-g', id: 'b2', user: 'bystander', convo: 'thread', group: true }));
+      assert.isUndefined(await AgentMessages.findOneAsync({ sessionId: binding.sessionId, kind: 'approval' }), 'bystander decided nothing');
+
+      // The opener still can.
+      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-g', id: 'o2', user: 'opener', convo: 'thread', group: true }));
+      assert.isDefined(await AgentMessages.findOneAsync({ sessionId: binding.sessionId, kind: 'approval' }), 'the opener decides their own ask');
+    });
+
+    it('forgets senders whose window has aged out — the throttle is bounded by concurrency, not history', async () => {
+      await registerTestChannel({ throttle: { limit: 5, intervalMs: 1_000 } });
+      const { handleInbound, _throttleStats } = await import('../server/channels/ingress');
+      for (let i = 0; i < 25; i += 1) {
+        await handleInbound('test', raw({ type: 'msg', text: 'x', id: `e${i}`, user: `sender-${i}`, convo: `c-${i}` }));
+      }
+      assert.equal(_throttleStats().tracked, 25, 'each distinct sender holds a window while live');
+      // A second later every window has aged out; the sweep must drop them all.
+      assert.equal(_throttleStats(Date.now() + 1_500).tracked, 0, 'aged-out senders are forgotten');
     });
 
     it('routes noop without touching anything', async () => {
@@ -390,6 +448,21 @@ describe('channels', () => {
       assert.equal(status, 413);
     });
 
+    it('settles a verified event the lens cannot interpret with 200 — never a retry-inviting 500', async () => {
+      const { def } = await registerTestChannel();
+      const base = def.lens.in.bind(def.lens);
+      def.lens.in = (event: any) => {
+        if (event.type === 'poison') throw new TypeError("Cannot read properties of null (reading 't')");
+        return base(event);
+      };
+      const { handleInbound } = await import('../server/channels/ingress');
+      const out = await handleInbound('test', raw({ type: 'poison' }));
+      assert.equal(out.status, 200);
+      // And the pipeline is intact afterwards.
+      const ok = await handleInbound('test', raw({ type: 'msg', text: 'still here', id: 'p1', user: 'u', convo: 'c' }));
+      assert.equal(ok.status, 200);
+    });
+
     it('echoes a noop respond as the 200 body — the URL-verification shape', async () => {
       const { def } = await registerTestChannel();
       const base = def.lens.in.bind(def.lens);
@@ -452,9 +525,78 @@ describe('channels', () => {
       const receipt = await DeliveryReceipts.findOneAsync({ bindingId: 'test:conv', state: 'sending' });
       assert.isDefined(receipt, 'the reserve stands, mid-sending');
 
+      // The retry runs on the backoff schedule — a later sweep, not the very
+      // next tick — so age the receipt past its first window as the sweep
+      // would find it.
+      await DeliveryReceipts.updateAsync(receipt!._id, { $set: { at: new Date(Date.now() - 60_000) } });
       await deliverBinding('test', 'test:conv');
       assert.deepEqual(transport.posts.map((p) => p.payload.text), ['first answer', 'second answer']);
       assert.equal((await ChannelBindings.findOneAsync('test:conv'))!.deliveredSeq, 2);
+    });
+
+    it('backs off a failing receipt instead of re-posting every sweep, then gives up after the cap', async () => {
+      const { transport } = await registerTestChannel({ onUncertainDelivery: 'retry' });
+      const { deliverBinding, MAX_DELIVERY_ATTEMPTS } = await import('../server/channels/egress');
+      const { ChannelBindings, DeliveryReceipts } = await import('../server/channels/collections');
+      await seedConversation();
+      transport.fail(1);
+      await deliverBinding('test', 'test:conv').catch(() => { /* first post fails */ });
+      assert.equal(transport.posts.length, 0);
+
+      // Immediately again: inside the backoff window → deferred, no post,
+      // cursor untouched.
+      await deliverBinding('test', 'test:conv');
+      assert.equal(transport.posts.length, 0, 'deferred: no hammering inside the window');
+      assert.equal((await ChannelBindings.findOneAsync('test:conv'))!.deliveredSeq, 0);
+
+      // Age the receipt past its window → the retry runs and delivery resumes.
+      await DeliveryReceipts.updateAsync('deliver:test:conv:m-sx-1', { $set: { at: new Date(Date.now() - 60_000) } });
+      await deliverBinding('test', 'test:conv');
+      assert.deepEqual(transport.posts.map((p) => p.payload.text), ['first answer', 'second answer']);
+
+      // The cap: a receipt at the attempt ceiling is abandoned and the
+      // conversation moves on rather than wedging forever.
+      await DeliveryReceipts.insertAsync({
+        _id: 'deliver:test:conv:m-sx-3', bindingId: 'test:conv', state: 'sending',
+        attempts: MAX_DELIVERY_ATTEMPTS, at: new Date(Date.now() - 60_000),
+      });
+      const { AgentMessages } = await import('../common/collections');
+      await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 3, content: 'third answer' }) as any);
+      await deliverBinding('test', 'test:conv');
+      assert.equal((await DeliveryReceipts.findOneAsync('deliver:test:conv:m-sx-3'))!.state, 'abandoned');
+      assert.equal((await ChannelBindings.findOneAsync('test:conv'))!.deliveredSeq, 3, 'the cursor moved past the abandoned row');
+    });
+
+    it('sweeps only recently active bindings — a parked prompt on a stale binding waits for activity', async function () {
+      this.timeout(10_000);
+      const { transport } = await registerTestChannel();
+      const { startEgress } = await import('../server/channels/egress');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      // A parked session with NO assistant rows (so the message observer has
+      // nothing to fire on — only the sweep could deliver the prompt), bound
+      // through a binding last active two days ago.
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'stale', nextSeq: 1, phase: 'awaiting',
+        pending: { toolCallId: 'tc-s', name: 'x', args: {} },
+      } as any);
+      await AgentMessages.insertAsync(msg({ sessionId: 'stale', seq: 0, role: 'user', content: 'q' }) as any);
+      await ChannelBindings.insertAsync({
+        _id: 'test:stale', kind: 'test', conversationRef: 'stale', destination: {}, audience: 'direct',
+        agent: 'channel-agent', sessionId: 'stale', userId: null, deliveredSeq: 0,
+        createdAt: new Date(Date.now() - 2 * 24 * 3_600_000), updatedAt: new Date(Date.now() - 2 * 24 * 3_600_000),
+      });
+      const worker = startEgress('test', { sweepMs: 60 });
+      try {
+        await new Promise((r) => { setTimeout(r, 400); });
+        assert.equal(transport.posts.length, 0, 'a stale binding is outside the sweep lookback');
+        // Activity bumps it back into the window; the next sweep delivers.
+        await ChannelBindings.updateAsync('test:stale', { $set: { updatedAt: new Date() } });
+        await until(async () => transport.posts.length > 0);
+        assert.include(String(transport.posts[0].payload.text), 'Approve x');
+      } finally {
+        await worker.stop();
+      }
     });
 
     it("honors 'abandon': the ambiguous receipt is given up and delivery moves on", async () => {
@@ -647,6 +789,28 @@ describe('channels', () => {
       assert.equal(out.status, 200, 'settled, not retried');
       const after = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
       assert.equal(after, before, 'the bystander\'s message never entered the owner\'s session');
+    });
+
+    it('refuses to re-point a linked identity at a different account — and never relabels a weak proof as oidc', async () => {
+      await registerTestChannel();
+      const {
+        linkIdentity, issueLinkToken, redeemLinkToken, resolveIdentity,
+      } = await import('../server/channels/linking');
+      await linkIdentity('test', 'ext-x', 'account-1', 'oidc');
+      let refused = false;
+      try {
+        await linkIdentity('test', 'ext-x', 'account-2', 'link');
+      } catch (e: any) {
+        refused = e?.error === 'already-linked';
+      }
+      assert.isTrue(refused, 'cross-account relink is refused');
+      const still = (await resolveIdentity('test', 'ext-x'))!;
+      assert.equal(still.userId, 'account-1');
+      assert.equal(still.assurance, 'oidc');
+      // Through the token path the refusal is the same indistinguishable null.
+      const token = await issueLinkToken('test', 'ext-x');
+      assert.isNull(await redeemLinkToken(token, 'account-2'));
+      assert.equal((await resolveIdentity('test', 'ext-x'))!.userId, 'account-1', 'unchanged');
     });
 
     it('a linked sender opens sessions owned by their account', async () => {

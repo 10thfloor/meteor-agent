@@ -71,6 +71,12 @@ export interface ChannelBinding {
   agent: string;
   sessionId: string;
   userId: string | null;
+  /** The OPENER's identity-proof strength at bind time (`'none'` when
+   *  unlinked). Recorded so repair-on-entry stamps a recreated session with
+   *  the owner's assurance rather than the current sender's — in a group the
+   *  two can differ. Absent on bindings created before this field existed
+   *  (read as `'none'`). */
+  assurance?: 'none' | 'link' | 'oidc';
   /** WHICH external identity opened this conversation — recorded at bind time
    *  so `linkIdentity`'s claim-history pass can find the anonymous bindings a
    *  newly-linked person created (`conversationRef` alone cannot: on Slack it
