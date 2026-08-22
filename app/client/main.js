@@ -7,9 +7,10 @@ import { Agent, defineAgentChat } from 'meteor/10thfloor:agent';
 // tool rows, phases, the approval bar — is one <agent-chat> tag. What THIS file
 // adds is the multi-surface story around it: an account (accounts-password), the
 // user's conversation list (the `agent.sessions` publication — which now
-// includes conversations that STARTED IN SLACK, badged by origin), and the
-// channel-linking hand-off (DM the bot the word "link", open the URL it
-// answers with, and the Slack conversation becomes this account's).
+// includes conversations that STARTED ON A CHANNEL (Slack, Telegram, WhatsApp,
+// SMS), badged by origin), and the channel-linking hand-off (DM the bot the
+// word "link", open the URL it answers with, and that channel's conversation
+// becomes this account's).
 //
 // Everything is plain DOM over reactive cursors — no framework, same as the
 // pre-element demo (`git show ad0dc0b:app/client/main.js`).
@@ -21,6 +22,10 @@ const $ = (id) => document.getElementById(id);
 
 Meteor.startup(() => {
   const chat = document.querySelector('agent-chat');
+  // `session-id` is a DOM attribute, not a reactive source — this dependency
+  // re-runs the list's `.current` highlight when the chat moves to another
+  // session (row click, New, the element's own auto-start).
+  const currentSession = new Tracker.Dependency();
 
   // ---- The chat element: attach BEFORE defining the tag --------------------
   // Registration upgrades the element immediately, and an upgrade with no
@@ -31,11 +36,14 @@ Meteor.startup(() => {
 
   chat.addEventListener('agent-chat:session', (e) => {
     localStorage.setItem(SESSION_KEY, e.detail.sessionId);
+    currentSession.changed();
   });
   // Self-healing on `no-session` ONLY — see the pre-element demo's history for
-  // why not on every error. It also covers the login/logout seam: an
-  // anonymous session doesn't belong to the account you just became, the next
-  // send is refused, and we fall back to a clean start.
+  // why not on every error (a transient failure must not discard a live
+  // conversation). Login/logout are handled explicitly in the auth autorun
+  // below (claimSession / startFresh); this is the backstop for a session the
+  // server no longer has: the saved id is dropped so the next load starts
+  // clean.
   chat.addEventListener('agent-chat:error', (e) => {
     if (e.detail?.error?.error !== 'no-session') return;
     localStorage.removeItem(SESSION_KEY);
@@ -46,6 +54,7 @@ Meteor.startup(() => {
   const openSession = (sessionId) => {
     localStorage.setItem(SESSION_KEY, sessionId);
     chat.setAttribute('session-id', sessionId);
+    currentSession.changed();
   };
 
   const startFresh = () => {
@@ -120,7 +129,7 @@ Meteor.startup(() => {
     pendingLinkToken = linkMatch[1];
     window.history.replaceState({}, '', '/');   // the token is spent below, not bookmarkable
     linkBox.hidden = false;
-    linkBox.textContent = 'Linking your Slack conversation — sign in (or create an account) to finish.';
+    linkBox.textContent = 'Linking a conversation from the bot — sign in (or create an account) to finish.';
   }
 
   function redeemPendingLink() {
@@ -131,7 +140,7 @@ Meteor.startup(() => {
     linkBox.textContent = 'Linking…';
     Meteor.callAsync('demo.linkChannel', token).then((res) => {
       linkBox.textContent = `Linked ${res.kind} identity ${res.externalUserId}. `
-        + 'Your Slack conversation now belongs to this account — it is in the list below, '
+        + `Your ${res.kind} conversation now belongs to this account — it is in the list below, `
         + 'and the agent knows who you are on both surfaces.';
     }).catch((err) => {
       linkBox.textContent = err?.reason ?? 'Linking failed.';
@@ -162,32 +171,40 @@ Meteor.startup(() => {
         // (see demo.claimSession), so signing in keeps the thread and makes
         // it durable. Only when there is nothing claimable (no held session,
         // db wiped, someone else's) does the account start clean.
-        const held = localStorage.getItem(SESSION_KEY) ?? '';
-        Meteor.callAsync('demo.claimSession', held).then((outcome) => {
-          if (outcome === 'no') {
+        const held = localStorage.getItem(SESSION_KEY);
+        if (!held) {
+          startFresh();
+        } else {
+          Meteor.callAsync('demo.claimSession', held).then((outcome) => {
+            if (outcome === 'no') {
+              localStorage.removeItem(SESSION_KEY);
+              startFresh();
+              return;
+            }
+            if (outcome === 'claimed') {
+              // The login re-ran the element's subscription BEFORE the claim
+              // landed — authorized as the new user against a still-anonymous
+              // session, it published nothing, and publications do not re-run
+              // when data changes. Remounting is the element's public reset
+              // seam ("tears down on disconnect, re-mounts clean"): it
+              // re-subscribes as the owner the session now has, and the
+              // transcript comes back.
+              const parent = chat.parentNode;
+              const next = chat.nextSibling;
+              chat.remove();
+              parent.insertBefore(chat, next);
+            }
+            // 'yours' (a re-login): the re-run subscription already authorized
+            // correctly — nothing to do.
+          }).catch((err) => {
+            // A failed claim (disconnect, rate limit) is treated like 'no':
+            // the held session would sit unreadable under the new identity, so
+            // start clean — but say so, this path was silent.
+            console.error('[demo] could not claim the held session; starting clean:', err);
             localStorage.removeItem(SESSION_KEY);
             startFresh();
-            return;
-          }
-          if (outcome === 'claimed') {
-            // The login re-ran the element's subscription BEFORE the claim
-            // landed — authorized as the new user against a still-anonymous
-            // session, it published nothing, and publications do not re-run
-            // when data changes. Remounting is the element's public reset
-            // seam ("tears down on disconnect, re-mounts clean"): it
-            // re-subscribes as the owner the session now has, and the
-            // transcript comes back.
-            const parent = chat.parentNode;
-            const next = chat.nextSibling;
-            chat.remove();
-            parent.insertBefore(chat, next);
-          }
-          // 'yours' (a re-login): the re-run subscription already authorized
-          // correctly — nothing to do.
-        }).catch(() => {
-          localStorage.removeItem(SESSION_KEY);
-          startFresh();
-        });
+          });
+        }
       } else {
         // Sign-OUT: the account's sessions are not anonymous-reachable, so a
         // clean anonymous conversation is the only honest continuation.
@@ -206,13 +223,12 @@ Meteor.startup(() => {
   const list = $('sessions-list');
   const empty = $('sessions-empty');
   Tracker.autorun(() => {
+    currentSession.depend();
     const signedIn = !!Meteor.userId();
-    // Minimongo doesn't inherit the publication's sort — order here.
-    const sessions = (signedIn ? demo.sessions().fetch() : [])
-      .sort((a, b) => (b.updatedAt?.getTime?.() ?? 0) - (a.updatedAt?.getTime?.() ?? 0));
+    const sessions = signedIn ? demo.sessions().fetch() : [];   // newest first — `sessions()` sorts by updatedAt desc
     empty.hidden = signedIn && sessions.length > 0;
     empty.textContent = signedIn
-      ? 'No conversations yet — say something, or DM the Slack bot.'
+      ? 'No conversations yet — say something, or DM the bot on any linked surface.'
       : 'Sign in to see your conversations across surfaces.';
     list.textContent = '';
     for (const session of sessions) {
@@ -220,7 +236,7 @@ Meteor.startup(() => {
       const button = document.createElement('button');
       button.type = 'button';
       button.className = 'session-row';
-      if (session._id === chat.getAttribute('session-id')) button.classList.add('current');
+      if (session._id === chat.sessionId) button.classList.add('current');
       const title = document.createElement('span');
       title.className = 'session-title';
       title.textContent = session.title ?? `Conversation ${session._id.slice(0, 6)}`;

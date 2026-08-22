@@ -115,7 +115,16 @@ function overflowUrlFor(
   return def.sessionUrl(session);
 }
 
-const dup = isDuplicateKey;
+/** Settle a `sending` receipt — guarded on `sending`, so of a crash-recovery
+ *  worker and a racing settle exactly one write lands. */
+async function settleReceipt(
+  receiptId: string, state: 'sent' | 'abandoned', providerMessageId?: string,
+): Promise<void> {
+  await DeliveryReceipts.updateAsync(
+    { _id: receiptId, state: 'sending' },
+    { $set: { state, ...(providerMessageId !== undefined ? { providerMessageId } : {}), at: new Date() } },
+  );
+}
 
 /**
  * The three-phase intent log (§11): reserve → post → confirm, keyed on a
@@ -124,9 +133,14 @@ const dup = isDuplicateKey;
  * on every boot.
  *
  * Returns `'delivered'` when the item is durably `sent` (whether by this call
- * or a previous one), `'abandoned'` when the channel's declared recovery gave
- * it up. Throws when the transport fails — the caller stops and the next
- * sweep retries under the same receipt.
+ * or a previous one), `'abandoned'` when the channel's declared recovery or
+ * the attempt cap gave it up, and `'deferred'` when a prior `sending` receipt
+ * is still inside its backoff window — nothing was posted; a cursor-driven
+ * caller stops and the next sweep retries, a one-shot caller (ingress, a tool
+ * body) should treat it as not sent. Throws when the transport fails — the
+ * caller stops and the next sweep retries under the same receipt.
+ *
+ * `item` may be a thunk; it runs only when a post actually happens.
  *
  * EXPORTED for tool bodies (§7's `channel.notify` shape): tool dispatch
  * re-runs on crash recovery — the package's own dispatch comment calls that
@@ -137,7 +151,7 @@ const dup = isDuplicateKey;
 export async function deliverOnce(
   kind: string,
   binding: ChannelBinding,
-  item: DeliveryItem,
+  item: DeliveryItem | (() => Promise<DeliveryItem>),
   suffix: string,
   opts: { expects?: ReceiptExpectation[]; def?: ChannelDef } = {},
 ): Promise<'delivered' | 'abandoned' | 'deferred'> {
@@ -157,7 +171,7 @@ export async function deliverOnce(
     });
     reserved = true;
   } catch (e) {
-    if (!dup(e)) throw e;
+    if (!isDuplicateKey(e)) throw e;
   }
 
   if (!reserved) {
@@ -165,24 +179,19 @@ export async function deliverOnce(
     if (!existing || existing.state === 'sent') return 'delivered';
     if (existing.state === 'abandoned') return 'abandoned';
     // Mid-`sending`: a crash between post and confirm, or a concurrent worker
-    // still in flight. The claim serializes workers per binding, so by the
-    // time we are here under the claim, "concurrent" is over and this is the
-    // crash case — apply the declared recovery.
+    // still in flight. Under `deliverBinding` the claim serializes workers per
+    // binding, so "concurrent" is over and this is the crash case; a one-shot
+    // caller is serialized by its own guard (the inbound event claim, the loop
+    // lease). Either way: apply the declared recovery.
     const mode = uncertainDeliveryMode(def);
     if (mode === 'abandon') {
-      await DeliveryReceipts.updateAsync(
-        { _id: receiptId, state: 'sending' },
-        { $set: { state: 'abandoned', at: new Date() } },
-      );
+      await settleReceipt(receiptId, 'abandoned');
       return 'abandoned';
     }
     if (mode === 'reconcile' && def.transport.reconcile) {
       const landed = await def.transport.reconcile(binding.destination, receiptId);
       if (landed) {
-        await DeliveryReceipts.updateAsync(
-          { _id: receiptId, state: 'sending' },
-          { $set: { state: 'sent', at: new Date() } },
-        );
+        await settleReceipt(receiptId, 'sent');
         return 'delivered';
       }
     }
@@ -195,10 +204,7 @@ export async function deliverOnce(
     // conversation forever. `deferred` tells the caller to stop here and
     // leave the cursor where it is.
     if (existing.attempts >= MAX_DELIVERY_ATTEMPTS) {
-      await DeliveryReceipts.updateAsync(
-        { _id: receiptId, state: 'sending' },
-        { $set: { state: 'abandoned', at: new Date() } },
-      );
+      await settleReceipt(receiptId, 'abandoned');
       return 'abandoned';
     }
     const wait = Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, existing.attempts - 1), BACKOFF_MAX_MS);
@@ -209,7 +215,12 @@ export async function deliverOnce(
   // POST. A lens may return several payloads (a segmented SMS); each gets its
   // own provider-side key — one shared key would make a tier-A provider
   // collapse the segments into one.
-  const rendered = def.lens.out(item, binding.destination);
+  //
+  // A thunk is resolved only here, on the POST path — side effects a
+  // rendering needs (a `link` channel's per-choice verdict tokens) must not
+  // run on a re-sweep that finds the receipt already settled or backed off.
+  const resolved = typeof item === 'function' ? await item() : item;
+  const rendered = def.lens.out(resolved, binding.destination);
   const payloads = Array.isArray(rendered) ? rendered : [rendered];
   let providerMessageId: string | undefined;
   for (let i = 0; i < payloads.length; i += 1) {
@@ -223,17 +234,8 @@ export async function deliverOnce(
     }
   }
 
-  // CONFIRM — guarded on `sending`, so a racing settle wins exactly once.
-  await DeliveryReceipts.updateAsync(
-    { _id: receiptId, state: 'sending' },
-    {
-      $set: {
-        state: 'sent',
-        ...(providerMessageId !== undefined ? { providerMessageId } : {}),
-        at: new Date(),
-      },
-    },
-  );
+  // CONFIRM.
+  await settleReceipt(receiptId, 'sent', providerMessageId);
   return 'delivered';
 }
 
@@ -295,17 +297,24 @@ export async function deliverBinding(
   // same one is a settled no-op.
   const prompt = promptItem(session, def.profile);
   if (prompt) {
-    if (def.profile.interact === 'link' && def.approvalUrl) {
-      for (const choice of prompt.choices) {
-        // eslint-disable-next-line no-await-in-loop
-        const token = await issueVerdictToken(
-          binding.agent, binding.sessionId, prompt.toolCallId,
-          choice.token === 'approve' ? 'approved' : 'denied',
-        );
-        choice.url = def.approvalUrl(token);
+    // `link` channels mint the per-choice verdict URLs here — LAZILY, as a
+    // thunk deliverOnce runs only on its POST path. Each token is a live
+    // single-use capability; minting eagerly would issue two per sweep per
+    // parked ask, forever, while the receipt is already `sent`.
+    const withUrls = async () => {
+      if (def.profile.interact === 'link' && def.approvalUrl) {
+        for (const choice of prompt.choices) {
+          // eslint-disable-next-line no-await-in-loop
+          const token = await issueVerdictToken(
+            binding.agent, binding.sessionId, prompt.toolCallId,
+            choice.token === 'approve' ? 'approved' : 'denied',
+          );
+          choice.url = def.approvalUrl(token);
+        }
       }
-    }
-    await deliverOnce(kind, binding, prompt, `prompt:${prompt.toolCallId}`, {
+      return prompt;
+    };
+    await deliverOnce(kind, binding, withUrls, `prompt:${prompt.toolCallId}`, {
       def, expects: expectationsFor(prompt),
     });
   }

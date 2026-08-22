@@ -1,8 +1,19 @@
 # Channels: letting your agent talk on Slack, SMS, and email
 
 **Date:** 2026-08-21
-**Status:** proposed design, checked against the actual source code. Revised twice: once after examining the Flue framework, once after a survey of cross-channel rendering prior art (§13).
+**Status:** as built (shipped 2026-08-22); see errata below. Revised twice before building: once after examining the Flue framework, once after a survey of cross-channel rendering prior art (§13).
 **Package:** `10thfloor:agent`
+
+**As built — errata.** The design shipped as written, with these concrete differences folded into the sections below. The source of truth is `app/packages/agent/server/channels/{contract,registry,ingress,egress,collections}.ts`; the channel packages are `app/packages/agent-channel-{slack,telegram,whatsapp,sms}`.
+
+- `lens.in` takes one argument, `in(event)`; the envelope also carries `audience?` and `respond?` (§8.3, `contract.ts`).
+- The `prompt` item carries `toolCallId`; a receipt's `expects` entries are `{ match, verdict, toolCallId }` (§6.3, §8.2, `collections.ts`).
+- Channel config has `verify` and `parse` — not a `signingSecret` — and the package factories supply both (§10, `registry.ts`).
+- `onUncertainDelivery` is optional and defaulted, not required (§11, `registry.ts`).
+- Throttled inbound events are dropped with a 200, not refused with a 429 (§9, `ingress.ts`).
+- One-time approval and linking tokens are single-use random ids stored server-side, not signed tokens (§8.4, §12, `linking.ts`).
+- `Agent.channel` ships in the package (§15); the side-action tool is an inline tool spec, not `Agent.tool` (§7).
+- An anonymous `group` binding admits only its opener until someone links (§3, `ingress.ts`).
 
 ---
 
@@ -46,7 +57,7 @@ The package says two things clearly: "the extension surface is hooks, and only h
 
 **Not in scope by design:** live token streaming to non-web surfaces. The live typing stream exists for the browser; every other surface is turn-at-a-time.
 
-**Scoped to single-human conversations for v1.** A binding carries one owner, and every call into the agent is owner-scoped (§5.1). A group thread — several humans talking to one agent in one Slack channel — needs an ownership model the framework doesn't have: the second human's `send` would fail the ownership check by design. Group conversations are an open question (§15), not a silent gap.
+**Scoped to single-human conversations for v1.** A binding carries one owner, and every call into the agent is owner-scoped (§5.1). A group thread — several humans talking to one agent in one Slack channel — needs an ownership model the framework doesn't have: the second human's `send` would fail the ownership check by design. Group conversations are an open question (§15), not a silent gap. As built, an anonymous group binding admits only its opener (ingress.ts) until someone links.
 
 ## 4. How it works
 
@@ -161,8 +172,8 @@ The `_id` is derived (not random) so that two servers racing to bind the same co
   state: 'sent',                             // 'sending' | 'sent' | 'abandoned'
   providerMessageId: 'SM8f2...',             // the surface's own id for what we posted
   expects: [                                 // present only when the delivery offered choices (§8.4)
-    { match: 'YES', intent: { kind: 'verdict', verdict: 'approved' }, toolCallId: 'tc_1' },
-    { match: 'NO',  intent: { kind: 'verdict', verdict: 'denied' },  toolCallId: 'tc_1' },
+    { match: 'YES', verdict: 'approved', toolCallId: 'tc_1' },
+    { match: 'NO',  verdict: 'denied',   toolCallId: 'tc_1' },
   ],                                         // toolCallId names the exact ask a reply answers — §8.3
   attempts: 1,
   at: Date,
@@ -215,7 +226,9 @@ A tool that takes a destination as an argument — `post(ref, text)` — lets wh
 ```js
 // The tool takes NO destination argument.
 // It posts to the surfaces this session is already bound to — nowhere else.
-const notify = Agent.tool('channel.notify', {
+// An inline tool spec, listed in the agent's `tools` array like any other.
+tools: [{
+  name: 'channel.notify',
   description: 'Send an out-of-band notice to this conversation.',
   args: { type: 'object', required: ['text'], properties: { text: { type: 'string' } } },
   gate: 'auto',
@@ -227,10 +240,10 @@ const notify = Agent.tool('channel.notify', {
       // recovery — the package's own comment calls that window "irreducible
       // without idempotency keys carried through to the tools themselves" —
       // so an unreceipted post here double-fires.
-      await deliverOnce(b, { item: 'reply', text: args.text }, `tool:${ctx.toolCallId}`);
+      await deliverOnce(b.kind, b, { item: 'reply', text: args.text }, `tool:${ctx.toolCallId}`);
     }
   },
-});
+}],
 ```
 
 If a tool genuinely needs to pick between surfaces, the argument is an enum of *this session's own bindings* — every option already authorized. It is never a free-form reference.
@@ -270,7 +283,7 @@ The shared planner walks the committed rows past the binding's cursor and produc
 ```js
 { item: 'reply',    text }                        // the turn's answer — opaque text, passed through
 { item: 'status',   kind, reason }                // error / budget / interrupted — turning tokens into prose is the lens's job
-{ item: 'prompt',   name, args, runAs, choices }  // the parked approval; choices carry canonical tokens ('approve' | 'deny')
+{ item: 'prompt',   name, args, runAs, toolCallId, choices }  // the parked approval; toolCallId names the exact ask; choices carry canonical tokens ('approve' | 'deny')
 { item: 'overflow', head, url }                   // what wouldn't fit: a mechanical head-slice plus a link to the web view
 ```
 
@@ -286,13 +299,15 @@ lens: {
   out(item, destination) → payload | [payload],
 
   // Interpret a verified inbound event into one of a fixed set of meanings.
-  in(event, ctx) → {
-    intent,           // { kind: 'message', text } | { kind: 'verdict', verdict, reason? }
+  in(event) → {
+    intent,           // { kind: 'message', text } | { kind: 'verdict', verdict, reason?, toolCallId? }
                       //   | { kind: 'link-request' } | { kind: 'noop' }
     eventId,          // the provider's redelivery-stable id — powers dedup (§11)
     externalUserId,   // → identities table
     conversationRef,  // → bindings table
     destination,      // where replies to this conversation go
+    audience?,        // 'direct' | 'group' — §8.5's capability-URL rule reads it; defaults to 'group' (the safe direction)
+    respond?,         // noop only: a body the provider expects echoed in the 200 (Slack's URL-verification challenge)
   }
 }
 ```
@@ -319,7 +334,7 @@ profile: { interact: 'native' | 'menu' | 'link', limit?: number }
 
 - **`native`** — the surface has real affordances (buttons, quick replies, rich-card suggested actions). The lens renders them and wires each postback to carry the canonical token, so interpretation doesn't depend on provider quirks. `interact` governs how choices are *offered*, not what inbound is accepted — a Slack user who types YES instead of clicking still lands in `in`, and a native lens may register text fallbacks in `expects` too.
 - **`menu`** — no affordances, but replies are cheap (SMS). The prompt renders as a reply menu — *"Reply YES to approve, NO to deny"* — and registers those tokens in the receipt's `expects`. This is the pattern the entire SMS/IVR industry converged on: on a widgetless surface, the interaction contract is a parse grammar over inbound text.
-- **`link`** — replies are awkward or unparseable (email, one-way notification surfaces). Each choice renders as a **signed one-time URL** — single-use, short-lived, bound to the specific pending verdict. This is the same token *primitive* account linking uses (§12), with a different subject: a linking token is bound to an external identity, an approval token to one pending verdict. They are never interchangeable.
+- **`link`** — replies are awkward or unparseable (email, one-way notification surfaces). Each choice renders as a **one-time URL** carrying a single-use random token stored server-side (unguessable, expiring, bound to its subject — here the specific pending verdict; no key management). This is the same token *primitive* account linking uses (§12), with a different subject: a linking token is bound to an external identity, an approval token to one pending verdict. They are never interchangeable.
 
 All three land inbound in the same place: a `verdict` intent. The grammar registered is exactly the affordance offered, which is exactly what the round-trip test checks.
 
@@ -350,11 +365,11 @@ The lens has four users, on a ladder — and the design succeeds when the first 
 **Most app developers install one and write no rendering code.** A channel package is one lens, one transport, one profile default — so the common path is configuration only:
 
 ```js
-import { slack } from 'meteor/tenthfloor:agent-channel-slack';
+import { slack } from 'meteor/10thfloor:agent-channel-slack';
 
 Agent.channel('slack', slack({
   agent: 'support',
-  token: Meteor.settings.packages['10thfloor:agent'].slack.botToken,
+  botToken: Meteor.settings.packages['10thfloor:agent'].slack.botToken,
   signingSecret: process.env.SLACK_SIGNING_SECRET,
 }));
 ```
@@ -415,7 +430,7 @@ verify signature → lens.in(event) → throttle → claim eventId → route by 
 
 1. **Verify** the provider's signature (401 if invalid — this is the trust boundary).
 2. **Interpret**: `lens.in` turns the raw event into an intent plus the routing envelope. Interpretation is pure — no side effects yet.
-3. **Throttle** per sender (429 if too many). The throttle comes before the claim because the throttle is a counter and the claim is a database write — a flood of validly-signed events must not buy an insert each. A provider retry that gets throttled simply retries later and collides with the claim then.
+3. **Throttle** per sender — throttled events are dropped with a 200, not refused with a 429: providers retry non-2xx and count failures toward disabling the integration, so a 429 would let one abusive sender degrade the whole channel (ingress.ts). The throttle comes before the claim because the throttle is a counter and the claim is a database write — a flood of validly-signed events must not buy an insert each. A throttled event is settled and forgotten; it buys neither a write nor a provider retry.
 4. **Claim the event id** (§11). A provider retry collides here and gets a 200 without running anything twice.
 5. **Route by intent:**
    - `message` → resolve identity, find-or-create the binding (binding first, then session), then `agent.send()` — never a direct database insert; sequence numbers are allocated atomically inside `send`, and a direct insert would race the running loop.
@@ -427,31 +442,45 @@ Free text while a prompt is outstanding is the one ambiguous case, and §8.3's r
 
 ## 10. Configuration
 
-Everything channel-specific now lives in two places: the lens (behavior) and the profile plus secrets (facts).
+Everything channel-specific now lives in two places: the lens (behavior) and the profile plus secrets (facts). The webhook's trust boundary is two functions on the definition — `verify` (does this request really come from the provider? a false is a 401 — §9 step 1) and `parse` (raw request → the provider event `lens.in` reads) — and the package factory supplies both, wrapping the secret, so the install-only path (§8.7) never writes them:
+
+```js
+import { sms } from 'meteor/10thfloor:agent-channel-sms';
+import { slack } from 'meteor/10thfloor:agent-channel-slack';
+const cfg = Meteor.settings.packages['10thfloor:agent'];
+
+Agent.channel('sms', sms({
+  agent: 'support',
+  accountSid: cfg.sms.accountSid,             // AC…
+  authToken: cfg.sms.authToken,               // also the signature key `verify` uses
+  webhookUrl: cfg.sms.webhookUrl,             // the EXACT public URL Twilio calls — its signature covers it
+}));
+
+Agent.channel('slack', slack({
+  agent: 'support',
+  botToken: cfg.slack.botToken,
+  signingSecret: cfg.slack.signingSecret,
+  statuses: ['error', 'budget', 'approval'],  // note kinds to deliver; 'approval' = the post-verdict outcome, never the ask (§8.2)
+}));
+```
+
+A factory is sugar over the plain definition — what a surface of your own writes:
 
 ```js
 Agent.channel('sms', {
   agent: 'support',
-  transport: twilioTransport({ from: '+15559990000' }),
-  signingSecret: process.env.TWILIO_AUTH_TOKEN,
-  profile: { interact: 'menu', limit: 1600 },
+  transport: smsTransport({ accountSid, authToken }),
   lens: smsLens,                              // { out, in } — §8.3
-  statuses: ['error'],                        // which status kinds this surface delivers
-  onUncertainDelivery: 'retry',               // 'reconcile' | 'retry' | 'abandon' — §11
-});
-
-Agent.channel('slack', {
-  agent: 'support',
-  transport: slackTransport({ token: Meteor.settings.packages['10thfloor:agent'].slack.botToken }),
-  signingSecret: process.env.SLACK_SIGNING_SECRET,
-  profile: { interact: 'native' },
-  lens: slackLens,
-  statuses: ['error', 'budget', 'approval'],  // note kinds to deliver; 'approval' = the post-verdict outcome, never the ask (§8.2)
-  onUncertainDelivery: 'reconcile',
+  profile: { interact: 'menu', limit: 1500 },
+  verify: (raw) => verifyTwilioSignature(raw, authToken, webhookUrl),
+  parse: (raw) => parseTwilioForm(raw.rawBody),
+  statuses: ['error', 'approval'],            // which status kinds this surface delivers
+  onUncertainDelivery: 'retry',               // 'reconcile' | 'retry' | 'abandon' — §11; optional, defaulted from the transport
 });
 ```
 
 - **Secrets** come from settings or environment variables, never inline.
+- **`onUncertainDelivery` is optional.** Unset, it defaults to `'reconcile'` when the transport supplies `reconcile`, else `'retry'` — §11 says when that default is wrong and a channel must declare.
 - **Bindings and identities are created at runtime**, never hand-authored.
 - Channels are **on by default** and can be disabled per-kind for deployments that run delivery on one designated instance.
 - A channel package (`agent-channel-sms`, `agent-channel-slack`) is exactly one lens, one transport, and one profile default — nothing else, because everything else is shared. §8.7 shows the resulting developer experience, from install-only to authoring a new surface.
@@ -496,7 +525,7 @@ A crash between 2 and 3 leaves a `sending` receipt — the one genuinely ambiguo
 | **B** | Lets you read back what you posted | Read the destination, look for the receipt id, post only if absent | Effectively-once |
 | **C** | Neither (raw SMTP, some gateways) | No way to know | **Declared choice: `retry` (may duplicate) or `abandon` (may lose)** |
 
-Leaving tier C undeclared just means picking one by accident — so `onUncertainDelivery` is a required config field for tier-C transports.
+Leaving tier C undeclared just means picking one by accident. As built, the field is optional and defaults to `'reconcile'` when the transport supplies `reconcile` (tier B), else `'retry'` (the tier-A assumption — safe when the provider honours the idempotency key, MAY DUPLICATE on tier C). A tier-C transport cannot be told apart from tier A by shape, so tier-C channels SHOULD declare `'retry'` or `'abandon'` explicitly (`uncertainDeliveryMode`, registry.ts).
 
 The receipt table also fixes a subtler bug: the observer replays the whole backlog when a server boots. Without receipts, every deploy re-sends old messages. With them, the backlog pass finds everything already `sent` and does nothing.
 
@@ -508,7 +537,7 @@ This is the one genuinely new trust decision channels introduce. An external use
 
 **Preferred — an OAuth/OIDC round-trip** where the surface supports one (Slack does, via Sign in with Slack). The user, already authenticated in your web app, proves control of the external account; both sides are proven in one flow. Record `assurance: 'oidc'`.
 
-**Fallback — signed one-time link** for surfaces without OAuth (SMS, email). The agent sends a link containing a token that is single-use, short-lived, signed, and bound to the specific external identity it will link. The user opens it while authenticated in the web app; the server verifies and writes the identity row. Record `assurance: 'link'`.
+**Fallback — one-time link** for surfaces without OAuth (SMS, email). The agent sends a link carrying a single-use random token stored server-side (unguessable, expiring, bound to its subject — the specific external identity it will link; no key management). The user opens it while authenticated in the web app; the server burns the token and writes the identity row. Record `assurance: 'link'`.
 
 **Direction matters.** Linking must be completed from the authenticated side. An unauthenticated inbound message can *request* a link; it can never *assert* one.
 
@@ -571,7 +600,7 @@ The lens design (§8) is built on lessons from thirty years of "one message, man
 
 ## 15. Open questions
 
-- **Package vs. app code.** The registry shape is fixed, but should `Agent.channel` ship inside the package or stay an app-level helper? Leaning app-owned for v1 to avoid the package depending on provider SDKs.
+- **Package vs. app code.** Resolved: `Agent.channel` ships in the package; provider SDKs live in the channel packages.
 - **Attachments and media.** Inbound images (MMS, Slack uploads) have no place in the current item vocabulary or in `AgentMessage`. Probably a framework-level question before a channel-level one.
 - **Read-back reconciliation coverage.** Tier B recovery (§11) needs per-provider verification of what can actually be read back, and from where, before a transport claims that tier.
 - **Group conversations.** A binding carries one owner and every agent call is owner-scoped, so v1 is single-human by construction (§3). A shared session with per-message attribution is a real ownership-model question for the framework, not a channel detail.

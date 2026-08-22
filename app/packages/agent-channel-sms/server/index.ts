@@ -232,8 +232,9 @@ export interface SmsChannelOptions {
   sessionUrl?: ChannelDef['sessionUrl'];
   linkUrl?: ChannelDef['linkUrl'];
   throttle?: ChannelDef['throttle'];
-  /** Override pieces of the default `{ interact: 'menu', limit: 1500 }`. */
-  profile?: Partial<ChannelProfile>;
+  /** Override the default `limit: 1500`. `interact` is fixed at `menu` — the
+   *  reply-word grammar is how this lens answers prompts at all. */
+  profile?: Pick<ChannelProfile, 'limit'>;
   /** TEST SEAM, threaded to the transport. */
   fetchImpl?: typeof fetch;
 }

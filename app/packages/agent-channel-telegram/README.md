@@ -82,10 +82,11 @@ The webhook mounts at **`/agent/channels/telegram`**.
   without text are noops by design.
 - **Duplicates never run twice**: admission dedup on `update_id` absorbs
   Telegram's webhook retries.
-- **`link`**, `/link`, or `/link@YourBot` (the bare gesture only — "link my
-  account please" reaches the agent as a message) answers with a one-time URL
-  that ties this Telegram identity to a signed-in web account, exactly the
-  Slack package's flow.
+- **`link`**, `/link`, or `/link@YourBot` — in a PRIVATE chat only, and the bare
+  gesture only ("link my account please" reaches the agent as a message) —
+  answers with a one-time URL that ties this Telegram identity to a signed-in
+  web account, exactly the Slack package's flow. The URL is a credential, so in
+  a group `/link` is just a message: DM the bot instead.
 
 ## Rendering
 

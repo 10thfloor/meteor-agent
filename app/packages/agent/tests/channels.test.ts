@@ -2,6 +2,7 @@ import { assert } from 'chai';
 import type { AgentMessage, AgentSession } from '../common/types';
 import type { ChannelDef, RawInbound } from '../server/channels/registry';
 import type { DeliveryItem, InboundReading } from '../server/channels/contract';
+import type { ChannelBinding } from '../server/channels/collections';
 
 /**
  * Channels (channels spec): the planner's line, the lens law, the
@@ -36,7 +37,7 @@ function testLens() {
       if (item.item === 'status') return { text: `[${item.kind}] ${item.reason ?? ''}` };
       if (item.item === 'overflow') return { text: `${item.head}${item.url ? ` ${item.url}` : ''}` };
       const menu = item.choices
-        .map((c) => (c.match ? `Reply ${c.match} to ${c.label.toLowerCase()}` : c.label))
+        .map((c) => (c.match ? `Reply ${c.match} to ${c.label.toLowerCase()}` : c.url ? `${c.label}: ${c.url}` : c.label))
         .join(', ');
       return { text: `Approve ${item.name}? ${menu}` };
     },
@@ -67,7 +68,7 @@ function testLens() {
 }
 
 /** A transport that records every post; `fail` makes the next N posts throw. */
-function testTransport() {
+function testTransport(extra: { reconcile?: () => Promise<boolean> } = {}) {
   const posts: Array<{ destination: unknown; payload: any; key: string }> = [];
   let failures = 0;
   return {
@@ -78,10 +79,11 @@ function testTransport() {
       posts.push({ destination, payload, key: opts.idempotencyKey });
       return { providerMessageId: `pm-${posts.length}` };
     },
+    ...(extra.reconcile ? { reconcile: extra.reconcile } : {}),
   };
 }
 
-async function registerTestChannel(over: Partial<ChannelDef> = {}) {
+async function registerTestChannel(over: Partial<ChannelDef> = {}, transport = testTransport()) {
   const { Agent, mockProvider } = await import('../server/index');
   const { _clearChannels } = await import('../server/channels/registry');
   _clearChannels();
@@ -89,7 +91,6 @@ async function registerTestChannel(over: Partial<ChannelDef> = {}) {
     model: 'mock', instructions: 'test',
     provider: mockProvider(() => ({ text: 'the answer' })),
   });
-  const transport = testTransport();
   const def: ChannelDef = {
     agent: 'channel-agent',
     transport,
@@ -105,6 +106,15 @@ async function registerTestChannel(over: Partial<ChannelDef> = {}) {
 
 function raw(event: unknown, sig = 'ok'): RawInbound {
   return { headers: { 'x-sig': sig }, rawBody: JSON.stringify(event) };
+}
+
+async function seedBinding(_id: string, over: Partial<ChannelBinding> = {}) {
+  const { ChannelBindings } = await import('../server/channels/collections');
+  await ChannelBindings.insertAsync({
+    _id, kind: 'test', conversationRef: _id.replace(/^test:/, ''), destination: {}, audience: 'direct',
+    agent: 'channel-agent', sessionId: `s-${_id}`, userId: null, deliveredSeq: 0,
+    createdAt: new Date(), updatedAt: new Date(), ...over,
+  });
 }
 
 async function cleanChannels() {
@@ -161,6 +171,19 @@ describe('channels', () => {
       );
     });
 
+    it('advances silently past an empty answer and passes status fields through', async () => {
+      const { planItems } = await import('../server/channels/plan');
+      const rows = [
+        msg({ sessionId: 's', seq: 1, content: '' }),
+        msg({ sessionId: 's', seq: 2, role: 'note', kind: 'approval', approved: false, reason: 'not today' }),
+        msg({ sessionId: 's', seq: 3, role: 'note', kind: 'budget', budget: 'toolCalls' }),
+      ];
+      const planned = planItems(rows, { statuses: ['approval', 'budget'], profile: { interact: 'menu' } });
+      assert.isNull(planned[0].item, 'nothing to say is nothing to post — the cursor still moves');
+      assert.deepEqual(planned[1].item, { item: 'status', kind: 'approval', reason: 'not today', approved: false });
+      assert.deepEqual(planned[2].item, { item: 'status', kind: 'budget', budget: 'toolCalls' });
+    });
+
     it('turns an over-limit reply into a mechanical head-slice, link included only when given', async () => {
       const { planItems } = await import('../server/channels/plan');
       const long = 'x'.repeat(500);
@@ -169,15 +192,33 @@ describe('channels', () => {
         profile: { interact: 'menu', limit: 100 }, overflowUrl: 'https://app.test/s/1',
       })[0].item as Extract<DeliveryItem, { item: 'overflow' }>;
       assert.equal(linked.item, 'overflow');
-      assert.isAtMost(linked.head.length, 100);
+      assert.isAtMost(linked.head.length + 1 + linked.url!.length, 100, 'head + space + url fits the limit');
       assert.equal(linked.url, 'https://app.test/s/1');
       const bare = planItems(rows, { profile: { interact: 'menu', limit: 100 } })[0]
         .item as Extract<DeliveryItem, { item: 'overflow' }>;
       assert.isUndefined(bare.url, 'no url unless the caller allowed one');
+      const tiny = planItems(rows, { profile: { interact: 'menu', limit: 3 }, overflowUrl: 'https://x' })[0]
+        .item as Extract<DeliveryItem, { item: 'overflow' }>;
+      assert.equal(tiny.head, 'x…', 'a limit under the reserve still yields one character');
+    });
+
+    it('never cuts a surrogate pair when slicing the head', async () => {
+      const { planItems } = await import('../server/channels/plan');
+      // 'a' then an emoji (two UTF-16 code units): with limit 4 the reserve of
+      // 2 leaves end = 2, which would split the pair — the slice backs off.
+      const rows = [msg({ sessionId: 's', seq: 1, content: `a😀${'b'.repeat(10)}` })];
+      const split = planItems(rows, { profile: { interact: 'menu', limit: 4 } })[0]
+        .item as Extract<DeliveryItem, { item: 'overflow' }>;
+      assert.equal(split.head, 'a…', 'the high surrogate was not left dangling');
+      // With room for the whole pair, it stays.
+      const whole = planItems(rows, { profile: { interact: 'menu', limit: 5 } })[0]
+        .item as Extract<DeliveryItem, { item: 'overflow' }>;
+      assert.equal(whole.head, 'a😀…');
     });
 
     it('builds the prompt from the parked state only while unanswered, with menu matches', async () => {
-      const { promptItem, MENU_MATCHES } = await import('../server/channels/plan');
+      const { promptItem } = await import('../server/channels/plan');
+      const { MENU_MATCHES } = await import('../server/channels/contract');
       const parked: AgentSession = {
         ...sessionBase, _id: 'p1', phase: 'awaiting',
         pending: { toolCallId: 'tc1', name: 'orders.refund', args: { id: 1 } },
@@ -192,6 +233,22 @@ describe('channels', () => {
         pending: { ...parked.pending!, verdict: 'approved' },
       };
       assert.isNull(promptItem(decided, { interact: 'menu' }), 'an answered ask is no prompt');
+      assert.notProperty(item, 'runAs');
+      const svc = promptItem({ ...parked, pending: { ...parked.pending!, runAs: null } }, { interact: 'menu' })!;
+      assert.property(svc, 'runAs');
+      assert.isNull(svc.runAs, 'null is a real value, not absence');
+    });
+
+    it('matchExpectation decides on the exact word only; native prompts register no grammar', async () => {
+      const { matchExpectation, expectationsFor, promptItem } = await import('../server/channels/plan');
+      const expects = [{ match: 'YES', verdict: 'approved' as const, toolCallId: 'tc1' }, { match: 'NO', verdict: 'denied' as const, toolCallId: 'tc1' }];
+      assert.deepEqual(matchExpectation(' yes ', expects), { verdict: 'approved', toolCallId: 'tc1' });
+      assert.deepEqual(matchExpectation('No', expects), { verdict: 'denied', toolCallId: 'tc1' });
+      assert.isNull(matchExpectation('yes please', expects), 'a sentence is a message');
+      assert.isNull(matchExpectation('YES', []));
+      const parked: AgentSession = { ...sessionBase, _id: 'p', phase: 'awaiting', pending: { toolCallId: 'tc1', name: 'x', args: {} } };
+      assert.deepEqual(expectationsFor(promptItem(parked, { interact: 'native' })!), []);
+      assert.deepEqual(expectationsFor(promptItem(parked, { interact: 'menu' })!).map((e) => [e.match, e.verdict]), [['YES', 'approved'], ['NO', 'denied']]);
     });
   });
 
@@ -234,20 +291,26 @@ describe('channels', () => {
         /round-trip failed/,
       );
     });
+
+    it('names the missing corpus kind, the missing synthesize, and a message that does not read back', async () => {
+      const { assertLensRoundTrip, exemplarItems } = await import('../server/channels/contract');
+      const lens = testLens();
+      const ev = (text: string) => ({ type: 'msg', text, id: 'e', user: 'u', convo: 'c' });
+      assert.throws(() => assertLensRoundTrip(lens, { interact: 'menu' }, {
+        items: exemplarItems().filter((i) => i.item !== 'overflow'), synthesize: (c) => ev(c.match ?? ''),
+      }), /carries no 'overflow' item/);
+      assert.throws(() => assertLensRoundTrip(lens, { interact: 'menu' }), /needs `synthesize`/);
+      assert.throws(() => assertLensRoundTrip(lens, { interact: 'menu' }, {
+        synthesize: (c) => ev(c.match ?? ''), message: () => ({ type: 'noop' }),
+      }), /plain inbound message event read back/);
+      const emptyArray = { ...lens, out: (i: DeliveryItem) => (i.item === 'status' ? [] : lens.out(i)) };
+      assert.throws(() => assertLensRoundTrip(emptyArray as any, { interact: 'menu' }, { synthesize: (c) => ev(c.match ?? '') }), /returned nothing for a 'status'/);
+    });
   });
 
   // ---- Claim and advance (§6.3 / §6.6) -------------------------------------
 
   describe('claim and cursor', () => {
-    async function seedBinding(_id: string) {
-      const { ChannelBindings } = await import('../server/channels/collections');
-      await ChannelBindings.insertAsync({
-        _id, kind: 'test', conversationRef: _id, destination: {}, audience: 'direct',
-        agent: 'channel-agent', sessionId: `s-${_id}`, userId: null,
-        deliveredSeq: 0, createdAt: new Date(), updatedAt: new Date(),
-      });
-    }
-
     it('lets exactly one of two racing workers claim a binding, and the owner renew', async () => {
       const { claimBinding } = await import('../server/channels/egress');
       await seedBinding('b1');
@@ -283,7 +346,7 @@ describe('channels', () => {
       assert.equal(await ChannelBindings.find({}).countAsync(), 0, 'nothing was spent');
     });
 
-    it('creates binding first and session second, channel descriptor included', async () => {
+    it('binds the conversation and opens its session with the channel descriptor', async () => {
       await registerTestChannel();
       const { handleInbound } = await import('../server/channels/ingress');
       const out = await handleInbound('test', raw({ type: 'msg', text: 'hello', id: 'e1', user: 'u1', convo: 'c1' }));
@@ -299,6 +362,25 @@ describe('channels', () => {
       assert.deepEqual(session.channel, { origin: 'test', assurance: 'none' });
       const users = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).fetchAsync();
       assert.deepEqual(users.map((u) => u.content), ['hello']);
+    });
+
+    it('repairs a binding whose session is missing (the crash window) with the OWNER\'s assurance, not the sender\'s', async () => {
+      await registerTestChannel();
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { handleInbound } = await import('../server/channels/ingress');
+      await ChannelBindings.insertAsync({
+        _id: 'test:crashed', kind: 'test', conversationRef: 'crashed', destination: { to: 'crashed' },
+        audience: 'direct', agent: 'channel-agent', sessionId: 'ghost', userId: 'owner-1', assurance: 'oidc',
+        externalUserId: 'u1', deliveredSeq: 0, createdAt: new Date(), updatedAt: new Date(),
+      });
+      assert.isUndefined(await AgentSessions.findOneAsync('ghost'), 'the winner crashed between its two writes');
+      // An UNLINKED sender triggers the repair; the session must still carry the owner's proof.
+      assert.equal((await handleInbound('test', raw({ type: 'msg', text: 'hi', id: 'e1', user: 'u1', convo: 'crashed' }))).status, 200);
+      const session = (await AgentSessions.findOneAsync('ghost'))!;
+      assert.equal(session.userId, 'owner-1');
+      assert.deepEqual(session.channel, { origin: 'test', assurance: 'oidc' });
+      assert.equal(await AgentMessages.find({ sessionId: 'ghost', role: 'user' }).countAsync(), 0, 'the unlinked sender still cannot drive the owned session');
     });
 
     it('admits each provider event exactly once — a retry runs no second turn', async () => {
@@ -481,16 +563,11 @@ describe('channels', () => {
   describe('egress delivery', () => {
     async function seedConversation() {
       const { AgentSessions, AgentMessages } = await import('../common/collections');
-      const { ChannelBindings } = await import('../server/channels/collections');
       await AgentSessions.insertAsync({ ...sessionBase, _id: 'sx', nextSeq: 3 } as any);
       await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 0, role: 'user', content: 'q' }) as any);
       await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 1, content: 'first answer' }) as any);
       await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 2, content: 'second answer' }) as any);
-      await ChannelBindings.insertAsync({
-        _id: 'test:conv', kind: 'test', conversationRef: 'conv', destination: { to: 'conv' },
-        audience: 'direct', agent: 'channel-agent', sessionId: 'sx', userId: null,
-        deliveredSeq: 0, createdAt: new Date(), updatedAt: new Date(),
-      });
+      await seedBinding('test:conv', { sessionId: 'sx', destination: { to: 'conv' } });
     }
 
     it('delivers the backlog once, advances the cursor, and a replay posts nothing', async () => {
@@ -511,6 +588,25 @@ describe('channels', () => {
       await ChannelBindings.updateAsync('test:conv', { $set: { deliveredSeq: 0 } });
       await deliverBinding('test', 'test:conv');
       assert.equal(transport.posts.length, 2, 'replay found receipts and posted nothing');
+    });
+
+    it('sends the overflow link only where §8.5 allows: an anonymous session\'s URL never enters a group', async () => {
+      const { transport } = await registerTestChannel({
+        profile: { interact: 'menu', limit: 40 },
+        sessionUrl: (s) => `https://app.test/s/${s._id}`,
+      });
+      const { deliverBinding } = await import('../server/channels/egress');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await seedConversation();   // sx is anonymous (userId: null)
+      await ChannelBindings.updateAsync('test:conv', { $set: { audience: 'group' } });
+      await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 3, content: 'x'.repeat(200) }) as any);
+      await deliverBinding('test', 'test:conv');
+      assert.notInclude(String(transport.posts.at(-1)!.payload.text), 'https://app.test/s/sx', 'anonymous + group: the link is a credential and stays home');
+      await AgentSessions.updateAsync('sx', { $set: { userId: 'owner' } });
+      await AgentMessages.insertAsync(msg({ sessionId: 'sx', seq: 4, content: 'y'.repeat(200) }) as any);
+      await deliverBinding('test', 'test:conv');
+      assert.include(String(transport.posts.at(-1)!.payload.text), 'https://app.test/s/sx', 'an owned session\'s URL is login-gated and may go anywhere');
     });
 
     it('a transport failure leaves the cursor unadvanced; the retry declared by the channel re-posts', async () => {
@@ -573,27 +669,30 @@ describe('channels', () => {
       const { startEgress } = await import('../server/channels/egress');
       const { AgentSessions, AgentMessages } = await import('../common/collections');
       const { ChannelBindings } = await import('../server/channels/collections');
-      // A parked session with NO assistant rows (so the message observer has
-      // nothing to fire on — only the sweep could deliver the prompt), bound
-      // through a binding last active two days ago.
-      await AgentSessions.insertAsync({
-        ...sessionBase, _id: 'stale', nextSeq: 1, phase: 'awaiting',
-        pending: { toolCallId: 'tc-s', name: 'x', args: {} },
+      // Two parked sessions with NO assistant rows (the message observer has
+      // nothing to fire on — only the sweep can deliver a prompt). One binding
+      // was last active two days ago; the other is fresh and is the CONTROL:
+      // once its prompt has posted, a sweep has provably run, and the stale
+      // binding must still be untouched.
+      const park = (id: string, name: string) => AgentSessions.insertAsync({
+        ...sessionBase, _id: id, nextSeq: 1, phase: 'awaiting',
+        pending: { toolCallId: `tc-${id}`, name, args: {} },
       } as any);
+      await park('stale', 'x');
+      await park('fresh', 'fresh-tool');
       await AgentMessages.insertAsync(msg({ sessionId: 'stale', seq: 0, role: 'user', content: 'q' }) as any);
-      await ChannelBindings.insertAsync({
-        _id: 'test:stale', kind: 'test', conversationRef: 'stale', destination: {}, audience: 'direct',
-        agent: 'channel-agent', sessionId: 'stale', userId: null, deliveredSeq: 0,
-        createdAt: new Date(Date.now() - 2 * 24 * 3_600_000), updatedAt: new Date(Date.now() - 2 * 24 * 3_600_000),
-      });
+      await AgentMessages.insertAsync(msg({ sessionId: 'fresh', seq: 0, role: 'user', content: 'q' }) as any);
+      const twoDaysAgo = new Date(Date.now() - 2 * 24 * 3_600_000);
+      await seedBinding('test:stale', { sessionId: 'stale', createdAt: twoDaysAgo, updatedAt: twoDaysAgo });
+      await seedBinding('test:fresh', { sessionId: 'fresh' });
       const worker = startEgress('test', { sweepMs: 60 });
       try {
-        await new Promise((r) => { setTimeout(r, 400); });
-        assert.equal(transport.posts.length, 0, 'a stale binding is outside the sweep lookback');
+        const posted = (name: string) => transport.posts.some((p) => String(p.payload.text).includes(`Approve ${name}`));
+        await until(async () => posted('fresh-tool'));   // a sweep has run
+        assert.isFalse(posted('x'), 'a stale binding is outside the sweep lookback');
         // Activity bumps it back into the window; the next sweep delivers.
         await ChannelBindings.updateAsync('test:stale', { $set: { updatedAt: new Date() } });
-        await until(async () => transport.posts.length > 0);
-        assert.include(String(transport.posts[0].payload.text), 'Approve x');
+        await until(async () => posted('x'));
       } finally {
         await worker.stop();
       }
@@ -617,9 +716,7 @@ describe('channels', () => {
     });
 
     it("honors 'reconcile': a read-back that finds the post confirms without re-posting", async () => {
-      const { transport, def } = await registerTestChannel();
-      (def.transport as any).reconcile = async () => true;
-      def.onUncertainDelivery = 'reconcile';
+      const { transport } = await registerTestChannel({ onUncertainDelivery: 'reconcile' }, testTransport({ reconcile: async () => true }));
       const { deliverBinding } = await import('../server/channels/egress');
       const { DeliveryReceipts } = await import('../server/channels/collections');
       await seedConversation();
@@ -668,6 +765,40 @@ describe('channels', () => {
       assert.isTrue(note!.approved);
     });
 
+    it("a 'link' profile mints one signed URL per choice at delivery, and redeeming one decides the ask", async () => {
+      const { transport } = await registerTestChannel({
+        profile: { interact: 'link' }, approvalUrl: (t) => `https://app.test/v/${t}`,
+      });
+      const { deliverBinding } = await import('../server/channels/egress');
+      const { redeemVerdictToken } = await import('../server/channels/linking');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await seedConversation();
+      await AgentSessions.updateAsync('sx', { $set: { phase: 'awaiting', pending: { toolCallId: 'tc-l', name: 'orders.refund', args: {} } } });
+      await deliverBinding('test', 'test:conv');
+      const text = String(transport.posts.find((p) => String(p.payload.text).includes('orders.refund'))!.payload.text);
+      const tokens = [...text.matchAll(/\/v\/([A-Za-z0-9_-]+)/g)].map((m) => m[1]);
+      assert.lengthOf(tokens, 2, 'one URL per choice');
+      assert.isTrue(await redeemVerdictToken(tokens[0]), 'the approve link decides');
+      assert.isTrue((await AgentMessages.findOneAsync({ sessionId: 'sx', kind: 'approval' }))!.approved);
+      assert.isFalse(await redeemVerdictToken(tokens[1]), 'the deny link is dead once the ask is decided');
+    });
+
+    it("a 'link' profile mints its verdict tokens only when the prompt actually posts — a re-sweep mints none", async () => {
+      const { transport } = await registerTestChannel({
+        profile: { interact: 'link' }, approvalUrl: (t) => `https://app.test/v/${t}`,
+      });
+      const { deliverBinding } = await import('../server/channels/egress');
+      const { ChannelVerdictTokens } = await import('../server/channels/collections');
+      const { AgentSessions } = await import('../common/collections');
+      await seedConversation();
+      await AgentSessions.updateAsync('sx', { $set: { phase: 'awaiting', pending: { toolCallId: 'tc-l2', name: 'orders.refund', args: {} } } });
+      await deliverBinding('test', 'test:conv');
+      await deliverBinding('test', 'test:conv');
+      await deliverBinding('test', 'test:conv');
+      assert.equal(await ChannelVerdictTokens.find().countAsync(), 2, 'two choices, two tokens — once, not per sweep');
+      assert.lengthOf(transport.posts.filter((p) => String(p.payload.text).includes('orders.refund')), 1, 'one ask, one delivery');
+    });
+
     it('drops a stale YES whose ask has moved on — it becomes an ordinary message', async () => {
       await registerTestChannel();
       const { deliverBinding } = await import('../server/channels/egress');
@@ -700,16 +831,11 @@ describe('channels', () => {
       await registerTestChannel({ profile: { interact: 'native' } });
       const { AgentSessions } = await import('../common/collections');
       const { handleInbound } = await import('../server/channels/ingress');
-      const { ChannelBindings } = await import('../server/channels/collections');
       await AgentSessions.insertAsync({
         ...sessionBase, _id: 'sn', phase: 'awaiting',
         pending: { toolCallId: 'tc-current', name: 'x', args: {} },
       } as any);
-      await ChannelBindings.insertAsync({
-        _id: 'test:convN', kind: 'test', conversationRef: 'convN', destination: {},
-        audience: 'direct', agent: 'channel-agent', sessionId: 'sn', userId: null,
-        deliveredSeq: 0, createdAt: new Date(), updatedAt: new Date(),
-      });
+      await seedBinding('test:convN', { sessionId: 'sn' });
 
       const { AgentMessages } = await import('../common/collections');
       await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-stale', id: 'a1', user: 'u1', convo: 'convN' }));
@@ -776,16 +902,17 @@ describe('channels', () => {
       const { linkIdentity } = await import('../server/channels/linking');
       await linkIdentity('test', 'owner-ext', 'owner-acct', 'oidc');
       const { handleInbound } = await import('../server/channels/ingress');
-      // The owner opens the conversation (a group surface: others can see it).
-      await handleInbound('test', raw({ type: 'msg', text: 'mine', id: 'o1', user: 'owner-ext', convo: 'shared' }));
+      // The owner opens the conversation on a GROUP surface (others can see it).
+      await handleInbound('test', raw({ type: 'msg', text: 'mine', id: 'o1', user: 'owner-ext', convo: 'shared', group: true }));
       const { ChannelBindings } = await import('../server/channels/collections');
       const { AgentMessages } = await import('../common/collections');
       const binding = (await ChannelBindings.findOneAsync('test:shared'))!;
       assert.equal(binding.userId, 'owner-acct');
+      assert.equal(binding.audience, 'group');
       const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
 
       // A bystander in the same thread — unlinked — tries to drive it.
-      const out = await handleInbound('test', raw({ type: 'msg', text: 'refund everything', id: 'b1', user: 'bystander', convo: 'shared' }));
+      const out = await handleInbound('test', raw({ type: 'msg', text: 'refund everything', id: 'b1', user: 'bystander', convo: 'shared', group: true }));
       assert.equal(out.status, 200, 'settled, not retried');
       const after = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
       assert.equal(after, before, 'the bystander\'s message never entered the owner\'s session');

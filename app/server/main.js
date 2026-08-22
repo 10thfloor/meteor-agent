@@ -12,12 +12,12 @@ import { sms } from 'meteor/10thfloor:agent-channel-sms';
 /**
  * The demo agent behind the chat UI in `client/`.
  *
- * With ANTHROPIC_API_KEY (or another pi-ai-recognized key) in the
- * environment, it talks to the real model — `provider` is simply omitted.
+ * With ANTHROPIC_API_KEY in the environment, it talks to the real model
+ * (claude-haiku-4-5 via pi-ai) — `provider` is simply omitted.
  * Without one it runs a scripted mock that still exercises the interesting
  * surface: streaming, a tool call, and an ask-gated tool the UI must approve.
  */
-const live = !!(process.env.ANTHROPIC_API_KEY || process.env.OPENAI_API_KEY);
+const live = !!process.env.ANTHROPIC_API_KEY;
 
 // A word-per-chunk script so streaming is visible at human speed in the demo.
 const demoScript = (() => {
@@ -85,8 +85,9 @@ new Agent('demo', {
  * WhatsApp and as "Reply YES/NO" over SMS, and any surface (or the web)
  * decides it — first answer wins.
  *
- * The linking gesture is shared: the bare word "link" on any surface answers
- * with /link/<token>, which the web client redeems from the SIGNED-IN side
+ * The linking gesture is shared: the word "link" in a DM on any surface
+ * (Telegram also takes /link) answers with /link/<token>, which the web
+ * client redeems from the SIGNED-IN side
  * (spec §12). Per-channel setup walkthroughs live in each package's README.
  */
 const channelCfg = Meteor.settings?.packages?.['10thfloor:agent'] ?? {};
@@ -135,10 +136,13 @@ if (channelCfg.sms?.accountSid && channelCfg.sms?.authToken && channelCfg.sms?.w
 
 // The demo's own methods take a token or a session id. Both are unguessable
 // (≈256-bit / ≈98-bit), so this is hygiene rather than a hole — but a public
-// endpoint that accepts guesses should meter them anyway. Per connection for
-// anonymous callers, per user for signed-in ones (DDPRateLimiter's default).
+// endpoint that accepts guesses should meter them anyway. Keyed per DDP
+// connection (`connectionId: () => true`, the shape accounts-base uses for its
+// login rule). Without a connectionId/userId matcher the counter key is built
+// from `type` + `name` alone — one bucket shared by every caller.
 DDPRateLimiter.addRule(
-  { type: 'method', name: (n) => typeof n === 'string' && n.startsWith('demo.') },
+  { type: 'method', name: (n) => typeof n === 'string' && n.startsWith('demo.'),
+    connectionId: () => true },
   10, 10_000,
 );
 
@@ -181,7 +185,7 @@ Meteor.methods({
 
   /**
    * Redeem a channel-linking token for the LOGGED-IN user. The token proves
-   * control of the external identity (only its Slack DM ever saw it); the
+   * control of the external identity (only its DM on that surface ever saw it); the
    * DDP session proves the web account; the package's `redeemLinkToken` burns
    * the token atomically, writes the identity row, and claims the anonymous
    * conversations that identity created. Returns what the UI needs to say.

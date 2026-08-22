@@ -114,7 +114,8 @@ message the agent runs as you on both surfaces. Wiring on the app side is a
 `linkUrl` option plus one method that calls `redeemLinkToken` — the demo app's
 `server/main.js` and `client/main.js` are the reference. Only the exact word
 triggers it; "link my account please" reaches the agent as an ordinary
-message.
+message. DMs only: the URL is a credential, so `@bot link` in a channel is
+just a message — send it in a DM.
 
 ## What the lens answers, and what it never does
 

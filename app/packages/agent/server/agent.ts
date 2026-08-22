@@ -333,15 +333,15 @@ export class Agent {
    * overwrite-with-warning on re-registration so a dev hot reload does not
    * throw.
    *
-   *   Agent.channel('sms', {
-   *     agent: 'support',
-   *     transport: twilioTransport({ from: '+15559990000' }),
-   *     lens: smsLens,                          // { out, in } — the two halves
-   *     profile: { interact: 'menu', limit: 1600 },
-   *     verify: (raw) => twilioSignatureOk(raw),
-   *     parse: (raw) => parseTwilioForm(raw.rawBody),
-   *     statuses: ['error'],
-   *   });
+   *   // Tier 1 (§8.7): a channel package's factory builds the definition —
+   *   import { sms } from 'meteor/10thfloor:agent-channel-sms';
+   *   Agent.channel('sms', sms({
+   *     agent: 'support', accountSid, authToken, webhookUrl,
+   *   }));
+   *
+   *   // — which is sugar over a plain ChannelDef: one lens ({ out, in }),
+   *   // one transport, one profile, the webhook's verify/parse, and the
+   *   // knobs (statuses, onUncertainDelivery, sessionUrl, linkUrl, throttle).
    *
    * Registration is inert by itself: the boot wiring (server/index.ts) mounts
    * the webhook at `/agent/channels/<kind>` and starts the egress worker,

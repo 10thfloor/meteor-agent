@@ -32,8 +32,9 @@ interface InboundResponse { status: number; body?: string }
 /** In-memory sliding windows, per process: the brake on a flood, deliberately
  *  BEFORE the admission claim — the throttle is a counter, the claim is a
  *  database write, and validly-signed junk must not buy an insert each. A
- *  throttled provider retry simply retries later and collides with the claim
- *  then.
+ *  throttled event is settled with a 200 and forgotten — it buys neither a
+ *  write nor a provider retry (see the handler: a 429 would be a failure the
+ *  provider retries and holds against the integration).
  *
  *  Bounded by CONCURRENT senders, not history: every `PRUNE_EVERY` calls the
  *  map is swept and any key whose newest hit has aged out of its own window
@@ -59,13 +60,10 @@ function throttled(key: string, limit: number, intervalMs: number): boolean {
     pruneWindows(now);
   }
   const hits = (windows.get(key)?.hits ?? []).filter((t) => now - t < intervalMs);
-  if (hits.length >= limit) {
-    windows.set(key, { hits, intervalMs });
-    return true;
-  }
-  hits.push(now);
+  const over = hits.length >= limit;
+  if (!over) hits.push(now);
   windows.set(key, { hits, intervalMs });
-  return false;
+  return over;
 }
 
 /** TEST SEAM: throttle state is process-lifetime, and a test must not inherit
@@ -91,16 +89,23 @@ export function _throttleStats(now = Date.now()): { tracked: number } {
  * catches the duplicate key having created NOTHING, and adopts the winner's
  * binding — whereas session-first would orphan a session on every lost race.
  *
- * A winner that crashes between the two writes leaves a binding whose session
- * does not exist yet; the `ensureSession` pass below repairs it on the next
- * message — the loop's own repair-on-entry ethos.
+ * `findOrCreateBinding` wins or adopts the binding; `ensureSession` then
+ * repairs the session it names.
  */
-async function upsertBinding(
-  kind: string, def: ChannelDef, reading: InboundReading,
+async function bindConversation(
+  kind: string, def: ChannelDef, conversationRef: string, reading: InboundReading,
   identity: { userId: string; assurance: 'link' | 'oidc' } | null,
 ): Promise<ChannelBinding | null> {
-  const ref = reading.conversationRef!;
-  const bindingId = `${kind}:${ref}`;
+  const binding = await findOrCreateBinding(kind, def, conversationRef, reading, identity);
+  if (!binding) return null;
+  return (await ensureSession(kind, binding)) ? binding : null;
+}
+
+async function findOrCreateBinding(
+  kind: string, def: ChannelDef, conversationRef: string, reading: InboundReading,
+  identity: { userId: string; assurance: 'link' | 'oidc' } | null,
+): Promise<ChannelBinding | null> {
+  const bindingId = `${kind}:${conversationRef}`;
 
   let binding = await ChannelBindings.findOneAsync(bindingId);
   if (!binding) {
@@ -109,7 +114,7 @@ async function upsertBinding(
       await ChannelBindings.insertAsync({
         _id: bindingId,
         kind,
-        conversationRef: ref,
+        conversationRef,
         destination: reading.destination ?? null,
         // Default 'group' — the SAFE direction for §8.5's capability-URL rule.
         audience: reading.audience ?? 'group',
@@ -117,7 +122,7 @@ async function upsertBinding(
         sessionId,
         userId: identity?.userId ?? null,
         // The OPENER's proof strength, recorded at bind time so a later
-        // repair-on-entry (below) stamps the session with the owner's
+        // repair-on-entry (`ensureSession`) stamps the session with the owner's
         // assurance — not that of whoever happens to trigger the repair.
         assurance: identity?.assurance ?? 'none',
         ...(reading.externalUserId !== undefined
@@ -138,19 +143,26 @@ async function upsertBinding(
     // conversations, not history), so every inbound event marks its binding.
     await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
   }
+  return binding;
+}
 
-  // Repair-on-entry: create the session the binding names if it does not
-  // exist yet (first contact, or the winner crashed between its two writes).
-  // The EXACT document `agent.start` builds, field for field, plus the
-  // additive channel descriptor (§5.2) — the loop, the lease and the watcher
-  // all read this shape.
+/**
+ * Repair-on-entry: create the session the binding names if it does not
+ * exist yet (first contact, or the winner crashed between its two writes).
+ * The EXACT document `agent.start` builds, field for field, plus the
+ * additive channel descriptor (§5.2) — the loop, the lease and the watcher
+ * all read this shape. A winner that crashed between its two writes left a
+ * binding whose session does not exist yet; this pass repairs it on the next
+ * message — the loop's own repair-on-entry ethos.
+ */
+async function ensureSession(kind: string, binding: ChannelBinding): Promise<boolean> {
   const config = getAgent(binding.agent);
   if (!config) {
     console.warn(
       `[10thfloor:agent] channel "${kind}": the binding for session ${binding.sessionId} names `
       + `unregistered agent "${binding.agent}"; dropping the event`,
     );
-    return null;
+    return false;
   }
   const existing = await AgentSessions.findOneAsync(binding.sessionId);
   if (!existing) {
@@ -173,7 +185,7 @@ async function upsertBinding(
       if (!isDuplicateKey(e)) throw e;   // another server's repair won — fine
     }
   }
-  return binding;
+  return true;
 }
 
 // ---- Free text against an outstanding prompt (§8.3) ------------------------
@@ -181,9 +193,11 @@ async function upsertBinding(
 /**
  * "YES" from a phone number is a verdict ONLY IF an approval prompt is
  * outstanding on that binding — otherwise it is a message. The receipt is the
- * memory of what was offered; the `toolCallId` guard drops a match whose ask
- * is no longer the parked one; and beneath both, the single-winner verdict
- * write remains the final authority.
+ * memory of what was offered, looked up by the CURRENTLY parked toolCallId —
+ * that lookup is the staleness guard: last week's prompt receipt is never
+ * consulted. The `toolCallId` check on the match is a belt-and-braces
+ * invariant (exported `deliverOnce` callers build their own `expects`); and
+ * beneath both, the single-winner verdict write remains the final authority.
  */
 async function verdictFromExpects(
   binding: ChannelBinding, text: string,
@@ -197,7 +211,7 @@ async function verdictFromExpects(
   if (!receipt?.expects) return null;
   const match = matchExpectation(text, receipt.expects);
   if (!match) return null;
-  if (match.toolCallId !== pending.toolCallId) return null;   // a stale grammar
+  if (match.toolCallId !== pending.toolCallId) return null;   // invariant: expects built for this ask
   return match.verdict;
 }
 
@@ -285,7 +299,7 @@ async function route(
   const identity = reading.externalUserId !== undefined
     ? await resolveIdentity(kind, reading.externalUserId)
     : null;
-  const binding = await upsertBinding(kind, def, reading, identity);
+  const binding = await bindConversation(kind, def, reading.conversationRef, reading, identity);
   if (!binding) return { status: 200 };
 
   // The identity the agent-facing calls run under: the SENDER's resolved
@@ -351,17 +365,25 @@ async function route(
     // offer at all.
     if (!def.linkUrl || reading.externalUserId === undefined) return { status: 200 };
     if (binding.audience !== 'direct') {
-      await deliverOnce(kind, binding, {
+      const outcome = await deliverOnce(kind, binding, {
         item: 'reply',
         text: 'To link your account, send me the word "link" in a direct message — not here.',
       }, `link-hint:${reading.eventId ?? reading.externalUserId}`, { def });
+      if (outcome !== 'delivered') {
+        console.warn(`[10thfloor:agent] channel "${kind}": link hint for session ${binding.sessionId} not delivered (${outcome})`);
+      }
       return { status: 200 };
     }
     const token = await issueLinkToken(kind, reading.externalUserId);
-    await deliverOnce(kind, binding, {
+    const outcome = await deliverOnce(kind, binding, {
       item: 'reply',
       text: `To link this conversation to your account, open: ${def.linkUrl(token)}`,
     }, `link:${reading.eventId ?? token}`, { def });
+    if (outcome !== 'delivered') {
+      // Link replies are not seq rows, so no sweep retries them: say so, and
+      // the user can send "link" again (a fresh eventId, a fresh receipt).
+      console.warn(`[10thfloor:agent] channel "${kind}": link reply for session ${binding.sessionId} not delivered (${outcome}); nothing retries it`);
+    }
     return { status: 200 };
   } catch (e) {
     // The agent-facing calls refuse with Meteor.Errors that are SETTLED facts
@@ -401,12 +423,12 @@ class BodyTooLarge extends Error {
 
 /** Read the whole request body UNPARSED: signature schemes sign raw bytes, and
  *  a re-serialized body never verifies. Capped — see `MAX_INBOUND_BYTES`. */
-function readRawBody(req: any, limit = MAX_INBOUND_BYTES): Promise<string> {
+function readRawBody(req: any): Promise<string> {
   return new Promise((resolve, reject) => {
     // Honor a declared length first: a truthful oversize client is refused
     // before a single chunk is buffered.
     const declared = Number(req.headers?.['content-length']);
-    if (Number.isFinite(declared) && declared > limit) {
+    if (Number.isFinite(declared) && declared > MAX_INBOUND_BYTES) {
       reject(new BodyTooLarge());
       return;
     }
@@ -415,7 +437,7 @@ function readRawBody(req: any, limit = MAX_INBOUND_BYTES): Promise<string> {
     req.setEncoding('utf8');
     req.on('data', (chunk: string) => {
       size += Buffer.byteLength(chunk, 'utf8');
-      if (size > limit) {
+      if (size > MAX_INBOUND_BYTES) {
         // Stop reading and close the socket — do not keep buffering while a
         // lying client streams past its declared length.
         req.destroy();

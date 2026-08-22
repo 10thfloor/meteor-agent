@@ -1,3 +1,4 @@
+import type { Mongo } from 'meteor/mongo';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
   ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
@@ -45,7 +46,7 @@ import { NAMES } from '../common/names';
  */
 export async function ensureIndexes(): Promise<void> {
   const specs: Array<{
-    collection: { createIndexAsync?: unknown };
+    collection: Pick<Mongo.Collection<any>, 'createIndexAsync'>;
     name: string;
     keys: Record<string, 1 | -1>;
     options?: Record<string, unknown>;
@@ -67,14 +68,6 @@ export async function ensureIndexes(): Promise<void> {
       keys: { phase: 1, 'lease.until': 1 },
     },
     // ---- Channels (channels spec §6) ----------------------------------------
-    // The bindings' reverse lookup is by DERIVED `_id`, so this compound key's
-    // day job is the egress sweep's `find({ kind })` slice (kind prefix) and
-    // the linking pass's `{ kind, externalUserId }` — hence two keys, not one.
-    {
-      collection: ChannelBindings,
-      name: NAMES.channelBindings,
-      keys: { kind: 1, conversationRef: 1 },
-    },
     // The fan-out lookup: a committed row → every binding of its session
     // (the egress observer runs it per insert), and the notify-tool shape.
     {
@@ -134,7 +127,7 @@ export async function ensureIndexes(): Promise<void> {
   for (const spec of specs) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      await (spec.collection as any).createIndexAsync(spec.keys, spec.options ?? {});
+      await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
     } catch (e: any) {
       console.warn(
         `[10thfloor:agent] could not create the ${spec.name} index `

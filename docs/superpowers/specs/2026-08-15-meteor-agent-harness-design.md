@@ -331,7 +331,7 @@ Support.stop(sessionId?)                      // teardown for component unmount
 ```
 
 Manual `Support.compact(sessionId)` was sketched here but NOT shipped in v1 —
-compaction is automatic (§9). On the server, `ask` takes an explicit
+compaction is automatic (§9). *(Shipped later: `Agent#compact(sessionId, { userId })` and the `agent.compact` method — see the package README.)* On the server, `ask` takes an explicit
 `{ userId }`; the other write methods are DDP methods.
 
 ### 5.4 Server-only surface
@@ -346,7 +346,7 @@ startWatcher(opts?)                           // §4.3 — usually automatic at 
 
 `Agent.provider(name, impl)` (a global provider registry) was sketched here but
 NOT shipped in v1: providers are per-agent config objects, and the pi-ai
-default covers the registry's main use.
+default covers the registry's main use. *(Shipped later: `Agent.provider(name, impl)` with `provider: 'name'` resolution at run time — see the package README.)*
 
 ### 5.5 Minimal consumer example
 
@@ -446,7 +446,7 @@ second, independent validation rather than the schema source.
 ## 7. Permissions, gates, and rate limiting
 
 Per-tool `gate`: `'auto'` (default) or `'ask'` (parks per §4.3). A predicate
-gate (`(ctx) => boolean | 'ask'`) was sketched here but NOT shipped in v1 —
+gate (`(ctx) => boolean | 'ask'`) was sketched here but NOT shipped in v1 *(it shipped later as predicate gates, alongside `runAs` — see the package README)* —
 `canUse(tool, ctx)`, the agent-wide backstop (checked before gates, so a
 forbidden tool never parks), covers the dynamic case; a per-tool predicate is
 a v2 candidate. Tools always run as the session's user (`runAs` not shipped).

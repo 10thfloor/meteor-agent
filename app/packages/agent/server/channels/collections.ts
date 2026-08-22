@@ -1,6 +1,6 @@
 import { Mongo } from 'meteor/mongo';
 import { NAMES } from '../../common/names';
-import type { Cond, Fields, TypedCollection } from '../../common/db';
+import type { Fields, TypedCollection } from '../../common/db';
 
 /**
  * The channel subsystem's collections (channels spec §6): identity, routing,
@@ -49,7 +49,7 @@ export interface ChannelIdentity {
  * watcher's orphan-child note: two servers racing to bind the same thread
  * collide on the primary key, and the loser adopts the winner's binding
  * having created nothing (the binding is inserted BEFORE the session — see
- * `upsertBinding` in ingress.ts).
+ * `findOrCreateBinding`/`bindConversation` in ingress.ts).
  *
  * ONE SESSION MAY HOLD MANY BINDINGS — that is the point of splitting identity
  * from routing. A session reachable from Slack and SMS has two rows, each with
@@ -126,8 +126,9 @@ export interface DeliveryReceipt {
   state: 'sending' | 'sent' | 'abandoned';
   providerMessageId?: string;
   /** Present only on prompt deliveries: the reply grammar this delivery
-   *  registered. The inbound side consults the binding's latest outstanding
-   *  one before falling through to "this is a message". */
+   *  registered. The inbound side consults the receipt for the currently
+   *  parked ask (`prompt:<toolCallId>`) before falling through to "this is a
+   *  message". */
   expects?: ReceiptExpectation[];
   attempts: number;
   at: Date;
@@ -235,10 +236,6 @@ export type LinkTokenQuery =
 export type VerdictTokenQuery =
   & Fields<ChannelVerdictToken>
   & { $or?: VerdictTokenQuery[]; $and?: VerdictTokenQuery[]; $nor?: VerdictTokenQuery[] };
-
-// `Cond` is re-exported by db.ts for exactly this kind of consumer; referencing
-// it keeps the import list honest about what the facade types are built from.
-export type { Cond };
 
 // ---- The collections -------------------------------------------------------
 

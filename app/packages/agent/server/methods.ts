@@ -304,13 +304,13 @@ export async function recordVerdict(
 /**
  * The CORE of `agent.send`, with identity as a plain parameter — the same
  * extract-with-`userId` refactor `ask`/`fork`/`compact` already had (channels
- * spec §5.1). The DDP method below is a cap over this: checks, the
- * `startable` refusal (a PUBLIC-surface rule — a server-side caller is app
- * code, exactly as `Agent.ask` already reaches non-startable specialists), and
- * then this core with `this.userId`.
+ * spec §5.1). `mSend` below is a cap over this: checks, the `startable`
+ * refusal (see its comment for why that lives on the cap, not here), then
+ * this core with `this.userId`. `Agent.send` (agent.ts) owns the public
+ * semantics.
  *
  * Nothing here is new machinery: `requireSession` is the same always-3-field
- * authorization every method uses (an omitted userId scopes to the ANONYMOUS
+ * authorization every method uses (`userId: null` scopes to the ANONYMOUS
  * owner, never to "all sessions"), the seq allocation is the same atomic
  * `findOneAndUpdate` with the budget `$lt` folded in — so any caller of the
  * core inherits the turn budget — and the wake is the one `deferTurn` path.
@@ -322,13 +322,32 @@ export async function sendToSession(
   if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
   await requireSession(agent, sessionId, userId);
 
-  // §9: the turn budget, enforced INSIDE the atomic allocation — see the DDP
-  // method's original comment; the semantics are unchanged by the extraction.
+  // §9: the turn budget, enforced INSIDE the atomic allocation below, not
+  // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
+  // here, but concurrent sends all reading the same pre-inc value would
+  // each pass a separate check — with capability-URL sessions the caller
+  // count is unbounded, so the overshoot would be too. Folding
+  // `$lt: limit` into the filter makes check-and-spend one operation: a
+  // budget of N permits exactly N sends under any concurrency.
+  //
+  // A refusal, not a stop. The other two budgets trip inside a running
+  // loop, where the only way to say no is a transcript note; here there is
+  // a caller on the other end, so tell them — and write nothing at all, so
+  // a refused send costs neither a seq nor a message nor the budget it was
+  // refused for. Asking again is refused identically until an operator
+  // raises the limit.
   const turnFilter: Record<string, unknown> = { _id: sessionId };
   if (config.budget?.turns !== undefined) {
+    // Matches when under budget. Sessions seeded before this field existed
+    // have budgetSpent.turns set by mStart, so $lt sees a number.
     turnFilter['budgetSpent.turns'] = { $lt: config.budget.turns };
   }
 
+  // Seq allocation is ATOMIC (single findOneAndUpdate), not read-then-
+  // insert. A read-then-insert here races the in-flight turn loop: both
+  // read the same nextSeq and the user message lands on the same seq the
+  // assistant is about to commit at, making transcript order
+  // non-deterministic. The loop allocates its seqs the same way.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     turnFilter,
     {

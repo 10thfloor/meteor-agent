@@ -29,6 +29,23 @@ function dmEvent(over: Record<string, unknown> = {}, envelopeOver: Record<string
   };
 }
 
+/** A fetch stub that records each call and answers with one fixed JSON body. */
+function fakeFetch(reply: unknown) {
+  const calls: Array<{ url: string; init: any }> = [];
+  const fetchImpl = (async (url: any, init: any) => {
+    calls.push({ url, init });
+    return { json: async () => reply };
+  }) as unknown as typeof fetch;
+  return { calls, fetchImpl };
+}
+
+/** Parse + read one event-callback envelope through the lens, as the host
+ *  would: `dmEvent(over, env)` → `parseSlackRequest` → `slackLens.in`. */
+async function read(over = {}, env = {}) {
+  const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+  return slackLens.in(parseSlackRequest({ headers: {}, rawBody: JSON.stringify(dmEvent(over, env)) }));
+}
+
 describe('agent-channel-slack', () => {
   describe('signature', () => {
     it('accepts a correctly signed request and rejects a tampered or stale one', async () => {
@@ -59,8 +76,7 @@ describe('agent-channel-slack', () => {
     });
 
     it('keys a DM by its CHANNEL — one conversation, however many messages', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
-      const reading = slackLens.in(parseSlackRequest({ headers: {}, rawBody: JSON.stringify(dmEvent()) }));
+      const reading = await read();
       assert.deepEqual(reading.intent, { kind: 'message', text: 'hello there' });
       assert.equal(reading.eventId, 'Ev001');
       assert.equal(reading.externalUserId, 'T1:U7');
@@ -70,90 +86,58 @@ describe('agent-channel-slack', () => {
       // The load-bearing property: a SECOND top-level DM message (new ts) maps
       // to the SAME conversation — keying DMs by message ts would mint a fresh
       // session per message, an agent with per-message amnesia.
-      const second = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ ts: '1700000099.000500' }, { event_id: 'Ev099' })),
-      }));
+      const second = await read({ ts: '1700000099.000500' }, { event_id: 'Ev099' });
       assert.equal(second.conversationRef, 'T1:D42');
-      const threadedInDm = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ thread_ts: '1699.5' })),
-      }));
+      const threadedInDm = await read({ thread_ts: '1699.5' });
       assert.equal(threadedInDm.conversationRef, 'T1:D42', 'a threaded DM reply still joins the one conversation');
     });
 
     it('keys a channel mention by its THREAD, and threads the replies', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
-      const mention = slackLens.in(parseSlackRequest({
-        headers: {},
-        rawBody: JSON.stringify(dmEvent(
-          { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> hi' },
-        )),
-      }));
+      const mention = await read(
+        { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> hi' },
+      );
       assert.equal(mention.conversationRef, 'T1:C9:1700000000.000100');
       assert.deepEqual(mention.destination, { channel: 'C9', threadTs: '1700000000.000100' });
-      const followUp = slackLens.in(parseSlackRequest({
-        headers: {},
-        rawBody: JSON.stringify(dmEvent(
-          { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> more', thread_ts: '1700000000.000100', ts: '1700000050.000200' },
-          { event_id: 'Ev050' },
-        )),
-      }));
+      const followUp = await read(
+        { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> more', thread_ts: '1700000000.000100', ts: '1700000050.000200' },
+        { event_id: 'Ev050' },
+      );
       assert.equal(followUp.conversationRef, 'T1:C9:1700000000.000100', 'a re-mention in the thread shares the ref');
     });
 
     it('never answers itself: bot posts and subtyped alterations are noops', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
-      const echo = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ bot_id: 'B9', user: undefined })),
-      }));
+      const echo = await read({ bot_id: 'B9', user: undefined });
       assert.equal(echo.intent.kind, 'noop', 'the self-reply loop is closed');
-      const edited = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ subtype: 'message_changed' })),
-      }));
+      const edited = await read({ subtype: 'message_changed' });
       assert.equal(edited.intent.kind, 'noop');
     });
 
     it('ignores channel chatter but answers a mention with the mention stripped', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
-      const chatter = slackLens.in(parseSlackRequest({
-        headers: {},
-        rawBody: JSON.stringify(dmEvent({ channel_type: 'channel', channel: 'C9' })),
-      }));
+      const chatter = await read({ channel_type: 'channel', channel: 'C9' });
       assert.equal(chatter.intent.kind, 'noop', 'unmentioned channel messages are not addressed to the agent');
-      const mention = slackLens.in(parseSlackRequest({
-        headers: {},
-        rawBody: JSON.stringify(dmEvent(
-          { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> what time is it?' },
-        )),
-      }));
+      const mention = await read(
+        { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> what time is it?' },
+      );
       assert.deepEqual(mention.intent, { kind: 'message', text: 'what time is it?' });
       assert.equal(mention.audience, 'group', 'a channel is a group surface');
     });
 
     it('yields the DM-shaped app_mention to message.im — one event, one turn', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
       // A mention typed inside the bot's own DM arrives as BOTH message.im and
       // app_mention, under two different event_ids — admission dedup cannot
       // collapse them, so the lens must.
-      const dmMention = slackLens.in(parseSlackRequest({
-        headers: {},
-        rawBody: JSON.stringify(dmEvent(
-          { type: 'app_mention', channel_type: undefined, channel: 'D42', text: '<@UBOT> hi' },
-          { event_id: 'Ev002' },
-        )),
-      }));
+      const dmMention = await read(
+        { type: 'app_mention', channel_type: undefined, channel: 'D42', text: '<@UBOT> hi' },
+        { event_id: 'Ev002' },
+      );
       assert.equal(dmMention.intent.kind, 'noop', 'the DM copy is authoritative; the mention copy yields');
     });
 
     it('reads the bare word "link" as a link request — and only the bare word', async () => {
-      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
-      const bare = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ text: '  Link ' })),
-      }));
+      const bare = await read({ text: '  Link ' });
       assert.equal(bare.intent.kind, 'link-request');
       assert.equal(bare.externalUserId, 'T1:U7', 'the request still carries who is asking');
-      const sentence = slackLens.in(parseSlackRequest({
-        headers: {}, rawBody: JSON.stringify(dmEvent({ text: 'link my account please' })),
-      }));
+      const sentence = await read({ text: 'link my account please' });
       assert.equal(sentence.intent.kind, 'message', 'a sentence containing "link" reaches the agent');
     });
 
@@ -176,6 +160,31 @@ describe('agent-channel-slack', () => {
       assert.deepEqual(reading.intent, { kind: 'verdict', verdict: 'approved', toolCallId: 'tc1' });
       assert.equal(reading.conversationRef, 'T1:D42', 'the click lands on the binding the DM created');
       assert.equal(reading.eventId, 'act:U7:1700000042.000000');
+    });
+
+    it('a click in a channel thread lands on the thread the mention created', async () => {
+      const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const mention = await read(
+        { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> refund' },
+      );
+      // The card is posted INTO the thread, so the click's message.ts is the
+      // card's own ts — the thread is message.thread_ts. Keying by .ts would
+      // route the verdict into a phantom conversation.
+      const payload = {
+        type: 'block_actions', team: { id: 'T1' }, user: { id: 'U7', team_id: 'T1' },
+        channel: { id: 'C9' },
+        message: { ts: '1700000001.000200', thread_ts: '1700000000.000100' },
+        actions: [{
+          action_id: 'agent-verdict-deny', action_ts: '1700.9',
+          value: JSON.stringify({ token: 'deny', toolCallId: 'tc1' }),
+        }],
+      };
+      const click = slackLens.in(parseSlackRequest({
+        headers: {}, rawBody: `payload=${encodeURIComponent(JSON.stringify(payload))}`,
+      }));
+      assert.equal(click.conversationRef, mention.conversationRef);
+      assert.deepEqual(click.destination, mention.destination);
+      assert.equal(click.audience, 'group');
     });
   });
 
@@ -213,7 +222,21 @@ describe('agent-channel-slack', () => {
     });
   });
 
-  describe('hostile model text in the approval card', () => {
+  describe('status prose', () => {
+    it('renders the default approval statuses as prose, never the bracketed fallback', async () => {
+      const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const out = (s: object) =>
+        (slackLens.out({ item: 'status', kind: 'approval', ...s } as any, {}) as any).text as string;
+      assert.include(out({ approved: true }), 'Approved');
+      assert.include(out({ approved: false }), 'Denied');
+      // The reason is a structured TOKEN the core writes (`'approval timed out'`);
+      // this pins that the lens keys on the same spelling.
+      assert.include(out({ approved: false, reason: 'approval timed out' }), 'timed out');
+      assert.notMatch(out({ approved: true }), /^\[/, 'never the default arm');
+    });
+  });
+
+  describe('hostile inputs', () => {
     it('escapes the tool name and arguments and keeps a fence-breakout inside the fence', async () => {
       const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
       const rendered = slackLens.out({
@@ -245,11 +268,7 @@ describe('agent-channel-slack', () => {
 
     it('a payload can never redirect a post, and rendering policy is pinned', async () => {
       const { slackTransport } = await import('meteor/10thfloor:agent-channel-slack');
-      const calls: any[] = [];
-      const fetchImpl = (async (url: any, init: any) => {
-        calls.push({ url, init });
-        return { json: async () => ({ ok: true, ts: '1' }) };
-      }) as unknown as typeof fetch;
+      const { calls, fetchImpl } = fakeFetch({ ok: true, ts: '1' });
       const transport = slackTransport({ botToken: 'xoxb-t', fetchImpl });
       await transport.post(
         { channel: 'D42' }, { text: 'hi', channel: 'C-EVIL', parse: 'full' }, { idempotencyKey: 'k' },
@@ -282,11 +301,7 @@ describe('agent-channel-slack', () => {
   describe('transport', () => {
     it('posts to chat.postMessage with the destination threaded and the receipt in metadata', async () => {
       const { slackTransport } = await import('meteor/10thfloor:agent-channel-slack');
-      const calls: any[] = [];
-      const fetchImpl = (async (url: any, init: any) => {
-        calls.push({ url, init });
-        return { json: async () => ({ ok: true, ts: '1700.42' }) };
-      }) as unknown as typeof fetch;
+      const { calls, fetchImpl } = fakeFetch({ ok: true, ts: '1700.42' });
       const transport = slackTransport({ botToken: 'xoxb-test', fetchImpl });
       const posted = await transport.post(
         { channel: 'D42', threadTs: '1700.1' }, { text: 'hi' }, { idempotencyKey: 'deliver:x:y' },
@@ -303,7 +318,7 @@ describe('agent-channel-slack', () => {
 
     it('throws the Slack error name so the receipt stays mid-sending for the retry', async () => {
       const { slackTransport } = await import('meteor/10thfloor:agent-channel-slack');
-      const fetchImpl = (async () => ({ json: async () => ({ ok: false, error: 'channel_not_found' }) })) as unknown as typeof fetch;
+      const { fetchImpl } = fakeFetch({ ok: false, error: 'channel_not_found' });
       const transport = slackTransport({ botToken: 'xoxb-test', fetchImpl });
       try {
         await transport.post({ channel: 'D0' }, { text: 'hi' }, { idempotencyKey: 'k' });

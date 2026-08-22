@@ -1,5 +1,5 @@
 import type { AgentMessage, AgentSession } from '../../common/types';
-import type { ChannelProfile, DeliveryItem } from './contract';
+import { MENU_MATCHES, type ChannelProfile, type DeliveryItem } from './contract';
 
 /**
  * The shared planner (channels spec §8.2): decide WHAT a surface receives.
@@ -41,7 +41,12 @@ export interface PlannedRow {
  *  room reserved for the ellipsis and the link. */
 function overflow(text: string, limit: number, url?: string): DeliveryItem {
   const reserve = 2 + (url ? url.length + 1 : 0);
-  const head = `${text.slice(0, Math.max(1, limit - reserve))}…`;
+  let end = Math.max(1, limit - reserve);
+  // Never cut a surrogate pair: a lone high surrogate is a payload providers
+  // reject deterministically (see egress.ts MAX_DELIVERY_ATTEMPTS).
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  const head = `${text.slice(0, end)}…`;
   return { item: 'overflow', head, ...(url !== undefined ? { url } : {}) };
 }
 
@@ -79,9 +84,6 @@ export function planItems(messages: AgentMessage[], opts: PlanOptions): PlannedR
   return messages.map((message) => ({ message, item: itemFor(message, opts) }));
 }
 
-export { MENU_MATCHES } from './contract';
-import { MENU_MATCHES } from './contract';
-
 /**
  * The parked approval as a `prompt` item — built from `session.pending`, never
  * from a note (§8.2), and only while the ask is still UNANSWERED. `toolCallId`
@@ -114,23 +116,4 @@ export function promptItem(
   };
 }
 
-/**
- * The reply grammar a delivered prompt registers (§8.3): what the receipt's
- * `expects` records, and what the inbound side matches free text against
- * before falling through to "this is a message". Only `menu` choices carry a
- * text grammar — `native` postbacks and `link` redemptions arrive as their own
- * event shapes, interpreted by the lens and the token table respectively.
- */
-export function expectationsFor(
-  prompt: Extract<DeliveryItem, { item: 'prompt' }>,
-): Array<{ match: string; verdict: 'approved' | 'denied'; toolCallId: string }> {
-  return prompt.choices
-    .filter((c) => c.match !== undefined)
-    .map((c) => ({
-      match: c.match!,
-      verdict: c.token === 'approve' ? 'approved' as const : 'denied' as const,
-      toolCallId: prompt.toolCallId,
-    }));
-}
-
-export { matchExpectation } from './contract';
+export { expectationsFor, matchExpectation } from './contract';

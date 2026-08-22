@@ -122,7 +122,7 @@ describe('agent-channel-telegram', () => {
   });
 
   describe('the callback payload', () => {
-    it('stays under Telegram’s 64-byte cap, degrading to token-only for a huge ask id', async () => {
+    it('carries the exact ask on every button, degrading to token-only past Telegram’s 64-byte cap', async () => {
       const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
       const prompt = {
         item: 'prompt' as const, name: 'x', args: {},
@@ -137,6 +137,13 @@ describe('agent-channel-telegram', () => {
         assert.isAtMost(Buffer.byteLength(row[0].callback_data, 'utf8'), 64);
         const data = JSON.parse(row[0].callback_data);
         assert.isUndefined(data.c, 'the over-long ask degraded to token-only, never a truncated wrong ask');
+      }
+
+      // The normal path: a sane ask id rides every button verbatim, so the
+      // staleness rule (exact toolCallId) survives render → click.
+      const normal: any = telegramLens.out({ ...prompt, toolCallId: 'tc1' }, { chatId: 1 });
+      for (const row of normal.reply_markup.inline_keyboard) {
+        assert.equal(JSON.parse(row[0].callback_data).c, 'tc1', 'a normal ask rides the button');
       }
     });
   });

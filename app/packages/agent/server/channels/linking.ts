@@ -114,6 +114,10 @@ export async function linkIdentity(
   const row: ChannelIdentity = {
     _id, kind, externalUserId, userId, assurance, linkedAt: new Date(),
   };
+  // The assurance the identity row ends up holding — the caller's proof, or
+  // the stronger `oidc` an existing row already carries. Stamped on claimed
+  // sessions too, so a session and its identity row never disagree.
+  let effective: 'link' | 'oidc' = assurance;
   try {
     await ChannelIdentities.insertAsync(row);
   } catch (e) {
@@ -132,13 +136,9 @@ export async function linkIdentity(
     // The SAME account re-proving itself (a second surface session, an
     // assurance upgrade): keep the stronger proof, never downgrade — an
     // `oidc` row stays `oidc` when a later link-token flow re-proves weaker.
-    const keepOidc = existing?.assurance === 'oidc';
+    if (existing?.assurance === 'oidc') effective = 'oidc';
     await ChannelIdentities.updateAsync(_id, {
-      $set: {
-        userId,
-        assurance: keepOidc ? 'oidc' : assurance,
-        linkedAt: new Date(),
-      },
+      $set: { userId, assurance: effective, linkedAt: new Date() },
     });
   }
 
@@ -162,7 +162,7 @@ export async function linkIdentity(
       {
         $set: {
           userId,
-          'channel.assurance': assurance,
+          'channel.assurance': effective,
           updatedAt: new Date(),
         },
       },
@@ -237,9 +237,15 @@ export async function redeemVerdictToken(token: string): Promise<boolean> {
       doc.verdict === 'denied' ? 'denied via approval link' : undefined,
     );
     return true;
-  } catch {
-    // `no-pending` (someone answered first) or `not-allowed` (the agent's
-    // approve predicate refused the owner): the ask was not decided by us.
-    return false;
+  } catch (e) {
+    // A Meteor.Error is a SETTLED refusal — `no-pending` (someone answered
+    // first), `not-allowed` (the agent's approve predicate refused the owner),
+    // `no-session`/`no-agent` (the token names a session or agent that no
+    // longer matches): the ask was not decided by us, and the same false every
+    // other failure gives is the right answer. Anything else (a failed write, a
+    // bug) is not a verdict on the token and propagates — the same split
+    // `redeemLinkToken` above and ingress.ts `route()` apply.
+    if (e instanceof Meteor.Error) return false;
+    throw e;
   }
 }

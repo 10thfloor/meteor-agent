@@ -64,12 +64,13 @@ export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 // `assertLensRoundTrip`.
 export {
   assertLensRoundTrip, exemplarItems, matchExpectation, DELIVERY_ITEM_KINDS,
+  MENU_MATCHES,
   type ChannelProfile, type ChannelTransport, type DeliveryItem,
   type InboundIntent, type InboundReading, type Lens, type PromptChoice,
   type RoundTripOptions,
 } from './channels/contract';
 export {
-  expectationsFor, planItems, promptItem, MENU_MATCHES,
+  expectationsFor, planItems, promptItem,
   type PlanOptions, type PlannedRow,
 } from './channels/plan';
 export { type ChannelDef, type RawInbound, listChannels } from './channels/registry';

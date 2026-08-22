@@ -486,18 +486,34 @@ form and interprets inbound events back into a fixed set of meanings.
 
 ```ts
 // server
+import { sms } from 'meteor/10thfloor:agent-channel-sms';
+
+const cfg = Meteor.settings.packages['10thfloor:agent'].sms;
+Agent.channel('sms', sms({
+  agent: 'support',
+  accountSid: cfg.accountSid,   // AC…
+  authToken: cfg.authToken,     // also the signature key
+  webhookUrl: cfg.webhookUrl,   // the EXACT public URL Twilio calls
+}));
+```
+
+The factory is sugar over a plain channel definition — the same pieces you
+would write for a surface of your own:
+
+```ts
 Agent.channel('sms', {
   agent: 'support',
-  transport: twilioTransport({ from: '+15559990000' }),
+  transport: smsTransport({ accountSid, authToken }),
   lens: smsLens,                              // { out, in } — two halves, one object
-  profile: { interact: 'menu', limit: 1600 }, // choices render as "Reply YES / NO"
-  verify: (raw) => twilioSignatureOk(raw),
+  profile: { interact: 'menu', limit: 1500 }, // choices render as "Reply YES / NO"
+  verify: (raw) => verifyTwilioSignature(raw, authToken, webhookUrl),
   parse: (raw) => parseTwilioForm(raw.rawBody),
-  statuses: ['error'],
+  statuses: ['error', 'approval'],
 });
 ```
 
-The webhook mounts at `/agent/channels/sms`; the worker delivers every
+(where `accountSid`, `authToken`, `webhookUrl` are the same three settings
+values). The webhook mounts at `/agent/channels/sms`; the worker delivers every
 committed reply to every surface bound to the session. One conversation can be
 live in Slack, mirrored over SMS, and open in the web app at once — each
 surface tracks its own cursor, so a downed gateway delays only itself.
@@ -514,7 +530,7 @@ What you inherit without writing it: **exactly-once admission** (a provider
 retry never runs a second turn), **effectively-once delivery** (a three-phase
 receipt log — a redeploy re-sends nothing), **approvals over any surface**
 (buttons where the surface has them, "Reply YES to approve" where it doesn't,
-signed one-time links where replies are awkward — same single-winner verdict
+single-use links where replies are awkward — same single-winner verdict
 either way), and **account linking with assurance levels**, so a gate can say
 "auto-approve for OAuth-proven users, ask otherwise" in one line:
 

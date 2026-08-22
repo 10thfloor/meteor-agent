@@ -161,13 +161,6 @@ function stripMentions(text: string): string {
   return text.replace(/<@[^>]+>/g, '').trim();
 }
 
-/** A Slack conversation id starting with `D` is a direct message — the one
- *  audience where an anonymous session's capability URL may travel (§8.5). */
-function audienceOf(channel: string, channelType?: string): 'direct' | 'group' {
-  if (channelType === 'im') return 'direct';
-  return channel?.startsWith('D') ? 'direct' : 'group';
-}
-
 export const slackLens: Lens = {
   out(item: DeliveryItem): unknown {
     switch (item.item) {
@@ -188,7 +181,7 @@ export const slackLens: Lens = {
         const clamped = escapeSlack(args.length > 2000 ? `${args.slice(0, 2000)}…` : args)
           .replace(/```/g, '`​`​`');
         const name = escapeSlack(item.name).replace(/`/g, '‘');
-        const runAs = 'runAs' in item && item.runAs !== undefined
+        const runAs = item.runAs !== undefined
           ? `\n_runs as ${escapeSlack(String(item.runAs ?? 'anonymous service context'))}_` : '';
         const fallback = `Approval needed: ${name}`;
         return {
@@ -254,7 +247,9 @@ export const slackLens: Lens = {
       // is amnesia: a DM is ONE ongoing conversation (key it by the channel —
       // keying by message ts would mint a fresh session per message), while a
       // channel conversation is the THREAD the mention started. Replies post
-      // accordingly: into the DM's main flow, into the channel's thread.
+      // accordingly: into the DM's main flow, into the channel's thread. A
+      // `D`-prefixed conversation id is a direct message — the one audience
+      // where an anonymous session's capability URL may travel (§8.5).
       const dm = ev.channel_type === 'im' || String(ev.channel ?? '').startsWith('D');
       // The account-linking gesture (spec §12): the bare word "link" asks for
       // a one-time URL that ties this Slack identity to a signed-in web
@@ -271,7 +266,7 @@ export const slackLens: Lens = {
         externalUserId: `${team}:${ev.user}`,
         conversationRef: dm ? `${team}:${ev.channel}` : `${team}:${ev.channel}:${threadTs}`,
         destination: { channel: ev.channel, ...(dm ? {} : { threadTs }) },
-        audience: audienceOf(ev.channel, ev.channel_type),
+        audience: dm ? 'direct' : 'group',
       };
     }
 
@@ -285,7 +280,10 @@ export const slackLens: Lens = {
       // a crafted value becomes a TypeError, a 500, and a provider retry loop.
       if (!value || typeof value !== 'object') return NOOP;
       if (value.token !== 'approve' && value.token !== 'deny') return NOOP;
-      const team = payload.user?.team_id ?? payload.team?.id ?? '';
+      // `team.id` is the workspace the interaction happened in — the same id
+      // the event envelope's `team_id` carries; `user.team_id` is the clicker's
+      // HOME workspace and differs in a Slack Connect channel.
+      const team = payload.team?.id ?? payload.user?.team_id ?? '';
       const channel = payload.channel?.id ?? '';
       // The same conversation key as the message path — a click must land on
       // the binding the message created, or verdicts route into a phantom
@@ -305,7 +303,7 @@ export const slackLens: Lens = {
         externalUserId: `${team}:${payload.user?.id}`,
         conversationRef: dm ? `${team}:${channel}` : `${team}:${channel}:${threadTs}`,
         destination: { channel, ...(dm ? {} : { threadTs }) },
-        audience: audienceOf(channel),
+        audience: dm ? 'direct' : 'group',
       };
     }
 

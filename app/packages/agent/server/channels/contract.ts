@@ -209,6 +209,25 @@ export function matchExpectation(
   return null;
 }
 
+/**
+ * The reply grammar a delivered prompt registers (§8.3): what the receipt's
+ * `expects` records, and what the inbound side matches free text against
+ * before falling through to "this is a message". Only `menu` choices carry a
+ * text grammar — `native` postbacks and `link` redemptions arrive as their own
+ * event shapes, interpreted by the lens and the token table respectively.
+ */
+export function expectationsFor(
+  prompt: Extract<DeliveryItem, { item: 'prompt' }>,
+): Array<{ match: string; verdict: 'approved' | 'denied'; toolCallId: string }> {
+  return prompt.choices
+    .filter((c) => c.match !== undefined)
+    .map((c) => ({
+      match: c.match!,
+      verdict: c.token === 'approve' ? 'approved' as const : 'denied' as const,
+      toolCallId: prompt.toolCallId,
+    }));
+}
+
 // ---- The one law, as a test (§8.3 / §8.7) ----------------------------------
 
 /** Canonical exemplars, one per item kind — the default corpus
@@ -315,13 +334,7 @@ export function assertLensRoundTrip(
       // `matchExpectation` the pipeline runs, over the same choices the
       // render was handed. Native/link activations arrive as their own event
       // shapes and must read back as verdicts from `in` directly.
-      const expects = item.choices
-        .filter((c) => c.match !== undefined)
-        .map((c) => ({
-          match: c.match!,
-          verdict: c.token === 'approve' ? 'approved' as const : 'denied' as const,
-          toolCallId: item.toolCallId,
-        }));
+      const expects = expectationsFor(item);
       for (const choice of item.choices) {
         const reading = lens.in(opts.synthesize(choice, payload));
         const want = choice.token === 'approve' ? 'approved' : 'denied';
