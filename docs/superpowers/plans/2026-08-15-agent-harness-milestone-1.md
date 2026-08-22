@@ -54,7 +54,7 @@ definitions every later task imports.
 - [ ] **Step 1: Create the host app**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 meteor create app --minimal --release METEOR@3.5
 cd app
 meteor add mongo ddp ddp-common check random
@@ -236,7 +236,7 @@ export {};
 - [ ] **Step 7: Run the tests — expect PASS**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: `2 passing`, exit code 0.
@@ -244,7 +244,7 @@ Expected: `2 passing`, exit code 0.
 - [ ] **Step 8: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent app/.meteor app/package.json
 git commit -m "feat(agent): package scaffold, shared types, name constants"
 ```
@@ -400,7 +400,7 @@ import './merge.test';
 - [ ] **Step 3: Run the tests to verify they fail**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: FAIL — `Cannot find module '../common/merge'`.
@@ -471,7 +471,7 @@ export function mergeView(
 - [ ] **Step 5: Run the tests to verify they pass**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: `15 passing`.
@@ -479,7 +479,7 @@ Expected: `15 passing`.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): merge committed messages with in-flight deltas (S5)"
 ```
@@ -587,7 +587,7 @@ import './loader.test';
 - [ ] **Step 4: Run to verify failure**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: FAIL — `Cannot find module '../server/providers/loader'`.
@@ -666,7 +666,7 @@ export async function loadPiAi(): Promise<unknown> {
 - [ ] **Step 6: Run to verify pass**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: `18 passing`. If the build prints `Cannot find module 'typebox'` warnings, that is expected — the throw is caught at runtime.
@@ -743,7 +743,7 @@ not mid-file.
 - [ ] **Step 9: Run to verify pass**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected: `20 passing`.
@@ -751,7 +751,7 @@ Expected: `20 passing`.
 - [ ] **Step 10: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): hedged pi-ai loader, provider seam, mock provider (S1)"
 ```
@@ -969,7 +969,7 @@ if (Meteor.isServer) {
 Expected: `24 passing`.
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): collections, capped delta store, publications"
 ```
@@ -1227,7 +1227,7 @@ Expected: `30 passing`.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): tool registry and dispatch via DDPCommon.MethodInvocation (S2b)"
 ```
@@ -1419,7 +1419,7 @@ Expected: `34 passing`.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): lease claim, heartbeat, and guarded commits (S4)"
 ```
@@ -1779,7 +1779,7 @@ Expected: `39 passing`.
 - [ ] **Step 6: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): streaming turn loop with guarded commits and tool dispatch"
 ```
@@ -2169,7 +2169,7 @@ import './integration.client';
 - [ ] **Step 8: Run to verify failure, then pass**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
+cd ~/meteor-agent/app && meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent
 ```
 
 Expected first run: FAIL on missing modules. After Steps 1–5 are in place:
@@ -2236,7 +2236,7 @@ See `docs/superpowers/specs/` for the full design.
 - [ ] **Step 10: Commit**
 
 ```bash
-cd /Users/mk/Desktop/meteor-agent
+cd ~/meteor-agent
 git add app/packages/agent
 git commit -m "feat(agent): public API, methods, client merge view, live DDP integration test"
 ```

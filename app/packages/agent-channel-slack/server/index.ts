@@ -51,8 +51,11 @@ function escapeSlack(text: string): string {
  */
 export function toMrkdwn(markdown: string): string {
   return escapeSlack(markdown)
-    // [label](url) → <url|label>
-    .replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<$2|$1>')
+    // [label](url) → <url|label> — http(s) ONLY. The text is model-generated,
+    // and a `<javascript:…|click>` or `<data:…|…>` link is exactly the kind of
+    // thing a prompt-injected model could be steered into emitting; a
+    // non-http link stays literal (and already escaped) text.
+    .replace(/\[([^\]]+)\]\((https?:\/\/[^)\s]+)\)/g, '<$2|$1>')
     // **bold** → *bold*
     .replace(/\*\*([^*]+)\*\*/g, '*$1*')
     // # Heading → *Heading* (mrkdwn has no headings)

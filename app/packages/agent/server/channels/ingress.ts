@@ -236,11 +236,15 @@ async function route(
   const binding = await upsertBinding(kind, def, reading, identity);
   if (!binding) return { status: 200 };
 
-  // The identity the agent-facing calls run under. `requireSession` stays the
-  // authority: a sender whose identity does not own the bound session gets
-  // `no-session`, which settles as 200 below — the channel is a courier, not
-  // an authority.
-  const userId = identity?.userId ?? binding.userId ?? null;
+  // The identity the agent-facing calls run under: the SENDER's resolved
+  // account, or null (anonymous) — and never the binding's owner as a
+  // fallback. An earlier draft fell back to `binding.userId`, which would have
+  // let any unlinked participant in a group thread act AS the linked owner
+  // (send, approve) — impersonation by proximity. Fail closed instead:
+  // `requireSession` stays the authority, an unlinked sender on an owned
+  // conversation gets `no-session`, which settles as 200 below. The channel
+  // is a courier, not an authority.
+  const userId = identity?.userId ?? null;
 
   try {
     if (intent.kind === 'message') {
@@ -300,13 +304,45 @@ async function route(
 
 // ---- The mount -------------------------------------------------------------
 
+/**
+ * The most a webhook body may be. Every provider's payload is small (a Slack
+ * event envelope is a few KB; Twilio's form a few hundred bytes), and this
+ * read happens BEFORE signature verification — so without a cap an
+ * unauthenticated sender could stream gigabytes into process memory. Over
+ * the cap the socket is closed and the request answered 413, having spent
+ * nothing but the bytes already buffered.
+ */
+export const MAX_INBOUND_BYTES = 1024 * 1024;
+
+class BodyTooLarge extends Error {
+  constructor() { super('request body over MAX_INBOUND_BYTES'); }
+}
+
 /** Read the whole request body UNPARSED: signature schemes sign raw bytes, and
- *  a re-serialized body never verifies. */
-function readRawBody(req: any): Promise<string> {
+ *  a re-serialized body never verifies. Capped — see `MAX_INBOUND_BYTES`. */
+function readRawBody(req: any, limit = MAX_INBOUND_BYTES): Promise<string> {
   return new Promise((resolve, reject) => {
+    // Honor a declared length first: a truthful oversize client is refused
+    // before a single chunk is buffered.
+    const declared = Number(req.headers?.['content-length']);
+    if (Number.isFinite(declared) && declared > limit) {
+      reject(new BodyTooLarge());
+      return;
+    }
     let body = '';
+    let size = 0;
     req.setEncoding('utf8');
-    req.on('data', (chunk: string) => { body += chunk; });
+    req.on('data', (chunk: string) => {
+      size += Buffer.byteLength(chunk, 'utf8');
+      if (size > limit) {
+        // Stop reading and close the socket — do not keep buffering while a
+        // lying client streams past its declared length.
+        req.destroy();
+        reject(new BodyTooLarge());
+        return;
+      }
+      body += chunk;
+    });
     req.on('end', () => resolve(body));
     req.on('error', reject);
   });
@@ -333,6 +369,13 @@ export function mountChannelRoutes(webAppHandlers: {
           res.writeHead(out.status, { 'content-type': 'text/plain' });
           res.end(out.body ?? '');
         } catch (e) {
+          if (e instanceof BodyTooLarge) {
+            // Not an error worth a stack trace — and not a 500 a provider
+            // would retry. The socket may already be destroyed; writing is
+            // best-effort.
+            try { res.writeHead(413); res.end(); } catch { /* socket gone */ }
+            return;
+          }
           console.error(`[10thfloor:agent] channel "${kind}" webhook failed:`, e);
           res.writeHead(500);
           res.end();

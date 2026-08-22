@@ -359,6 +359,37 @@ describe('channels', () => {
       assert.equal(binding.userId, 'web-user', 'redeeming from the signed-in side claimed the conversation');
     });
 
+    it('refuses an oversize webhook body with 413 before verifying anything', async () => {
+      await registerTestChannel();
+      const { mountChannelRoutes, MAX_INBOUND_BYTES } = await import('../server/channels/ingress');
+      let handler: ((req: any, res: any) => void) | null = null;
+      mountChannelRoutes({ use(_path: string, fn: any) { handler = fn; } });
+      assert.isFunction(handler, 'the route was mounted');
+
+      // A fake request that LIES about its length (small header) and streams
+      // past the cap, and a fake response that records the status.
+      const listeners: Record<string, (x?: any) => void> = {};
+      let destroyed = false;
+      const req = {
+        headers: { 'content-length': '10', 'x-sig': 'ok' },
+        url: '/agent/channels/test',
+        setEncoding() {},
+        on(ev: string, fn: (x?: any) => void) { listeners[ev] = fn; },
+        destroy() { destroyed = true; },
+      };
+      let status = 0;
+      const res = { writeHead(s: number) { status = s; }, end() {} };
+      handler!(req, res);
+      // Stream 2 MiB in 64 KiB chunks — the cap must trip mid-stream.
+      const chunk = 'x'.repeat(64 * 1024);
+      for (let sent = 0; sent < 2 * MAX_INBOUND_BYTES && !destroyed; sent += chunk.length) {
+        listeners.data(chunk);
+      }
+      await new Promise((r) => { setTimeout(r, 20); });
+      assert.isTrue(destroyed, 'the socket was closed at the cap');
+      assert.equal(status, 413);
+    });
+
     it('echoes a noop respond as the 200 body — the URL-verification shape', async () => {
       const { def } = await registerTestChannel();
       const base = def.lens.in.bind(def.lens);
@@ -596,6 +627,26 @@ describe('channels', () => {
       await linkIdentity('test', 'ext-1', 'meteor-user', 'oidc');
       await linkIdentity('test', 'ext-1', 'meteor-user', 'link');
       assert.equal((await resolveIdentity('test', 'ext-1'))!.assurance, 'oidc', 'stronger proof survives');
+    });
+
+    it('an unlinked sender can never act as the conversation\'s linked owner', async () => {
+      await registerTestChannel();
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'owner-ext', 'owner-acct', 'oidc');
+      const { handleInbound } = await import('../server/channels/ingress');
+      // The owner opens the conversation (a group surface: others can see it).
+      await handleInbound('test', raw({ type: 'msg', text: 'mine', id: 'o1', user: 'owner-ext', convo: 'shared' }));
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const { AgentMessages } = await import('../common/collections');
+      const binding = (await ChannelBindings.findOneAsync('test:shared'))!;
+      assert.equal(binding.userId, 'owner-acct');
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+
+      // A bystander in the same thread — unlinked — tries to drive it.
+      const out = await handleInbound('test', raw({ type: 'msg', text: 'refund everything', id: 'b1', user: 'bystander', convo: 'shared' }));
+      assert.equal(out.status, 200, 'settled, not retried');
+      const after = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+      assert.equal(after, before, 'the bystander\'s message never entered the owner\'s session');
     });
 
     it('a linked sender opens sessions owned by their account', async () => {

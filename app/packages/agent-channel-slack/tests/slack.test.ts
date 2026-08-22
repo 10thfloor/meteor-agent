@@ -213,6 +213,13 @@ describe('agent-channel-slack', () => {
       const { toMrkdwn } = await import('meteor/10thfloor:agent-channel-slack');
       assert.equal(toMrkdwn('**bold** stays'), '*bold* stays');
       assert.equal(toMrkdwn('see [the docs](https://x.test/a)'), 'see <https://x.test/a|the docs>');
+      // Model text is untrusted: a non-http scheme never becomes a live link.
+      assert.equal(
+        toMrkdwn('[click](javascript:alert(1))'),
+        '[click](javascript:alert(1))',
+        'a javascript: link stays literal text',
+      );
+      assert.notInclude(toMrkdwn('<!channel> hi'), '<!channel>', 'mention syntax is escaped, never injected');
       assert.equal(toMrkdwn('## Heading\nbody'), '*Heading*\nbody');
       assert.equal(toMrkdwn('a < b & c > d'), 'a &lt; b &amp; c &gt; d');
       assert.equal(toMrkdwn('_italic_ and `code` pass through'), '_italic_ and `code` pass through');
