@@ -4,9 +4,9 @@
 **Status:** as built (shipped 2026-08-22); see errata below. Revised twice before building: once after examining the Flue framework, once after a survey of cross-channel rendering prior art (§13).
 **Package:** `10thfloor:agent`
 
-**As built — errata.** The design shipped as written, with these concrete differences folded into the sections below. The source of truth is `app/packages/agent/server/channels/{contract,registry,ingress,egress,collections}.ts`; the channel packages are `app/packages/agent-channel-{slack,telegram,whatsapp,sms}`.
+**As built — errata.** The design shipped as written, with these concrete differences folded into the sections below. The source of truth is `app/packages/agent/common/channel-contract.ts` (the lens contract — pure and isomorphic, so the channel packages and the core share one module) and `app/packages/agent/server/channels/{registry,ingress,egress,plan,linking,collections}.ts`; the channel packages are `app/packages/agent-channel-{slack,telegram,whatsapp,sms}`.
 
-- `lens.in` takes one argument, `in(event)`; the envelope also carries `audience?` and `respond?` (§8.3, `contract.ts`).
+- `lens.in` takes one argument, `in(event)`; the envelope also carries `audience?` and `respond?` (§8.3, `common/channel-contract.ts`).
 - The `prompt` item carries `toolCallId`; a receipt's `expects` entries are `{ match, verdict, toolCallId }` (§6.3, §8.2, `collections.ts`).
 - Channel config has `verify` and `parse` — not a `signingSecret` — and the package factories supply both (§10, `registry.ts`).
 - `onUncertainDelivery` is optional and defaulted, not required (§11, `registry.ts`).
@@ -240,7 +240,7 @@ tools: [{
       // recovery — the package's own comment calls that window "irreducible
       // without idempotency keys carried through to the tools themselves" —
       // so an unreceipted post here double-fires.
-      await deliverOnce(b.kind, b, { item: 'reply', text: args.text }, `tool:${ctx.toolCallId}`);
+      await deliverOnce(b, { item: 'reply', text: args.text }, `tool:${ctx.toolCallId}`);
     }
   },
 }],
@@ -257,7 +257,10 @@ If a tool has a `gate: 'ask'`, the agent pauses and the turn is parked as a docu
 Because the session records how strongly the user was identified, a gate can require a strong link for sensitive actions:
 
 ```js
-gate: (ctx) => ctx.session.channel?.assurance === 'oidc' ? 'auto' : 'ask'
+gate: async ({ sessionId }) => {
+  const session = await AgentSessions.findOneAsync(sessionId);
+  return session?.channel?.assurance === 'oidc' ? true : 'ask';
+}
 ```
 
 ## 8. The lens — one answer, many surfaces
@@ -413,7 +416,14 @@ export const discordLens = {
 };
 
 // the one law (§8.3), as the framework ships it:
-assertLensRoundTrip(discordLens, { interact: 'native', limit: 2000 });
+assertLensRoundTrip(discordLens, { interact: 'native', limit: 2000 }, {
+  // Only the lens author knows a click's wire shape — build it from the
+  // ACTUAL rendered buttons, so drift between out() and in() fails here.
+  synthesize: (choice, rendered) => ({
+    type: 'MESSAGE_COMPONENT', data: { custom_id: buttonFor(rendered, choice).custom_id },
+  }),
+  message: (text) => ({ type: 'MESSAGE_CREATE', content: text, author: { bot: false } }),
+});
 ```
 
 `assertLensRoundTrip` is a shipped helper doing two jobs: **totality** — all four items produce a payload, so no surface silently drops an approval ask — and **round-trip** — every affordance `out` offers, `in` interprets back to the exact canonical intent. Both halves are pure, so the test runs with zero provider credentials.

@@ -135,8 +135,11 @@ headings — the constructs the two dialects disagree on); `_italics_`,
 `` `code` `` and fences already coincide. Prompts render as a section plus
 Approve/Deny buttons whose values carry the canonical token **and the exact
 ask** (`toolCallId`), so a click on last week's message can never decide this
-week's different request. Override any of it per the core README's lens
-ladder — spread `slackLens` and replace one item.
+week's different request. The value is the core's shared postback codec
+(`encodeVerdictPostback` / `decodeVerdictPostback`, exported from
+`meteor/10thfloor:agent`), so an override that renders its own buttons keeps
+the click readable by using the same pair. Override any of it per the core
+README's lens ladder — spread `slackLens` and replace one item.
 
 ## Delivery guarantees
 

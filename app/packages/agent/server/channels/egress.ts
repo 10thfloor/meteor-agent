@@ -3,13 +3,13 @@ import { AgentMessages, AgentSessions } from '../../common/collections';
 import type { AgentSession } from '../../common/types';
 import { SERVER_ID } from '../lease';
 import {
-  ChannelBindings, DeliveryReceipts, isDuplicateKey,
+  ChannelBindings, DeliveryReceipts, insertOrLose,
   type ChannelBinding, type ReceiptExpectation,
 } from './collections';
 import { expectationsFor, planItems, promptItem } from './plan';
 import { issueVerdictToken } from './linking';
 import { getChannel, uncertainDeliveryMode, type ChannelDef } from './registry';
-import type { DeliveryItem } from './contract';
+import { VERDICT_FOR, type DeliveryItem } from '../../common/channel-contract';
 
 /**
  * The egress worker (channels spec §6.4/§11) — `startWatcher` with the
@@ -140,7 +140,9 @@ async function settleReceipt(
  * body) should treat it as not sent. Throws when the transport fails — the
  * caller stops and the next sweep retries under the same receipt.
  *
- * `item` may be a thunk; it runs only when a post actually happens.
+ * `item` may be a thunk; it runs only when a post actually happens. The
+ * channel is the binding's own `kind` — a binding can only ever be delivered
+ * through the surface that created it, so the caller names nothing twice.
  *
  * EXPORTED for tool bodies (§7's `channel.notify` shape): tool dispatch
  * re-runs on crash recovery — the package's own dispatch comment calls that
@@ -149,30 +151,23 @@ async function settleReceipt(
  * key carried through.
  */
 export async function deliverOnce(
-  kind: string,
   binding: ChannelBinding,
   item: DeliveryItem | (() => Promise<DeliveryItem>),
   suffix: string,
-  opts: { expects?: ReceiptExpectation[]; def?: ChannelDef } = {},
+  opts: { expects?: ReceiptExpectation[] } = {},
 ): Promise<'delivered' | 'abandoned' | 'deferred'> {
-  const def = opts.def ?? getChannel(kind);
-  if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${kind}"`);
+  const def = getChannel(binding.kind);
+  if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${binding.kind}"`);
   const receiptId = `deliver:${binding._id}:${suffix}`;
 
   // RESERVE. The duplicate-key loser reads the winner's state instead of
   // posting: `sent`/`abandoned` are settled; `sending` is the one ambiguous
   // state, resolved per the channel's declared tier (§11).
-  let reserved = false;
-  try {
-    await DeliveryReceipts.insertAsync({
-      _id: receiptId, bindingId: binding._id, state: 'sending',
-      ...(opts.expects && opts.expects.length > 0 ? { expects: opts.expects } : {}),
-      attempts: 1, at: new Date(),
-    });
-    reserved = true;
-  } catch (e) {
-    if (!isDuplicateKey(e)) throw e;
-  }
+  const reserved = await insertOrLose(DeliveryReceipts, {
+    _id: receiptId, bindingId: binding._id, state: 'sending',
+    ...(opts.expects && opts.expects.length > 0 ? { expects: opts.expects } : {}),
+    attempts: 1, at: new Date(),
+  });
 
   if (!reserved) {
     const existing = await DeliveryReceipts.findOneAsync(receiptId);
@@ -224,7 +219,10 @@ export async function deliverOnce(
   const payloads = Array.isArray(rendered) ? rendered : [rendered];
   let providerMessageId: string | undefined;
   for (let i = 0; i < payloads.length; i += 1) {
-    const key = payloads.length === 1 ? receiptId : `${receiptId}:${i}`;
+    // Segment 0 carries the bare receipt id — that is the key `reconcile`
+    // looks for; later segments are suffixed so a tier-A provider does not
+    // collapse them.
+    const key = i === 0 ? receiptId : `${receiptId}:${i}`;
     // eslint-disable-next-line no-await-in-loop
     const posted = await def.transport.post(binding.destination, payloads[i], {
       idempotencyKey: key,
@@ -281,7 +279,7 @@ export async function deliverBinding(
     if (!(await claimBinding(bindingId, claimMs))) return;
     if (row.item) {
       // eslint-disable-next-line no-await-in-loop
-      const outcome = await deliverOnce(kind, binding, row.item, row.message._id, { def });
+      const outcome = await deliverOnce(binding, row.item, row.message._id);
       // A deferred row is in its backoff window: stop here, cursor unmoved,
       // and let a later sweep retry it. Rows behind it wait — in-order
       // delivery is the contract.
@@ -306,16 +304,15 @@ export async function deliverBinding(
         for (const choice of prompt.choices) {
           // eslint-disable-next-line no-await-in-loop
           const token = await issueVerdictToken(
-            binding.agent, binding.sessionId, prompt.toolCallId,
-            choice.token === 'approve' ? 'approved' : 'denied',
+            binding.agent, binding.sessionId, prompt.toolCallId, VERDICT_FOR[choice.token],
           );
           choice.url = def.approvalUrl(token);
         }
       }
       return prompt;
     };
-    await deliverOnce(kind, binding, withUrls, `prompt:${prompt.toolCallId}`, {
-      def, expects: expectationsFor(prompt),
+    await deliverOnce(binding, withUrls, `prompt:${prompt.toolCallId}`, {
+      expects: expectationsFor(prompt),
     });
   }
 }

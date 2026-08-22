@@ -95,9 +95,11 @@ mangles ordinary prose, so this lens opts out of `parse_mode` entirely and
 passes the agent's text through untouched (the core never parses content;
 conversion is per-surface opt-in, and this surface declines). Prompts render
 as a message plus an inline keyboard whose `callback_data` carries the
-canonical token **and the exact ask** (`toolCallId`) — compacted under
-Telegram's 64-byte cap, degrading to token-only for an oversized ask id
-rather than ever truncating it into a *wrong* ask.
+canonical token **and the exact ask** (`toolCallId`) — the core's shared
+postback codec (`encodeVerdictPostback` / `decodeVerdictPostback`, the terse
+`{ t: 'a' | 'd', c }` shape) with Telegram's 64-byte cap applied, degrading to
+token-only for an oversized ask id rather than ever truncating it into a
+*wrong* ask.
 
 Known wart, v1: the button's loading spinner is not answered
 (`answerCallbackQuery`) — it times out harmlessly after a few seconds.

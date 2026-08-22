@@ -150,13 +150,17 @@ describe('agent-channel-telegram', () => {
 
   describe('the one law', () => {
     it('round-trips: the rendered keyboard interprets back to its verdicts', async () => {
-      const { assertLensRoundTrip } = await import('meteor/10thfloor:agent');
+      const { assertLensRoundTrip, decodeVerdictPostback, VERDICT_FOR } = await import('meteor/10thfloor:agent');
       const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
       assertLensRoundTrip(telegramLens, { interact: 'native' }, {
         destination: { chatId: 4242 },
         synthesize: (choice, rendered) => {
+          // Pick the button by what its ACTUAL rendered callback_data decodes
+          // to, so the synthetic click is the wire payload verbatim.
           const rows = (rendered as any).reply_markup.inline_keyboard as any[];
-          const button = rows.flat().find((b: any) => JSON.parse(b.callback_data).t === (choice.token === 'approve' ? 'a' : 'd'));
+          const button = rows.flat().find(
+            (b: any) => decodeVerdictPostback(b.callback_data)?.verdict === VERDICT_FOR[choice.token],
+          );
           return {
             update_id: 9,
             callback_query: {

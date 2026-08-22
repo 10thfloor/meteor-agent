@@ -23,9 +23,10 @@ policy.
 autopublish`) — the defaults Meteor ships in every new app. `autopublish` would
 push transcripts to every client, and `insecure` grants clients direct write
 access to collections, which voids the method-and-publication auth model
-wholesale. The package registers a blanket client-write `deny` on its three
-collections at startup as a backstop against `insecure`, but removing it is the
-correct fix.
+wholesale. The package registers a blanket client-write `deny` on every one of
+its collections at startup — the three transcript collections and the six
+channel collections (see **Channels**) — as a backstop against `insecure`, but
+removing it is the correct fix.
 
 ## Define an agent
 
@@ -301,8 +302,9 @@ Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
 Meteor's constraint, not this package's.
 
 **Indexes are created at startup.** Mongo creates exactly one index for you —
-`_id` — so the package creates the three its own queries need, on every boot,
-idempotently:
+`_id` — so the package creates the ones its own queries need, on every boot,
+idempotently: these three for the transcript and the watcher, and seven more
+for channels (listed under **Channels**):
 
 | Collection | Key | Why |
 | --- | --- | --- |
@@ -313,7 +315,7 @@ idempotently:
 A failure to create them **warns and continues**: a locked-down Atlas user may
 not hold the `createIndex` action, and a package that refused to boot over a
 performance index would trade a slow deployment for no deployment. If that
-warning is in your logs, create the three by hand — the queries are correct
+warning is in your logs, create them by hand — the queries are correct
 without them, just proportional to your whole history rather than to one
 session. Call `ensureIndexes()` yourself if you want them made under a
 different connection.
@@ -1161,6 +1163,364 @@ spend kill-switch), on top of per-session `budget` and the opt-in `rateLimit`
 knobs. Configure a `sends` rate limit and give every agent a `budget` at
 minimum; treat the aggregate ceiling as the operator's responsibility.
 
+## Channels
+
+A channel puts the same agent on an external surface — Slack, Telegram,
+WhatsApp, SMS — as two adapters over the machinery above. **Inbound** is a
+verified webhook that calls the same core the web client's `send`/`approve`/
+`deny` call, with an explicit `userId`. **Outbound** is a worker that observes
+committed rows and posts them to every surface bound to the session, exactly
+as the web client subscribes to them. Nothing new enters the loop — no hook, no
+second protocol — and the core takes no provider SDK dependency: the provider
+call is supplied by a channel package.
+
+```ts
+// server
+import { Agent } from 'meteor/10thfloor:agent';
+import { sms } from 'meteor/10thfloor:agent-channel-sms';
+
+const cfg = Meteor.settings.packages['10thfloor:agent'].sms;
+Agent.channel('sms', sms({
+  agent: 'support',
+  accountSid: cfg.accountSid, authToken: cfg.authToken, webhookUrl: cfg.webhookUrl,
+}));
+```
+
+Four surface packages ship — `10thfloor:agent-channel-slack`, `-telegram`,
+`-whatsapp` and `-sms` — each exactly one lens, one transport and one profile
+default, zero npm dependencies; each README carries the provider-side setup.
+Server-side `agent.send(sessionId, text, { userId })`,
+`agent.approve(sessionId, { userId })` and `agent.deny(sessionId, reason,
+{ userId })` landed with channels: the same core the DDP methods call, always
+scoped to `{ agent, session, userId }` — `userId: null` is the anonymous owner,
+never "all sessions". The DDP rate limiter does not see this path (its rules
+match method names); the session budget does, and the webhook brings its own
+per-sender throttle.
+
+### `Agent.channel(kind, def)`
+
+Static and global like `Agent.provider`, with the same registry contract:
+validated at registration so a miswired channel is a startup error rather than
+a dropped delivery, overwrite-with-warning on re-registration (a dev hot
+reload), `kind` a short identifier (letters, digits, `-`, `_`). A package
+factory is sugar over a plain `ChannelDef`:
+
+```ts
+Agent.channel('sms', {
+  agent: 'support',
+  transport: smsTransport({ accountSid, authToken }),
+  lens: smsLens,                                   // { out, in } — see The lens
+  profile: { interact: 'menu', limit: 1500 },      // how choices are offered; payload budget
+  verify: (raw) => verifyTwilioSignature(raw, authToken, webhookUrl),
+  parse: (raw) => parseTwilioForm(raw.rawBody),
+  statuses: ['error', 'approval'],
+  onUncertainDelivery: 'retry',
+  sessionUrl: (session) => Meteor.absoluteUrl(`s/${session._id}`),
+  linkUrl: (token) => Meteor.absoluteUrl(`link/${token}`),
+  throttle: { limit: 30, intervalMs: 60000 },
+});
+```
+
+| Field | Meaning |
+| --- | --- |
+| `agent` | **Required.** The registered agent this surface drives. |
+| `transport` | **Required.** `{ post(destination, payload, { idempotencyKey }), reconcile?(destination, idempotencyKey) }` — the provider call itself, supplied by the package so the core never depends on a provider SDK. `post` receives whatever `lens.out` produced and may return `{ providerMessageId }`; `reconcile` answers "did a post under this key already land?" and its presence is what makes `onUncertainDelivery: 'reconcile'` legal. |
+| `lens` | **Required.** `{ out(item, destination), in(event) }` — see **The lens**. |
+| `profile` | **Required.** `{ interact: 'native' \| 'menu' \| 'link', limit? }` — see **The lens**. |
+| `verify(raw)` | **Required.** The trust boundary: does this request really come from the provider? `false` is answered 401 before anything else runs. `raw` is `{ headers, rawBody, url? }` — headers lower-cased, the body **unparsed** (signature schemes sign raw bytes; a re-serialized body never verifies), `url` the path+query as Node saw it. |
+| `parse(raw)` | **Required.** Raw request → the provider event `lens.in` reads. Pure. |
+| `statuses` | Which note kinds this surface delivers as `status` items. Default none — an error is worth an SMS, a compaction note is not, and the channel says which. `'approval'` is the post-verdict outcome; the ask itself is always the `prompt` item. |
+| `onUncertainDelivery` | What to do with a receipt found mid-`sending` after a crash: `'reconcile'` (needs `transport.reconcile`), `'retry'` (re-post under the same idempotency key — the provider collapses it, or MAY DUPLICATE if it does not), `'abandon'` (MAY LOSE). Default `'reconcile'` when the transport can, else `'retry'`; a transport that honors no key should declare. |
+| `sessionUrl(session)` | The session's web view, for overflow links. Only the app knows its routes. |
+| `approvalUrl(token)` | `link`-interact channels only: a minted verdict token → the URL a prompt's choice renders as. The app's route hands the token to `redeemVerdictToken`. |
+| `linkUrl(token)` | A minted linking token → the URL the surface carries in answer to a `link-request`. The app's route hands it to `redeemLinkToken` from a signed-in session. Without it link-requests are acknowledged and ignored. |
+| `throttle` | Per-sender webhook throttle, in-memory per process — the brake on a flood, not an accounting system. Default `{ limit: 30, intervalMs: 60000 }`. |
+
+`ChannelKnobs` is `Pick<ChannelDef, 'statuses' | 'onUncertainDelivery' |
+'sessionUrl' | 'linkUrl' | 'throttle'>` — the knobs a package factory forwards
+to the core untouched, so a package's options type extends it rather than
+re-documenting what the core owns.
+
+### The lens
+
+One object per surface, two halves, both **pure** (no I/O): `out` renders a
+delivery item into the surface's native form; `in` interprets a verified
+inbound event back into a fixed set of meanings. They live together because on
+a surface with no buttons, "Reply YES to approve" is a parse grammar the
+outbound render created — split render from interpret and the two drift.
+Purity is what lets the round-trip test run with zero provider credentials,
+and what makes redelivery after a crash reproduce the same payload
+(idempotence comes from receipts, not from rendering). `out` may return one
+payload or several (a segmented SMS); the worker posts them in order under one
+receipt.
+
+Both vocabularies are **closed**, like the phase union — a channel cannot
+invent items or intents, and a new member is a framework change made once:
+
+```ts
+// DeliveryItem — what the planner emits (DELIVERY_ITEM_KINDS asserts the set):
+{ item: 'reply',    text }                                          // the turn's answer: an assistant row with no toolCalls; opaque text
+{ item: 'status',   kind, reason?, approved?, timedOut?, budget? }  // a note kind the channel opted into via `statuses`
+{ item: 'prompt',   name, args, runAs?, toolCallId, choices }       // the parked ask, from session.pending — never from a note
+{ item: 'overflow', head, url? }                                    // a reply over profile.limit: a mechanical head-slice, plus the web link when the audience allows
+
+// InboundReading — what lens.in returns: the intent plus the routing envelope
+{ intent, eventId?, externalUserId?, conversationRef?, destination?, audience?, respond? }
+
+// InboundIntent:
+{ kind: 'message', text }
+{ kind: 'verdict', verdict: 'approved' | 'denied', reason?, toolCallId? }
+{ kind: 'link-request' }
+{ kind: 'noop' }       // everything without a defined meaning, BY DESIGN: handshakes, echoes, edits, reactions, receipts
+```
+
+`reply` text is opaque — no markdown parser in the shared core; a lens that
+wants mrkdwn or HTML converts inside its own `out`. `overflow` is a head-slice,
+never a summary: the worker never calls a model. A `prompt`'s `choices` are
+`{ token: 'approve' | 'deny', label, match?, url? }` — `token` is canonical,
+and the grammar fields are filled per the profile before the lens sees the
+item. In the envelope, `eventId` must be the provider's **redelivery-stable**
+id (it powers exactly-once admission); `externalUserId` keys the identities
+table and `conversationRef` the bindings table; `destination` is where replies
+go, stored on the binding, opaque to the core; `audience` is `'direct'` (one
+recipient) or `'group'`, defaulting to `'group'` — the safe direction, since an
+anonymous session's web URL is its credential and only travels to a `direct`
+destination; `respond` is for `noop` only, a body the provider expects echoed
+in the 200 (Slack's URL-verification challenge). A `noop` may leave the routing
+fields undefined; `link-request` is optional — a lens with no gesture for it
+never emits it.
+
+**The profile** says how choices are *offered* — not what inbound is accepted
+(a typed YES on a buttons surface still lands in `in` if the lens reads it):
+
+| `interact` | Choices render as | Come back as |
+| --- | --- | --- |
+| `native` | buttons whose postback carries the canonical token and the ask (`encodeVerdictPostback`) | a `verdict` intent from `in` |
+| `menu` | a reply menu — "Reply YES to approve, NO to deny" (`MENU_MATCHES`), the words registered in the delivery receipt's `expects` | free text that the pipeline matches against the receipt before treating it as a `message` |
+| `link` | one-time URLs, each carrying a single-use server-side token bound to that one pending verdict (`issueVerdictToken` → `approvalUrl`) | the app's route calling `redeemVerdictToken` |
+
+`limit` is the hard payload budget; a reply over it becomes an `overflow`.
+
+Two staleness rules make a reply safe: each registered expectation names the
+exact ask it answers (`toolCallId`), and the router drops a match whose ask is
+no longer the one parked — a YES aimed at last week's request cannot approve
+today's different one; beneath that, the single-winner verdict write remains
+the final authority.
+
+**The one law, as a test.** `assertLensRoundTrip(lens, profile, opts?)` checks
+**totality** (every item renders to a non-null payload, so no surface silently
+drops an approval ask) and **round-trip** (every affordance `out` offers, `in`
+reads back as the exact canonical intent). It throws with a named failure on
+the first violation and returns quietly when the lens holds:
+
+```ts
+assertLensRoundTrip(smsLens, { interact: 'menu' }, {
+  destination: { to: '+15550001111', from: '+15559990000' },   // what `out` accepts; default {}
+  synthesize: (choice, rendered) => twilioForm({ Body: choice.match }),   // the surface's event for activating `choice`
+  message: (text) => twilioForm({ Body: text }),                // a plain inbound message; must read back as one
+  // items: [...]                                               // the corpus; default exemplarItems(), one per kind
+});
+```
+
+`synthesize` is the half only the lens author can supply — the framework
+cannot forge a provider's wire format — and it is **required** to check the
+prompt round-trip. Under a `menu` profile the helper fills the prompt's choices
+with `MENU_MATCHES` exactly as the planner would and accepts a `message`
+reading whose text matches via `matchExpectation` — the same rule the pipeline
+runs. Overriding `reply`, `status` or `overflow` in a package's lens (spread it,
+replace one item) is prose-only and cannot break the contract; overriding
+`prompt` can, and this is the test that catches it in CI.
+
+Lens-author helpers, all exported from `meteor/10thfloor:agent`:
+
+| Export | What it is |
+| --- | --- |
+| `headerValue(raw, name)` | The first value of a possibly-repeated header — Node hands a repeated header up as an array, and a signature check wants one string. |
+| `safeEqual(a, b)` | Constant-time string equality for signature checks (server-only). |
+| `encodeVerdictPostback(token, toolCallId, { maxBytes? })` / `decodeVerdictPostback(raw)` | The native-postback codec — terse JSON `{ t: 'a' \| 'd', c: toolCallId }`, shared so every surface's buttons decode the same way. Over `maxBytes` (Telegram caps `callback_data` at 64 bytes) the id is **dropped**, not cut: token-only still decides the parked ask, where a truncated id would name a wrong one. `decode` returns `null` for anything that is not a verdict postback, so a lens maps it to `noop` rather than throwing. |
+| `isLinkGesture(text)`, `LINK_GESTURE` | The bare word `link` — exact after trimming, any case — that asks for an account link; the core's own group hint names it, so lenses read it rather than spelling their own. |
+| `VERDICT_FOR` | `{ approve: 'approved', deny: 'denied' }` — one place for which token records which verdict. |
+| `MENU_MATCHES` | `{ approve: 'YES', deny: 'NO' }` — the `menu` grammar's reply words. |
+| `matchExpectation(text, expects)`, `expectationsFor(prompt)`, `exemplarItems()`, `DELIVERY_ITEM_KINDS` | The pipeline's matching rule, the grammar a prompt registers, the default corpus, and the closed item list. |
+
+### Boot
+
+Registration is inert by itself. At startup — after indexes, never under test,
+and only when at least one channel is registered — the package mounts every
+channel's webhook at **`/agent/channels/<kind>`** on **every** instance,
+unconditionally: inbound HTTP is load-balanced, and an unmounted route is a
+provider retry storm. The body is read unparsed and capped at 1 MiB (413 past
+it, before verification spends anything). The **egress worker** follows the
+watcher's boot contract instead — one per kind, on by default, off per kind
+for deployments that run delivery on a designated instance:
+
+```json
+{ "packages": { "10thfloor:agent": { "channels": { "sms": false } } } }
+```
+
+The workers this process started are the exported `egress` map
+(`Map<kind, EgressWorker>`, each with `stop()`) — a host that wires a real
+SIGTERM handler stops these alongside `watcher`. For a host that wires its own
+boot, `mountChannelRoutes(handlers)`, `handleInbound(kind, raw)` (the whole
+pipeline as a function over `{ headers, rawBody }`, returning `{ status,
+body? }`) and `startEgress(kind, { sweepMs, claimMs, sweepLookbackMs })` are
+exported.
+
+The webhook pipeline is the same for every channel: **verify** (401) → **`lens.in`**
+(a verified event the lens cannot interpret settles with a 200 and one warning —
+a lens bug must not become a channel-wide outage) → **throttle** per sender
+(dropped with a 200, not a 429: providers retry non-2xx and count failures
+against the integration) → **claim the event id** (one insert on a derived
+`_id`; a provider retry collides and is answered 200 without running twice) →
+**route**: a `message` is first matched against the outstanding prompt's
+registered `expects`, else sent; a `verdict` is dropped if its `toolCallId` no
+longer names the parked ask, else recorded; a `link-request` answers with the
+`linkUrl` on a `direct` destination and with a hint on a group one. An unlinked
+sender gets an anonymous session. On a `group` surface an anonymous
+conversation admits only its opener until someone links — otherwise any
+member could send into it or press Approve on someone else's ask. Refusals
+from the agent core (`no-session`, a budget, nothing pending) settle as 200 and
+a log line; a provider retry would meet the identical refusal forever.
+
+### Delivery
+
+The worker is `startWatcher` with the collection swapped: one observer over
+committed assistant and note rows (insert-only, so `added` is the whole story)
+plus a 15s sweep for everything no write signals — an expired claim, a parked
+prompt (a park writes the session document, which the observer deliberately
+does not watch). One worker, query-sliced, never an observer per conversation:
+a Slack thread never disconnects, so per-conversation observers would
+accumulate forever. Each binding carries its own cursor (`deliveredSeq`) and
+its own claim, so a downed gateway delays only itself. The worker never calls
+a model.
+
+Posting and recording the post are two writes to two systems with no shared
+transaction, so outbound is **effectively**-once — the surface shows the message
+once — through a three-phase receipt: reserve (`sending`) → post → confirm
+(`sent`), keyed on `deliver:<bindingId>:<suffix>`. A replayed backlog on boot
+finds its receipts `sent` and does nothing. A receipt found mid-`sending` is
+settled per `onUncertainDelivery`; a `retry` backs off doubling from one sweep
+interval, capped at an hour, and is abandoned after 48 attempts, so a payload
+the provider rejects deterministically neither hammers it nor wedges the
+conversation behind it.
+
+**`deliverOnce` for tool bodies.** Replies are delivered by the worker — do
+not give an agent a general "reply" tool, it would send the same text twice.
+A deliberate side-action (a notice, an escalation) is a tool, and it posts
+through the same receipt, keyed on the tool call's id:
+
+```ts
+import { ChannelBindings, deliverOnce } from 'meteor/10thfloor:agent';
+
+tools: [{
+  name: 'channel.notify',
+  description: 'Send an out-of-band notice to this conversation.',
+  args: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] },
+  async run(args, ctx) {
+    const bindings = await ChannelBindings.find({ sessionId: ctx.sessionId }).fetchAsync();
+    for (const b of bindings) {
+      await deliverOnce(b, { item: 'reply', text: args.text }, `tool:${ctx.toolCallId}`);
+    }
+  },
+}]
+```
+
+```ts
+deliverOnce(binding, item | () => Promise<item>, suffix, { expects? })
+  : Promise<'delivered' | 'abandoned' | 'deferred'>
+```
+
+The channel is the binding's own `kind` — a binding can only ever be delivered
+through the surface that created it. The receipt is not optional: tool dispatch
+**re-runs on crash recovery**, and an unreceipted post double-fires. Nor is the
+destination a tool argument: the model picks the text, never where it goes —
+destinations come from the session's own bindings, and a tool that must choose
+between surfaces takes an enum of those. `'delivered'` means durably `sent`
+(by this call or an earlier one), `'abandoned'` that the declared recovery or
+the attempt cap gave it up, `'deferred'` that a prior `sending` receipt is
+still inside its backoff window and nothing was posted — a one-shot caller
+treats that as not sent. A thunk `item` runs only when a post actually
+happens, so a rendering's side effects (minting verdict tokens) never run on a
+re-sweep that finds the receipt settled.
+
+### Linking
+
+An external user id is identification, not authentication. Turning it into an
+app account requires proof, and the proof completes from the **authenticated**
+side: an unauthenticated inbound message can request a link; it can never
+assert one. Auto-linking on a matching email address, trusting a phone number
+for anything privileged, or trusting the external id by itself are each an
+account-takeover primitive and are deliberately absent.
+
+```ts
+resolveIdentity(kind, externalUserId)                 // → ChannelIdentity | null; null is UNLINKED, a legal state
+issueLinkToken(kind, externalUserId, { ttlMs? })       // → token; single-use, random, stored server-side; 10 min default
+redeemLinkToken(token, userId)                         // → ChannelIdentity | null; from the signed-in side
+linkIdentity(kind, externalUserId, userId, assurance)  // → ChannelIdentity; assurance 'link' | 'oidc'
+issueVerdictToken(agent, sessionId, toolCallId, verdict, { ttlMs? })   // → token; 24h default
+redeemVerdictToken(token)                              // → boolean
+```
+
+`redeemLinkToken` burns the token atomically (`findOneAndDelete` — of two
+racing redeems exactly one wins, across servers) and answers one
+indistinguishable `null` for unknown, spent, expired, or already linked to
+another account, so a probe learns nothing about which. `linkIdentity` is what
+it calls, and what an OIDC flow calls directly with `'oidc'` after its own
+round-trip proved both sides; it writes the identity row and **claims
+history** — the anonymous bindings and sessions this external identity created
+become the user's, guarded so an already-owned session is never reassigned.
+A different account presenting proof for an already-linked identity is refused
+with `already-linked`, never re-pointed, and an `oidc` row is never downgraded
+by a later weaker proof. `redeemVerdictToken` records the verdict **as the
+session's owner** (the token is the authorization, exactly as an anonymous
+capability-URL approval is), refuses a token whose `toolCallId` is no longer
+the parked ask, and answers one `false` for everything else. The demo app
+wires linking as ``linkUrl: (token) => Meteor.absoluteUrl(`link/${token}`)``
+plus one method that calls `redeemLinkToken(token, this.userId)`.
+
+A channel-originated session carries `channel: { origin, assurance }` —
+`origin` the kind, `assurance` `'none'` (unlinked, an anonymous session),
+`'link'` (proved by a one-time link) or `'oidc'` (a full OAuth round-trip) —
+a descriptor, not routing state, with no secrets, so it ships to the client.
+Gates and tools read it to vary by surface; a gate is handed `sessionId`, not
+the session, so:
+
+```ts
+import { AgentSessions } from 'meteor/10thfloor:agent';
+
+gate: async ({ sessionId }) => {
+  const session = await AgentSessions.findOneAsync(sessionId);
+  return session?.channel?.assurance === 'oidc' ? true : 'ask';
+}
+```
+
+### Collections
+
+Six more, server-declared (no client stub — routing and delivery bookkeeping
+are the worker's business) and denied client writes like the first three.
+Every `_id` but the tokens' is **derived**, so the races resolve on the primary
+key: two servers binding one conversation, admitting one event, or reserving
+one delivery collide on the insert, and one wins.
+
+| Collection | `_id` | Holds |
+| --- | --- | --- |
+| `agent_channel_identities` | `<kind>:<externalUserId>` | Who an external sender is: `{ kind, externalUserId, userId, assurance, linkedAt }`. One app user, many rows; no row means unlinked. |
+| `agent_channel_bindings` | `<kind>:<conversationRef>` | Which conversation maps to which session: `destination`, `audience`, `agent`, `sessionId`, `userId`, the opener's `externalUserId` and `assurance`, `deliveredSeq` (this surface's cursor), `claim` (the delivering worker's lease). One session, many bindings. Inserted **before** the session, so a lost race creates nothing. |
+| `agent_delivery_receipts` | `deliver:<bindingId>:<suffix>` | The three-phase intent log: `state` (`sending` \| `sent` \| `abandoned`), `providerMessageId`, `expects` (the reply grammar a prompt delivery registered), `attempts`, `at`. |
+| `agent_inbound_submissions` | `<kind>:<eventId>` | Exactly-once admission: one row per admitted provider event. TTL-reaped after a week — the replay horizon for signatures that carry no timestamp. |
+| `agent_channel_link_tokens` | `Random.secret()` | Single-use linking tokens, bound to one external identity. |
+| `agent_channel_verdict_tokens` | `Random.secret()` | Single-use approval tokens for `link`-interact prompts, bound to one pending verdict — a separate table from link tokens so the two can never be presented for each other. |
+
+Their indexes are created at startup alongside the three above, with the same
+warn-and-continue: bindings `{ sessionId }` (the fan-out lookup per committed
+row), `{ kind, externalUserId }` sparse (the claim-history pass) and `{ kind,
+updatedAt }` (the sweep's lookback slice — what keeps per-sweep cost
+proportional to live conversations, not history); receipts `{ bindingId }`;
+and TTL reapers on submissions (`at`, 7 days) and both token tables
+(`expiresAt` — the janitor only; redemption checks expiry itself, because
+Mongo's TTL sweep runs on its own schedule and a token must be dead the
+millisecond it expires).
+
 ## Scope
 
 **Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**
@@ -1214,6 +1574,16 @@ Milestone 5 (v3) shipped on top of that list:
   being collection scans.
 - **A `tool_args` delta clamp** — one runaway argument stream can no longer
   evict every other session's tokens from the capped delta collection.
+
+The sixth addition is **channels** (see **Channels**): the lens contract with
+its round-trip test, the watcher-shaped egress worker, the generic webhook
+pipeline, exactly-once admission, receipt-backed delivery, account linking,
+and server-side `send`/`approve`/`deny` with an explicit `userId`. The core
+takes no provider SDK dependency; four surface packages prove the contract,
+each one lens + one transport + zero npm dependencies —
+`10thfloor:agent-channel-slack`, `-telegram`, `-whatsapp` and `-sms`, the last
+being the design's stress test (no buttons, no threads: approvals ride the
+receipt-registered "Reply YES/NO" grammar).
 
 **The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
 `afterToolResult` are the two seams this package offers an app for changing what

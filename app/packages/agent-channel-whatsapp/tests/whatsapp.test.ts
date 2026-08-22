@@ -122,7 +122,9 @@ describe('agent-channel-whatsapp', () => {
         text: undefined,
         interactive: {
           type: 'button_reply',
-          button_reply: { id: JSON.stringify({ t: 'deny', c: 'tc7' }), title: 'Deny' },
+          // The core's shared postback codec, spelled out: a click from a
+          // button rendered earlier carries exactly this on the wire.
+          button_reply: { id: '{"t":"d","c":"tc7"}', title: 'Deny' },
         },
       }))));
       assert.deepEqual(reading.intent, { kind: 'verdict', verdict: 'denied', toolCallId: 'tc7' });
@@ -132,13 +134,17 @@ describe('agent-channel-whatsapp', () => {
 
   describe('the one law', () => {
     it('round-trips: the rendered buttons interpret back to their verdicts', async () => {
-      const { assertLensRoundTrip } = await import('meteor/10thfloor:agent');
+      const { assertLensRoundTrip, decodeVerdictPostback, VERDICT_FOR } = await import('meteor/10thfloor:agent');
       const { whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
       assertLensRoundTrip(whatsappLens, { interact: 'native' }, {
         destination: { phoneNumberId: 'PN1', to: '15550001111' },
         synthesize: (choice, rendered) => {
+          // Pick the button by decoding the ACTUAL rendered id — the click is
+          // built from what the lens emitted, never from a hand-spelled id.
           const buttons = (rendered as any).interactive.action.buttons as any[];
-          const button = buttons.find((b) => JSON.parse(b.reply.id).t === choice.token);
+          const button = buttons.find(
+            (b) => decodeVerdictPostback(b.reply.id)?.verdict === VERDICT_FOR[choice.token],
+          );
           return {
             wa: 'event',
             body: textEvent({

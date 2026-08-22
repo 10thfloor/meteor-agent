@@ -57,25 +57,31 @@ export { ensureIndexes } from './indexes';
 export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 
 // ---- Channels (channels spec) ----------------------------------------------
-// The lens contract and its test helper, the planner, the worker, the
-// pipeline, linking, and the collections — the whole §8.7 ladder: install a
-// channel package (it calls `Agent.channel`), override one item of its lens,
-// or author a new surface against these types and prove it with
-// `assertLensRoundTrip`.
+// What a channel AUTHOR or a HOST needs, and no more — the §8.7 ladder:
+// install a channel package (it calls `Agent.channel`), override one item of
+// its lens, or author a new surface against these types and prove it with
+// `assertLensRoundTrip`. Exported: the lens contract (types, the grammar
+// constants, the postback codec, the round-trip helper), the webhook helpers
+// a `verify` needs, `deliverOnce` for tool bodies (§7), `startEgress` and the
+// pipeline for a host that wires its own boot, linking, and the collections.
+// The worker's and planner's INTERNALS — claim, cursor, per-binding delivery,
+// `planItems`/`promptItem` — stay inside the package: nothing outside it has a
+// reason to call them, and the tests reach them by path.
 export {
-  assertLensRoundTrip, exemplarItems, matchExpectation, DELIVERY_ITEM_KINDS,
-  MENU_MATCHES,
+  assertLensRoundTrip, exemplarItems, matchExpectation,
+  DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
+  encodeVerdictPostback, decodeVerdictPostback,
   type ChannelProfile, type ChannelTransport, type DeliveryItem,
   type InboundIntent, type InboundReading, type Lens, type PromptChoice,
   type RoundTripOptions,
-} from './channels/contract';
+} from '../common/channel-contract';
+export type { PlanOptions, PlannedRow } from './channels/plan';
 export {
-  expectationsFor, planItems, promptItem,
-  type PlanOptions, type PlannedRow,
-} from './channels/plan';
-export { type ChannelDef, type RawInbound, listChannels } from './channels/registry';
+  type ChannelDef, type ChannelKnobs, type RawInbound,
+  listChannels, headerValue, safeEqual,
+} from './channels/registry';
 export {
-  startEgress, deliverBinding, deliverOnce, claimBinding, advanceCursor,
+  startEgress, deliverOnce,
   type EgressOptions, type EgressWorker,
 } from './channels/egress';
 export { handleInbound, mountChannelRoutes } from './channels/ingress';

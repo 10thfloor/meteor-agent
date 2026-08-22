@@ -26,13 +26,15 @@
     "noImplicitAny": false,
     "useUnknownInCatchVariables": false,
     "paths": {
-      // The package imports its own public surface through the Meteor namespace
-      // (`meteor/10thfloor:agent`); off the Meteor build there is no such module,
-      // so point it at the client entry that re-exports that surface. The client
-      // entry also re-exports the (pure, isomorphic) channel lens contract, so
-      // channel packages type-check against the same module id they import at
-      // runtime — see client/index.ts.
-      "meteor/10thfloor:agent": ["./packages/agent/client/index.ts"],
+      // Off the Meteor build there is no `meteor/10thfloor:agent` module, so
+      // `tsc` needs telling what that id resolves to. Every type-checked
+      // importer of it is a SERVER-ONLY channel package (`api.use('10thfloor:agent',
+      // 'server')`), and the server entry is exactly the module they resolve at
+      // runtime — so that is what the id points at. `paths` cannot split by
+      // architecture: a client-side TypeScript importer of the id would need its
+      // own id/entry (none exists today — the demo app's client is plain JS,
+      // outside this config's `include`).
+      "meteor/10thfloor:agent": ["./packages/agent/server/index.ts"],
       "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/server/index.ts"],
       "meteor/10thfloor:agent-channel-telegram": ["./packages/agent-channel-telegram/server/index.ts"],
       "meteor/10thfloor:agent-channel-whatsapp": ["./packages/agent-channel-whatsapp/server/index.ts"],

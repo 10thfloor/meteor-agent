@@ -532,10 +532,13 @@ receipt log — a redeploy re-sends nothing), **approvals over any surface**
 (buttons where the surface has them, "Reply YES to approve" where it doesn't,
 single-use links where replies are awkward — same single-winner verdict
 either way), and **account linking with assurance levels**, so a gate can say
-"auto-approve for OAuth-proven users, ask otherwise" in one line:
+"auto-approve for OAuth-proven users, ask otherwise" in a few lines:
 
 ```ts
-gate: (ctx) => ctx.session.channel?.assurance === 'oidc' ? 'auto' : 'ask'
+gate: async ({ sessionId }) => {
+  const session = await AgentSessions.findOneAsync(sessionId);
+  return session?.channel?.assurance === 'oidc' ? true : 'ask';
+}
 ```
 
 A new surface is a few dozen lines — two functions and one shipped property
@@ -547,7 +550,7 @@ back as the meaning you meant. The design is
 
 The **[package README](app/packages/agent/README.md)** is the full API
 reference — config surface, tools, budgets, gates, subagents, MCP, skills,
-hooks, theming, and the operational notes that matter in production.
+hooks, theming, channels, and the operational notes that matter in production.
 **[by-example.md](docs/by-example.md)** covers the same ground as working
 code — including a failure drill that kills the server mid-stream and watches
 the transcript put itself back together.

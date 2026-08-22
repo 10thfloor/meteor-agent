@@ -1,7 +1,8 @@
-import { createHmac, timingSafeEqual } from 'crypto';
-import type {
-  ChannelDef, ChannelProfile, ChannelTransport, DeliveryItem, InboundReading,
-  Lens, RawInbound,
+import { createHmac } from 'crypto';
+import {
+  headerValue, isLinkGesture, safeEqual,
+  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -66,7 +67,9 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
     case 'interrupted':
       return 'The reply was stopped.';
     case 'approval':
-      if (item.reason === 'approval timed out') return 'The approval request timed out and was denied.';
+      // The structured flag, not the note's prose: a timeout is a denial that
+      // nobody made, and the surface must say so rather than imply a refusal.
+      if (item.timedOut) return 'The approval request timed out and was denied.';
       return item.approved ? 'Approved.' : 'Denied.';
     case 'compaction':
       return 'Earlier conversation was summarized.';
@@ -96,15 +99,12 @@ export function parseTwilioForm(rawBody: string): Record<string, string> {
 export function verifyTwilioSignature(
   raw: RawInbound, authToken: string, webhookUrl: string,
 ): boolean {
-  const header = raw.headers['x-twilio-signature'];
-  const signature = Array.isArray(header) ? header[0] : header;
+  const signature = headerValue(raw, 'x-twilio-signature');
   if (!signature) return false;
   const params = parseTwilioForm(raw.rawBody);
   const data = webhookUrl + Object.keys(params).sort().map((k) => k + params[k]).join('');
   const expected = createHmac('sha1', authToken).update(data).digest('base64');
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return safeEqual(signature, expected);
 }
 
 // ---- The lens --------------------------------------------------------------
@@ -156,7 +156,10 @@ export const smsLens: Lens = {
       destination: { to: p.From, from: p.To },
       audience: 'direct' as const,
     };
-    if (body.toLowerCase() === 'link') return { intent: { kind: 'link-request' }, ...envelope };
+    // The core's link gesture, unguarded: SMS is `direct` by construction, so
+    // the DM-only surface rule the group-capable lenses apply has nothing to
+    // restrict here.
+    if (isLinkGesture(body)) return { intent: { kind: 'link-request' }, ...envelope };
     // Everything else is a message — INCLUDING "YES"/"NO": whether those
     // decide a parked approval is the PIPELINE's call, made against the
     // receipt's registered expects (§8.3), never this stateless lens's.
@@ -215,7 +218,10 @@ export function smsTransport(options: SmsTransportOptions): ChannelTransport {
 
 // ---- The factory (§8.7 tier 1) ---------------------------------------------
 
-export interface SmsChannelOptions {
+/** The five core knobs (`statuses`, `onUncertainDelivery`, `sessionUrl`,
+ *  `linkUrl`, `throttle`) come from `ChannelKnobs` — the core's own types,
+ *  forwarded untouched — plus what Twilio itself needs. */
+export interface SmsChannelOptions extends ChannelKnobs {
   /** The registered agent this number fronts. */
   agent: string;
   /** Twilio Account SID (`AC…`). */
@@ -226,12 +232,6 @@ export interface SmsChannelOptions {
    *  Twilio's signature covers it, so a mismatch (scheme, host, trailing
    *  slash) is a 401 on every request. */
   webhookUrl: string;
-  /** Note kinds delivered as statuses. Default `['error', 'approval']`. */
-  statuses?: ChannelDef['statuses'];
-  onUncertainDelivery?: ChannelDef['onUncertainDelivery'];
-  sessionUrl?: ChannelDef['sessionUrl'];
-  linkUrl?: ChannelDef['linkUrl'];
-  throttle?: ChannelDef['throttle'];
   /** Override the default `limit: 1500`. `interact` is fixed at `menu` — the
    *  reply-word grammar is how this lens answers prompts at all. */
   profile?: Pick<ChannelProfile, 'limit'>;
@@ -256,6 +256,8 @@ export function sms(options: SmsChannelOptions): ChannelDef {
     profile: { interact: 'menu', limit: 1500, ...options.profile },
     verify: (raw) => verifyTwilioSignature(raw, options.authToken, options.webhookUrl),
     parse: (raw) => parseTwilioForm(raw.rawBody),
+    // Note kinds delivered as statuses: the errors a texter must hear about,
+    // and the approval outcome that closes a "Reply YES" exchange.
     statuses: options.statuses ?? ['error', 'approval'],
     ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
     ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),

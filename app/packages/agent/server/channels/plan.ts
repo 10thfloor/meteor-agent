@@ -1,5 +1,5 @@
 import type { AgentMessage, AgentSession } from '../../common/types';
-import { MENU_MATCHES, type ChannelProfile, type DeliveryItem } from './contract';
+import { MENU_MATCHES, type ChannelProfile, type DeliveryItem } from '../../common/channel-contract';
 
 /**
  * The shared planner (channels spec §8.2): decide WHAT a surface receives.
@@ -69,6 +69,7 @@ function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null 
       kind: message.kind,
       ...(message.reason !== undefined ? { reason: message.reason } : {}),
       ...(message.approved !== undefined ? { approved: message.approved } : {}),
+      ...(message.timedOut !== undefined ? { timedOut: message.timedOut } : {}),
       ...(message.budget !== undefined ? { budget: message.budget } : {}),
     };
   }
@@ -92,7 +93,7 @@ export function planItems(messages: AgentMessage[], opts: PlanOptions): PlannedR
  *
  * The profile decides the grammar the choices carry: `menu` choices get their
  * reply `match` words here — the single source the lens renders from and the
- * worker registers — and `link` choices get their signed `url`s later, at
+ * worker registers — and `link` choices get their single-use `url`s later, at
  * delivery time, because minting a token is I/O and the planner is pure.
  */
 export function promptItem(
@@ -116,4 +117,4 @@ export function promptItem(
   };
 }
 
-export { expectationsFor, matchExpectation } from './contract';
+export { expectationsFor, matchExpectation } from '../../common/channel-contract';

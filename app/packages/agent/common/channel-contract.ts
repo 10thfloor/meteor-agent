@@ -1,4 +1,4 @@
-import type { AgentMessage } from '../../common/types';
+import type { AgentMessage } from './types';
 
 /**
  * The lens contract (channels spec §8): what the shared planner emits, what a
@@ -15,14 +15,14 @@ import type { AgentMessage } from '../../common/types';
 
 /** One choice a prompt offers. `token` is CANONICAL (`approve`/`deny`) — the
  *  lens maps it onto whatever the surface does (a button postback, a reply
- *  keyword, a signed URL) and back. The grammar fields are filled per the
+ *  keyword, a single-use URL) and back. The grammar fields are filled per the
  *  profile's `interact` before the lens sees the item:
  *
  *    `match` — `menu` only: the reply word the surface's grammar registers
  *              ("Reply YES to approve"); the same word lands in the delivery
  *              receipt's `expects`, so the render and the parse are one
  *              artifact by construction.
- *    `url`   — `link` only: the signed one-time approval URL for this choice,
+ *    `url`   — `link` only: the single-use approval URL for this choice,
  *              minted at delivery time (see `issueVerdictToken`). Absent when
  *              the channel supplies no `approvalUrl`.
  */
@@ -47,6 +47,10 @@ export type DeliveryItem =
     /** `kind: 'approval'` notes only — the post-verdict audit outcome. The ASK
      *  itself is never a status; it is always the `prompt` item. */
     approved?: boolean;
+    /** `kind: 'approval'` notes only, and only when true: nobody answered
+     *  before `budget.approval` elapsed and the watcher denied the ask. A lens
+     *  must be able to say "timed out" rather than imply a person refused. */
+    timedOut?: boolean;
     budget?: AgentMessage['budget'];
   }
   /** The parked approval, built from `session.pending` — never from a note.
@@ -144,7 +148,7 @@ export interface Lens {
  *              canonical token.
  *   `menu`   — no affordances, cheap replies (SMS): the prompt renders a reply
  *              menu and registers its tokens in the receipt's `expects`.
- *   `link`   — replies are awkward (email): each choice is a signed one-time
+ *   `link`   — replies are awkward (email): each choice is a single-use
  *              URL bound to the specific pending verdict.
  *
  * `limit` is the hard payload budget; a reply over it becomes an `overflow`
@@ -165,7 +169,11 @@ export interface ChannelProfile {
  * `idempotencyKey` is passed where the provider honors one (tier A, §11);
  * `reconcile` is tier B — "did a post carrying this key already land at this
  * destination?" — and its presence is what makes `onUncertainDelivery:
- * 'reconcile'` legal for the channel.
+ * 'reconcile'` legal for the channel. The key it is asked about is the BARE
+ * receipt id, which is what segment 0 of a multi-payload post was sent under
+ * (later segments carry `<receiptId>:<i>`); "did segment 0 land" is the
+ * question, because a post that got past its first segment has a receipt
+ * worth settling.
  */
 export interface ChannelTransport {
   post(
@@ -186,6 +194,78 @@ export const MENU_MATCHES: Record<'approve' | 'deny', string> = {
   approve: 'YES',
   deny: 'NO',
 };
+
+/** The canonical choice token → the verdict it records. ONE place, so the
+ *  planner's grammar, the round-trip helper, the `link` token mint and every
+ *  lens's postback agree on which word means what. */
+export const VERDICT_FOR = { approve: 'approved', deny: 'denied' } as const;
+
+// ---- The linking gesture (§12) ---------------------------------------------
+
+/** The bare word that asks for an account link: exact after trimming, any
+ *  case — "link" and " LINK " ask; "link my account" is a message. The core's
+ *  own group hint names this word ("send me the word "link" in a direct
+ *  message"), so it lives here and lenses read it rather than spelling their
+ *  own: what the hint says to type is, by construction, what the lens
+ *  interprets. A lens with a surface-specific spelling (`/link@Bot`) still
+ *  accepts this one. */
+export const LINK_GESTURE = 'link';
+export function isLinkGesture(text: string): boolean {
+  return text.trim().toLowerCase() === LINK_GESTURE;
+}
+
+// ---- The native-postback codec (§8.4) --------------------------------------
+
+/**
+ * The wire shape a `native` lens embeds in a button's postback, so the click
+ * comes back carrying the canonical token AND the ask it answers (§8.3's
+ * staleness rule): terse JSON, `{ t: 'a' | 'd', c: toolCallId }`. Pure, and
+ * shared so every surface's buttons decode the same way.
+ *
+ * `maxBytes` is for providers that cap the postback (Telegram's
+ * `callback_data` is 64 bytes). Over the cap the id is DROPPED, not cut:
+ * `{ t }` alone still decides the parked ask (the single-winner verdict write
+ * is the backstop), whereas a truncated id would name a WRONG ask and be
+ * dropped as stale — or worse, collide. Degrading to token-only is deliberate.
+ */
+export function encodeVerdictPostback(
+  token: 'approve' | 'deny', toolCallId: string, opts: { maxBytes?: number } = {},
+): string {
+  const t = token === 'approve' ? 'a' : 'd';
+  const full = JSON.stringify({ t, c: toolCallId });
+  if (opts.maxBytes === undefined || utf8Bytes(full) <= opts.maxBytes) return full;
+  return JSON.stringify({ t });
+}
+
+/**
+ * The other half: a postback (the raw string, or a value the provider already
+ * parsed) → the verdict and, when it rode along, the ask. `null` for anything
+ * that is not a verdict postback — malformed JSON, a non-object, an unknown
+ * `t` — so a lens maps it to `noop` rather than throwing.
+ *
+ * `JSON.parse('null')` SUCCEEDS and yields `null`, whose `typeof` is
+ * `'object'` — a user-craftable payload that would pass a bare object check
+ * and then throw on the `t` read. Guarded explicitly.
+ */
+export function decodeVerdictPostback(
+  raw: unknown,
+): { verdict: 'approved' | 'denied'; toolCallId?: string } | null {
+  let value: unknown = raw;
+  if (typeof raw === 'string') {
+    try { value = JSON.parse(raw); } catch { return null; }
+  }
+  if (value === null || typeof value !== 'object') return null;
+  const { t, c } = value as { t?: unknown; c?: unknown };
+  const verdict = t === 'a' ? VERDICT_FOR.approve : t === 'd' ? VERDICT_FOR.deny : null;
+  if (!verdict) return null;
+  return { verdict, ...(typeof c === 'string' ? { toolCallId: c } : {}) };
+}
+
+/** UTF-8 length without `Buffer` — this module is isomorphic and must not
+ *  reach for a Node global. */
+function utf8Bytes(s: string): number {
+  return new TextEncoder().encode(s).length;
+}
 
 // ---- The menu grammar's matching rule (§8.3) -------------------------------
 
@@ -223,7 +303,7 @@ export function expectationsFor(
     .filter((c) => c.match !== undefined)
     .map((c) => ({
       match: c.match!,
-      verdict: c.token === 'approve' ? 'approved' as const : 'denied' as const,
+      verdict: VERDICT_FOR[c.token],
       toolCallId: prompt.toolCallId,
     }));
 }
@@ -337,7 +417,7 @@ export function assertLensRoundTrip(
       const expects = expectationsFor(item);
       for (const choice of item.choices) {
         const reading = lens.in(opts.synthesize(choice, payload));
-        const want = choice.token === 'approve' ? 'approved' : 'denied';
+        const want = VERDICT_FOR[choice.token];
         const direct = reading.intent.kind === 'verdict' && reading.intent.verdict === want;
         const viaGrammar = profile.interact === 'menu'
           && reading.intent.kind === 'message'

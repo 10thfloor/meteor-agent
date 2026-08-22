@@ -4,11 +4,11 @@ import { AgentSessions } from '../../common/collections';
 import { getAgent } from '../registry';
 import { recordVerdict, sendToSession } from '../methods';
 import {
-  ChannelBindings, DeliveryReceipts, InboundSubmissions, isDuplicateKey,
+  ChannelBindings, DeliveryReceipts, InboundSubmissions, insertOrLose,
   type ChannelBinding,
 } from './collections';
-import { matchExpectation } from './contract';
-import type { InboundReading } from './contract';
+import { LINK_GESTURE, matchExpectation } from '../../common/channel-contract';
+import type { InboundReading } from '../../common/channel-contract';
 import { deliverOnce } from './egress';
 import { issueLinkToken, resolveIdentity } from './linking';
 import { getChannel, listChannels, type ChannelDef, type RawInbound } from './registry';
@@ -110,31 +110,28 @@ async function findOrCreateBinding(
   let binding = await ChannelBindings.findOneAsync(bindingId);
   if (!binding) {
     const sessionId = Random.id();
-    try {
-      await ChannelBindings.insertAsync({
-        _id: bindingId,
-        kind,
-        conversationRef,
-        destination: reading.destination ?? null,
-        // Default 'group' — the SAFE direction for §8.5's capability-URL rule.
-        audience: reading.audience ?? 'group',
-        agent: def.agent,
-        sessionId,
-        userId: identity?.userId ?? null,
-        // The OPENER's proof strength, recorded at bind time so a later
-        // repair-on-entry (`ensureSession`) stamps the session with the owner's
-        // assurance — not that of whoever happens to trigger the repair.
-        assurance: identity?.assurance ?? 'none',
-        ...(reading.externalUserId !== undefined
-          ? { externalUserId: reading.externalUserId } : {}),
-        deliveredSeq: 0,
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-    } catch (e) {
-      if (!isDuplicateKey(e)) throw e;
-      // The race's loser: adopt the winner's binding, having created nothing.
-    }
+    // Win or lose, the next read is the same: the race's loser adopts the
+    // winner's binding, having created nothing.
+    await insertOrLose(ChannelBindings, {
+      _id: bindingId,
+      kind,
+      conversationRef,
+      destination: reading.destination ?? null,
+      // Default 'group' — the SAFE direction for §8.5's capability-URL rule.
+      audience: reading.audience ?? 'group',
+      agent: def.agent,
+      sessionId,
+      userId: identity?.userId ?? null,
+      // The OPENER's proof strength, recorded at bind time so a later
+      // repair-on-entry (`ensureSession`) stamps the session with the owner's
+      // assurance — not that of whoever happens to trigger the repair.
+      assurance: identity?.assurance ?? 'none',
+      ...(reading.externalUserId !== undefined
+        ? { externalUserId: reading.externalUserId } : {}),
+      deliveredSeq: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
     binding = await ChannelBindings.findOneAsync(bindingId);
     if (!binding) return null;
   } else {
@@ -166,24 +163,21 @@ async function ensureSession(kind: string, binding: ChannelBinding): Promise<boo
   }
   const existing = await AgentSessions.findOneAsync(binding.sessionId);
   if (!existing) {
-    try {
-      await AgentSessions.insertAsync({
-        _id: binding.sessionId,
-        agent: binding.agent,
-        userId: binding.userId,
-        phase: 'idle',
-        model: config.model,
-        nextSeq: 0,
-        usage: { input: 0, output: 0, cost: 0 },
-        budgetSpent: { turns: 0, toolCalls: 0 },
-        // The OWNER's assurance, from the binding — not the current sender's.
-        channel: { origin: kind, assurance: binding.assurance ?? 'none' },
-        createdAt: new Date(),
-        updatedAt: new Date(),
-      });
-    } catch (e) {
-      if (!isDuplicateKey(e)) throw e;   // another server's repair won — fine
-    }
+    // A lost insert is another server's repair winning — fine either way.
+    await insertOrLose(AgentSessions, {
+      _id: binding.sessionId,
+      agent: binding.agent,
+      userId: binding.userId,
+      phase: 'idle',
+      model: config.model,
+      nextSeq: 0,
+      usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      // The OWNER's assurance, from the binding — not the current sender's.
+      channel: { origin: kind, assurance: binding.assurance ?? 'none' },
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
   }
   return true;
 }
@@ -264,11 +258,8 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   let claimId: string | null = null;
   if (eventId !== undefined) {
     claimId = `${kind}:${eventId}`;
-    try {
-      await InboundSubmissions.insertAsync({ _id: claimId, at: new Date() });
-    } catch (e) {
-      if (isDuplicateKey(e)) return { status: 200 };   // already admitted
-      throw e;
+    if (!(await insertOrLose(InboundSubmissions, { _id: claimId, at: new Date() }))) {
+      return { status: 200 };   // already admitted
     }
   }
 
@@ -365,20 +356,20 @@ async function route(
     // offer at all.
     if (!def.linkUrl || reading.externalUserId === undefined) return { status: 200 };
     if (binding.audience !== 'direct') {
-      const outcome = await deliverOnce(kind, binding, {
+      const outcome = await deliverOnce(binding, {
         item: 'reply',
-        text: 'To link your account, send me the word "link" in a direct message — not here.',
-      }, `link-hint:${reading.eventId ?? reading.externalUserId}`, { def });
+        text: `To link your account, send me the word "${LINK_GESTURE}" in a direct message — not here.`,
+      }, `link-hint:${reading.eventId ?? reading.externalUserId}`);
       if (outcome !== 'delivered') {
         console.warn(`[10thfloor:agent] channel "${kind}": link hint for session ${binding.sessionId} not delivered (${outcome})`);
       }
       return { status: 200 };
     }
     const token = await issueLinkToken(kind, reading.externalUserId);
-    const outcome = await deliverOnce(kind, binding, {
+    const outcome = await deliverOnce(binding, {
       item: 'reply',
       text: `To link this conversation to your account, open: ${def.linkUrl(token)}`,
-    }, `link:${reading.eventId ?? token}`, { def });
+    }, `link:${reading.eventId ?? token}`);
     if (outcome !== 'delivered') {
       // Link replies are not seq rows, so no sweep retries them: say so, and
       // the user can send "link" again (a fresh eventId, a fresh receipt).

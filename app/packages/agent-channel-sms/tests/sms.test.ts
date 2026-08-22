@@ -103,6 +103,19 @@ describe('agent-channel-sms', () => {
     });
   });
 
+  describe('lens.out statuses', () => {
+    it('reads the approval outcome from the structured flags, never the note’s prose', async () => {
+      const { smsLens } = await import('meteor/10thfloor:agent-channel-sms');
+      const dest = { to: '+1', from: '+2' };
+      const out = (extra: object): string =>
+        (smsLens.out({ item: 'status', kind: 'approval', ...extra } as any, dest) as any).body;
+      assert.equal(out({ approved: true }), 'Approved.');
+      assert.equal(out({ approved: false }), 'Denied.');
+      assert.include(out({ approved: false, timedOut: true }), 'timed out',
+        'the flag decides — a timeout is a denial nobody made, and the text must say so');
+    });
+  });
+
   describe('toPlainText', () => {
     it('strips decoration and keeps both halves of a link', async () => {
       const { toPlainText } = await import('meteor/10thfloor:agent-channel-sms');

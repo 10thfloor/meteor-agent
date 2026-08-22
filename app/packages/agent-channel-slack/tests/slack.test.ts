@@ -142,7 +142,11 @@ describe('agent-channel-slack', () => {
     });
 
     it('reads a button click as a verdict carrying the exact ask', async () => {
+      const { encodeVerdictPostback } = await import('meteor/10thfloor:agent');
       const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      // The button value is the core's shared postback codec — the same
+      // encoder `lens.out` renders with (the round-trip test below pins that
+      // render and interpret agree; this one pins the routing envelope).
       const payload = {
         type: 'block_actions',
         user: { id: 'U7', team_id: 'T1' },
@@ -150,7 +154,7 @@ describe('agent-channel-slack', () => {
         message: { ts: '1700000000.000100' },
         actions: [{
           action_id: 'agent-verdict-approve', action_ts: '1700000042.000000',
-          value: JSON.stringify({ token: 'approve', toolCallId: 'tc1' }),
+          value: encodeVerdictPostback('approve', 'tc1'),
         }],
       };
       const reading = slackLens.in(parseSlackRequest({
@@ -163,6 +167,7 @@ describe('agent-channel-slack', () => {
     });
 
     it('a click in a channel thread lands on the thread the mention created', async () => {
+      const { encodeVerdictPostback } = await import('meteor/10thfloor:agent');
       const { parseSlackRequest, slackLens } = await import('meteor/10thfloor:agent-channel-slack');
       const mention = await read(
         { type: 'app_mention', channel_type: undefined, channel: 'C9', text: '<@UBOT> refund' },
@@ -176,7 +181,7 @@ describe('agent-channel-slack', () => {
         message: { ts: '1700000001.000200', thread_ts: '1700000000.000100' },
         actions: [{
           action_id: 'agent-verdict-deny', action_ts: '1700.9',
-          value: JSON.stringify({ token: 'deny', toolCallId: 'tc1' }),
+          value: encodeVerdictPostback('deny', 'tc1'),
         }],
       };
       const click = slackLens.in(parseSlackRequest({
@@ -229,9 +234,10 @@ describe('agent-channel-slack', () => {
         (slackLens.out({ item: 'status', kind: 'approval', ...s } as any, {}) as any).text as string;
       assert.include(out({ approved: true }), 'Approved');
       assert.include(out({ approved: false }), 'Denied');
-      // The reason is a structured TOKEN the core writes (`'approval timed out'`);
-      // this pins that the lens keys on the same spelling.
-      assert.include(out({ approved: false, reason: 'approval timed out' }), 'timed out');
+      // The timeout is a structured FLAG the core writes (`timedOut: true`,
+      // which the planner passes through onto the status item); this pins
+      // that the lens keys on the flag, not on the reason's spelling.
+      assert.include(out({ approved: false, timedOut: true }), 'timed out');
       assert.notMatch(out({ approved: true }), /^\[/, 'never the default arm');
     });
   });

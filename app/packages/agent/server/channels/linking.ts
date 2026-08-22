@@ -4,7 +4,7 @@ import { AgentSessions } from '../../common/collections';
 import { recordVerdict } from '../methods';
 import {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
-  isDuplicateKey, type ChannelIdentity,
+  insertOrLose, type ChannelIdentity,
 } from './collections';
 
 /**
@@ -118,10 +118,7 @@ export async function linkIdentity(
   // the stronger `oidc` an existing row already carries. Stamped on claimed
   // sessions too, so a session and its identity row never disagree.
   let effective: 'link' | 'oidc' = assurance;
-  try {
-    await ChannelIdentities.insertAsync(row);
-  } catch (e) {
-    if (!isDuplicateKey(e)) throw e;
+  if (!(await insertOrLose(ChannelIdentities, row))) {
     const existing = await ChannelIdentities.findOneAsync(_id);
     // A DIFFERENT account presenting proof for an already-linked identity is
     // REFUSED, not re-pointed. Re-pointing would silently dispossess the

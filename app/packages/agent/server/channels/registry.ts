@@ -1,5 +1,6 @@
+import { timingSafeEqual } from 'crypto';
 import type { AgentMessage, AgentSession } from '../../common/types';
-import type { ChannelProfile, ChannelTransport, Lens } from './contract';
+import type { ChannelProfile, ChannelTransport, Lens } from '../../common/channel-contract';
 
 /**
  * The channel registry (channels spec §10): a static `Agent.channel(kind, def)`
@@ -25,6 +26,25 @@ export interface RawInbound {
   headers: Record<string, string | string[] | undefined>;
   rawBody: string;
   url?: string;
+}
+
+/** The first value of a possibly-repeated header — Node hands a repeated
+ *  header up as an array, and a signature scheme wants ONE string to check.
+ *  `undefined` when absent. */
+export function headerValue(raw: RawInbound, name: string): string | undefined {
+  const v = raw.headers[name];
+  return Array.isArray(v) ? v[0] : v;
+}
+
+/** Constant-time string equality for signature checks. `timingSafeEqual`
+ *  throws on unequal lengths, so the length is compared first — which leaks
+ *  the length, not the content, and every scheme's digest length is public
+ *  anyway. SERVER-ONLY (Buffer, crypto) — which is why it lives here beside
+ *  `RawInbound` and not in the isomorphic contract. */
+export function safeEqual(a: string, b: string): boolean {
+  const ab = Buffer.from(a);
+  const bb = Buffer.from(b);
+  return ab.length === bb.length && timingSafeEqual(ab, bb);
 }
 
 export interface ChannelDef {
@@ -81,6 +101,14 @@ export interface ChannelDef {
    *  60s per sender. */
   throttle?: { limit: number; intervalMs: number };
 }
+
+/** The knobs a tier-1 factory forwards to the core untouched (§8.7): a
+ *  channel package's `options` accepts these by the core's own types and hands
+ *  them to `Agent.channel` as-is, so the package neither re-documents nor
+ *  re-validates what the core already owns. */
+export type ChannelKnobs = Pick<
+  ChannelDef, 'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
+>;
 
 const channels = new Map<string, ChannelDef>();
 

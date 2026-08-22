@@ -1,7 +1,7 @@
-import { timingSafeEqual } from 'crypto';
-import type {
-  ChannelDef, ChannelProfile, ChannelTransport, DeliveryItem, InboundReading,
-  Lens, RawInbound,
+import {
+  LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
+  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -26,9 +26,10 @@ import type {
  *
  *  INTERACTION — `native`: inline keyboards. Each button's `callback_data`
  *  carries the canonical token AND the exact ask (`toolCallId`), so the
- *  staleness rule rides the button. Telegram caps callback_data at 64 BYTES —
- *  the payload is compacted, and an over-long toolCallId degrades to a
- *  token-only payload (the single-winner verdict write remains the backstop).
+ *  staleness rule rides the button — the core's shared postback codec, with
+ *  Telegram's cap applied: callback_data is 64 BYTES, so an over-long
+ *  toolCallId degrades to a token-only payload (the single-winner verdict
+ *  write remains the backstop).
  *
  *  ECHO RULE — Telegram never delivers a bot its own messages, so the
  *  self-reply loop cannot form; what must still be dropped is OTHER bots
@@ -38,16 +39,12 @@ import type {
 
 // ---- The prompt's callback payload -----------------------------------------
 
-/** Compact on purpose: Telegram rejects callback_data over 64 bytes. `t` is
- *  the verdict ('a'pprove / 'd'eny), `c` the exact ask it answers. */
-function callbackData(token: 'approve' | 'deny', toolCallId: string): string {
-  const full = JSON.stringify({ t: token === 'approve' ? 'a' : 'd', c: toolCallId });
-  if (Buffer.byteLength(full, 'utf8') <= 64) return full;
-  // Degrade rather than truncate the ask into a WRONG ask: a payload without
-  // `c` skips the router's staleness pre-check and leans on the verdict
-  // write's own single-winner guard.
-  return JSON.stringify({ t: token === 'approve' ? 'a' : 'd' });
-}
+/** Telegram rejects callback_data over 64 bytes. The core's postback codec
+ *  (`{ t: 'a' | 'd', c: toolCallId }`) takes that cap and, past it, DROPS the
+ *  ask rather than truncating it into a WRONG ask: a payload without `c`
+ *  skips the router's staleness pre-check and leans on the verdict write's
+ *  own single-winner guard. */
+const CALLBACK_DATA_MAX_BYTES = 64;
 
 // ---- Status prose — this surface's noteText --------------------------------
 
@@ -60,7 +57,7 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
     case 'interrupted':
       return '🛑 The turn was stopped.';
     case 'approval':
-      if (item.reason === 'approval timed out') return '⏳ The approval request timed out and was denied.';
+      if (item.timedOut) return '⏳ The approval request timed out and was denied.';
       return item.approved ? '✅ Approved.' : '❌ Denied.';
     case 'compaction':
       return '📦 Earlier conversation was summarized to stay within context.';
@@ -80,12 +77,9 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
  * it is still a bearer credential.
  */
 export function verifyTelegramSecret(raw: RawInbound, webhookSecret: string): boolean {
-  const header = raw.headers['x-telegram-bot-api-secret-token'];
-  const got = Array.isArray(header) ? header[0] : header;
+  const got = headerValue(raw, 'x-telegram-bot-api-secret-token');
   if (!got) return false;
-  const a = Buffer.from(got);
-  const b = Buffer.from(webhookSecret);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return safeEqual(got, webhookSecret);
 }
 
 export function parseTelegramUpdate(raw: RawInbound): unknown {
@@ -101,10 +95,14 @@ export function parseTelegramUpdate(raw: RawInbound): unknown {
 const NOOP: InboundReading = { intent: { kind: 'noop' } };
 
 /** `/link@MyBot` and `/link` and `link` all mean the same gesture; a sentence
- *  containing the word does not. */
-function isLinkGesture(text: string): boolean {
+ *  containing the word does not. The bare word is the core's `LINK_GESTURE`
+ *  (what its group hint tells people to type), read from the same constant so
+ *  hint and lens cannot disagree; the slash-command spelling, with or without
+ *  Telegram's `@Bot` suffix, is this surface's addition — which is why this is
+ *  not a bare `isLinkGesture(text)`: the `@` split happens first. */
+function isTelegramLinkGesture(text: string): boolean {
   const word = text.trim().toLowerCase().split('@')[0];
-  return word === 'link' || word === '/link';
+  return word === LINK_GESTURE || word === `/${LINK_GESTURE}`;
 }
 
 export const telegramLens: Lens = {
@@ -129,7 +127,9 @@ export const telegramLens: Lens = {
           reply_markup: {
             inline_keyboard: item.choices.map((choice) => ([{
               text: choice.label,
-              callback_data: callbackData(choice.token, item.toolCallId),
+              callback_data: encodeVerdictPostback(
+                choice.token, item.toolCallId, { maxBytes: CALLBACK_DATA_MAX_BYTES },
+              ),
             }])),
           },
         };
@@ -148,21 +148,17 @@ export const telegramLens: Lens = {
     // attached to — its chat is the conversation the verdict belongs to.
     if (update.callback_query) {
       const cq = update.callback_query;
-      let data: { t?: string; c?: string } = {};
-      try { data = JSON.parse(cq.data ?? '{}'); } catch { return NOOP; }
-      // Telegram lets any client send arbitrary `data` for a bot's message,
-      // and `JSON.parse('null')` succeeds — guard the shape before reading
-      // it, or a crafted click is a TypeError, a 500, and a retry loop.
-      if (!data || typeof data !== 'object') return NOOP;
-      if (data.t !== 'a' && data.t !== 'd') return NOOP;
+      // Telegram lets any client send arbitrary `data` for a bot's message;
+      // the shared codec answers `null` for anything that is not a verdict
+      // postback (bad JSON, the literal `'null'`, an unknown token), so a
+      // crafted click is a noop rather than a TypeError, a 500, and a retry
+      // loop.
+      const decoded = decodeVerdictPostback(cq.data);
+      if (!decoded) return NOOP;
       const chat = cq.message?.chat;
       if (!chat) return NOOP;
       return {
-        intent: {
-          kind: 'verdict',
-          verdict: data.t === 'a' ? 'approved' : 'denied',
-          ...(data.c !== undefined ? { toolCallId: data.c } : {}),
-        },
+        intent: { kind: 'verdict', ...decoded },
         eventId,
         externalUserId: String(cq.from?.id ?? ''),
         conversationRef: String(chat.id),
@@ -189,7 +185,7 @@ export const telegramLens: Lens = {
     // The linking gesture is honored in PRIVATE chats only: the URL it earns
     // is a credential, and the core refuses to post one into a group anyway —
     // in a group, `/link` is just a message.
-    if (isLinkGesture(text) && m.chat.type === 'private') {
+    if (isTelegramLinkGesture(text) && m.chat.type === 'private') {
       return { intent: { kind: 'link-request' }, ...envelope };
     }
     return { intent: { kind: 'message', text }, ...envelope };
@@ -232,7 +228,11 @@ export function telegramTransport(options: TelegramTransportOptions): ChannelTra
 
 // ---- The factory (§8.7 tier 1) ---------------------------------------------
 
-export interface TelegramChannelOptions {
+/** The credentials plus the core's five pass-through knobs (`ChannelKnobs`:
+ *  `statuses`, `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`),
+ *  forwarded to the `ChannelDef` untouched — except `statuses`, which defaults
+ *  to `['error', 'approval']`. */
+export interface TelegramChannelOptions extends ChannelKnobs {
   /** The registered agent this bot fronts. */
   agent: string;
   /** The BotFather token (`123456:ABC-…`). */
@@ -240,12 +240,6 @@ export interface TelegramChannelOptions {
   /** The `secret_token` you passed to `setWebhook` — the webhook's whole
    *  authentication, so make it long and random. */
   webhookSecret: string;
-  /** Note kinds delivered as statuses. Default `['error', 'approval']`. */
-  statuses?: ChannelDef['statuses'];
-  onUncertainDelivery?: ChannelDef['onUncertainDelivery'];
-  sessionUrl?: ChannelDef['sessionUrl'];
-  linkUrl?: ChannelDef['linkUrl'];
-  throttle?: ChannelDef['throttle'];
   /** Override pieces of the default `{ interact: 'native', limit: 4096 }`. */
   profile?: Partial<ChannelProfile>;
   /** TEST SEAM, threaded to the transport. */

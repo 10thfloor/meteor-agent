@@ -1,7 +1,7 @@
 import { assert } from 'chai';
 import type { AgentMessage, AgentSession } from '../common/types';
 import type { ChannelDef, RawInbound } from '../server/channels/registry';
-import type { DeliveryItem, InboundReading } from '../server/channels/contract';
+import type { DeliveryItem, InboundReading } from '../common/channel-contract';
 import type { ChannelBinding } from '../server/channels/collections';
 
 /**
@@ -218,7 +218,7 @@ describe('channels', () => {
 
     it('builds the prompt from the parked state only while unanswered, with menu matches', async () => {
       const { promptItem } = await import('../server/channels/plan');
-      const { MENU_MATCHES } = await import('../server/channels/contract');
+      const { MENU_MATCHES } = await import('../common/channel-contract');
       const parked: AgentSession = {
         ...sessionBase, _id: 'p1', phase: 'awaiting',
         pending: { toolCallId: 'tc1', name: 'orders.refund', args: { id: 1 } },
@@ -256,7 +256,7 @@ describe('channels', () => {
 
   describe('assertLensRoundTrip', () => {
     it('accepts a lens whose grammar round-trips, menu text included', async () => {
-      const { assertLensRoundTrip } = await import('../server/channels/contract');
+      const { assertLensRoundTrip } = await import('../common/channel-contract');
       const lens = testLens();
       assertLensRoundTrip(lens, { interact: 'menu' }, {
         synthesize: (choice) => ({ type: 'msg', text: choice.match ?? choice.token, id: 'e', user: 'u', convo: 'c' }),
@@ -265,7 +265,7 @@ describe('channels', () => {
     });
 
     it('rejects a lens that drops an item (totality)', async () => {
-      const { assertLensRoundTrip } = await import('../server/channels/contract');
+      const { assertLensRoundTrip } = await import('../common/channel-contract');
       const lens = testLens();
       const dropping = {
         ...lens,
@@ -280,7 +280,7 @@ describe('channels', () => {
     });
 
     it('rejects a lens whose offered affordance does not read back (the one law)', async () => {
-      const { assertLensRoundTrip } = await import('../server/channels/contract');
+      const { assertLensRoundTrip } = await import('../common/channel-contract');
       const lens = testLens();
       assert.throws(
         () => assertLensRoundTrip(lens, { interact: 'native' }, {
@@ -293,7 +293,7 @@ describe('channels', () => {
     });
 
     it('names the missing corpus kind, the missing synthesize, and a message that does not read back', async () => {
-      const { assertLensRoundTrip, exemplarItems } = await import('../server/channels/contract');
+      const { assertLensRoundTrip, exemplarItems } = await import('../common/channel-contract');
       const lens = testLens();
       const ev = (text: string) => ({ type: 'msg', text, id: 'e', user: 'u', convo: 'c' });
       assert.throws(() => assertLensRoundTrip(lens, { interact: 'menu' }, {
@@ -305,6 +305,28 @@ describe('channels', () => {
       }), /plain inbound message event read back/);
       const emptyArray = { ...lens, out: (i: DeliveryItem) => (i.item === 'status' ? [] : lens.out(i)) };
       assert.throws(() => assertLensRoundTrip(emptyArray as any, { interact: 'menu' }, { synthesize: (c) => ev(c.match ?? '') }), /returned nothing for a 'status'/);
+    });
+
+    it('the shared postback codec round-trips, degrades to token-only over a byte cap, and rejects junk', async () => {
+      const {
+        encodeVerdictPostback, decodeVerdictPostback, VERDICT_FOR, isLinkGesture, LINK_GESTURE,
+      } = await import('../common/channel-contract');
+      assert.deepEqual(decodeVerdictPostback(encodeVerdictPostback('approve', 'tc1')), { verdict: 'approved', toolCallId: 'tc1' });
+      assert.deepEqual(decodeVerdictPostback(encodeVerdictPostback('deny', 'tc1')), { verdict: 'denied', toolCallId: 'tc1' });
+      assert.equal(VERDICT_FOR.approve, 'approved');
+      assert.equal(VERDICT_FOR.deny, 'denied');
+      // Over the cap the id is DROPPED, never truncated into a wrong ask.
+      const long = encodeVerdictPostback('approve', 'x'.repeat(100), { maxBytes: 64 });
+      assert.isAtMost(Buffer.byteLength(long, 'utf8'), 64);
+      assert.deepEqual(decodeVerdictPostback(long), { verdict: 'approved' });
+      // An already-parsed value decodes too; junk maps to null, not a throw.
+      assert.deepEqual(decodeVerdictPostback({ t: 'd', c: 'tc2' }), { verdict: 'denied', toolCallId: 'tc2' });
+      assert.isNull(decodeVerdictPostback('null'), "JSON.parse('null') is guarded");
+      assert.isNull(decodeVerdictPostback('not json'));
+      assert.isNull(decodeVerdictPostback({ t: 'x' }));
+      assert.isNull(decodeVerdictPostback(42));
+      assert.isTrue(isLinkGesture(` ${LINK_GESTURE.toUpperCase()} `), 'exact word, any case, trimmed');
+      assert.isFalse(isLinkGesture('link my account'), 'a sentence is a message');
     });
   });
 
@@ -443,6 +465,16 @@ describe('channels', () => {
       // A bystander sends into it — nothing enters.
       await handleInbound('test', raw({ type: 'msg', text: 'me too', id: 'b1', user: 'bystander', convo: 'thread', group: true }));
       assert.equal(await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync(), before);
+
+      // The opener's first message kicked off a REAL (mock) turn. Let it
+      // finish before hand-parking the session: a turn still winding down
+      // idles the phase back in its `finally`, and the park would be undone
+      // under the click — a race the test must not invite.
+      await until(async () => {
+        const s = await AgentSessions.findOneAsync(binding.sessionId);
+        const replied = await AgentMessages.find({ sessionId: binding.sessionId, role: 'assistant' }).countAsync();
+        return s?.phase === 'idle' && replied > 0;
+      });
 
       // A bystander clicks Approve on the opener's parked ask — nothing decided.
       await AgentSessions.updateAsync(binding.sessionId, {
@@ -713,6 +745,25 @@ describe('channels', () => {
       assert.equal(abandoned.state, 'abandoned');
       assert.deepEqual(transport.posts.map((p) => p.payload.text), ['second answer'], 'the rest still flows');
       assert.equal((await ChannelBindings.findOneAsync('test:conv'))!.deliveredSeq, 2);
+    });
+
+    it('posts a segmented render under per-segment keys, segment 0 carrying the bare receipt id', async () => {
+      const { transport, def } = await registerTestChannel();
+      const base = def.lens.out.bind(def.lens);
+      // A surface that splits a reply into two payloads (a segmented SMS).
+      def.lens.out = (item: DeliveryItem, destination: unknown) => (item.item === 'reply'
+        ? [{ text: `${item.text} [1/2]` }, { text: `${item.text} [2/2]` }]
+        : base(item, destination));
+      const { deliverOnce } = await import('../server/channels/egress');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      await seedConversation();
+      const binding = (await ChannelBindings.findOneAsync('test:conv'))!;
+      assert.equal(await deliverOnce(binding, { item: 'reply', text: 'hello' }, 'seg'), 'delivered');
+      // The bare id on segment 0 is what `reconcile` is later asked about; the
+      // suffix on the rest keeps a tier-A provider from collapsing them.
+      assert.deepEqual(transport.posts.map((p) => p.key), ['deliver:test:conv:seg', 'deliver:test:conv:seg:1']);
+      assert.equal(await deliverOnce(binding, { item: 'reply', text: 'hello' }, 'seg'), 'delivered');
+      assert.lengthOf(transport.posts, 2, 'a settled receipt posts nothing again');
     });
 
     it("honors 'reconcile': a read-back that finds the post confirms without re-posting", async () => {

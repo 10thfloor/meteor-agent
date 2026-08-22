@@ -266,3 +266,21 @@ export function isDuplicateKey(e: unknown): boolean {
   const err = e as { code?: number; message?: string } | null;
   return err?.code === 11000 || /duplicate key/i.test(String(err?.message ?? ''));
 }
+
+/** Insert a row whose `_id` is DERIVED, and report which side of the race this
+ *  caller is on: `true` — inserted, we won; `false` — duplicate key, someone
+ *  else did, adopt theirs. Anything else is a real failure and propagates. The
+ *  idiom behind every single-winner insert in the subsystem (binding, session
+ *  repair, admission claim, receipt reserve, identity row), so each site reads
+ *  as the decision it makes rather than as a try/catch. */
+export async function insertOrLose<T extends { _id: string }>(
+  coll: Pick<Mongo.Collection<T>, 'insertAsync'>, doc: Mongo.OptionalId<T>,
+): Promise<boolean> {
+  try {
+    await coll.insertAsync(doc);
+    return true;
+  } catch (e) {
+    if (isDuplicateKey(e)) return false;
+    throw e;
+  }
+}

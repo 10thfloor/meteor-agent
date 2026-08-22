@@ -1,7 +1,8 @@
-import { createHmac, timingSafeEqual } from 'crypto';
-import type {
-  ChannelDef, ChannelProfile, ChannelTransport, DeliveryItem, InboundReading,
-  Lens, RawInbound,
+import { createHmac } from 'crypto';
+import {
+  decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -73,7 +74,9 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
     case 'interrupted':
       return ':octagonal_sign: The turn was stopped.';
     case 'approval':
-      if (item.reason === 'approval timed out') return ':hourglass: The approval request timed out and was denied.';
+      // `timedOut` is the core's structured flag for "nobody answered and the
+      // watcher denied it" — a timeout must never read as a person refusing.
+      if (item.timedOut) return ':hourglass: The approval request timed out and was denied.';
       return item.approved ? ':white_check_mark: Approved.' : ':x: Denied.';
     case 'compaction':
       return ':package: Earlier conversation was summarized to stay within context.';
@@ -96,10 +99,8 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
 export function verifySlackSignature(
   raw: RawInbound, signingSecret: string, nowMs = Date.now(),
 ): boolean {
-  const header = raw.headers['x-slack-signature'];
-  const ts = raw.headers['x-slack-request-timestamp'];
-  const signature = Array.isArray(header) ? header[0] : header;
-  const timestamp = Array.isArray(ts) ? ts[0] : ts;
+  const signature = headerValue(raw, 'x-slack-signature');
+  const timestamp = headerValue(raw, 'x-slack-request-timestamp');
   if (!signature || !timestamp) return false;
   // A non-numeric timestamp must FAIL the window, not skip it: `NaN > 300`
   // is false, so without the finiteness check a garbage timestamp would
@@ -110,9 +111,7 @@ export function verifySlackSignature(
   const expected = `v0=${createHmac('sha256', signingSecret)
     .update(`v0:${timestamp}:${raw.rawBody}`)
     .digest('hex')}`;
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return safeEqual(signature, expected);
 }
 
 // ---- Parse: HTTP body → one of three Slack shapes --------------------------
@@ -204,7 +203,9 @@ export const slackLens: Lens = {
                 // The postback carries the canonical token AND the exact ask —
                 // the staleness rule (§8.3) rides the button, so a click on
                 // last week's message cannot decide today's different ask.
-                value: JSON.stringify({ token: choice.token, toolCallId: item.toolCallId }),
+                // The core's shared codec, so `in` below decodes it the same
+                // way every other native surface does.
+                value: encodeVerdictPostback(choice.token, item.toolCallId),
               })),
             },
           ],
@@ -254,11 +255,12 @@ export const slackLens: Lens = {
       // The account-linking gesture (spec §12): the bare word "link" asks for
       // a one-time URL that ties this Slack identity to a signed-in web
       // account. A reserved word rather than a slash command so it needs no
-      // extra Slack configuration; it is an exact-word match, so "link my
-      // account please" still reaches the agent as an ordinary message. DMs
-      // ONLY: the URL is a credential, and the core refuses to post one into
-      // a group anyway — in a channel the word is just a message.
-      const linkRequested = dm && text.trim().toLowerCase() === 'link';
+      // extra Slack configuration; the core's `isLinkGesture` is an
+      // exact-word match, so "link my account please" still reaches the
+      // agent as an ordinary message. DMs ONLY: the URL is a credential, and
+      // the core refuses to post one into a group anyway — in a channel the
+      // word is just a message.
+      const linkRequested = dm && isLinkGesture(text);
       const threadTs = ev.thread_ts ?? ev.ts;
       return {
         intent: linkRequested ? { kind: 'link-request' } : { kind: 'message', text },
@@ -274,12 +276,11 @@ export const slackLens: Lens = {
       const { payload } = e;
       if (payload.type !== 'block_actions' || !payload.actions?.length) return NOOP;
       const action = payload.actions[0];
-      let value: { token?: string; toolCallId?: string } = {};
-      try { value = JSON.parse(action.value ?? '{}'); } catch { return NOOP; }
-      // `JSON.parse('null')` succeeds — guard the shape before reading it, or
-      // a crafted value becomes a TypeError, a 500, and a provider retry loop.
-      if (!value || typeof value !== 'object') return NOOP;
-      if (value.token !== 'approve' && value.token !== 'deny') return NOOP;
+      // The core's codec null-guards the whole shape (bad JSON, a literal
+      // `null`, an unknown token) — a crafted value is a noop, never a
+      // TypeError, a 500, and a provider retry loop.
+      const decoded = decodeVerdictPostback(action.value);
+      if (!decoded) return NOOP;
       // `team.id` is the workspace the interaction happened in — the same id
       // the event envelope's `team_id` carries; `user.team_id` is the clicker's
       // HOME workspace and differs in a Slack Connect channel.
@@ -291,11 +292,7 @@ export const slackLens: Lens = {
       const dm = String(channel).startsWith('D');
       const threadTs = payload.message?.thread_ts ?? payload.message?.ts;
       return {
-        intent: {
-          kind: 'verdict',
-          verdict: value.token === 'approve' ? 'approved' : 'denied',
-          toolCallId: value.toolCallId,
-        },
+        intent: { kind: 'verdict', verdict: decoded.verdict, toolCallId: decoded.toolCallId },
         // Interactivity has no redelivery-stable event id (Slack does not
         // retry action posts); the user+click timestamp is stable across the
         // double-click case, which is the duplicate that actually happens.
@@ -369,22 +366,23 @@ export function slackTransport(options: SlackTransportOptions): ChannelTransport
 
 // ---- The factory (§8.7 tier 1: install, configure, done) -------------------
 
-export interface SlackChannelOptions {
+/**
+ * The factory's options: Slack's own three, the profile override, the test
+ * seam — and the core's five pass-through knobs (`statuses`,
+ * `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`), typed and
+ * documented once on `ChannelDef` and forwarded untouched. The one default
+ * this package sets: `statuses` is `['error', 'approval']` — a failed turn and
+ * a decided approval are worth saying in the thread. `linkUrl` is what turns
+ * a "link" DM into an answer (spec §12); without it, link requests are
+ * acknowledged and ignored.
+ */
+export interface SlackChannelOptions extends ChannelKnobs {
   /** The registered agent this workspace talks to. */
   agent: string;
   /** `xoxb-…` — the app's bot token (OAuth & Permissions page). */
   botToken: string;
   /** The app's signing secret (Basic Information page). */
   signingSecret: string;
-  /** Note kinds to deliver as statuses. Default `['error', 'approval']` —
-   *  a failed turn and a decided approval are worth saying in the thread. */
-  statuses?: ChannelDef['statuses'];
-  onUncertainDelivery?: ChannelDef['onUncertainDelivery'];
-  sessionUrl?: ChannelDef['sessionUrl'];
-  /** Turns a minted linking token into the web URL a "link" DM is answered
-   *  with (spec §12). Without it, link requests are acknowledged and ignored. */
-  linkUrl?: ChannelDef['linkUrl'];
-  throttle?: ChannelDef['throttle'];
   /** Override pieces of the default `{ interact: 'native', limit: 12000 }`. */
   profile?: Partial<ChannelProfile>;
   /** TEST SEAM, threaded to the transport. */

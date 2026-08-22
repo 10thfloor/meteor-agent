@@ -115,9 +115,11 @@ know that it works this way before pointing a slow agent at WhatsApp.
 Text passes through untouched (WhatsApp renders `*bold*`/`_italic_` natively
 and tolerates markdown-ish prose; the core never parses content and this lens
 declines to). Prompts render as interactive **reply buttons** whose ids carry
-the canonical token **and the exact ask** (`toolCallId`) — the staleness rule
-rides the button, and the Cloud API's 256-character id cap never forces a
-degrade. Long answers become a head-slice plus the session's web URL.
+the canonical token **and the exact ask** (`toolCallId`) in the core's shared
+postback codec (`encodeVerdictPostback` / `decodeVerdictPostback`) — the
+staleness rule rides the button, and the Cloud API's 256-character id cap
+never forces a degrade. Long answers become a head-slice plus the session's
+web URL.
 
 ## Delivery guarantees
 

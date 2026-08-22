@@ -205,7 +205,7 @@ export interface AgentSession {
    * a union, because kinds are app-registered. `assurance` is the identity
    * strength the session was created under: `'none'` for an unlinked sender
    * (an anonymous capability-owned session), `'link'` for one proven by a
-   * signed one-time link, `'oidc'` for a full OAuth round-trip. Gates and tools
+   * single-use link, `'oidc'` for a full OAuth round-trip. Gates and tools
    * read it to vary by surface — "require a real login before a refund" is a
    * one-line predicate, not a second permission system. It holds no secrets,
    * so it may ship to the client unprojected.

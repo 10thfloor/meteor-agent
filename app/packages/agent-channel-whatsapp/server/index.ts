@@ -1,7 +1,8 @@
-import { createHmac, timingSafeEqual } from 'crypto';
-import type {
-  ChannelDef, ChannelProfile, ChannelTransport, DeliveryItem, InboundReading,
-  Lens, RawInbound,
+import { createHmac } from 'crypto';
+import {
+  decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -54,7 +55,7 @@ function statusProse(item: Extract<DeliveryItem, { item: 'status' }>): string {
     case 'interrupted':
       return '🛑 The reply was stopped.';
     case 'approval':
-      if (item.reason === 'approval timed out') return '⏳ The approval request timed out and was denied.';
+      if (item.timedOut) return '⏳ The approval request timed out and was denied.';
       return item.approved ? '✅ Approved.' : '❌ Denied.';
     case 'compaction':
       return '📦 Earlier conversation was summarized.';
@@ -90,17 +91,12 @@ export function verifyWhatsAppRequest(
 ): boolean {
   if (isSubscriptionHandshake(raw)) {
     const got = queryParams(raw.url).get('hub.verify_token') ?? '';
-    const a = Buffer.from(got);
-    const b = Buffer.from(verifyToken);
-    return a.length === b.length && timingSafeEqual(a, b);
+    return safeEqual(got, verifyToken);
   }
-  const header = raw.headers['x-hub-signature-256'];
-  const signature = Array.isArray(header) ? header[0] : header;
+  const signature = headerValue(raw, 'x-hub-signature-256');
   if (!signature) return false;
   const expected = `sha256=${createHmac('sha256', appSecret).update(raw.rawBody).digest('hex')}`;
-  const a = Buffer.from(signature);
-  const b = Buffer.from(expected);
-  return a.length === b.length && timingSafeEqual(a, b);
+  return safeEqual(signature, expected);
 }
 
 /** What `parse` hands the lens: the handshake (echo the challenge) or an
@@ -152,9 +148,10 @@ export const whatsappLens: Lens = {
                 type: 'reply',
                 reply: {
                   // The id carries the token AND the exact ask (§8.3's
-                  // staleness rule riding the button); the Cloud API allows
-                  // 256 characters here, so no degrade path is needed.
-                  id: JSON.stringify({ t: choice.token, c: item.toolCallId }),
+                  // staleness rule riding the button) in the core's shared
+                  // postback codec; the Cloud API allows 256 characters here,
+                  // so no `maxBytes` degrade path is needed.
+                  id: encodeVerdictPostback(choice.token, item.toolCallId),
                   title: choice.label,   // ≤ 20 chars: 'Approve' / 'Deny' fit
                 },
               })),
@@ -195,25 +192,17 @@ export const whatsappLens: Lens = {
     };
 
     if (m.type === 'interactive' && m.interactive?.button_reply) {
-      let data: { t?: string; c?: string } = {};
-      try { data = JSON.parse(m.interactive.button_reply.id ?? '{}'); } catch { return NOOP; }
-      // `JSON.parse('null')` succeeds — guard the shape before reading it.
-      if (!data || typeof data !== 'object') return NOOP;
-      if (data.t !== 'approve' && data.t !== 'deny') return NOOP;
-      return {
-        intent: {
-          kind: 'verdict',
-          verdict: data.t === 'approve' ? 'approved' : 'denied',
-          ...(data.c !== undefined ? { toolCallId: data.c } : {}),
-        },
-        ...envelope,
-      };
+      // The shared codec null-guards the hostile shapes (bad JSON, a literal
+      // `null`, an unknown token) — anything that is not a verdict is a noop.
+      const decoded = decodeVerdictPostback(m.interactive.button_reply.id);
+      if (!decoded) return NOOP;
+      return { intent: { kind: 'verdict', ...decoded }, ...envelope };
     }
 
     if (m.type === 'text') {
       const text = String(m.text?.body ?? '').trim();
       if (text === '') return NOOP;
-      if (text.toLowerCase() === 'link') return { intent: { kind: 'link-request' }, ...envelope };
+      if (isLinkGesture(text)) return { intent: { kind: 'link-request' }, ...envelope };
       return { intent: { kind: 'message', text }, ...envelope };
     }
 
@@ -276,7 +265,10 @@ export function whatsappTransport(options: WhatsAppTransportOptions): ChannelTra
 
 // ---- The factory (§8.7 tier 1) ---------------------------------------------
 
-export interface WhatsAppChannelOptions {
+/** The core's pass-through knobs (`ChannelKnobs`: `statuses`,
+ *  `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`) ride along
+ *  untouched; `statuses` defaults to `['error', 'approval']` here. */
+export interface WhatsAppChannelOptions extends ChannelKnobs {
   /** The registered agent this number fronts. */
   agent: string;
   /** Graph API access token (System User, `whatsapp_business_messaging`). */
@@ -286,12 +278,6 @@ export interface WhatsAppChannelOptions {
   /** The `hub.verify_token` you type into the webhook dashboard — you invent
    *  it; the GET handshake checks it. */
   verifyToken: string;
-  /** Note kinds delivered as statuses. Default `['error', 'approval']`. */
-  statuses?: ChannelDef['statuses'];
-  onUncertainDelivery?: ChannelDef['onUncertainDelivery'];
-  sessionUrl?: ChannelDef['sessionUrl'];
-  linkUrl?: ChannelDef['linkUrl'];
-  throttle?: ChannelDef['throttle'];
   /** Override pieces of the default `{ interact: 'native', limit: 4000 }`. */
   profile?: Partial<ChannelProfile>;
   /** Graph API version segment, threaded to the transport. */
