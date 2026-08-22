@@ -110,6 +110,25 @@ export type ChannelKnobs = Pick<
   ChannelDef, 'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
 >;
 
+/** The value-side twin of `ChannelKnobs`, and its totality check: the keys a
+ *  factory forwards, as data, `satisfies` the type so a knob added to the Pick
+ *  without a matching entry here is a compile error — not a silently dropped
+ *  option in four packages. */
+export const CHANNEL_KNOB_KEYS = [
+  'statuses', 'onUncertainDelivery', 'sessionUrl', 'linkUrl', 'throttle',
+] as const satisfies ReadonlyArray<keyof ChannelKnobs>;
+
+/** The knobs PRESENT on `options`, and nothing else — what a tier-1 factory
+ *  spreads into its ChannelDef. Copied only when set, so a def carries no
+ *  explicit-undefined keys; one place, so every package forwards every knob. */
+export function channelKnobs(options: ChannelKnobs): ChannelKnobs {
+  const out: Record<string, unknown> = {};
+  for (const key of CHANNEL_KNOB_KEYS) {
+    if (options[key] !== undefined) out[key] = options[key];
+  }
+  return out as ChannelKnobs;
+}
+
 const channels = new Map<string, ChannelDef>();
 
 export function registerChannel(kind: string, def: ChannelDef): void {
@@ -138,6 +157,15 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   }
   if (typeof def.verify !== 'function' || typeof def.parse !== 'function') {
     throw new Error(`[10thfloor:agent] channel "${kind}": def.verify and def.parse are required`);
+  }
+  // A half-specified throttle (`{ limit: 30 }` from a JS host) would make every
+  // window compare against `undefined`, filter empty, and never throttle —
+  // silently. Refuse it here, like every other knob the machinery reads.
+  if (def.throttle && !(
+    Number.isFinite(def.throttle.limit) && def.throttle.limit > 0
+    && Number.isFinite(def.throttle.intervalMs) && def.throttle.intervalMs > 0
+  )) {
+    throw new Error(`[10thfloor:agent] channel "${kind}": def.throttle must be { limit > 0, intervalMs > 0 }`);
   }
   if (def.onUncertainDelivery === 'reconcile' && typeof def.transport.reconcile !== 'function') {
     throw new Error(

@@ -1,6 +1,11 @@
 import { Mongo } from 'meteor/mongo';
 import { NAMES } from '../../common/names';
 import type { Fields, TypedCollection } from '../../common/db';
+import type { ReceiptExpectation } from '../../common/channel-contract';
+
+// Re-exported so receipt consumers (egress, ingress, tests) keep one import site;
+// the SHAPE is the contract's — it is exactly what `expectationsFor` produces.
+export type { ReceiptExpectation };
 
 /**
  * The channel subsystem's collections (channels spec §6): identity, routing,
@@ -84,8 +89,10 @@ export interface ChannelBinding {
    *  sender. */
   externalUserId?: string;
   /** The egress high-water mark: everything at or below this seq has been
-   *  handled for THIS surface. Advanced only by the guarded conditional write
-   *  in egress.ts, only after a confirmed post. */
+   *  HANDLED for THIS surface — posted and receipted, abandoned (the channel's
+   *  declared §11 recovery tier or `MAX_DELIVERY_ATTEMPTS`), or planned as
+   *  advance-past. Advanced only by the guarded conditional write in egress.ts
+   *  (`advanceCursor`); a deferred row leaves it where it is. */
   deliveredSeq: number;
   /** The delivering worker's per-binding lease, `claimLease`-shaped — all four
    *  `$or` branches including "already ours", because a delivering worker is a
@@ -98,15 +105,15 @@ export interface ChannelBinding {
 
 // ---- Delivery receipts (§6.3) — what has actually been sent ----------------
 
-/** One choice a delivered prompt offered, and the exact ask it answers.
- *  `match` is the reply token the surface's grammar registered (a keyword, a
- *  postback value); `toolCallId` names the parked call, so a stale YES aimed at
- *  last week's ask can never decide today's different one (§8.3). */
-export interface ReceiptExpectation {
-  match: string;
-  verdict: 'approved' | 'denied';
-  toolCallId: string;
-}
+
+/** The receipt key, spelled ONCE: `deliver:<bindingId>:<suffix>`. Egress writes
+ *  it; ingress reads it back to find the registered grammar of the currently
+ *  parked ask — a cross-module coupling that must not be held together by two
+ *  string literals agreeing. */
+export const receiptIdFor = (bindingId: string, suffix: string): string => `deliver:${bindingId}:${suffix}`;
+/** The suffix a delivered PROMPT uses: one receipt per ask, so a re-park of a
+ *  different call is a new receipt and a re-sweep of the same one is settled. */
+export const promptSuffix = (toolCallId: string): string => `prompt:${toolCallId}`;
 
 /**
  * The three-phase intent log that makes outbound delivery EFFECTIVELY-once

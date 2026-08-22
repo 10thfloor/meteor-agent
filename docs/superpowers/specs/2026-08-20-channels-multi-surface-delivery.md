@@ -150,6 +150,8 @@ One app user can have many identity rows — Slack, SMS, and email all pointing 
   agent: 'support',
   sessionId: 'abc123',
   userId: 'meteor-user-id',
+  externalUserId: '+15551234567', // who OPENED it — the key the claim-history pass matches on (§12)
+  assurance: 'link',             // the opener's proof strength at bind time; 'none' when unlinked
   deliveredSeq: 5,               // "this surface has received everything up to message #5"
   claim: { serverId: 'srv-1', until: Date },
   createdAt: Date,
@@ -335,7 +337,7 @@ The profile declares how choices are offered on this surface:
 profile: { interact: 'native' | 'menu' | 'link', limit?: number }
 ```
 
-- **`native`** — the surface has real affordances (buttons, quick replies, rich-card suggested actions). The lens renders them and wires each postback to carry the canonical token, so interpretation doesn't depend on provider quirks. `interact` governs how choices are *offered*, not what inbound is accepted — a Slack user who types YES instead of clicking still lands in `in`, and a native lens may register text fallbacks in `expects` too.
+- **`native`** — the surface has real affordances (buttons, quick replies, rich-card suggested actions). The lens renders them and wires each postback to carry the canonical token, so interpretation doesn't depend on provider quirks. `interact` governs how choices are *offered*, not what inbound is accepted — a Slack user who types YES instead of clicking still lands in `in` as a message.
 - **`menu`** — no affordances, but replies are cheap (SMS). The prompt renders as a reply menu — *"Reply YES to approve, NO to deny"* — and registers those tokens in the receipt's `expects`. This is the pattern the entire SMS/IVR industry converged on: on a widgetless surface, the interaction contract is a parse grammar over inbound text.
 - **`link`** — replies are awkward or unparseable (email, one-way notification surfaces). Each choice renders as a **one-time URL** carrying a single-use random token stored server-side (unguessable, expiring, bound to its subject — here the specific pending verdict; no key management). This is the same token *primitive* account linking uses (§12), with a different subject: a linking token is bound to an external identity, an approval token to one pending verdict. They are never interchangeable.
 
@@ -379,11 +381,14 @@ Agent.channel('slack', slack({
 
 Note that nobody ever *calls* a lens. The worker calls `out` at the delivery edge; the webhook calls `in` at the ingress edge. Developers only supply it.
 
-**A developer with opinions overrides one item.** The closed vocabulary is what makes customization surgical: "change how errors read" or "use our branded blocks for replies" is one function, and the API for it is deliberately just object spread — no combinator framework:
+**A developer with opinions overrides one item.** The closed vocabulary is what makes customization surgical: "change how errors read" or "use our branded blocks for replies" is one function, and the API for it is deliberately just object spread — over the definition the factory returns (the factories take no `lens` option) and over the package's stock lens — no combinator framework:
 
 ```js
-Agent.channel('slack', slack({
-  agent: 'support', /* …secrets */
+import { slack, slackLens } from 'meteor/10thfloor:agent-channel-slack';
+
+const def = slack({ agent: 'support', /* …secrets */ });
+Agent.channel('slack', {
+  ...def,                               // the factory returns the plain definition (§10)
   lens: {
     ...slackLens,
     out: (item, dest) =>
@@ -391,7 +396,7 @@ Agent.channel('slack', slack({
         ? myBrandedBlocks(item.text)      // yours
         : slackLens.out(item, dest),      // everything else: stock
   },
-}));
+});
 ```
 
 Overriding `reply`, `status`, or `overflow` is prose-only and can't break the contract. Overriding `prompt` is the one that can — you might render choices `in` no longer understands — and that is exactly what the round-trip test catches, so a customization that drifts fails in CI, not in a customer's thread.
@@ -443,6 +448,7 @@ verify signature → lens.in(event) → throttle → claim eventId → route by 
 3. **Throttle** per sender — throttled events are dropped with a 200, not refused with a 429: providers retry non-2xx and count failures toward disabling the integration, so a 429 would let one abusive sender degrade the whole channel (ingress.ts). The throttle comes before the claim because the throttle is a counter and the claim is a database write — a flood of validly-signed events must not buy an insert each. A throttled event is settled and forgotten; it buys neither a write nor a provider retry.
 4. **Claim the event id** (§11). A provider retry collides here and gets a 200 without running anything twice.
 5. **Route by intent:**
+   - **Admission and identity:** the calls below run as the SENDER's own resolved identity (or `null`, anonymous) — never the binding's owner as a fallback, which would let any unlinked participant in a group thread act as the linked owner. On a `group` surface an anonymous conversation admits only its opener until someone links (§3); a non-opener is settled silently with a 200.
    - `message` → resolve identity, find-or-create the binding (binding first, then session), then `agent.send()` — never a direct database insert; sequence numbers are allocated atomically inside `send`, and a direct insert would race the running loop.
    - `verdict` → `agent.approve()` / `agent.deny()`. The channel carries identity to the agent's approve predicate; the predicate decides.
    - `link-request` → the account-linking flow (§12).
@@ -515,7 +521,7 @@ try {
 }
 ```
 
-This holds across servers because it's one atomic insert.
+This holds across servers because it's one atomic insert. As built the idiom is one helper, `insertOrLose` (`server/channels/collections.ts`): insert on a derived `_id`, `true` if this caller won, `false` on duplicate key, anything else propagates — shared by the binding insert, session repair, this admission claim, the receipt reserve and the identity row.
 
 ### Outbound: effectively-once — and why it can't be more
 

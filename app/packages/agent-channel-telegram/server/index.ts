@@ -1,5 +1,5 @@
 import {
-  LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
+  channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -99,9 +99,11 @@ const NOOP: InboundReading = { intent: { kind: 'noop' } };
  *  (what its group hint tells people to type), read from the same constant so
  *  hint and lens cannot disagree; the slash-command spelling, with or without
  *  Telegram's `@Bot` suffix, is this surface's addition — which is why this is
- *  not a bare `isLinkGesture(text)`: the `@` split happens first. */
+ *  not a bare `isLinkGesture(text)`: the `@Bot` suffix is stripped first, and
+ *  only from the slash form as the whole token, so `/link@MyBot please` and
+ *  `link@anything` stay messages. */
 function isTelegramLinkGesture(text: string): boolean {
-  const word = text.trim().toLowerCase().split('@')[0];
+  const word = text.trim().toLowerCase().replace(/^(\/\S+?)@\S+$/, '$1');
   return word === LINK_GESTURE || word === `/${LINK_GESTURE}`;
 }
 
@@ -120,7 +122,7 @@ export const telegramLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 800 ? `${args.slice(0, 800)}…` : args;
-        const runAs = 'runAs' in item && item.runAs !== undefined
+        const runAs = item.runAs !== undefined
           ? `\nruns as: ${item.runAs ?? 'anonymous service context'}` : '';
         return {
           text: `The agent wants to run ${item.name}(${clamped})${runAs}`,
@@ -258,9 +260,8 @@ export function telegram(options: TelegramChannelOptions): ChannelDef {
     verify: (raw) => verifyTelegramSecret(raw, options.webhookSecret),
     parse: parseTelegramUpdate,
     statuses: options.statuses ?? ['error', 'approval'],
-    ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
-    ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),
-    ...(options.linkUrl ? { linkUrl: options.linkUrl } : {}),
-    ...(options.throttle ? { throttle: options.throttle } : {}),
+    // Every knob the core names, forwarded by one helper — a knob added to
+    // ChannelKnobs tomorrow is forwarded here without this file changing.
+    ...channelKnobs(options),
   };
 }

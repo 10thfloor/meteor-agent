@@ -9,6 +9,11 @@ import type { AgentMessage } from './types';
  * invent items or intents, and extending either set is a framework change made
  * deliberately, here, once. The unit test asserts the item list is total so a
  * new member cannot be added without the totality check knowing about it.
+ *
+ * ISOMORPHIC on purpose — pure functions and types only, no Node globals (`Buffer`,
+ * `crypto`) — which is why it lives under `common/` and why the server-only
+ * webhook helpers (`headerValue`, `safeEqual`, `RawInbound`) live beside the
+ * registry instead. Today only the server entry re-exports it; a client may.
  */
 
 // ---- Delivery items (§8.2) — what the planner can say ----------------------
@@ -141,8 +146,9 @@ export interface Lens {
 
 /**
  * How choices are OFFERED on this surface — not what inbound is accepted
- * (typed YES on a buttons surface still lands in `in`, if the lens registered
- * a text fallback):
+ * (a typed YES on a buttons surface still reaches `in`; it reads as a
+ * `message`, because only the `menu` grammar registers reply words in the
+ * receipt's `expects` — see `expectationsFor`):
  *
  *   `native` — real affordances (buttons, quick replies); postbacks carry the
  *              canonical token.
@@ -276,9 +282,19 @@ function utf8Bytes(s: string): number {
  * decide, "yes please" is a message. `toolCallId` travels with the verdict so
  * the router can drop a match whose ask is no longer the parked one.
  */
+/** One choice a delivered prompt offered, and the exact ask it answers.
+ *  `match` is the reply token the surface's grammar registered (a keyword, a
+ *  postback value); `toolCallId` names the parked call, so a stale YES aimed at
+ *  last week's ask can never decide today's different one (§8.3). */
+export interface ReceiptExpectation {
+  match: string;
+  verdict: 'approved' | 'denied';
+  toolCallId: string;
+}
+
 export function matchExpectation(
   text: string,
-  expects: ReadonlyArray<{ match: string; verdict: 'approved' | 'denied'; toolCallId: string }>,
+  expects: ReadonlyArray<ReceiptExpectation>,
 ): { verdict: 'approved' | 'denied'; toolCallId: string } | null {
   const normalized = text.trim().toUpperCase();
   for (const e of expects) {
@@ -298,7 +314,7 @@ export function matchExpectation(
  */
 export function expectationsFor(
   prompt: Extract<DeliveryItem, { item: 'prompt' }>,
-): Array<{ match: string; verdict: 'approved' | 'denied'; toolCallId: string }> {
+): ReceiptExpectation[] {
   return prompt.choices
     .filter((c) => c.match !== undefined)
     .map((c) => ({

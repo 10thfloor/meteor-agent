@@ -440,9 +440,8 @@ export function registerMethods(): void {
         throw new Meteor.Error('not-startable', 'This agent cannot be driven directly');
       }
 
-      // The core carries the rest — authorization, the budget-folded atomic
-      // seq allocation, the message insert, the stopped/error clear, and the
-      // wake. See `sendToSession` (channels spec §5.1): one body, two callers.
+      // The core carries the rest — see `sendToSession` above (channels spec §5.1):
+      // one body, two callers.
       return sendToSession(agent, sessionId, text, this.userId ?? null);
     },
 

@@ -75,10 +75,9 @@ export {
   type InboundIntent, type InboundReading, type Lens, type PromptChoice,
   type RoundTripOptions,
 } from '../common/channel-contract';
-export type { PlanOptions, PlannedRow } from './channels/plan';
 export {
   type ChannelDef, type ChannelKnobs, type RawInbound,
-  listChannels, headerValue, safeEqual,
+  listChannels, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
 } from './channels/registry';
 export {
   startEgress, deliverOnce,
@@ -136,7 +135,7 @@ const UNDER_TEST = Meteor.isTest || Meteor.isAppTest || Meteor.isPackageTest;
 /**
  * SAFETY BY CONSTRUCTION against Meteor's `insecure` package.
  *
- * The three collections carry no allow/deny rules of their own, so in a host app
+ * None of the package's collections carry allow/deny rules of their own, so in a host app
  * that still has `insecure` installed (Meteor ships it in every new app) a
  * client would inherit FULL write access to sessions, messages and deltas —
  * inserting forged transcript rows, editing budgets, deleting anyone's history —

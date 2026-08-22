@@ -4,7 +4,7 @@ import { AgentSessions } from '../../common/collections';
 import { recordVerdict } from '../methods';
 import {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
-  insertOrLose, type ChannelIdentity,
+  insertOrLose, type ChannelIdentity, type ChannelLinkToken, type ChannelVerdictToken,
 } from './collections';
 
 /**
@@ -39,9 +39,10 @@ export async function resolveIdentity(
 
 /**
  * Mint a single-use, short-lived token bound to ONE external identity. The
- * caller (typically a lens answering a `link-request` intent) delivers it to
- * that identity's surface — proving, when it comes back through a signed-in
- * session, that the presenter controls both sides.
+ * caller — the pipeline answering a `link-request` intent (`route()` in
+ * ingress.ts), or an app's own flow — delivers it to that identity's surface,
+ * proving, when it comes back through a signed-in session, that the presenter
+ * controls both sides. (A lens never calls this: lenses are pure.)
  */
 export async function issueLinkToken(
   kind: string, externalUserId: string, opts: { ttlMs?: number } = {},
@@ -77,9 +78,8 @@ export async function redeemLinkToken(
 ): Promise<ChannelIdentity | null> {
   const doc = await ChannelLinkTokens.rawCollection().findOneAndDelete(
     { _id: token },
-  ) as unknown as { kind: string; externalUserId: string; expiresAt: Date } | null;
-  if (!doc) return null;
-  if (doc.expiresAt.getTime() < Date.now()) return null;
+  ) as unknown as ChannelLinkToken | null;
+  if (!doc || doc.expiresAt.getTime() < Date.now()) return null;
   try {
     return await linkIdentity(doc.kind, doc.externalUserId, userId, 'link');
   } catch (e) {
@@ -216,12 +216,8 @@ export async function issueVerdictToken(
 export async function redeemVerdictToken(token: string): Promise<boolean> {
   const doc = await ChannelVerdictTokens.rawCollection().findOneAndDelete(
     { _id: token },
-  ) as unknown as {
-    agent: string; sessionId: string; toolCallId: string;
-    verdict: 'approved' | 'denied'; expiresAt: Date;
-  } | null;
-  if (!doc) return false;
-  if (doc.expiresAt.getTime() < Date.now()) return false;
+  ) as unknown as ChannelVerdictToken | null;
+  if (!doc || doc.expiresAt.getTime() < Date.now()) return false;
 
   const session = await AgentSessions.findOneAsync(doc.sessionId);
   if (!session) return false;

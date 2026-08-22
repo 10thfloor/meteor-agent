@@ -1341,7 +1341,7 @@ Lens-author helpers, all exported from `meteor/10thfloor:agent`:
 | `isLinkGesture(text)`, `LINK_GESTURE` | The bare word `link` — exact after trimming, any case — that asks for an account link; the core's own group hint names it, so lenses read it rather than spelling their own. |
 | `VERDICT_FOR` | `{ approve: 'approved', deny: 'denied' }` — one place for which token records which verdict. |
 | `MENU_MATCHES` | `{ approve: 'YES', deny: 'NO' }` — the `menu` grammar's reply words. |
-| `matchExpectation(text, expects)`, `expectationsFor(prompt)`, `exemplarItems()`, `DELIVERY_ITEM_KINDS` | The pipeline's matching rule, the grammar a prompt registers, the default corpus, and the closed item list. |
+| `matchExpectation(text, expects)`, `exemplarItems()`, `DELIVERY_ITEM_KINDS` | The pipeline's matching rule, the default corpus, and the closed item list. |
 
 ### Boot
 

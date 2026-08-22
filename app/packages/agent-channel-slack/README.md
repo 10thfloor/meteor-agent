@@ -2,7 +2,7 @@
 
 Slack as a surface for a [`10thfloor:agent`](../agent/README.md) agent: DM the
 bot or @-mention it in a channel, and the conversation is a real agent session
-— streamed replies delivered into the thread, approval gates as Approve/Deny
+— replies delivered into the thread, approval gates as Approve/Deny
 buttons, and the same transcript open in the web app at the same time.
 
 Per the channels spec, this package is **one lens, one transport, one profile

@@ -43,16 +43,21 @@ function textEvent(over: Record<string, unknown> = {}) {
   };
 }
 
+/** A signed event through parse + lens.in — the shape every POST test reads. */
+async function read(body: unknown) {
+  const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
+  return whatsappLens.in(parseWhatsAppRequest(signed(body)));
+}
+
 describe('agent-channel-whatsapp', () => {
   describe('hostile inputs', () => {
     it('treats a literal-null button id as a noop, not a crash', async () => {
-      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
       const event = textEvent({
         type: 'interactive',
         text: undefined,
         interactive: { type: 'button_reply', button_reply: { id: 'null', title: 'Approve' } },
       });
-      const reading = whatsappLens.in(parseWhatsAppRequest(signed(event)));
+      const reading = await read(event);
       assert.equal(reading.intent.kind, 'noop');
     });
   });
@@ -87,8 +92,7 @@ describe('agent-channel-whatsapp', () => {
     });
 
     it('keys the conversation by business number + wa_id, always direct', async () => {
-      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
-      const reading = whatsappLens.in(parseWhatsAppRequest(signed(textEvent())));
+      const reading = await read(textEvent());
       assert.deepEqual(reading.intent, { kind: 'message', text: 'hello there' });
       assert.equal(reading.conversationRef, 'PN1:15550001111');
       assert.equal(reading.externalUserId, '15550001111');
@@ -98,26 +102,23 @@ describe('agent-channel-whatsapp', () => {
     });
 
     it('noops status echoes and unsupported media', async () => {
-      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
-      const statusEcho = whatsappLens.in(parseWhatsAppRequest(signed({
+      const statusEcho = await read({
         entry: [{ changes: [{ value: { metadata: { phone_number_id: 'PN1' }, statuses: [{ id: 'wamid.out', status: 'delivered' }] } }] }],
-      })));
+      });
       assert.equal(statusEcho.intent.kind, 'noop', 'our own sends echo as statuses — the echo rule');
-      const image = whatsappLens.in(parseWhatsAppRequest(signed(textEvent({ type: 'image', text: undefined }))));
+      const image = await read(textEvent({ type: 'image', text: undefined }));
       assert.equal(image.intent.kind, 'noop');
     });
 
     it('reads the bare word "link" as the link gesture', async () => {
-      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
-      const link = whatsappLens.in(parseWhatsAppRequest(signed(textEvent({ text: { body: ' Link ' } }))));
+      const link = await read(textEvent({ text: { body: ' Link ' } }));
       assert.equal(link.intent.kind, 'link-request');
-      const sentence = whatsappLens.in(parseWhatsAppRequest(signed(textEvent({ text: { body: 'link me up' } }))));
+      const sentence = await read(textEvent({ text: { body: 'link me up' } }));
       assert.equal(sentence.intent.kind, 'message');
     });
 
     it('reads a button reply as a verdict carrying the exact ask', async () => {
-      const { parseWhatsAppRequest, whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
-      const reading = whatsappLens.in(parseWhatsAppRequest(signed(textEvent({
+      const reading = await read(textEvent({
         type: 'interactive',
         text: undefined,
         interactive: {
@@ -126,7 +127,7 @@ describe('agent-channel-whatsapp', () => {
           // button rendered earlier carries exactly this on the wire.
           button_reply: { id: '{"t":"d","c":"tc7"}', title: 'Deny' },
         },
-      }))));
+      }));
       assert.deepEqual(reading.intent, { kind: 'verdict', verdict: 'denied', toolCallId: 'tc7' });
       assert.equal(reading.conversationRef, 'PN1:15550001111');
     });
@@ -157,7 +158,9 @@ describe('agent-channel-whatsapp', () => {
         message: (text) => ({ wa: 'event', body: textEvent({ text: { body: text } }) }),
       });
     });
+  });
 
+  describe('lens.out caps', () => {
     it('keeps button titles within the Cloud API’s 20-character cap', async () => {
       const { whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
       const rendered: any = whatsappLens.out({

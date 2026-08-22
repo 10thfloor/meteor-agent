@@ -117,6 +117,14 @@ async function seedBinding(_id: string, over: Partial<ChannelBinding> = {}) {
   });
 }
 
+/** Park an ask on an existing session — the shape promptItem reads. */
+async function parkAsk(sessionId: string, toolCallId: string, name = 'orders.refund') {
+  const { AgentSessions } = await import('../common/collections');
+  await AgentSessions.updateAsync(sessionId, {
+    $set: { phase: 'awaiting', pending: { toolCallId, name, args: {}, requestedAt: new Date() } },
+  });
+}
+
 async function cleanChannels() {
   const { AgentSessions, AgentMessages } = await import('../common/collections');
   const {
@@ -175,12 +183,12 @@ describe('channels', () => {
       const { planItems } = await import('../server/channels/plan');
       const rows = [
         msg({ sessionId: 's', seq: 1, content: '' }),
-        msg({ sessionId: 's', seq: 2, role: 'note', kind: 'approval', approved: false, reason: 'not today' }),
+        msg({ sessionId: 's', seq: 2, role: 'note', kind: 'approval', approved: false, timedOut: true, reason: 'approval timed out' }),
         msg({ sessionId: 's', seq: 3, role: 'note', kind: 'budget', budget: 'toolCalls' }),
       ];
       const planned = planItems(rows, { statuses: ['approval', 'budget'], profile: { interact: 'menu' } });
       assert.isNull(planned[0].item, 'nothing to say is nothing to post — the cursor still moves');
-      assert.deepEqual(planned[1].item, { item: 'status', kind: 'approval', reason: 'not today', approved: false });
+      assert.deepEqual(planned[1].item, { item: 'status', kind: 'approval', reason: 'approval timed out', approved: false, timedOut: true }, 'the timeout FLAG rides the item — lenses key on it, not on the reason');
       assert.deepEqual(planned[2].item, { item: 'status', kind: 'budget', budget: 'toolCalls' });
     });
 
@@ -233,6 +241,7 @@ describe('channels', () => {
         pending: { ...parked.pending!, verdict: 'approved' },
       };
       assert.isNull(promptItem(decided, { interact: 'menu' }), 'an answered ask is no prompt');
+      assert.isNull(promptItem({ ...parked, phase: 'idle' }, { interact: 'menu' }), 'only a parked session prompts');
       assert.notProperty(item, 'runAs');
       const svc = promptItem({ ...parked, pending: { ...parked.pending!, runAs: null } }, { interact: 'menu' })!;
       assert.property(svc, 'runAs');
@@ -240,7 +249,8 @@ describe('channels', () => {
     });
 
     it('matchExpectation decides on the exact word only; native prompts register no grammar', async () => {
-      const { matchExpectation, expectationsFor, promptItem } = await import('../server/channels/plan');
+      const { promptItem } = await import('../server/channels/plan');
+      const { matchExpectation, expectationsFor } = await import('../common/channel-contract');
       const expects = [{ match: 'YES', verdict: 'approved' as const, toolCallId: 'tc1' }, { match: 'NO', verdict: 'denied' as const, toolCallId: 'tc1' }];
       assert.deepEqual(matchExpectation(' yes ', expects), { verdict: 'approved', toolCallId: 'tc1' });
       assert.deepEqual(matchExpectation('No', expects), { verdict: 'denied', toolCallId: 'tc1' });
@@ -254,7 +264,7 @@ describe('channels', () => {
 
   // ---- The lens law (§8.3 / §8.7) ------------------------------------------
 
-  describe('assertLensRoundTrip', () => {
+  describe('lens contract', () => {
     it('accepts a lens whose grammar round-trips, menu text included', async () => {
       const { assertLensRoundTrip } = await import('../common/channel-contract');
       const lens = testLens();
@@ -272,7 +282,7 @@ describe('channels', () => {
         out: (item: DeliveryItem) => (item.item === 'prompt' ? null : lens.out(item)),
       };
       assert.throws(
-        () => assertLensRoundTrip(dropping as any, { interact: 'menu' }, {
+        () => assertLensRoundTrip(dropping, { interact: 'menu' }, {
           synthesize: (c) => ({ type: 'msg', text: c.match ?? '', id: 'e', user: 'u', convo: 'c' }),
         }),
         /returned nothing for a 'prompt'/,
@@ -304,7 +314,7 @@ describe('channels', () => {
         synthesize: (c) => ev(c.match ?? ''), message: () => ({ type: 'noop' }),
       }), /plain inbound message event read back/);
       const emptyArray = { ...lens, out: (i: DeliveryItem) => (i.item === 'status' ? [] : lens.out(i)) };
-      assert.throws(() => assertLensRoundTrip(emptyArray as any, { interact: 'menu' }, { synthesize: (c) => ev(c.match ?? '') }), /returned nothing for a 'status'/);
+      assert.throws(() => assertLensRoundTrip(emptyArray, { interact: 'menu' }, { synthesize: (c) => ev(c.match ?? '') }), /returned nothing for a 'status'/);
     });
 
     it('the shared postback codec round-trips, degrades to token-only over a byte cap, and rejects junk', async () => {
@@ -319,6 +329,10 @@ describe('channels', () => {
       const long = encodeVerdictPostback('approve', 'x'.repeat(100), { maxBytes: 64 });
       assert.isAtMost(Buffer.byteLength(long, 'utf8'), 64);
       assert.deepEqual(decodeVerdictPostback(long), { verdict: 'approved' });
+      // The cap is BYTES, not UTF-16 units: 20 emoji are 40 code units but 80 bytes.
+      const wide = encodeVerdictPostback('approve', '😀'.repeat(20), { maxBytes: 64 });
+      assert.isAtMost(Buffer.byteLength(wide, 'utf8'), 64);
+      assert.deepEqual(decodeVerdictPostback(wide), { verdict: 'approved' }, 'a multibyte id over the byte cap is dropped — its char count would have fit');
       // An already-parsed value decodes too; junk maps to null, not a throw.
       assert.deepEqual(decodeVerdictPostback({ t: 'd', c: 'tc2' }), { verdict: 'denied', toolCallId: 'tc2' });
       assert.isNull(decodeVerdictPostback('null'), "JSON.parse('null') is guarded");
@@ -327,6 +341,17 @@ describe('channels', () => {
       assert.isNull(decodeVerdictPostback(42));
       assert.isTrue(isLinkGesture(` ${LINK_GESTURE.toUpperCase()} `), 'exact word, any case, trimmed');
       assert.isFalse(isLinkGesture('link my account'), 'a sentence is a message');
+    });
+
+    it('DELIVERY_ITEM_KINDS and the DeliveryItem union name the same kinds — both ways, at compile time', async () => {
+      const { DELIVERY_ITEM_KINDS, exemplarItems } = await import('../common/channel-contract');
+      type Listed = (typeof DELIVERY_ITEM_KINDS)[number];
+      // A union member absent from the list fails the first line (missing key);
+      // a listed kind absent from the union fails the second.
+      const byUnion: Record<DeliveryItem['item'], Listed> = { reply: 'reply', status: 'status', prompt: 'prompt', overflow: 'overflow' };
+      const byList: Record<Listed, DeliveryItem['item']> = byUnion;
+      void byList;
+      assert.sameMembers(exemplarItems().map((i) => i.item), [...DELIVERY_ITEM_KINDS], 'the default corpus covers every kind exactly once');
     });
   });
 
@@ -477,15 +502,36 @@ describe('channels', () => {
       });
 
       // A bystander clicks Approve on the opener's parked ask — nothing decided.
-      await AgentSessions.updateAsync(binding.sessionId, {
-        $set: { phase: 'awaiting', pending: { toolCallId: 'tc-g', name: 'refund', args: {} } },
-      });
+      await parkAsk(binding.sessionId, 'tc-g', 'refund');
       await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-g', id: 'b2', user: 'bystander', convo: 'thread', group: true }));
       assert.isUndefined(await AgentMessages.findOneAsync({ sessionId: binding.sessionId, kind: 'approval' }), 'bystander decided nothing');
 
       // The opener still can.
       await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-g', id: 'o2', user: 'opener', convo: 'thread', group: true }));
       assert.isDefined(await AgentMessages.findOneAsync({ sessionId: binding.sessionId, kind: 'approval' }), 'the opener decides their own ask');
+    });
+
+    it('a native postback carries its ask and is dropped when the ask changed', async () => {
+      await registerTestChannel({ profile: { interact: 'native' } });
+      const { AgentSessions } = await import('../common/collections');
+      const { handleInbound } = await import('../server/channels/ingress');
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'sn', phase: 'awaiting',
+        pending: { toolCallId: 'tc-current', name: 'x', args: {} },
+      } as any);
+      await seedBinding('test:convN', { sessionId: 'sn' });
+
+      const { AgentMessages } = await import('../common/collections');
+      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-stale', id: 'a1', user: 'u1', convo: 'convN' }));
+      assert.isUndefined(
+        await AgentMessages.findOneAsync({ sessionId: 'sn', kind: 'approval' }),
+        'stale click decided nothing',
+      );
+
+      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-current', id: 'a2', user: 'u1', convo: 'convN' }));
+      const note = await AgentMessages.findOneAsync({ sessionId: 'sn', kind: 'approval' });
+      assert.isDefined(note, 'the live click left its audit row');
+      assert.isTrue(note!.approved);
     });
 
     it('forgets senders whose window has aged out — the throttle is bounded by concurrency, not history', async () => {
@@ -783,16 +829,10 @@ describe('channels', () => {
     it('delivers a parked prompt once with its registered grammar, and YES decides it', async () => {
       const { transport } = await registerTestChannel();
       const { deliverBinding } = await import('../server/channels/egress');
-      const { AgentSessions } = await import('../common/collections');
       const { DeliveryReceipts } = await import('../server/channels/collections');
       const { handleInbound } = await import('../server/channels/ingress');
       await seedConversation();
-      await AgentSessions.updateAsync('sx', {
-        $set: {
-          phase: 'awaiting',
-          pending: { toolCallId: 'tc9', name: 'orders.refund', args: { id: 9 }, requestedAt: new Date() },
-        },
-      });
+      await parkAsk('sx', 'tc9');
 
       await deliverBinding('test', 'test:conv');
       const promptPost = transport.posts.find((p) => String(p.payload.text).includes('orders.refund'))!;
@@ -822,9 +862,9 @@ describe('channels', () => {
       });
       const { deliverBinding } = await import('../server/channels/egress');
       const { redeemVerdictToken } = await import('../server/channels/linking');
-      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { AgentMessages } = await import('../common/collections');
       await seedConversation();
-      await AgentSessions.updateAsync('sx', { $set: { phase: 'awaiting', pending: { toolCallId: 'tc-l', name: 'orders.refund', args: {} } } });
+      await parkAsk('sx', 'tc-l');
       await deliverBinding('test', 'test:conv');
       const text = String(transport.posts.find((p) => String(p.payload.text).includes('orders.refund'))!.payload.text);
       const tokens = [...text.matchAll(/\/v\/([A-Za-z0-9_-]+)/g)].map((m) => m[1]);
@@ -840,9 +880,8 @@ describe('channels', () => {
       });
       const { deliverBinding } = await import('../server/channels/egress');
       const { ChannelVerdictTokens } = await import('../server/channels/collections');
-      const { AgentSessions } = await import('../common/collections');
       await seedConversation();
-      await AgentSessions.updateAsync('sx', { $set: { phase: 'awaiting', pending: { toolCallId: 'tc-l2', name: 'orders.refund', args: {} } } });
+      await parkAsk('sx', 'tc-l2');
       await deliverBinding('test', 'test:conv');
       await deliverBinding('test', 'test:conv');
       await deliverBinding('test', 'test:conv');
@@ -856,49 +895,16 @@ describe('channels', () => {
       const { AgentSessions, AgentMessages } = await import('../common/collections');
       const { handleInbound } = await import('../server/channels/ingress');
       await seedConversation();
-      await AgentSessions.updateAsync('sx', {
-        $set: {
-          phase: 'awaiting',
-          pending: { toolCallId: 'tc-old', name: 'orders.refund', args: {}, requestedAt: new Date() },
-        },
-      });
+      await parkAsk('sx', 'tc-old');
       await deliverBinding('test', 'test:conv');   // registers tc-old's grammar
 
       // The old ask resolves and a DIFFERENT one parks; the old receipt stands.
-      await AgentSessions.updateAsync('sx', {
-        $set: {
-          phase: 'awaiting',
-          pending: { toolCallId: 'tc-new', name: 'orders.cancel', args: {}, requestedAt: new Date() },
-        },
-      });
+      await parkAsk('sx', 'tc-new', 'orders.cancel');
       await handleInbound('test', raw({ type: 'msg', text: 'YES', id: 'ev2', user: 'u1', convo: 'conv' }));
       const session = (await AgentSessions.findOneAsync('sx'))!;
       assert.isUndefined(session.pending?.verdict, "the stale grammar decided nothing");
       const users = await AgentMessages.find({ sessionId: 'sx', role: 'user' }).fetchAsync();
       assert.include(users.map((u) => u.content), 'YES', 'the text became a message instead');
-    });
-
-    it('a native postback carries its ask and is dropped when the ask changed', async () => {
-      await registerTestChannel({ profile: { interact: 'native' } });
-      const { AgentSessions } = await import('../common/collections');
-      const { handleInbound } = await import('../server/channels/ingress');
-      await AgentSessions.insertAsync({
-        ...sessionBase, _id: 'sn', phase: 'awaiting',
-        pending: { toolCallId: 'tc-current', name: 'x', args: {} },
-      } as any);
-      await seedBinding('test:convN', { sessionId: 'sn' });
-
-      const { AgentMessages } = await import('../common/collections');
-      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-stale', id: 'a1', user: 'u1', convo: 'convN' }));
-      assert.isUndefined(
-        await AgentMessages.findOneAsync({ sessionId: 'sn', kind: 'approval' }),
-        'stale click decided nothing',
-      );
-
-      await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-current', id: 'a2', user: 'u1', convo: 'convN' }));
-      const note = await AgentMessages.findOneAsync({ sessionId: 'sn', kind: 'approval' });
-      assert.isDefined(note, 'the live click left its audit row');
-      assert.isTrue(note!.approved);
     });
 
     it('the worker observes a committed row and delivers it without waiting for a sweep', async function () {

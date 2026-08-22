@@ -6,9 +6,9 @@ import { recordVerdict, sendToSession } from '../methods';
 import {
   ChannelBindings, DeliveryReceipts, InboundSubmissions, insertOrLose,
   type ChannelBinding,
+  receiptIdFor, promptSuffix,
 } from './collections';
-import { LINK_GESTURE, matchExpectation } from '../../common/channel-contract';
-import type { InboundReading } from '../../common/channel-contract';
+import { LINK_GESTURE, matchExpectation, type InboundReading } from '../../common/channel-contract';
 import { deliverOnce } from './egress';
 import { issueLinkToken, resolveIdentity } from './linking';
 import { getChannel, listChannels, type ChannelDef, type RawInbound } from './registry';
@@ -145,12 +145,11 @@ async function findOrCreateBinding(
 
 /**
  * Repair-on-entry: create the session the binding names if it does not
- * exist yet (first contact, or the winner crashed between its two writes).
- * The EXACT document `agent.start` builds, field for field, plus the
+ * exist yet — first contact, or the winner crashed between its two writes and
+ * this pass repairs it on the next message (the loop's own repair-on-entry
+ * ethos). The EXACT document `agent.start` builds, field for field, plus the
  * additive channel descriptor (§5.2) — the loop, the lease and the watcher
- * all read this shape. A winner that crashed between its two writes left a
- * binding whose session does not exist yet; this pass repairs it on the next
- * message — the loop's own repair-on-entry ethos.
+ * all read this shape.
  */
 async function ensureSession(kind: string, binding: ChannelBinding): Promise<boolean> {
   const config = getAgent(binding.agent);
@@ -200,7 +199,7 @@ async function verdictFromExpects(
   const pending = session?.pending;
   if (!session || session.phase !== 'awaiting' || !pending || pending.verdict) return null;
   const receipt = await DeliveryReceipts.findOneAsync(
-    `deliver:${binding._id}:prompt:${pending.toolCallId}`,
+    receiptIdFor(binding._id, promptSuffix(pending.toolCallId)),
   );
   if (!receipt?.expects) return null;
   const match = matchExpectation(text, receipt.expects);
@@ -213,9 +212,9 @@ async function verdictFromExpects(
 
 /**
  * The whole webhook, as a function — §9's five steps in order. Returns the
- * HTTP answer; throws only on a genuinely unexpected failure (the mount
- * answers 500 and RELEASES the admission claim so the provider's retry can
- * try again — see `handleInbound`'s catch).
+ * HTTP answer; throws only on a genuinely unexpected failure — the claim is
+ * RELEASED on the way out (the catch below) so the provider's retry can try
+ * again, and the mount answers 500.
  */
 export async function handleInbound(kind: string, raw: RawInbound): Promise<InboundResponse> {
   const def = getChannel(kind);
@@ -254,13 +253,9 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
 
   // 4. CLAIM the event id — exactly-once admission (§11). A provider retry
   // collides on the derived _id and is answered 200 without running twice.
-  const eventId = reading.eventId;
-  let claimId: string | null = null;
-  if (eventId !== undefined) {
-    claimId = `${kind}:${eventId}`;
-    if (!(await insertOrLose(InboundSubmissions, { _id: claimId, at: new Date() }))) {
-      return { status: 200 };   // already admitted
-    }
+  const claimId = reading.eventId !== undefined ? `${kind}:${reading.eventId}` : null;
+  if (claimId && !(await insertOrLose(InboundSubmissions, { _id: claimId, at: new Date() }))) {
+    return { status: 200 };   // already admitted
   }
 
   // 5. ROUTE by intent. Failures past the claim would strand the event as
@@ -456,9 +451,15 @@ export function mountChannelRoutes(webAppHandlers: {
       void (async () => {
         try {
           const rawBody = await readRawBody(req);
+          // `originalUrl`, not `url`: under `handlers.use('/agent/channels/<kind>', fn)`
+          // express strips the mount prefix from `req.url`, and `RawInbound.url`
+          // promises the path+query as Node saw it (a signature that covers the
+          // full webhook URL needs the real path). The fallback is for a bare
+          // Node request with no express in front.
+          const url = req.originalUrl ?? req.url;
           const out = await handleInbound(kind, {
             headers: req.headers ?? {}, rawBody,
-            ...(req.url ? { url: req.url } : {}),
+            ...(url ? { url } : {}),
           });
           res.writeHead(out.status, { 'content-type': 'text/plain' });
           res.end(out.body ?? '');

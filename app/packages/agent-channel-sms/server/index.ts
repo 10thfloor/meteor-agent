@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  headerValue, isLinkGesture, safeEqual,
+  channelKnobs, headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -147,7 +147,7 @@ export const smsLens: Lens = {
     if (!p || typeof p !== 'object') return NOOP;
     const body = (p.Body ?? '').trim();
     // A delivery-status callback, not an inbound message — noop by design.
-    if (body === '' || (!p.From && !p.To)) return NOOP;
+    if (body === '' || !p.From || !p.To) return NOOP;
 
     const envelope = {
       eventId: p.MessageSid ?? p.SmsSid,
@@ -253,15 +253,14 @@ export function sms(options: SmsChannelOptions): ChannelDef {
     // 1500, under Twilio's hard 1600-character API cap with room for the
     // overflow link — long answers become a head-slice plus the web URL,
     // which on this always-`direct` surface may always be sent (§8.5).
-    profile: { interact: 'menu', limit: 1500, ...options.profile },
+    profile: { interact: 'menu', limit: options.profile?.limit ?? 1500 },
     verify: (raw) => verifyTwilioSignature(raw, options.authToken, options.webhookUrl),
     parse: (raw) => parseTwilioForm(raw.rawBody),
     // Note kinds delivered as statuses: the errors a texter must hear about,
     // and the approval outcome that closes a "Reply YES" exchange.
     statuses: options.statuses ?? ['error', 'approval'],
-    ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
-    ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),
-    ...(options.linkUrl ? { linkUrl: options.linkUrl } : {}),
-    ...(options.throttle ? { throttle: options.throttle } : {}),
+    // Every knob the core names, forwarded by one helper — a knob added to
+    // ChannelKnobs tomorrow is forwarded here without this file changing.
+    ...channelKnobs(options),
   };
 }

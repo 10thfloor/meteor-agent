@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -303,9 +303,8 @@ export function whatsapp(options: WhatsAppChannelOptions): ChannelDef {
     verify: (raw) => verifyWhatsAppRequest(raw, options.appSecret, options.verifyToken),
     parse: parseWhatsAppRequest,
     statuses: options.statuses ?? ['error', 'approval'],
-    ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
-    ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),
-    ...(options.linkUrl ? { linkUrl: options.linkUrl } : {}),
-    ...(options.throttle ? { throttle: options.throttle } : {}),
+    // Every knob the core names, forwarded by one helper — a knob added to
+    // ChannelKnobs tomorrow is forwarded here without this file changing.
+    ...channelKnobs(options),
   };
 }

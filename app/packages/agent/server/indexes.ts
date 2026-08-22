@@ -76,6 +76,8 @@ export async function ensureIndexes(): Promise<void> {
       keys: { sessionId: 1 },
     },
     // The linking claim-history pass (`{ kind, externalUserId, userId: null }`).
+    // `sparse` is the header's MODEST case again: `kind` is always present, so the
+    // flag drops nothing today; kept for the same reasons as the parent index.
     {
       collection: ChannelBindings,
       name: NAMES.channelBindings,

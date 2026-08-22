@@ -5,8 +5,10 @@ import { SERVER_ID } from '../lease';
 import {
   ChannelBindings, DeliveryReceipts, insertOrLose,
   type ChannelBinding, type ReceiptExpectation,
+  receiptIdFor, promptSuffix,
 } from './collections';
-import { expectationsFor, planItems, promptItem } from './plan';
+import { planItems, promptItem } from './plan';
+import { expectationsFor } from '../../common/channel-contract';
 import { issueVerdictToken } from './linking';
 import { getChannel, uncertainDeliveryMode, type ChannelDef } from './registry';
 import { VERDICT_FOR, type DeliveryItem } from '../../common/channel-contract';
@@ -158,7 +160,7 @@ export async function deliverOnce(
 ): Promise<'delivered' | 'abandoned' | 'deferred'> {
   const def = getChannel(binding.kind);
   if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${binding.kind}"`);
-  const receiptId = `deliver:${binding._id}:${suffix}`;
+  const receiptId = receiptIdFor(binding._id, suffix);
 
   // RESERVE. The duplicate-key loser reads the winner's state instead of
   // posting: `sent`/`abandoned` are settled; `sending` is the one ambiguous
@@ -311,7 +313,7 @@ export async function deliverBinding(
       }
       return prompt;
     };
-    await deliverOnce(binding, withUrls, `prompt:${prompt.toolCallId}`, {
+    await deliverOnce(binding, withUrls, promptSuffix(prompt.toolCallId), {
       expects: expectationsFor(prompt),
     });
   }

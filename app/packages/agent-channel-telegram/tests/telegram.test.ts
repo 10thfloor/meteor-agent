@@ -26,10 +26,25 @@ function messageUpdate(over: Record<string, unknown> = {}, chat: Record<string, 
   };
 }
 
+/** Parse + read one update through the lens, as the host would. */
+async function read(update: unknown) {
+  const { parseTelegramUpdate, telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+  return telegramLens.in(parseTelegramUpdate(raw(update)));
+}
+
+/** A fetch stub that records each call and answers with one fixed JSON body. */
+function fakeFetch(reply: unknown) {
+  const calls: Array<{ url: string; init: any }> = [];
+  const fetchImpl = (async (url: any, init: any) => {
+    calls.push({ url, init });
+    return { json: async () => reply };
+  }) as unknown as typeof fetch;
+  return { calls, fetchImpl };
+}
+
 describe('agent-channel-telegram', () => {
   describe('hostile and group inputs', () => {
     it('treats a literal-null callback_data as a noop, not a crash', async () => {
-      const { parseTelegramUpdate, telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
       const update = {
         update_id: 2002,
         callback_query: {
@@ -38,17 +53,14 @@ describe('agent-channel-telegram', () => {
           data: 'null',
         },
       };
-      const reading = telegramLens.in(parseTelegramUpdate(raw(update)));
+      const reading = await read(update);
       assert.equal(reading.intent.kind, 'noop');
     });
 
     it('honors the link gesture in private chats only — in a group it is just a message', async () => {
-      const { parseTelegramUpdate, telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
-      const inGroup = telegramLens.in(parseTelegramUpdate(raw(
-        messageUpdate({ text: '/link' }, { id: -100777, type: 'supergroup' }),
-      )));
+      const inGroup = await read(messageUpdate({ text: '/link' }, { id: -100777, type: 'supergroup' }));
       assert.equal(inGroup.intent.kind, 'message', 'a group /link never earns a credential');
-      const inPrivate = telegramLens.in(parseTelegramUpdate(raw(messageUpdate({ text: '/link' }))));
+      const inPrivate = await read(messageUpdate({ text: '/link' }));
       assert.equal(inPrivate.intent.kind, 'link-request');
     });
   });
@@ -64,8 +76,7 @@ describe('agent-channel-telegram', () => {
 
   describe('lens.in', () => {
     it('keys a conversation by chat id, with audience by chat type', async () => {
-      const { telegramLens, parseTelegramUpdate } = await import('meteor/10thfloor:agent-channel-telegram');
-      const dm = telegramLens.in(parseTelegramUpdate(raw(messageUpdate())));
+      const dm = await read(messageUpdate());
       assert.deepEqual(dm.intent, { kind: 'message', text: 'hello there' });
       assert.equal(dm.conversationRef, '4242');
       assert.equal(dm.externalUserId, '42');
@@ -73,40 +84,37 @@ describe('agent-channel-telegram', () => {
       assert.deepEqual(dm.destination, { chatId: 4242 });
       assert.equal(dm.audience, 'direct');
 
-      const group = telegramLens.in(parseTelegramUpdate(raw(
-        messageUpdate({}, { id: -100999, type: 'supergroup' }),
-      )));
+      const group = await read(messageUpdate({}, { id: -100999, type: 'supergroup' }));
       assert.equal(group.conversationRef, '-100999');
       assert.equal(group.audience, 'group');
     });
 
     it('noops other bots, edits, and empty/media messages', async () => {
-      const { telegramLens, parseTelegramUpdate } = await import('meteor/10thfloor:agent-channel-telegram');
-      const bot = telegramLens.in(parseTelegramUpdate(raw(
-        messageUpdate({ from: { id: 9, is_bot: true } }),
-      )));
+      const bot = await read(messageUpdate({ from: { id: 9, is_bot: true } }));
       assert.equal(bot.intent.kind, 'noop');
-      const edited = telegramLens.in(parseTelegramUpdate(raw({
+      const edited = await read({
         update_id: 1002, edited_message: { chat: { id: 1 }, from: { id: 2 }, text: 'x' },
-      })));
+      });
       assert.equal(edited.intent.kind, 'noop');
-      const sticker = telegramLens.in(parseTelegramUpdate(raw(messageUpdate({ text: undefined }))));
+      const sticker = await read(messageUpdate({ text: undefined }));
       assert.equal(sticker.intent.kind, 'noop');
     });
 
     it('reads link / /link / /link@Bot as the link gesture, but not sentences', async () => {
-      const { telegramLens, parseTelegramUpdate } = await import('meteor/10thfloor:agent-channel-telegram');
       for (const text of ['link', ' /link ', '/link@MyAgentBot']) {
-        const reading = telegramLens.in(parseTelegramUpdate(raw(messageUpdate({ text }))));
+        const reading = await read(messageUpdate({ text }));
         assert.equal(reading.intent.kind, 'link-request', `"${text}" is the gesture`);
       }
-      const sentence = telegramLens.in(parseTelegramUpdate(raw(messageUpdate({ text: 'link my account' }))));
+      const sentence = await read(messageUpdate({ text: 'link my account' }));
       assert.equal(sentence.intent.kind, 'message');
+      for (const text of ['/link@MyAgentBot please', 'link@anything goes']) {
+        const r = await read(messageUpdate({ text }));
+        assert.equal(r.intent.kind, 'message', `"${text}" is a message, not the gesture`);
+      }
     });
 
     it('reads a button press as a verdict carrying the exact ask', async () => {
-      const { telegramLens, parseTelegramUpdate } = await import('meteor/10thfloor:agent-channel-telegram');
-      const reading = telegramLens.in(parseTelegramUpdate(raw({
+      const reading = await read({
         update_id: 1003,
         callback_query: {
           id: 'cbq1',
@@ -114,7 +122,7 @@ describe('agent-channel-telegram', () => {
           message: { chat: { id: 4242, type: 'private' } },
           data: JSON.stringify({ t: 'a', c: 'tc9' }),
         },
-      })));
+      });
       assert.deepEqual(reading.intent, { kind: 'verdict', verdict: 'approved', toolCallId: 'tc9' });
       assert.equal(reading.conversationRef, '4242');
       assert.equal(reading.eventId, '1003');
@@ -178,11 +186,7 @@ describe('agent-channel-telegram', () => {
   describe('transport', () => {
     it('posts sendMessage with the chat threaded in and reports the message id', async () => {
       const { telegramTransport } = await import('meteor/10thfloor:agent-channel-telegram');
-      const calls: any[] = [];
-      const fetchImpl = (async (url: any, init: any) => {
-        calls.push({ url, init });
-        return { json: async () => ({ ok: true, result: { message_id: 77 } }) };
-      }) as unknown as typeof fetch;
+      const { calls, fetchImpl } = fakeFetch({ ok: true, result: { message_id: 77 } });
       const transport = telegramTransport({ botToken: '123:ABC', fetchImpl });
       const posted = await transport.post({ chatId: 4242 }, { text: 'hi' }, { idempotencyKey: 'k' });
       assert.deepEqual(posted, { providerMessageId: '77' });
@@ -192,11 +196,17 @@ describe('agent-channel-telegram', () => {
       assert.equal(body.text, 'hi');
     });
 
+    it('a payload can never redirect a post to another chat', async () => {
+      const { telegramTransport } = await import('meteor/10thfloor:agent-channel-telegram');
+      const { calls, fetchImpl } = fakeFetch({ ok: true, result: { message_id: 1 } });
+      await telegramTransport({ botToken: 't', fetchImpl })
+        .post({ chatId: 4242 }, { text: 'hi', chat_id: -999 }, { idempotencyKey: 'k' });
+      assert.equal(JSON.parse(calls[0].init.body).chat_id, 4242, 'destination wins over payload');
+    });
+
     it('throws the API description so the receipt stays mid-sending for the retry', async () => {
       const { telegramTransport } = await import('meteor/10thfloor:agent-channel-telegram');
-      const fetchImpl = (async () => ({
-        json: async () => ({ ok: false, description: 'Bad Request: chat not found' }),
-      })) as unknown as typeof fetch;
+      const { fetchImpl } = fakeFetch({ ok: false, description: 'Bad Request: chat not found' });
       const transport = telegramTransport({ botToken: 't', fetchImpl });
       try {
         await transport.post({ chatId: 1 }, { text: 'x' }, { idempotencyKey: 'k' });

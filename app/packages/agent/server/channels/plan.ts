@@ -117,4 +117,3 @@ export function promptItem(
   };
 }
 
-export { expectationsFor, matchExpectation } from '../../common/channel-contract';

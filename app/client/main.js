@@ -22,9 +22,13 @@ const $ = (id) => document.getElementById(id);
 
 Meteor.startup(() => {
   const chat = document.querySelector('agent-chat');
-  // `session-id` is a DOM attribute, not a reactive source — this dependency
-  // re-runs the list's `.current` highlight when the chat moves to another
-  // session (row click, New, the element's own auto-start).
+  // `chat.sessionId` is a plain getter (the auto-start path sets it without
+  // ever writing the `session-id` attribute) — not a reactive source, so
+  // this dependency re-runs the list's `.current` highlight when the chat
+  // moves to another session (row click, New, the element's own auto-start).
+  // `openSession` bumps it right after `setAttribute`, when the element has
+  // already detached; the re-attach is a microtask, Tracker's flush a
+  // macrotask, so the autorun sees the new id.
   const currentSession = new Tracker.Dependency();
 
   // ---- The chat element: attach BEFORE defining the tag --------------------
@@ -153,6 +157,41 @@ Meteor.startup(() => {
   // distinguishes a page LOAD (leave the saved session alone) from a genuine
   // login/logout TRANSITION (the old session is not this identity's — detach
   // and start clean rather than letting the next send bounce).
+  const startClean = () => { localStorage.removeItem(SESSION_KEY); startFresh(); };
+  // The element's public reset seam ("tears down on disconnect, re-mounts clean"):
+  // re-subscribes under the identity the connection now has.
+  const remountChat = () => {
+    const parent = chat.parentNode, next = chat.nextSibling;
+    chat.remove();
+    parent.insertBefore(chat, next);
+  };
+  // Sign-IN: adopt the conversation this browser already holds instead of
+  // discarding it — possession of an anonymous session IS ownership (see
+  // demo.claimSession), so signing in keeps the thread and makes it durable.
+  // Only when there is nothing claimable (no held session, db wiped, someone
+  // else's) does the account start clean.
+  function adoptHeldSession() {
+    const held = localStorage.getItem(SESSION_KEY);
+    if (!held) { startFresh(); return; }
+    Meteor.callAsync('demo.claimSession', held).then((outcome) => {
+      if (outcome === 'no') { startClean(); return; }
+      // The login re-ran the element's subscription BEFORE the claim landed —
+      // authorized as the new user against a still-anonymous session, it
+      // published nothing, and publications do not re-run when data changes.
+      // Remounting is the element's public reset seam ("tears down on
+      // disconnect, re-mounts clean"): it re-subscribes as the owner the
+      // session now has, and the transcript comes back.
+      if (outcome === 'claimed') remountChat();
+      // 'yours' (a re-login): the re-run subscription already authorized
+      // correctly — nothing to do.
+    }).catch((err) => {
+      // A failed claim (disconnect, rate limit) is treated like 'no': the held
+      // session would sit unreadable under the new identity, so start clean —
+      // but say so, this path was silent.
+      console.error('[demo] could not claim the held session; starting clean:', err);
+      startClean();
+    });
+  }
   let previousUser;
   Tracker.autorun(() => {
     const userId = Meteor.userId();
@@ -160,57 +199,18 @@ Meteor.startup(() => {
     if (userId) {
       renderSignedIn(username);
       demo.subscribeSessions();
-      redeemPendingLink();
+      // Not while a stored token is still being RESUMED: userId is set
+      // optimistically at page load, and a failed resume would run the
+      // redeem unauthenticated and burn the armed token client-side.
+      if (!Meteor.loggingIn()) redeemPendingLink();
     } else {
       renderSignedOut();
     }
     if (previousUser !== undefined && previousUser !== userId) {
-      if (userId) {
-        // Sign-IN: adopt the conversation this browser already holds instead
-        // of discarding it — possession of an anonymous session IS ownership
-        // (see demo.claimSession), so signing in keeps the thread and makes
-        // it durable. Only when there is nothing claimable (no held session,
-        // db wiped, someone else's) does the account start clean.
-        const held = localStorage.getItem(SESSION_KEY);
-        if (!held) {
-          startFresh();
-        } else {
-          Meteor.callAsync('demo.claimSession', held).then((outcome) => {
-            if (outcome === 'no') {
-              localStorage.removeItem(SESSION_KEY);
-              startFresh();
-              return;
-            }
-            if (outcome === 'claimed') {
-              // The login re-ran the element's subscription BEFORE the claim
-              // landed — authorized as the new user against a still-anonymous
-              // session, it published nothing, and publications do not re-run
-              // when data changes. Remounting is the element's public reset
-              // seam ("tears down on disconnect, re-mounts clean"): it
-              // re-subscribes as the owner the session now has, and the
-              // transcript comes back.
-              const parent = chat.parentNode;
-              const next = chat.nextSibling;
-              chat.remove();
-              parent.insertBefore(chat, next);
-            }
-            // 'yours' (a re-login): the re-run subscription already authorized
-            // correctly — nothing to do.
-          }).catch((err) => {
-            // A failed claim (disconnect, rate limit) is treated like 'no':
-            // the held session would sit unreadable under the new identity, so
-            // start clean — but say so, this path was silent.
-            console.error('[demo] could not claim the held session; starting clean:', err);
-            localStorage.removeItem(SESSION_KEY);
-            startFresh();
-          });
-        }
-      } else {
-        // Sign-OUT: the account's sessions are not anonymous-reachable, so a
-        // clean anonymous conversation is the only honest continuation.
-        localStorage.removeItem(SESSION_KEY);
-        startFresh();
-      }
+      if (userId) adoptHeldSession();
+      // Sign-OUT: the account's sessions are not anonymous-reachable, so a
+      // clean anonymous conversation is the only honest continuation.
+      else startClean();
     }
     previousUser = userId;
   });

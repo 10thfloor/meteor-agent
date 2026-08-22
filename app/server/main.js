@@ -19,7 +19,9 @@ import { sms } from 'meteor/10thfloor:agent-channel-sms';
  */
 const live = !!process.env.ANTHROPIC_API_KEY;
 
-// A word-per-chunk script so streaming is visible at human speed in the demo.
+// The scripted turns the mock provider plays back. The mock streams one
+// CHARACTER per chunk (providers/mock.ts), so the demo visibly streams
+// even with no model behind it.
 const demoScript = (() => {
   let calls = 0;
   return (req) => {
@@ -159,8 +161,8 @@ Meteor.methods({
    * is the point of claiming.
    *
    * Returns 'claimed' (adopted just now), 'yours' (already this account's —
-   * a re-login), or 'no' (unknown, or owned by someone else — the two are
-   * deliberately indistinguishable).
+   * a re-login), or 'no' (unknown, owned by someone else, or a channel-origin
+   * session — see below; the three are deliberately indistinguishable).
    */
   async 'demo.claimSession'(sessionId) {
     check(sessionId, String);

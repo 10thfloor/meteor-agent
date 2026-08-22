@@ -89,7 +89,7 @@ export class Agent {
       // ordering invariant, and having one path in the package that does it
       // differently is how the next reader concludes it is optional.
       //
-      // `mSend`'s `budgetSpent.turns: { $lt: … }` filter is deliberately NOT
+      // `sendToSession`'s `budgetSpent.turns: { $lt: … }` filter is deliberately NOT
       // here: this session has never sent, `budget.turns` is validated to be a
       // positive integer, so the filter could only ever match. The `$inc` still
       // runs so the accounting a nested run inherits is the real one.
@@ -159,12 +159,11 @@ export class Agent {
 
   /**
    * Send a message into an EXISTING session and wake a turn — the server-side
-   * form of `agent.send` (channels spec §5.1), the same extract-with-`userId`
-   * refactor `ask`/`fork`/`compact` already had. A channel webhook, a cron
-   * job, or another agent calls this with a RESOLVED identity; the DDP method
-   * is a cap over the identical core, so both run on the same terms —
-   * authorization, the budget folded into the atomic seq allocation, and the
-   * one `deferTurn` wake path.
+   * form of `agent.send` (channels spec §5.1). A channel webhook, a cron job,
+   * or another agent calls this with a RESOLVED identity; the DDP method is a
+   * cap over the identical core, `sendToSession` (methods.ts), so both run on
+   * the same terms — authorization, the budget folded into the atomic seq
+   * allocation, and the one `deferTurn` wake path.
    *
    * `userId` scopes the lookup, always three-field (`{_id, agent, userId}`):
    * an omitted one defaults to null and scopes to the ANONYMOUS owner — never
@@ -344,9 +343,10 @@ export class Agent {
    *   // knobs (statuses, onUncertainDelivery, sessionUrl, linkUrl, throttle).
    *
    * Registration is inert by itself: the boot wiring (server/index.ts) mounts
-   * the webhook at `/agent/channels/<kind>` and starts the egress worker,
-   * gated per kind by `settings.channels.<kind> !== false` and skipped under
-   * test — exactly the watcher's boot contract.
+   * the webhook at `/agent/channels/<kind>` on EVERY instance, and starts the
+   * egress worker — the worker alone gated per kind by
+   * `settings.channels.<kind> !== false` — both skipped under test; the worker
+   * follows the watcher's boot contract.
    */
   static channel(kind: string, def: ChannelDef): void {
     registerChannel(kind, def);

@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -292,7 +292,7 @@ export const slackLens: Lens = {
       const dm = String(channel).startsWith('D');
       const threadTs = payload.message?.thread_ts ?? payload.message?.ts;
       return {
-        intent: { kind: 'verdict', verdict: decoded.verdict, toolCallId: decoded.toolCallId },
+        intent: { kind: 'verdict', ...decoded },
         // Interactivity has no redelivery-stable event id (Slack does not
         // retry action posts); the user+click timestamp is stable across the
         // double-click case, which is the duplicate that actually happens.
@@ -401,9 +401,8 @@ export function slack(options: SlackChannelOptions): ChannelDef {
     verify: (raw) => verifySlackSignature(raw, options.signingSecret),
     parse: parseSlackRequest,
     statuses: options.statuses ?? ['error', 'approval'],
-    ...(options.onUncertainDelivery ? { onUncertainDelivery: options.onUncertainDelivery } : {}),
-    ...(options.sessionUrl ? { sessionUrl: options.sessionUrl } : {}),
-    ...(options.linkUrl ? { linkUrl: options.linkUrl } : {}),
-    ...(options.throttle ? { throttle: options.throttle } : {}),
+    // Every knob the core names, forwarded by one helper — a knob added to
+    // ChannelKnobs tomorrow is forwarded here without this file changing.
+    ...channelKnobs(options),
   };
 }
