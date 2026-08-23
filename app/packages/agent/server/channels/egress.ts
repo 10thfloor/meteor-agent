@@ -7,8 +7,9 @@ import {
   type ChannelBinding, type ReceiptExpectation,
   receiptIdFor, promptSuffix,
 } from './collections';
-import { planItems, promptItem } from './plan';
+import { planItems, promptItem, type PlannedRow } from './plan';
 import { expectationsFor } from '../../common/channel-contract';
+import { hydrateRefs } from '../attachments';
 import { issueVerdictToken } from './linking';
 import { getChannel, uncertainDeliveryMode, type ChannelDef } from './registry';
 import { VERDICT_FOR, type DeliveryItem } from '../../common/channel-contract';
@@ -151,14 +152,31 @@ async function settleReceipt(
  * window "irreducible without idempotency keys carried through to the tools
  * themselves" — and this, keyed on the tool call's id, is that idempotency
  * key carried through.
+ *
+ * The binding parameter is a PICK on purpose (email v2 spec §9): exactly the
+ * three fields the log reads — `_id` (the receipt key), `kind` (the def
+ * lookup), `destination`. A proactive tool (compose) passes a SYNTHETIC
+ * binding — `{ _id: 'compose:email:<toolCallId>', kind, destination }` — and
+ * gets the full three-phase log with no new machinery; `opts.def` supplies
+ * the transport/lens directly so the tool works with no channel registered.
  */
+
+/** What `deliverOnce` reads from a binding — a real row satisfies it; a
+ *  synthetic one is these three fields and nothing more. */
+export type DeliverableBinding = Pick<ChannelBinding, '_id' | 'kind' | 'destination'>;
+
 export async function deliverOnce(
-  binding: ChannelBinding,
+  binding: DeliverableBinding,
   item: DeliveryItem | (() => Promise<DeliveryItem>),
   suffix: string,
-  opts: { expects?: ReceiptExpectation[] } = {},
+  opts: {
+    expects?: ReceiptExpectation[];
+    /** The transport/lens/tier to deliver through, when the caller holds them
+     *  directly (compose). Default: the registry's def for `binding.kind`. */
+    def?: Pick<ChannelDef, 'transport' | 'lens' | 'onUncertainDelivery'>;
+  } = {},
 ): Promise<'delivered' | 'abandoned' | 'deferred'> {
-  const def = getChannel(binding.kind);
+  const def = opts.def ?? getChannel(binding.kind);
   if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${binding.kind}"`);
   const receiptId = receiptIdFor(binding._id, suffix);
 
@@ -240,6 +258,33 @@ export async function deliverOnce(
 }
 
 /**
+ * A planned row's deliverable: the item itself, or — when its message carries
+ * attachment refs — a THUNK that hydrates them (email v2 spec §8). Bytes load
+ * only on `deliverOnce`'s POST path: a settled receipt or a backoff window
+ * loads nothing, exactly like verdict-token minting. A ref that no longer
+ * hydrates (pruned by the retention TTL) is dropped from the payload and the
+ * text gains one bracket line — the courier never claims to have delivered a
+ * file it didn't, and never wedges the conversation over one.
+ */
+function deliverable(
+  binding: ChannelBinding, row: PlannedRow,
+): DeliveryItem | (() => Promise<DeliveryItem>) {
+  const item = row.item!;
+  const refs = row.message.attachments;
+  if (!refs?.length || (item.item !== 'reply' && item.item !== 'overflow')) return item;
+  return async () => {
+    const { attachments, missing } = await hydrateRefs(binding.sessionId, refs);
+    const note = missing
+      .map((r) => `\n[the file "${r.name}" expired before this could be delivered]`)
+      .join('');
+    const files = attachments.length > 0 ? { attachments } : {};
+    return item.item === 'reply'
+      ? { ...item, text: `${item.text}${note}`, ...files }
+      : { ...item, head: `${item.head}${note}`, ...files };
+  };
+}
+
+/**
  * Deliver one binding's backlog: claim it, walk the transcript past the
  * cursor, post what the planner says to post, advance past the rest, then
  * offer the parked prompt (receipt-guarded — a prompt is session state, not a
@@ -281,7 +326,7 @@ export async function deliverBinding(
     if (!(await claimBinding(bindingId, claimMs))) return;
     if (row.item) {
       // eslint-disable-next-line no-await-in-loop
-      const outcome = await deliverOnce(binding, row.item, row.message._id);
+      const outcome = await deliverOnce(binding, deliverable(binding, row), row.message._id);
       // A deferred row is in its backoff window: stop here, cursor unmoved,
       // and let a later sweep retry it. Rows behind it wait — in-order
       // delivery is the contract.

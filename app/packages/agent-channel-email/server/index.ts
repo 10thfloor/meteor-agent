@@ -1,8 +1,10 @@
-import { createHash } from 'crypto';
+import { createHash, randomBytes } from 'crypto';
 import {
-  channelKnobs, headerValue, isLinkGesture, safeEqual,
-  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
-  type DeliveryItem, type InboundReading, type Lens, type RawInbound,
+  AgentAttachments, DEFAULT_ATTACHMENT_CAPS, channelKnobs, deliverOnce, headerValue,
+  isLinkGesture, prettySize, resolveIdentity, safeEqual,
+  type ChannelAttachment, type ChannelDef, type ChannelKnobs, type ChannelProfile,
+  type ChannelTransport, type DeliveryItem, type Gate, type InboundReading,
+  type InlineTool, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -233,15 +235,35 @@ export const emailLens: Lens = {
   out(item: DeliveryItem, destination: unknown): unknown {
     const dest = (destination ?? {}) as Partial<EmailDestination>;
     const Subject = dest.subject ?? 'Re: (no subject)';
+    // Email is the surface that carries real BYTES (email v2 spec §8): a
+    // file-bearing reply/overflow renders Postmark's `Attachments` field —
+    // which also satisfies the naming clause (the `Name` field IS the name).
+    // The item arrives hydrated; a lens never fetches.
+    const files = (item.item === 'reply' || item.item === 'overflow') && item.attachments?.length
+      ? {
+        Attachments: item.attachments.map((a) => ({
+          Name: a.name, Content: a.content, ContentType: a.contentType,
+        })),
+      }
+      : {};
     switch (item.item) {
       case 'reply':
-        return { Subject, TextBody: item.text };
+        // A file with no cover note still needs a body — Postmark refuses an
+        // empty TextBody, and a deterministic provider rejection would burn
+        // MAX_DELIVERY_ATTEMPTS on a healthy message.
+        return {
+          Subject,
+          TextBody: item.text === '' && 'Attachments' in files
+            ? 'The file is attached.' : item.text,
+          ...files,
+        };
       case 'status':
         return { Subject, TextBody: statusProse(item) };
       case 'overflow':
         return {
           Subject,
           TextBody: `${item.head}${item.url ? `\n\nContinue on the web: ${item.url}` : ''}`,
+          ...files,
         };
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {}, null, 2);
@@ -280,12 +302,30 @@ export const emailLens: Lens = {
     if (from === '') return NOOP;
     if (isAutomated(headers, from)) return NOOP;
 
+    // Files the mail carried (email v2 spec §6): pass through what Postmark
+    // delivered — `Content` is already base64 — minus inline `ContentID`
+    // entries, which are overwhelmingly signature furniture. `ContentLength`
+    // is advisory; admission recomputes sizes from the actual bytes. CAPS ARE
+    // NOT THE LENS'S JOB — the pipeline applies the channel's caps and notes
+    // what it drops; this only translates.
+    const attachments: ChannelAttachment[] = (Array.isArray(b.Attachments) ? b.Attachments : [])
+      .filter((a: any) => a && typeof a.Content === 'string'
+        && !(typeof a.ContentID === 'string' && a.ContentID !== ''))
+      .map((a: any) => ({
+        name: String(a.Name ?? 'file'),
+        contentType: String(a.ContentType ?? 'application/octet-stream'),
+        size: Number(a.ContentLength ?? 0) || 0,
+        content: String(a.Content),
+      }));
+
     // The new text — Postmark's stripped reply when it has one, else our own
-    // strip over the plain body. No text (an HTML-only or attachment-only
-    // mail) is a noop: there is nothing to send the agent.
+    // strip over the plain body. The v1 noop rule sharpens (email v2 spec
+    // §6): NEITHER text NOR attachments is a noop. An attachment-only mail —
+    // a person answering "can you check this?" with just the file — is a
+    // message now, carried as empty text plus the files.
     const stripped = String(b.StrippedTextReply ?? '').trim();
     const text = stripped !== '' ? stripped : stripQuotedReply(String(b.TextBody ?? ''));
-    if (text === '') return NOOP;
+    if (text === '' && attachments.length === 0) return NOOP;
 
     // The thread key: mailbox hash first (our own Reply-To coming back), then
     // the root of the References chain, then In-Reply-To, then this message's
@@ -317,7 +357,11 @@ export const emailLens: Lens = {
       audience: 'direct' as const,
     };
     if (isLinkGesture(text)) return { intent: { kind: 'link-request' }, ...envelope };
-    return { intent: { kind: 'message', text }, ...envelope };
+    return {
+      intent: { kind: 'message', text },
+      ...envelope,
+      ...(attachments.length > 0 ? { attachments } : {}),
+    };
   },
 };
 
@@ -334,6 +378,14 @@ export interface EmailTransportOptions {
   inboundAddress: string;
   /** Postmark message stream; default `outbound`. */
   messageStream?: string;
+  /**
+   * The RFC 3834 class stamped on outbound mail. `auto-replied` (default) is
+   * the reactive channel's answer-to-a-message; COMPOSE stamps
+   * `auto-generated` — a machine-sent mail that OPENS a correspondence rather
+   * than answering one. Both suppress well-behaved auto-responders, and our
+   * own inbound `isAutomated` drops any echo of either.
+   */
+  autoSubmitted?: 'auto-replied' | 'auto-generated';
   /** TEST SEAM. */
   fetchImpl?: typeof fetch;
 }
@@ -359,12 +411,12 @@ export function emailTransport(options: EmailTransportOptions): ChannelTransport
         MessageStream: options.messageStream ?? 'outbound',
         Headers: [
           ...(root ? [{ Name: 'In-Reply-To', Value: root }, { Name: 'References', Value: root }] : []),
-          // RFC 3834: mark our own replies as machine-generated. A well-behaved
+          // RFC 3834: mark our own mail as machine-generated. A well-behaved
           // remote auto-responder suppresses replying to auto-submitted mail,
           // and our OWN inbound `isAutomated` reads this exact header — so a
           // reply that loops back to us is dropped and the ping-pong the header
           // comment promises "never forms" actually cannot.
-          { Name: 'Auto-Submitted', Value: 'auto-replied' },
+          { Name: 'Auto-Submitted', Value: options.autoSubmitted ?? 'auto-replied' },
           { Name: 'X-Agent-Receipt', Value: opts.idempotencyKey },
         ],
       };
@@ -432,7 +484,217 @@ export function email(options: EmailChannelOptions): ChannelDef {
     verify: (raw) => verifyPostmarkWebhook(raw, options.webhookUser, options.webhookPassword),
     parse: parsePostmarkInbound,
     statuses: options.statuses ?? ['error', 'approval'],
+    // Postmark delivers up to 35 MB of cumulative attachments base64'd INSIDE
+    // the webhook JSON (~47 MB encoded, plus bodies and headroom). The shared
+    // 1 MB default would 413 the whole mail — text included — so email raises
+    // its own ceiling; admission caps still decide what is KEPT. An app knob
+    // of the same name (channelKnobs, spread below) wins.
+    maxInboundBytes: 50 * 1024 * 1024,
     ...(options.approvalUrl ? { approvalUrl: options.approvalUrl } : {}),
     ...channelKnobs(options),
+  };
+}
+
+// ---- Compose — the tool (email v2 spec §9) ---------------------------------
+
+/**
+ * The recipient POLICY — the one decision compose refuses to default (§7's
+ * rule survives contact with a destination parameter: the model PROPOSES
+ * `to`; trusted app code decides):
+ *
+ *   `'linked'`   — addresses in `ChannelIdentities` belonging to the SESSION'S
+ *                  OWNER (kind `'email'`). Covers "email it to me"; an
+ *                  anonymous session has no linked addresses and every
+ *                  recipient is refused.
+ *   `string[]`   — an explicit allowlist, compared case-insensitively.
+ *   a predicate  — `(to, { sessionId, userId }) => boolean`, sync or async.
+ *                  A predicate that THROWS refuses (fail closed).
+ */
+export type ComposeRecipientsPolicy =
+  | 'linked'
+  | string[]
+  | ((to: string, session: { sessionId: string; userId: string | null }) =>
+    boolean | Promise<boolean>);
+
+export interface ComposeEmailToolOptions {
+  /** The same thin transport the channel uses — compose depends on the
+   *  TRANSPORT, not on the channel registration; an app can list this tool
+   *  with no email channel registered at all (§2 decision 6). */
+  serverToken: string;
+  from: string;
+  /** Where a recipient's REPLY lands: composed mail replies-to the PLAIN
+   *  inbound address — no thread key — so their answer starts its own fresh
+   *  conversation through the normal inbound path (§2 decision 8). */
+  inboundAddress: string;
+  messageStream?: string;
+  fetchImpl?: typeof fetch;
+  /** REQUIRED — no permissive default exists. See `ComposeRecipientsPolicy`. */
+  recipients: ComposeRecipientsPolicy;
+  /** Default `'ask'`: every compose parks for approval unless the app
+   *  explicitly loosens it. The parked prompt shows `to`, `subject`, `body`
+   *  and the ref ids through the existing prompt rendering. */
+  gate?: Gate;
+  name?: string;
+  description?: string;
+}
+
+const EMAIL_SHAPE = /^[^@\s]+@[^@\s]+\.[^@\s]+$/;
+
+async function recipientAllowed(
+  policy: ComposeRecipientsPolicy, to: string,
+  session: { sessionId: string; userId: string | null },
+): Promise<boolean> {
+  try {
+    if (policy === 'linked') {
+      if (session.userId === null) return false;
+      const identity = await resolveIdentity('email', to);
+      return identity?.userId === session.userId;
+    }
+    if (Array.isArray(policy)) {
+      return policy.some((a) => a.trim().toLowerCase() === to);
+    }
+    return (await policy(to, session)) === true;
+  } catch {
+    return false;   // a broken policy must not mail anyone
+  }
+}
+
+/**
+ * A tool factory: compose and send a NEW email — the §7 side-action pattern
+ * with the one parameter §7 forbids (a destination) handled the only
+ * acceptable way: validated by app-authored policy, gated `'ask'` by default.
+ *
+ *   tools: [composeEmailTool({
+ *     serverToken, from: 'Agent <agent@ourdomain.com>', inboundAddress,
+ *     recipients: (to) => to.endsWith('@ourco.com'),
+ *   })]
+ *
+ * Effectively-once through the existing three-phase receipt log: the tool
+ * passes `deliverOnce` a SYNTHETIC binding keyed on the tool call
+ * (`compose:email:<toolCallId>`), so the crash-recovery re-run of a dispatched
+ * tool finds the receipt settled and does not re-send — §7's "idempotency key
+ * carried through to the tool itself", verbatim.
+ *
+ * What compose is NOT: a reply path. The worker already delivers the turn's
+ * answer to the conversation's own surfaces; composing to the person you are
+ * talking to is the double-delivery trap. The description says so to the model.
+ */
+export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
+  for (const k of ['serverToken', 'from', 'inboundAddress'] as const) {
+    if (!options?.[k]) throw new Error(`[agent-channel-email] composeEmailTool({ ${k} }) is required`);
+  }
+  if (options.recipients === undefined || options.recipients === null) {
+    throw new Error(
+      '[agent-channel-email] composeEmailTool requires a `recipients` policy — an '
+      + 'unconfigured compose tool that mails anyone the model names would ship a '
+      + "prompt-injection hole. Pass 'linked', an allowlist array, or a predicate.",
+    );
+  }
+  const transport = emailTransport({
+    serverToken: options.serverToken,
+    from: options.from,
+    inboundAddress: options.inboundAddress,
+    messageStream: options.messageStream,
+    // A mail that OPENS a correspondence, not one answering a message.
+    autoSubmitted: 'auto-generated',
+    fetchImpl: options.fetchImpl,
+  });
+  // Everything deliverOnce needs, supplied directly — no channel registration
+  // required. Postmark has no send idempotency key, so the tier is `retry`
+  // (declared): a crash in the post-confirm window may re-send.
+  const def = { transport, lens: emailLens, onUncertainDelivery: 'retry' as const };
+
+  return {
+    name: options.name ?? 'compose_email',
+    description: options.description
+      ?? 'Compose and send a NEW email to a specific address. Use this only to reach '
+      + 'someone this conversation is not already talking to — the person you are '
+      + 'conversing with receives your replies automatically, and composing to them '
+      + 'would deliver twice. The recipient must be allowed by the application\'s '
+      + 'policy; a refusal comes back as { refused: true } — do not retry the same '
+      + 'address. `attachments` takes ids of files already in this conversation.',
+    args: {
+      type: 'object',
+      properties: {
+        to: { type: 'string', description: 'The recipient address' },
+        subject: { type: 'string' },
+        body: { type: 'string', description: 'Plain text body' },
+        attachments: {
+          type: 'array', items: { type: 'string' },
+          description: 'Attachment ids (att…) from this conversation to include',
+        },
+      },
+      required: ['to', 'subject', 'body'],
+    },
+    gate: options.gate ?? 'ask',
+    async run(args: { to: string; subject: string; body: string; attachments?: string[] }, ctx) {
+      const to = String(args.to ?? '').trim().toLowerCase();
+      if (!EMAIL_SHAPE.test(to)) return { refused: true, reason: 'invalid-recipient' };
+      const session = { sessionId: ctx.sessionId, userId: ctx.userId };
+      if (!(await recipientAllowed(options.recipients, to, session))) {
+        return { refused: true, reason: 'recipient-not-allowed', to };
+      }
+
+      // Refs → hydrated files, SESSION-SCOPED: an id from another conversation
+      // reads as missing. The model supplies ids to files trusted code already
+      // holds; it never supplies bytes.
+      const ids = Array.isArray(args.attachments)
+        ? args.attachments.filter((x): x is string => typeof x === 'string')
+        : [];
+      const files: ChannelAttachment[] = [];
+      const missing: string[] = [];
+      for (const id of ids) {
+        // eslint-disable-next-line no-await-in-loop
+        const row = await AgentAttachments.findOneAsync({ _id: id, sessionId: ctx.sessionId });
+        if (row) {
+          files.push({
+            name: row.name, contentType: row.contentType, size: row.size, content: row.content,
+          });
+        } else missing.push(id);
+      }
+      const caps = DEFAULT_ATTACHMENT_CAPS;
+      const total = files.reduce((sum, f) => sum + f.size, 0);
+      if (files.length > caps.maxFiles || total > caps.maxTotalBytes) {
+        return {
+          refused: true,
+          reason: 'attachments-over-limit',
+          detail: `${files.length} files, ${prettySize(total)} — the limits are ${caps.maxFiles} files / ${prettySize(caps.maxTotalBytes)}`,
+        };
+      }
+
+      // Decision 8: no thread key. Reply-To is the PLAIN inbound address, so
+      // the recipient's answer opens their own fresh conversation.
+      const destination: EmailDestination = {
+        to, subject: String(args.subject ?? ''), replyKey: '',
+      };
+      // The receipt id derives from the TOOL CALL: dispatch's crash-recovery
+      // re-run collides on it and reads the settled receipt instead of
+      // re-sending. A caller outside dispatch (a test driving run directly,
+      // with no toolCallId) gets a random key — and no idempotency, which is
+      // exactly what "no idempotency key" should cost.
+      const binding = {
+        _id: `compose:email:${ctx.toolCallId ?? randomBytes(9).toString('hex')}`,
+        kind: 'email',
+        destination,
+      };
+      const item: DeliveryItem = {
+        item: 'reply',
+        text: String(args.body ?? ''),
+        ...(files.length > 0 ? { attachments: files } : {}),
+      };
+      const outcome = await deliverOnce(binding, item, 'send', { def });
+      if (outcome === 'delivered') {
+        return {
+          sent: true, to, subject: destination.subject,
+          ...(files.length > 0 ? { attached: files.map((f) => f.name) } : {}),
+          ...(missing.length > 0 ? { missingAttachments: missing } : {}),
+        };
+      }
+      // 'abandoned': the attempt cap gave up on a payload the provider keeps
+      // rejecting. 'deferred': a previous attempt's receipt is inside its
+      // backoff window — in flight, not sent. Both are facts the model can
+      // relay, not errors to throw.
+      return { sent: false, state: outcome, to };
+    },
   };
 }

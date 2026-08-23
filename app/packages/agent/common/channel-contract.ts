@@ -16,6 +16,46 @@ import type { AgentMessage } from './types';
  * registry instead. Today only the server entry re-exports it; a client may.
  */
 
+// ---- Attachments (email v2 spec §4) ----------------------------------------
+
+/**
+ * A file riding a DELIVERY ITEM at render time: hydrated, base64 `content`.
+ * A lens never fetches — by the time `out` sees the item, the bytes are in it
+ * (the egress worker hydrates refs from the store on the POST path, the same
+ * lazy seam verdict-token minting uses). Base64 end to end, deliberately:
+ * providers emit and demand it, the contract stays isomorphic (no `Buffer`),
+ * and decoding to binary in between would buy nothing.
+ */
+export interface ChannelAttachment {
+  name: string;
+  contentType: string;
+  /** DECODED byte count — what a human-readable size line should say. */
+  size: number;
+  /** The bytes, base64. */
+  content: string;
+}
+
+/**
+ * The naming-clause FLOOR for a surface that cannot carry bytes (§8.5's
+ * degrade, downward from the full row): one text line per file, appended to
+ * the rendered text so the recipient learns the file exists and what it is
+ * called. Email renders real provider attachments instead; carrying actual
+ * bytes to the chat surfaces is future work per surface — naming them is the
+ * floor, and the floor is mandatory (`assertLensRoundTrip`'s naming check).
+ * Empty string when there is nothing to name, so call sites can append
+ * unconditionally.
+ */
+export function attachmentNotice(
+  attachments?: ChannelAttachment[],
+  /** A surface's own text escaping (Slack's `&<>`), applied to each name —
+   *  names ultimately come through tool bodies and deserve the same handling
+   *  as any other text landing in live markup. */
+  escape: (name: string) => string = (n) => n,
+): string {
+  if (!attachments || attachments.length === 0) return '';
+  return attachments.map((a) => `\n[file attached: ${escape(a.name)}]`).join('');
+}
+
 // ---- Delivery items (§8.2) — what the planner can say ----------------------
 
 /** One choice a prompt offers. `token` is CANONICAL (`approve`/`deny`) — the
@@ -41,8 +81,13 @@ export interface PromptChoice {
 export type DeliveryItem =
   /** The turn's answer — opaque text, passed through. The core never parses
    *  it (no markdown parser in the shared core, §8.5); a lens that wants
-   *  Slack markup or email HTML converts inside its own `out`. */
-  | { item: 'reply'; text: string }
+   *  Slack markup or email HTML converts inside its own `out`.
+   *
+   *  `attachments` is a SIDECAR, not a new item kind: a file almost never
+   *  travels alone (email sends body + files as one message), and a separate
+   *  `file` item would post two mails for one answer. Every lens must account
+   *  for it — see the naming clause in `assertLensRoundTrip`. */
+  | { item: 'reply'; text: string; attachments?: ChannelAttachment[] }
   /** A harness note the channel opted into (`statuses` in the channel def).
    *  Structured token in, surface prose out — the lens is a second `noteText`. */
   | {
@@ -71,8 +116,11 @@ export type DeliveryItem =
   }
   /** A reply that would not fit the profile's `limit`: a MECHANICAL head-slice
    *  (the worker never calls a model — no summarization) plus, when the
-   *  audience rules allow one, a link to the session's web view. */
-  | { item: 'overflow'; head: string; url?: string };
+   *  audience rules allow one, a link to the session's web view.
+   *
+   *  Overflow KEEPS its files: the TEXT overflowed, not the work product — a
+   *  truncated cover note must not cost the recipient the report. */
+  | { item: 'overflow'; head: string; url?: string; attachments?: ChannelAttachment[] };
 
 /** Every `item` discriminant, for the totality test and for lens authors who
  *  want to switch exhaustively. Kept adjacent to the union so they cannot
@@ -131,6 +179,14 @@ export interface InboundReading {
    *  URL-verification `challenge` is the canonical case. Ignored on routable
    *  intents, whose 200 carries no body. */
   respond?: string;
+  /**
+   * Files the provider delivered with a `message` intent, already base64 (the
+   * lens passes through what the webhook carried, minus inline/`ContentID`
+   * entries). CAPS ARE NOT THE LENS'S JOB: admission policy is core policy —
+   * the pipeline applies the channel's caps, keeps what passes, stores the
+   * bytes, and notes what it dropped. The lens translates.
+   */
+  attachments?: ChannelAttachment[];
 }
 
 // ---- The lens itself (§8.3) ------------------------------------------------
@@ -338,10 +394,23 @@ export function expectationsFor(
 // ---- The one law, as a test (§8.3 / §8.7) ----------------------------------
 
 /** Canonical exemplars, one per item kind — the default corpus
- *  `assertLensRoundTrip` renders when the caller supplies none. */
+ *  `assertLensRoundTrip` renders when the caller supplies none. The corpus
+ *  carries a FILE-BEARING reply as well as a bare one, so every lens meets a
+ *  file and the naming clause below is exercised by default — a surface that
+ *  cannot carry bytes must still say the file's name. */
 export function exemplarItems(): DeliveryItem[] {
   return [
     { item: 'reply', text: 'The order shipped this morning.' },
+    {
+      item: 'reply',
+      text: 'The summary is attached.',
+      attachments: [{
+        name: 'report.csv',
+        contentType: 'text/csv',
+        size: 21,
+        content: 'aWQsdG90YWwKMSwyMDAKMiwzNTAK',   // "id,total\n1,200\n2,350\n"
+      }],
+    },
     { item: 'status', kind: 'error', reason: 'provider-failed' },
     {
       item: 'prompt',
@@ -435,6 +504,25 @@ export function assertLensRoundTrip(
         `[10thfloor:agent] lens.out returned nothing for a '${item.item}' item — `
         + 'every lens must render all four items (totality, spec §8.7).',
       );
+    }
+
+    // THE NAMING CLAUSE (email v2 spec §10): a rendered item's attachments
+    // must each appear BY NAME in the payload — as a real provider attachment
+    // (email's `Name` field) or as a textual notice ("file attached:
+    // report.csv"). What it forbids is silence: no lens may render a
+    // file-bearing item and drop the file without a trace.
+    if ((item.item === 'reply' || item.item === 'overflow') && item.attachments) {
+      const rendered = JSON.stringify(payload);
+      for (const a of item.attachments) {
+        if (!rendered.includes(a.name)) {
+          throw new Error(
+            `[10thfloor:agent] round-trip failed: a '${item.item}' item carried the `
+            + `attachment "${a.name}" but its name does not appear in the rendered `
+            + 'payload. A lens that cannot carry bytes must still NAME the file '
+            + '(the naming clause) — silently vanishing a file is forbidden.',
+          );
+        }
+      }
     }
 
     if (item.item === 'prompt' && profile.interact === 'link') {

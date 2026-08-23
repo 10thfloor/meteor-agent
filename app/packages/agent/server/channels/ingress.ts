@@ -9,6 +9,8 @@ import {
   receiptIdFor, promptSuffix,
 } from './collections';
 import { LINK_GESTURE, matchExpectation, type InboundReading } from '../../common/channel-contract';
+import { admitInboundAttachments } from '../attachments';
+import type { AttachmentRef } from '../../common/types';
 import { deliverOnce } from './egress';
 import { issueLinkToken, resolveIdentity } from './linking';
 import { getChannel, listChannels, type ChannelDef, type RawInbound } from './registry';
@@ -347,7 +349,31 @@ async function route(
         );
         return { status: 200 };
       }
-      await sendToSession(binding.agent, binding.sessionId, intent.text, userId);
+
+      // Files the event carried (email v2 spec §6): admission is CORE policy —
+      // apply the channel's caps, store what passes, and append one bracket
+      // note per rejected file so the model and the web transcript both see
+      // exactly what the agent actually has. `attachments: false` restores
+      // v1's ignore-them behavior. An attachment-only event (empty text, kept
+      // files — or dropped files whose notes are the whole story) is a
+      // MESSAGE now; only an event with no text, no files kept and nothing to
+      // report settles without a send.
+      let text = intent.text;
+      let refs: AttachmentRef[] | undefined;
+      if (def.attachments !== false && reading.attachments?.length) {
+        const admitted = await admitInboundAttachments(
+          binding.sessionId, reading.attachments, def.attachments || undefined,
+        );
+        if (admitted.refs.length > 0) refs = admitted.refs;
+        if (admitted.notes.length > 0) {
+          text = [text, ...admitted.notes].filter((s) => s !== '').join('\n');
+        }
+      }
+      if (text === '' && !refs) return { status: 200 };
+      await sendToSession(
+        binding.agent, binding.sessionId, text, userId,
+        refs ? { attachments: refs } : undefined,
+      );
       return { status: 200 };
     }
 
@@ -430,13 +456,15 @@ class BodyTooLarge extends Error {
 }
 
 /** Read the whole request body UNPARSED: signature schemes sign raw bytes, and
- *  a re-serialized body never verifies. Capped — see `MAX_INBOUND_BYTES`. */
-function readRawBody(req: any): Promise<string> {
+ *  a re-serialized body never verifies. Capped — `MAX_INBOUND_BYTES` unless
+ *  the channel declared its own ceiling (`maxInboundBytes` — email's webhook
+ *  legitimately carries tens of MB of base64'd attachments). */
+function readRawBody(req: any, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
     // Honor a declared length first: a truthful oversize client is refused
     // before a single chunk is buffered.
     const declared = Number(req.headers?.['content-length']);
-    if (Number.isFinite(declared) && declared > MAX_INBOUND_BYTES) {
+    if (Number.isFinite(declared) && declared > maxBytes) {
       reject(new BodyTooLarge());
       return;
     }
@@ -445,7 +473,7 @@ function readRawBody(req: any): Promise<string> {
     req.setEncoding('utf8');
     req.on('data', (chunk: string) => {
       size += Buffer.byteLength(chunk, 'utf8');
-      if (size > MAX_INBOUND_BYTES) {
+      if (size > maxBytes) {
         // Stop reading and close the socket — do not keep buffering while a
         // lying client streams past its declared length.
         req.destroy();
@@ -468,11 +496,12 @@ function readRawBody(req: any): Promise<string> {
 export function mountChannelRoutes(webAppHandlers: {
   use(path: string, fn: (req: any, res: any, next: () => void) => void): void;
 }): void {
-  for (const [kind] of listChannels()) {
+  for (const [kind, def] of listChannels()) {
+    const maxBytes = def.maxInboundBytes ?? MAX_INBOUND_BYTES;
     webAppHandlers.use(`/agent/channels/${kind}`, (req: any, res: any) => {
       void (async () => {
         try {
-          const rawBody = await readRawBody(req);
+          const rawBody = await readRawBody(req, maxBytes);
           // `originalUrl`, not `url`: under `handlers.use('/agent/channels/<kind>', fn)`
           // express strips the mount prefix from `req.url`, and `RawInbound.url`
           // promises the path+query as Node saw it (a signature that covers the

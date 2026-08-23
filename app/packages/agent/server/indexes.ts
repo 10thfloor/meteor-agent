@@ -1,9 +1,11 @@
+import { Meteor } from 'meteor/meteor';
 import type { Mongo } from 'meteor/mongo';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
   ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
+import { AgentAttachments } from './attachments';
 import { NAMES } from '../common/names';
 
 /**
@@ -45,6 +47,10 @@ import { NAMES } from '../common/names';
  * deployment for no deployment. The queries are all still correct without them.
  */
 export async function ensureIndexes(): Promise<void> {
+  // The one package setting the store reads: how long attachment bytes live.
+  const retentionDays = Number(
+    (Meteor.settings as any)?.packages?.['10thfloor:agent']?.attachments?.retentionDays ?? 0,
+  ) || 0;
   const specs: Array<{
     collection: Pick<Mongo.Collection<any>, 'createIndexAsync'>;
     name: string;
@@ -124,6 +130,27 @@ export async function ensureIndexes(): Promise<void> {
       keys: { expiresAt: 1 },
       options: { expireAfterSeconds: 0 },
     },
+    // ---- Attachments (email v2 spec §5) -------------------------------------
+    // The staged-set scan (`{ sessionId, staged: true }`) at every create-with-
+    // attach and every turn-final claim, and the hydration reads — all lead
+    // with sessionId.
+    {
+      collection: AgentAttachments,
+      name: NAMES.attachments,
+      keys: { sessionId: 1 },
+    },
+    // Retention, when configured: caps bound a MESSAGE, TTL bounds a
+    // STRANGER'S PATIENCE — deployments that admit anonymous mail should set
+    // `attachments.retentionDays` so an unlinked sender's files do not occupy
+    // the store forever (§12). Unset = keep forever. NOTE: changing the value
+    // later needs the old index dropped by hand (`createIndex` cannot alter
+    // `expireAfterSeconds` in place) — the warning below names the failure.
+    ...(retentionDays > 0 ? [{
+      collection: AgentAttachments,
+      name: NAMES.attachments,
+      keys: { createdAt: 1 } as Record<string, 1 | -1>,
+      options: { expireAfterSeconds: Math.round(retentionDays * 24 * 60 * 60) },
+    }] : []),
   ];
 
   for (const spec of specs) {

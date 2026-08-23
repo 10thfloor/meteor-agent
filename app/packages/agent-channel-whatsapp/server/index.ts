@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -125,13 +125,15 @@ export const whatsappLens: Lens = {
   out(item: DeliveryItem): unknown {
     switch (item.item) {
       case 'reply':
-        return { type: 'text', text: { body: item.text } };
+        // The naming clause: no bytes on this surface yet (WhatsApp media is
+        // future work), so each file appears as a text line naming it.
+        return { type: 'text', text: { body: `${item.text}${attachmentNotice(item.attachments)}` } };
       case 'status':
         return { type: 'text', text: { body: statusProse(item) } };
       case 'overflow':
         return {
           type: 'text',
-          text: { body: `${item.head}${item.url ? `\n${item.url}` : ''}` },
+          text: { body: `${item.head}${item.url ? `\n${item.url}` : ''}${attachmentNotice(item.attachments)}` },
         };
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});

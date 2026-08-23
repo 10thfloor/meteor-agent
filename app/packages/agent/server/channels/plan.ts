@@ -53,10 +53,14 @@ function overflow(text: string, limit: number, url?: string): DeliveryItem {
 function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null {
   if (message.role === 'assistant') {
     // The turn-final signal: no toolCalls. Empty text is possible (a turn that
-    // ended on a refusal note) — nothing to say is nothing to post.
+    // ended on a refusal note) — nothing to say is nothing to post, UNLESS
+    // the row carries attachment refs: a file with no cover note is still a
+    // message (email v2 spec §8), and dropping it would vanish work product.
+    // The refs themselves are NOT attached here — the planner stays pure and
+    // byte-free; the egress worker hydrates them on the POST path.
     if (message.toolCalls && message.toolCalls.length > 0) return null;
     const text = message.content ?? '';
-    if (text === '') return null;
+    if (text === '' && !(message.attachments?.length)) return null;
     const limit = opts.profile.limit;
     if (limit !== undefined && text.length > limit) {
       return overflow(text, limit, opts.overflowUrl);

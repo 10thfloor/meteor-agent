@@ -1,5 +1,5 @@
 import {
-  channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
+  attachmentNotice, channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -114,11 +114,13 @@ export const telegramLens: Lens = {
         // Plain text, no parse_mode: Telegram's MarkdownV2 demands escaping
         // that mangles ordinary prose, and the core's rule stands — content
         // is opaque unless a surface opts into conversion. This one opts out.
-        return { text: item.text };
+        // The naming clause: no bytes on this surface yet, so each file
+        // appears as a text line naming it.
+        return { text: `${item.text}${attachmentNotice(item.attachments)}` };
       case 'status':
         return { text: statusProse(item) };
       case 'overflow':
-        return { text: `${item.head}${item.url ? `\n${item.url}` : ''}` };
+        return { text: `${item.head}${item.url ? `\n${item.url}` : ''}${attachmentNotice(item.attachments)}` };
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 800 ? `${args.slice(0, 800)}…` : args;

@@ -12,6 +12,7 @@ import {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
+import { AgentAttachments } from './attachments';
 import { listChannels } from './channels/registry';
 import { mountChannelRoutes } from './channels/ingress';
 import { startEgress, type EgressWorker } from './channels/egress';
@@ -68,12 +69,12 @@ export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 // `planItems`/`promptItem` — stay inside the package: nothing outside it has a
 // reason to call them, and the tests reach them by path.
 export {
-  assertLensRoundTrip, exemplarItems, matchExpectation,
+  assertLensRoundTrip, exemplarItems, matchExpectation, attachmentNotice,
   DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
   encodeVerdictPostback, decodeVerdictPostback,
-  type ChannelProfile, type ChannelTransport, type DeliveryItem,
-  type InboundIntent, type InboundReading, type Lens, type PromptChoice,
-  type RoundTripOptions,
+  type ChannelAttachment, type ChannelProfile, type ChannelTransport,
+  type DeliveryItem, type InboundIntent, type InboundReading, type Lens,
+  type PromptChoice, type RoundTripOptions,
 } from '../common/channel-contract';
 export {
   type ChannelDef, type ChannelKnobs, type RawInbound,
@@ -81,7 +82,7 @@ export {
 } from './channels/registry';
 export {
   startEgress, deliverOnce,
-  type EgressOptions, type EgressWorker,
+  type DeliverableBinding, type EgressOptions, type EgressWorker,
 } from './channels/egress';
 export { handleInbound, mountChannelRoutes } from './channels/ingress';
 export {
@@ -95,6 +96,16 @@ export {
   type ChannelVerdictToken, type DeliveryReceipt, type InboundSubmission,
   type ReceiptExpectation,
 } from './channels/collections';
+// Attachments (email v2 spec): the store, the caps, and the pieces a channel
+// package or a host needs — `Agent.attachments.create`/`.readTool` are the
+// blessed doors (agent.ts); these exports are for lens authors (the contract
+// types ride the channel-contract block above via `ChannelAttachment`) and for
+// hosts that read or prune the store themselves.
+export {
+  AgentAttachments, DEFAULT_ATTACHMENT_CAPS,
+  sanitizeAttachmentName, prettySize,
+  type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions,
+} from './attachments';
 
 /**
  * This process's boot watcher, or null when the settings or the environment
@@ -156,6 +167,8 @@ function denyAllClientWrites(): void {
     // without one — so the belt covers them identically.
     ChannelIdentities, ChannelBindings, DeliveryReceipts,
     InboundSubmissions, ChannelLinkTokens, ChannelVerdictTokens,
+    // The attachment store holds raw file bytes — the same lockout, doubly so.
+    AgentAttachments,
   ]) {
     (c as any).deny(deny);
   }
