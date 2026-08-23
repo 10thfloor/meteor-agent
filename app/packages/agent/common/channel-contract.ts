@@ -108,6 +108,17 @@ export interface InboundReading {
   intent: InboundIntent;
   eventId?: string;
   externalUserId?: string;
+  /**
+   * Whether the CHANNEL vouches that `externalUserId` really is who sent this
+   * event — the gate on resolving it to a linked account (§12). Omitted by
+   * provider-authenticated surfaces (the provider proved the id, so it is
+   * trustworthy to map to an account); set to `false` by a surface whose
+   * sender id is forgeable (email, unless the mail passed author-aligned DKIM)
+   * so the core keeps an unverified sender ANONYMOUS and a spoofed id cannot
+   * inherit a linked owner's account. Never gates ROUTING — an unverified
+   * sender still drives its own anonymous conversation; it gates only identity.
+   */
+  senderVerified?: boolean;
   conversationRef?: string;
   /** Where replies to this conversation go — stored on the binding at bind
    *  time, opaque to the core. */

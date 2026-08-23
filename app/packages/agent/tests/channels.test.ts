@@ -50,6 +50,9 @@ function testLens() {
         destination: { to: event.convo },
         // `group: true` on a test event models a surface others can see.
         audience: (event.group ? 'group' : 'direct') as 'group' | 'direct',
+        // A forgeable-sender surface (email) sets this false when the mail was
+        // not authenticated; omitted models a provider-authenticated surface.
+        ...(event.senderVerified !== undefined ? { senderVerified: event.senderVerified } : {}),
       };
       if (event.type === 'action') {
         return {
@@ -509,6 +512,50 @@ describe('channels', () => {
       // The opener still can.
       await handleInbound('test', raw({ type: 'action', token: 'approve', toolCallId: 'tc-g', id: 'o2', user: 'opener', convo: 'thread', group: true }));
       assert.isDefined(await AgentMessages.findOneAsync({ sessionId: binding.sessionId, kind: 'approval' }), 'the opener decides their own ask');
+    });
+
+    it('a direct thread whose ref is not the sender (email-shaped) still rejects a stranger', async () => {
+      // Email's conversationRef is a THREAD key, not the sender, so a Cc'd or
+      // reply-all party reaches the opener's binding with a different id. The
+      // opener guard must fire even though the audience is 'direct' — the
+      // provider-keyed surfaces are unaffected (there the ref embeds the
+      // sender, so a stranger is a different binding and this never arises).
+      await registerTestChannel();
+      const { handleInbound } = await import('../server/channels/ingress');
+      const { AgentMessages } = await import('../common/collections');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      await handleInbound('test', raw({ type: 'msg', text: 'opener here', id: 'd1', user: 'ada', convo: 'thread-x' }));
+      const binding = (await ChannelBindings.findOneAsync('test:thread-x'))!;
+      assert.equal(binding.userId, null, 'anonymous conversation');
+      assert.equal(binding.audience, 'direct');
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+
+      // A different sender on the SAME thread — the shared-key stranger.
+      await handleInbound('test', raw({ type: 'msg', text: 'me too', id: 'd2', user: 'bob', convo: 'thread-x' }));
+      assert.equal(
+        await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync(), before,
+        'a stranger on a direct thread injects nothing',
+      );
+    });
+
+    it('an unverified sender never resolves to a linked account (the email spoof gate)', async () => {
+      // ext-x is a linked identity. A surface whose sender id is forgeable
+      // (email without author-aligned DKIM) marks the reading senderVerified:
+      // false — and the pipeline must then treat the sender as anonymous, so a
+      // spoofed `From: ext-x` cannot act as the account ext-x linked to.
+      await registerTestChannel();
+      const { handleInbound } = await import('../server/channels/ingress');
+      const { linkIdentity } = await import('../server/channels/linking');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      await linkIdentity('test', 'ext-x', 'acct-1', 'oidc');
+
+      await handleInbound('test', raw({ type: 'msg', text: 'spoofed', id: 'u1', user: 'ext-x', convo: 'thread-spoof', senderVerified: false }));
+      const spoofed = (await ChannelBindings.findOneAsync('test:thread-spoof'))!;
+      assert.equal(spoofed.userId, null, 'unverified sender stays anonymous despite the linked identity');
+
+      await handleInbound('test', raw({ type: 'msg', text: 'genuine', id: 'u2', user: 'ext-x', convo: 'thread-real', senderVerified: true }));
+      const genuine = (await ChannelBindings.findOneAsync('test:thread-real'))!;
+      assert.equal(genuine.userId, 'acct-1', 'a verified sender resolves to the linked account');
     });
 
     it('a native postback carries its ask and is dropped when the ask changed', async () => {

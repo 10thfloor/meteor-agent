@@ -282,7 +282,17 @@ async function route(
     return { status: 200 };
   }
 
-  const identity = reading.externalUserId !== undefined
+  // Identity resolution is gated on the channel VOUCHING for the sender's
+  // claimed id (§12). Provider-authenticated surfaces (SMS/WhatsApp/Slack/
+  // Telegram) leave `senderVerified` undefined — the provider already proved
+  // the number or account, so the external id is trustworthy to map to a
+  // linked account. Email is forgeable: its lens sets `senderVerified: false`
+  // unless the inbound mail passed author-aligned DKIM, and an UNVERIFIED
+  // sender must never resolve to a linked identity — else a spoofed `From:`
+  // inherits the victim's account (send AND approve, as the owner). An
+  // unverified sender still drives its OWN anonymous conversation (below);
+  // it just cannot become someone who linked.
+  const identity = reading.externalUserId !== undefined && reading.senderVerified !== false
     ? await resolveIdentity(kind, reading.externalUserId)
     : null;
   const binding = await bindConversation(kind, def, reading.conversationRef, reading, identity);
@@ -298,16 +308,28 @@ async function route(
   // is a courier, not an authority.
   const userId = identity?.userId ?? null;
 
-  // GROUP surfaces, anonymous conversation: only the OPENER may drive it.
-  // `requireSession` scopes OWNED sessions, but an anonymous (`userId: null`)
-  // session matches every unlinked caller — so on a surface where others can
-  // see the conversation, any member could send into it or press Approve on
-  // someone else's ask. The binding recorded who opened it; until someone
-  // links, that is the only party with standing. Settled silently: a refusal
-  // posted into the thread is itself a spam channel.
+  // Anonymous conversation: only the OPENER may drive it. `requireSession`
+  // scopes OWNED sessions, but an anonymous (`userId: null`) session matches
+  // every unlinked caller — so anyone who can reach the conversation could
+  // send into it or press Approve on someone else's ask. The binding recorded
+  // who opened it; until someone links, that is the only party with standing.
+  // Settled silently: a refusal posted into the thread is itself a spam channel.
+  //
+  // This fires regardless of `audience`. It was once gated on
+  // `audience === 'group'`, on the assumption that a `direct` surface's
+  // conversationRef embeds the sender — true for SMS/WhatsApp/Slack-DM/
+  // Telegram-DM, where a different sender is a different binding, so the guard
+  // never trips for them either way. EMAIL breaks that assumption: its
+  // conversationRef is a THREAD key, and a Cc'd or reply-all party lands on the
+  // opener's binding with a different `From`. Dropping the audience condition
+  // closes that "impersonation by proximity" (approving someone else's parked
+  // ask, injecting messages into their session) without changing any
+  // provider-keyed surface. A rare legitimate case — the opener replying from
+  // a second address before linking — is refused too: the safe direction, and
+  // it resolves the moment they link.
   const opener = binding.externalUserId;
   if (
-    binding.audience === 'group' && binding.userId === null
+    binding.userId === null
     && opener !== undefined && reading.externalUserId !== opener
   ) {
     return { status: 200 };
