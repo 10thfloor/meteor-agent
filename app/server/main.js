@@ -137,12 +137,16 @@ if (channelCfg.sms?.accountSid && channelCfg.sms?.authToken && channelCfg.sms?.w
   }));
   registeredChannels.push('sms');
 }
-if (channelCfg.email?.serverToken && channelCfg.email?.inboundAddress
+if (channelCfg.email?.serverToken && channelCfg.email?.from && channelCfg.email?.inboundAddress
   && channelCfg.email?.webhookUser && channelCfg.email?.webhookPassword) {
   Agent.channel('email', email({
     agent: 'demo',
     serverToken: channelCfg.email.serverToken,
-    from: channelCfg.email.from ?? channelCfg.email.inboundAddress,
+    // Required: a VERIFIED Postmark Sender Signature. The inbound stream
+    // address cannot stand in for it — Postmark rejects any unverified From,
+    // which would wedge every send in the retry tier — so `from` gates
+    // registration rather than defaulting.
+    from: channelCfg.email.from,
     inboundAddress: channelCfg.email.inboundAddress,
     webhookUser: channelCfg.email.webhookUser,
     webhookPassword: channelCfg.email.webhookPassword,
@@ -211,19 +215,6 @@ Meteor.methods({
    * the token atomically, writes the identity row, and claims the anonymous
    * conversations that identity created. Returns what the UI needs to say.
    */
-  /**
-   * Decide a parked approval from an approval link — the email channel's
-   * `link` grammar. No login: the token IS the capability, addressed to the
-   * person the prompt was delivered to; the package burns it atomically,
-   * checks it names the CURRENTLY parked ask, and records the verdict as the
-   * session's owner. True when this click decided it; false for unknown,
-   * spent, expired, or stale — one indistinguishable answer, on purpose.
-   */
-  async 'demo.redeemVerdict'(token) {
-    check(token, String);
-    return redeemVerdictToken(token);
-  },
-
   async 'demo.linkChannel'(token) {
     check(token, String);
     if (!this.userId) {
@@ -235,6 +226,19 @@ Meteor.methods({
       throw new Meteor.Error('bad-token', 'That link is invalid or has expired. Ask the bot for a new one.');
     }
     return { kind: identity.kind, externalUserId: identity.externalUserId };
+  },
+
+  /**
+   * Decide a parked approval from an approval link — the email channel's
+   * `link` grammar. No login: the token IS the capability, addressed to the
+   * person the prompt was delivered to; the package burns it atomically,
+   * checks it names the CURRENTLY parked ask, and records the verdict as the
+   * session's owner. True when this click decided it; false for unknown,
+   * spent, expired, or stale — one indistinguishable answer, on purpose.
+   */
+  async 'demo.redeemVerdict'(token) {
+    check(token, String);
+    return redeemVerdictToken(token);
   },
 });
 

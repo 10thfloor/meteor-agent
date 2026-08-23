@@ -128,22 +128,37 @@ Meteor.startup(() => {
   // linking always completes from the authenticated side.
   const linkBox = $('link-box');
   let pendingLinkToken = null;
-  // An approval link from an email (the `link` grammar): redeem it right
-  // away — the token is the capability, no sign-in needed — and say what
-  // happened. Unknown, spent, expired and stale all read the same, on purpose.
+  // An approval link from an email (the `link` grammar). The token IS the
+  // capability — no sign-in — but redemption waits for an explicit CLICK, it
+  // does not run on load. Approval mails carry both the Approve and Deny URLs
+  // in plain text, and mail-security scanners (Defender SafeLinks, Proofpoint,
+  // Mimecast) fetch AND execute page JS on links before the human reads the
+  // mail; an auto-redeem on load would let a scanner silently decide the ask.
+  // A button needs a real click, which scanners do not perform — the same
+  // reason the sibling /link flow below redeems only on a user action.
   const verdictMatch = window.location.pathname.match(/^\/verdict\/([A-Za-z0-9_-]+)$/);
   if (verdictMatch) {
     const token = verdictMatch[1];
-    window.history.replaceState({}, '', '/');
+    window.history.replaceState({}, '', '/');   // keep the token out of history immediately
     linkBox.hidden = false;
-    linkBox.textContent = 'Recording your decision…';
-    Meteor.callAsync('demo.redeemVerdict', token).then((decided) => {
-      linkBox.textContent = decided
-        ? 'Decision recorded — the agent is continuing. You can close this tab.'
-        : 'That approval link is no longer valid: it was already used, it expired, or the request it answered has moved on.';
-    }).catch((err) => {
-      linkBox.textContent = err?.reason ?? 'Could not record the decision.';
+    linkBox.textContent = '';
+    const prompt = document.createElement('p');
+    prompt.textContent = 'You opened an approval link from an email. Confirm to record your decision:';
+    const confirmBtn = document.createElement('button');
+    confirmBtn.type = 'button';
+    confirmBtn.textContent = 'Confirm decision';
+    confirmBtn.addEventListener('click', () => {
+      confirmBtn.disabled = true;
+      linkBox.textContent = 'Recording your decision…';
+      Meteor.callAsync('demo.redeemVerdict', token).then((decided) => {
+        linkBox.textContent = decided
+          ? 'Decision recorded — the agent is continuing. You can close this tab.'
+          : 'That approval link is no longer valid: it was already used, it expired, or the request it answered has moved on.';
+      }).catch((err) => {
+        linkBox.textContent = err?.reason ?? 'Could not record the decision.';
+      });
     });
+    linkBox.append(prompt, confirmBtn);
   }
 
   const linkMatch = window.location.pathname.match(/^\/link\/([A-Za-z0-9_-]+)$/);
