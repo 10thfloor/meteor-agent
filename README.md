@@ -587,7 +587,8 @@ app/packages/agent/                   the package (this is what ships)
 app/packages/agent-channel-slack/     Slack surface     ┐
 app/packages/agent-channel-telegram/  Telegram surface  │ one lens, one
 app/packages/agent-channel-whatsapp/  WhatsApp surface  │ transport each
-app/packages/agent-channel-sms/       SMS (Twilio)      ┘
+app/packages/agent-channel-sms/       SMS (Twilio)      │
+app/packages/agent-channel-email/     Email (Postmark)  ┘
 app/                                  host app: test harness + the demo chat
 docs/superpowers/                     design spec + per-milestone implementation plans
 scripts/verify-build.sh               proves the loader against a real production bundle
@@ -626,14 +627,16 @@ The sixth addition is **channels** — multi-surface delivery per the
 the lens contract with its round-trip test, the watcher-shaped egress worker,
 the generic webhook pipeline, exactly-once admission, receipt-backed delivery,
 and account linking. Server-side `agent.send/approve/deny({ userId })` landed
-with it. The core takes no provider SDK dependency; four surface packages
+with it. The core takes no provider SDK dependency; five surface packages
 prove the contract, each one lens + one transport + zero npm dependencies:
 **[Slack](app/packages/agent-channel-slack/README.md)**,
 **[Telegram](app/packages/agent-channel-telegram/README.md)**,
-**[WhatsApp](app/packages/agent-channel-whatsapp/README.md)**, and
-**[SMS/Twilio](app/packages/agent-channel-sms/README.md)** — the last being
-the design's stress test (no buttons, no threads: approvals ride the
-receipt-registered "Reply YES/NO" grammar).
+**[WhatsApp](app/packages/agent-channel-whatsapp/README.md)**,
+**[SMS/Twilio](app/packages/agent-channel-sms/README.md)** — the design's
+stress test (no buttons, no threads: approvals ride the receipt-registered
+"Reply YES/NO" grammar) — and **[Email/Postmark](app/packages/agent-channel-email/README.md)**,
+where the conversation is a thread recovered statelessly from our own
+Reply-To address and approvals are single-use Approve/Deny links.
 
 CI runs the full suite plus a production-bundle verification on every push.
 

@@ -128,6 +128,24 @@ Meteor.startup(() => {
   // linking always completes from the authenticated side.
   const linkBox = $('link-box');
   let pendingLinkToken = null;
+  // An approval link from an email (the `link` grammar): redeem it right
+  // away — the token is the capability, no sign-in needed — and say what
+  // happened. Unknown, spent, expired and stale all read the same, on purpose.
+  const verdictMatch = window.location.pathname.match(/^\/verdict\/([A-Za-z0-9_-]+)$/);
+  if (verdictMatch) {
+    const token = verdictMatch[1];
+    window.history.replaceState({}, '', '/');
+    linkBox.hidden = false;
+    linkBox.textContent = 'Recording your decision…';
+    Meteor.callAsync('demo.redeemVerdict', token).then((decided) => {
+      linkBox.textContent = decided
+        ? 'Decision recorded — the agent is continuing. You can close this tab.'
+        : 'That approval link is no longer valid: it was already used, it expired, or the request it answered has moved on.';
+    }).catch((err) => {
+      linkBox.textContent = err?.reason ?? 'Could not record the decision.';
+    });
+  }
+
   const linkMatch = window.location.pathname.match(/^\/link\/([A-Za-z0-9_-]+)$/);
   if (linkMatch) {
     pendingLinkToken = linkMatch[1];
