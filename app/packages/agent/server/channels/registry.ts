@@ -100,6 +100,27 @@ export interface ChannelDef {
    *  the brake on a flood, not an accounting system. Default 30 events per
    *  60s per sender. */
   throttle?: { limit: number; intervalMs: number };
+  /**
+   * Inbound attachment admission for this surface (email v2 spec §5). `false`
+   * restores the ignore-them behavior (files are dropped without a store
+   * write or a note); an object overrides the default caps
+   * (`DEFAULT_ATTACHMENT_CAPS` — 5 MB/file, 5 files, 6 MB/message); absent
+   * means the defaults. Caps are CORE policy, applied by the pipeline at
+   * admission — never by the lens, which only translates.
+   */
+  attachments?: false | { maxFileBytes?: number; maxFiles?: number; maxTotalBytes?: number };
+  /**
+   * The webhook body ceiling for THIS surface, when the shared default
+   * (`MAX_INBOUND_BYTES`, 1 MB) is too small for the provider's honest
+   * payloads. Email needs it: Postmark delivers up to 35 MB of cumulative
+   * attachments base64'd INSIDE the webhook JSON, and a 1 MB cap would 413
+   * the whole mail — text included — before the lens ever saw it. The read
+   * still happens BEFORE signature verification, so this is a per-surface
+   * trade the channel makes knowingly; admission caps then decide what is
+   * KEPT (parsing the body is the provider's ceiling, not ours to change
+   * from below — email v2 spec §11).
+   */
+  maxInboundBytes?: number;
 }
 
 /** The knobs a tier-1 factory forwards to the core untouched (§8.7): a
@@ -107,7 +128,9 @@ export interface ChannelDef {
  *  them to `Agent.channel` as-is, so the package neither re-documents nor
  *  re-validates what the core already owns. */
 export type ChannelKnobs = Pick<
-  ChannelDef, 'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
+  ChannelDef,
+  'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
+  | 'attachments' | 'maxInboundBytes'
 >;
 
 /** The value-side twin of `ChannelKnobs`, and its totality check: the keys a
@@ -116,6 +139,7 @@ export type ChannelKnobs = Pick<
  *  option in four packages. */
 export const CHANNEL_KNOB_KEYS = [
   'statuses', 'onUncertainDelivery', 'sessionUrl', 'linkUrl', 'throttle',
+  'attachments', 'maxInboundBytes',
 ] as const satisfies ReadonlyArray<keyof ChannelKnobs>;
 
 /** The knobs PRESENT on `options`, and nothing else — what a tier-1 factory
@@ -167,6 +191,12 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   )) {
     throw new Error(`[10thfloor:agent] channel "${kind}": def.throttle must be { limit > 0, intervalMs > 0 }`);
   }
+  // A non-positive body cap would refuse every webhook silently — the same
+  // "half-specified knob" failure the throttle check catches.
+  if (def.maxInboundBytes !== undefined
+    && !(Number.isFinite(def.maxInboundBytes) && def.maxInboundBytes > 0)) {
+    throw new Error(`[10thfloor:agent] channel "${kind}": def.maxInboundBytes must be a positive number`);
+  }
   if (def.onUncertainDelivery === 'reconcile' && typeof def.transport.reconcile !== 'function') {
     throw new Error(
       `[10thfloor:agent] channel "${kind}": onUncertainDelivery 'reconcile' needs `
@@ -201,8 +231,11 @@ export function _clearChannels(): void {
 
 /** The declared recovery for a `sending` receipt (§11) — see
  *  `ChannelDef.onUncertainDelivery` for why the default depends on the
- *  transport's capability. */
-export function uncertainDeliveryMode(def: ChannelDef): 'reconcile' | 'retry' | 'abandon' {
+ *  transport's capability. A PICK because `deliverOnce` may be handed a bare
+ *  transport+lens (compose's explicit def) rather than a registered channel. */
+export function uncertainDeliveryMode(
+  def: Pick<ChannelDef, 'transport' | 'onUncertainDelivery'>,
+): 'reconcile' | 'retry' | 'abandon' {
   if (def.onUncertainDelivery) return def.onUncertainDelivery;
   return typeof def.transport.reconcile === 'function' ? 'reconcile' : 'retry';
 }

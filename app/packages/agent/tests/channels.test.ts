@@ -33,9 +33,13 @@ function msg(over: Partial<AgentMessage> & { sessionId: string; seq: number }): 
 function testLens() {
   return {
     out(item: DeliveryItem): unknown {
-      if (item.item === 'reply') return { text: item.text };
+      // The naming clause: a text surface names each file it cannot carry.
+      const files = (item.item === 'reply' || item.item === 'overflow')
+        ? (item.attachments ?? []).map((a) => ` [file: ${a.name}]`).join('')
+        : '';
+      if (item.item === 'reply') return { text: `${item.text}${files}` };
       if (item.item === 'status') return { text: `[${item.kind}] ${item.reason ?? ''}` };
-      if (item.item === 'overflow') return { text: `${item.head}${item.url ? ` ${item.url}` : ''}` };
+      if (item.item === 'overflow') return { text: `${item.head}${item.url ? ` ${item.url}` : ''}${files}` };
       const menu = item.choices
         .map((c) => (c.match ? `Reply ${c.match} to ${c.label.toLowerCase()}` : c.url ? `${c.label}: ${c.url}` : c.label))
         .join(', ');
@@ -65,7 +69,12 @@ function testLens() {
         };
       }
       if (event.type === 'link') return { intent: { kind: 'link-request' }, ...envelope };
-      return { intent: { kind: 'message', text: event.text }, ...envelope };
+      return {
+        intent: { kind: 'message', text: event.text },
+        ...envelope,
+        // Files a test event carries — the email-shaped pass-through.
+        ...(event.files ? { attachments: event.files } : {}),
+      };
     },
   };
 }
@@ -136,8 +145,10 @@ async function cleanChannels() {
   } = await import('../server/channels/collections');
   const { _clearThrottle } = await import('../server/channels/ingress');
   const { _clearChannels } = await import('../server/channels/registry');
+  const { AgentAttachments } = await import('../server/attachments');
   await AgentSessions.removeAsync({});
   await AgentMessages.removeAsync({});
+  await AgentAttachments.removeAsync({});
   await ChannelBindings.removeAsync({});
   await ChannelIdentities.removeAsync({});
   await ChannelLinkTokens.removeAsync({});
@@ -354,7 +365,9 @@ describe('channels', () => {
       const byUnion: Record<DeliveryItem['item'], Listed> = { reply: 'reply', status: 'status', prompt: 'prompt', overflow: 'overflow' };
       const byList: Record<Listed, DeliveryItem['item']> = byUnion;
       void byList;
-      assert.sameMembers(exemplarItems().map((i) => i.item), [...DELIVERY_ITEM_KINDS], 'the default corpus covers every kind exactly once');
+      // Every kind is covered; `reply` appears twice on purpose (a bare one
+      // and a file-bearing one, so the naming clause is exercised by default).
+      assert.sameMembers([...new Set(exemplarItems().map((i) => i.item))], [...DELIVERY_ITEM_KINDS], 'the default corpus covers every kind');
     });
   });
 
@@ -412,6 +425,56 @@ describe('channels', () => {
       assert.deepEqual(session.channel, { origin: 'test', assurance: 'none' });
       const users = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).fetchAsync();
       assert.deepEqual(users.map((u) => u.content), ['hello']);
+    });
+
+    it('admits inbound files under the channel caps: refs ride the user row, rejections become notes', async () => {
+      await registerTestChannel({ attachments: { maxFileBytes: 10 } });
+      const { handleInbound } = await import('../server/channels/ingress');
+      const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+      const out = await handleInbound('test', raw({
+        type: 'msg', text: 'the data is attached', id: 'e1', user: 'u1', convo: 'c1',
+        files: [
+          { name: 'data.csv', contentType: 'text/csv', size: 8, content: b64('a,b\n1,2\n') },
+          { name: 'big.bin', contentType: 'application/octet-stream', size: 20, content: b64('x'.repeat(20)) },
+        ],
+      }));
+      assert.equal(out.status, 200);
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const { AgentMessages } = await import('../common/collections');
+      const { AgentAttachments } = await import('../server/attachments');
+      const binding = (await ChannelBindings.findOneAsync('test:c1'))!;
+      const user = (await AgentMessages.findOneAsync({ sessionId: binding.sessionId, role: 'user' }))!;
+      assert.equal(user.attachments!.length, 1, 'the kept file rides the row as a ref');
+      assert.equal(user.attachments![0].name, 'data.csv');
+      assert.match(user.content!, /^the data is attached\n\[file "big\.bin" \(20 bytes\) exceeded the 10 bytes limit/);
+      const stored = (await AgentAttachments.findOneAsync({ _id: user.attachments![0].id }))!;
+      assert.equal(stored.sessionId, binding.sessionId);
+      assert.equal(Buffer.from(stored.content, 'base64').toString('utf8'), 'a,b\n1,2\n');
+    });
+
+    it('an attachment-only event is a message now, and `attachments: false` restores v1', async () => {
+      await registerTestChannel();
+      const { handleInbound } = await import('../server/channels/ingress');
+      const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+      const file = { name: 'answer.txt', contentType: 'text/plain', size: 3, content: b64('yes') };
+      await handleInbound('test', raw({ type: 'msg', text: '', id: 'e1', user: 'u1', convo: 'c1', files: [file] }));
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const { AgentMessages } = await import('../common/collections');
+      const binding = (await ChannelBindings.findOneAsync('test:c1'))!;
+      const user = (await AgentMessages.findOneAsync({ sessionId: binding.sessionId, role: 'user' }))!;
+      assert.equal(user.content, '', 'empty text, a message even so');
+      assert.equal(user.attachments![0].name, 'answer.txt');
+
+      // The opt-out: files dropped without a store write, a ref or a note —
+      // and an attachment-only event is then nothing at all: no user row.
+      await registerTestChannel({ attachments: false });
+      await handleInbound('test', raw({ type: 'msg', text: '', id: 'e2', user: 'u2', convo: 'c2', files: [file] }));
+      const b2 = await ChannelBindings.findOneAsync('test:c2');
+      if (b2) {
+        assert.equal(await AgentMessages.find({ sessionId: b2.sessionId, role: 'user' }).countAsync(), 0);
+      }
+      const { AgentAttachments } = await import('../server/attachments');
+      assert.equal(await AgentAttachments.find({ name: 'answer.txt' }).countAsync(), 1, 'only the admitted copy exists');
     });
 
     it('repairs a binding whose session is missing (the crash window) with the OWNER\'s assurance, not the sender\'s', async () => {
@@ -713,6 +776,39 @@ describe('channels', () => {
       await ChannelBindings.updateAsync('test:conv', { $set: { deliveredSeq: 0 } });
       await deliverBinding('test', 'test:conv');
       assert.equal(transport.posts.length, 2, 'replay found receipts and posted nothing');
+    });
+
+    it('hydrates a file-bearing reply on the POST path, and an expired ref becomes a note, not a wedge', async () => {
+      // A lens that CARRIES bytes (the email shape): attachments ride the
+      // payload as `files`; the item arrives hydrated — the lens never fetches.
+      const base = testLens();
+      const byteLens = {
+        ...base,
+        out(item: DeliveryItem): unknown {
+          if (item.item === 'reply') return { text: item.text, files: item.attachments ?? [] };
+          return base.out(item);
+        },
+      };
+      const { transport } = await registerTestChannel({ lens: byteLens });
+      const { deliverBinding } = await import('../server/channels/egress');
+      const { createAttachment } = await import('../server/attachments');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await AgentSessions.insertAsync({ ...sessionBase, _id: 'sf', nextSeq: 2 } as any);
+      const ref = await createAttachment({
+        sessionId: 'sf', name: 'summary.csv', contentType: 'text/csv', content: 'a,b\n',
+      });
+      const gone = { id: 'attgone', name: 'expired.csv', contentType: 'text/csv', size: 4 };
+      await AgentMessages.insertAsync(msg({ sessionId: 'sf', seq: 0, role: 'user', content: 'q' }) as any);
+      await AgentMessages.insertAsync(msg({ sessionId: 'sf', seq: 1, content: 'the report', attachments: [ref, gone] }) as any);
+      await seedBinding('test:convf', { sessionId: 'sf', destination: { to: 'convf' } });
+      await deliverBinding('test', 'test:convf');
+      assert.equal(transport.posts.length, 1);
+      const p = transport.posts[0].payload as { text: string; files: Array<{ name: string; content: string }> };
+      assert.match(p.text, /^the report\n\[the file "expired\.csv" expired before this could be delivered\]$/);
+      assert.equal(p.files.length, 1, 'the courier never claims a file it did not deliver');
+      assert.equal(Buffer.from(p.files[0].content, 'base64').toString('utf8'), 'a,b\n', 'bytes hydrated from the store');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      assert.equal((await ChannelBindings.findOneAsync('test:convf'))!.deliveredSeq, 1, 'the conversation moved on');
     });
 
     it('sends the overflow link only where §8.5 allows: an anonymous session\'s URL never enters a group', async () => {

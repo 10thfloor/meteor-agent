@@ -117,6 +117,47 @@ describe('agent-channel-email', () => {
     });
   });
 
+  describe('attachments (email v2)', () => {
+    const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+    const files = [
+      { Name: 'report.csv', Content: b64('a,b\n1,2\n'), ContentType: 'text/csv', ContentLength: 8, ContentID: '' },
+      { Name: 'logo.png', Content: b64('png'), ContentType: 'image/png', ContentLength: 3, ContentID: 'cid:logo@sig' },
+    ];
+
+    it('passes real attachments through and skips inline ContentID entries', async () => {
+      const r = await read(pm({ Attachments: files }));
+      assert.equal(r.intent.kind, 'message');
+      assert.equal(r.attachments!.length, 1, 'the signature logo is furniture, not a file');
+      assert.deepEqual(r.attachments![0], {
+        name: 'report.csv', contentType: 'text/csv', size: 8, content: b64('a,b\n1,2\n'),
+      });
+    });
+
+    it('an attachment-only mail is a message now — empty text, files riding', async () => {
+      const r = await read(pm({ StrippedTextReply: '', TextBody: '', Attachments: [files[0]] }));
+      assert.deepEqual(r.intent, { kind: 'message', text: '' });
+      assert.equal(r.attachments!.length, 1);
+      // No text and no kept files stays a noop — the v1 rule's floor.
+      const empty = await read(pm({ StrippedTextReply: '', TextBody: '', Attachments: [files[1]] }));
+      assert.equal(empty.intent.kind, 'noop', 'inline-only mail has nothing to send');
+    });
+
+    it('renders reply and overflow attachments as Postmark\'s Attachments field', async () => {
+      const { emailLens } = await import('meteor/10thfloor:agent-channel-email');
+      const dest = { to: 'ada@example.com', subject: 'Re: Order A-1001', replyKey: 'k' };
+      const hydrated = [{ name: 'summary.csv', contentType: 'text/csv', size: 8, content: b64('x,y\n1,2\n') }];
+      const reply: any = emailLens.out({ item: 'reply', text: 'Attached.', attachments: hydrated }, dest);
+      assert.equal(reply.TextBody, 'Attached.');
+      assert.deepEqual(reply.Attachments, [
+        { Name: 'summary.csv', Content: b64('x,y\n1,2\n'), ContentType: 'text/csv' },
+      ]);
+      const overflow: any = emailLens.out({ item: 'overflow', head: 'Long…', attachments: hydrated }, dest);
+      assert.equal(overflow.Attachments.length, 1, 'the text overflowed, not the work product');
+      const bare: any = emailLens.out({ item: 'reply', text: 'No files.' }, dest);
+      assert.notProperty(bare, 'Attachments');
+    });
+  });
+
   describe('sender verification (the linked-account gate)', () => {
     it('trusts a From only when the mail passed author-aligned DKIM', async () => {
       const { isFromAuthenticated } = await import('meteor/10thfloor:agent-channel-email');
@@ -226,6 +267,129 @@ describe('agent-channel-email', () => {
     });
   });
 
+  describe('composeEmailTool (email v2 §9)', () => {
+    const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
+
+    /** A transport-capturing fetch: every Postmark send body, in order. */
+    function fakePostmark() {
+      const sends: any[] = [];
+      const fetchImpl = (async (_url: unknown, init: any) => {
+        sends.push(JSON.parse(init.body));
+        return { ok: true, status: 200, json: async () => ({ MessageID: `pm-${sends.length}`, ErrorCode: 0 }) };
+      }) as unknown as typeof fetch;
+      return { sends, fetchImpl };
+    }
+
+    const factory = async (over: Record<string, unknown> = {}, fetchImpl?: typeof fetch) => {
+      const { composeEmailTool } = await import('meteor/10thfloor:agent-channel-email');
+      return composeEmailTool({
+        serverToken: 't', from: 'Agent <agent@ourco.com>', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'],
+        fetchImpl,
+        ...over,
+      } as any);
+    };
+
+    beforeEach(async () => {
+      const { DeliveryReceipts, AgentAttachments, ChannelIdentities } = await import('meteor/10thfloor:agent');
+      await (DeliveryReceipts as any).removeAsync({});
+      await (AgentAttachments as any).removeAsync({});
+      await (ChannelIdentities as any).removeAsync({});
+    });
+
+    it('requires a recipients policy and gates ask by default', async () => {
+      const { composeEmailTool } = await import('meteor/10thfloor:agent-channel-email');
+      assert.throws(() => composeEmailTool({
+        serverToken: 't', from: 'a@b', inboundAddress: 'i@b',
+      } as any), /recipients/);
+      const tool = await factory();
+      assert.equal(tool.gate, 'ask', 'every compose parks for approval unless the app loosens it');
+      assert.equal((await factory({ gate: 'auto' })).gate, 'auto');
+      assert.equal(tool.name, 'compose_email');
+    });
+
+    it('the model proposes `to`; the policy decides — allowlist, predicate, and fail-closed on a broken one', async () => {
+      const { sends, fetchImpl } = fakePostmark();
+      const ctx = { userId: 'u1', sessionId: 's1', toolCallId: 'tc-a' };
+      const allow = await factory({}, fetchImpl);
+      const refused: any = await allow.run({ to: 'stranger@evil.test', subject: 's', body: 'b' }, ctx as any);
+      assert.isTrue(refused.refused);
+      assert.equal(refused.reason, 'recipient-not-allowed');
+      assert.equal(sends.length, 0, 'a refusal posts nothing');
+      const badShape: any = await allow.run({ to: 'not-an-address', subject: 's', body: 'b' }, ctx as any);
+      assert.equal(badShape.reason, 'invalid-recipient');
+
+      const sent: any = await allow.run({ to: 'Dana@OurCo.com', subject: 'Hi', body: 'The summary.' }, ctx as any);
+      assert.isTrue(sent.sent, 'the allowlist compares case-insensitively');
+      assert.equal(sends.length, 1);
+
+      const predicate = await factory({
+        recipients: (to: string) => to.endsWith('@ourco.com'),
+      }, fetchImpl);
+      assert.isTrue((await predicate.run({ to: 'eng@ourco.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-b' } as any) as any).sent);
+      assert.isTrue((await predicate.run({ to: 'eng@other.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-c' } as any) as any).refused);
+
+      const broken = await factory({
+        recipients: () => { throw new Error('boom'); },
+      }, fetchImpl);
+      const out: any = await broken.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-d' } as any);
+      assert.isTrue(out.refused, 'a policy that throws mails nobody');
+    });
+
+    it("'linked' allows exactly the session owner's linked addresses", async () => {
+      const { linkIdentity } = await import('meteor/10thfloor:agent');
+      const { sends, fetchImpl } = fakePostmark();
+      await linkIdentity('email', 'me@personal.test', 'u1', 'link');
+      const tool = await factory({ recipients: 'linked' }, fetchImpl);
+      const mine: any = await tool.run({ to: 'me@personal.test', subject: 's', body: 'b' }, { userId: 'u1', sessionId: 's1', toolCallId: 'tc-1' } as any);
+      assert.isTrue(mine.sent);
+      const theirs: any = await tool.run({ to: 'me@personal.test', subject: 's', body: 'b' }, { userId: 'u2', sessionId: 's2', toolCallId: 'tc-2' } as any);
+      assert.isTrue(theirs.refused, "someone else's linked address is not yours to mail");
+      const anon: any = await tool.run({ to: 'me@personal.test', subject: 's', body: 'b' }, { userId: null, sessionId: 's3', toolCallId: 'tc-3' } as any);
+      assert.isTrue(anon.refused, 'an anonymous session has no linked addresses');
+      assert.equal(sends.length, 1);
+    });
+
+    it('sends through the thin transport: plain Reply-To, auto-generated, the receipt in the header', async () => {
+      const { sends, fetchImpl } = fakePostmark();
+      const { AgentAttachments } = await import('meteor/10thfloor:agent');
+      await (AgentAttachments as any).insertAsync({
+        _id: 'attC1', sessionId: 's1', name: 'summary.csv', contentType: 'text/csv',
+        size: 8, content: b64('a,b\n1,2\n'), origin: 'tool', createdAt: new Date(),
+      });
+      const tool = await factory({}, fetchImpl);
+      const out: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 'Q3 numbers', body: 'Attached.', attachments: ['attC1', 'attGone'] },
+        { userId: 'u1', sessionId: 's1', toolCallId: 'tc-9' } as any,
+      );
+      assert.isTrue(out.sent);
+      assert.deepEqual(out.attached, ['summary.csv']);
+      assert.deepEqual(out.missingAttachments, ['attGone'], 'a foreign or expired id is reported, never guessed at');
+      const body = sends[0];
+      assert.equal(body.To, 'dana@ourco.com');
+      assert.equal(body.Subject, 'Q3 numbers');
+      assert.equal(body.ReplyTo, 'inbound@ourco.com', 'no thread key — a reply opens a FRESH conversation (decision 8)');
+      assert.deepEqual(body.Attachments, [{ Name: 'summary.csv', Content: b64('a,b\n1,2\n'), ContentType: 'text/csv' }]);
+      const headers = Object.fromEntries(body.Headers.map((h: any) => [h.Name, h.Value]));
+      assert.equal(headers['Auto-Submitted'], 'auto-generated', 'opens a correspondence; not auto-replied');
+      assert.equal(headers['X-Agent-Receipt'], 'deliver:compose:email:tc-9:send');
+    });
+
+    it('is effectively-once on the tool call: a crash-recovery re-run reads the receipt instead of re-sending', async () => {
+      const { sends, fetchImpl } = fakePostmark();
+      const tool = await factory({}, fetchImpl);
+      const ctx = { userId: 'u1', sessionId: 's1', toolCallId: 'tc-once' };
+      const first: any = await tool.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, ctx as any);
+      const second: any = await tool.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, ctx as any);
+      assert.isTrue(first.sent);
+      assert.isTrue(second.sent, 'the re-run reports the same settled fact');
+      assert.equal(sends.length, 1, 'one mail, whatever dispatch recovery does');
+      // A DIFFERENT tool call is a different receipt — a genuinely new send.
+      await tool.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-two' } as any);
+      assert.equal(sends.length, 2);
+    });
+  });
+
   describe('email() factory', () => {
     it('picks the link profile with an approvalUrl and the menu profile without one', async () => {
       const { email } = await import('meteor/10thfloor:agent-channel-email');
@@ -245,6 +409,14 @@ describe('agent-channel-email', () => {
       const { email } = await import('meteor/10thfloor:agent-channel-email');
       assert.throws(() => email({ agent: 'demo', serverToken: '', from: 'a@b', inboundAddress: 'i@b', webhookUser: 'u', webhookPassword: 'p' }), /serverToken/);
       assert.throws(() => email({ agent: 'demo', serverToken: 't', from: 'a@b', inboundAddress: 'i@b', webhookUser: '', webhookPassword: 'p' }), /webhookUser/);
+    });
+
+    it('raises the webhook body ceiling for attachment-bearing mail, app knob winning', async () => {
+      const { email } = await import('meteor/10thfloor:agent-channel-email');
+      const base = { agent: 'demo', serverToken: 't', from: 'a@b', inboundAddress: 'i@b', webhookUser: 'u', webhookPassword: 'p' };
+      assert.equal(email(base).maxInboundBytes, 50 * 1024 * 1024, 'Postmark inbound runs to 35 MB of files, base64d');
+      assert.equal(email({ ...base, maxInboundBytes: 2 * 1024 * 1024 }).maxInboundBytes, 2 * 1024 * 1024);
+      assert.deepEqual(email({ ...base, attachments: { maxFiles: 2 } }).attachments, { maxFiles: 2 }, 'the admission knob forwards');
     });
   });
 });

@@ -1,6 +1,7 @@
 import { createHmac } from 'crypto';
 import {
-  channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback,
+  headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -164,11 +165,13 @@ export const slackLens: Lens = {
   out(item: DeliveryItem): unknown {
     switch (item.item) {
       case 'reply':
-        return { text: toMrkdwn(item.text) };
+        // The naming clause: this surface carries no bytes (Slack uploads are
+        // future work), so each file appears as a text line naming it.
+        return { text: `${toMrkdwn(item.text)}${attachmentNotice(item.attachments, escapeSlack)}` };
       case 'status':
         return { text: statusProse(item) };
       case 'overflow':
-        return { text: `${toMrkdwn(item.head)}${item.url ? `\n<${item.url}|Continue on the web>` : ''}` };
+        return { text: `${toMrkdwn(item.head)}${item.url ? `\n<${item.url}|Continue on the web>` : ''}${attachmentNotice(item.attachments, escapeSlack)}` };
       case 'prompt': {
         // Tool name and arguments are MODEL-influenced text landing in live
         // mrkdwn: escape them like any other model text, and neutralize a

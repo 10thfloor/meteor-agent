@@ -14,5 +14,6 @@ import './fork.test';
 import './candidates.test';
 import './watcher.test';
 import './channels.test';
+import './attachments.test';
 import './perf.test';
 import './integration.server';

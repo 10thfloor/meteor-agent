@@ -8,7 +8,9 @@ import { runTurn } from './loop';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
 import { forkSession } from './fork';
 import { MAX_SUBAGENT_DEPTH } from './subagent';
-import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import {
+  ACTIVE_PHASES, type AgentSession, type AttachmentRef, type SessionInc,
+} from '../common/types';
 import type { SessionSet } from '../common/db';
 
 /**
@@ -317,6 +319,11 @@ export async function recordVerdict(
  */
 export async function sendToSession(
   agent: string, sessionId: string, text: string, userId: string | null,
+  /** Server-side extras a channel's admission supplies (email v2 spec §6):
+   *  REFS to files already inserted into the attachment store. Never reachable
+   *  from the DDP cap — a client cannot hand refs in; only trusted admission
+   *  code that just wrote the bytes can. */
+  extras?: { attachments?: AttachmentRef[] },
 ): Promise<string> {
   const config = getAgent(agent);
   if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
@@ -367,7 +374,9 @@ export async function sendToSession(
 
   await AgentMessages.insertAsync({
     _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
-    content: text, createdAt: new Date(),
+    content: text,
+    ...(extras?.attachments?.length ? { attachments: extras.attachments } : {}),
+    createdAt: new Date(),
   });
 
   // A new message is the resume signal after an interrupt OR a provider

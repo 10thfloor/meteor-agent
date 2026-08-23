@@ -109,6 +109,92 @@ reply grammar.
 > redeem on page load and a scanner silently decides the ask. The demo's
 > `/verdict/<token>` page does exactly this.
 
+## Attachments
+
+Real work product travels both ways (the email v2 spec,
+`docs/superpowers/specs/2026-08-23-email-attachments-and-compose.md`):
+
+- **Inbound** — files on a mail are admitted under caps (defaults: 5 MB/file,
+  5 files, 6 MB/message), stored server-side, and ride the user's message as
+  metadata refs; every rejected file becomes a visible bracket note in the
+  message ("fail closed, never silently"). An **attachment-only mail is a
+  message** — someone answering "can you check this?" with just the file.
+  The model sees name/type/size/id lines and reads content through the
+  shipped tool — list it like any other spec:
+
+  ```js
+  tools: [Agent.attachments.readTool, /* … */]
+  ```
+
+  Text-like files return text (capped at 64 KB); binary files return a
+  structured refusal the model can still *forward*. File content is data from
+  the sender, never instructions.
+
+  Tune or disable per channel: `email({ …, attachments: { maxFileBytes, maxFiles,
+  maxTotalBytes } })`, or `attachments: false` for v1's ignore-them behavior.
+  Deployments that admit strangers' mail should set the store-wide retention
+  (`settings.packages['10thfloor:agent'].attachments.retentionDays`): caps
+  bound a message, TTL bounds a stranger's patience.
+
+- **Outbound** — a tool body creates a file and stages it for the reply:
+
+  ```js
+  const ref = await Agent.attachments.create({
+    sessionId: ctx.sessionId, name: 'summary.csv', contentType: 'text/csv',
+    content: csvText,                  // or { base64 } for binary
+    attach: true, toolCallId: ctx.toolCallId,   // idempotent across crash re-runs
+  });
+  ```
+
+  The turn-final reply claims every staged file and the mail carries real
+  Postmark attachments. Bytes hydrate only when a post actually happens; a
+  file pruned by retention before delivery becomes a bracket note, never a
+  silent loss. Chat surfaces (Slack/SMS/…) can't carry bytes yet — they name
+  each file in text instead; no surface may silently vanish one (the lens
+  law's naming clause).
+
+- **The webhook body ceiling** is raised to 50 MB for this channel
+  (`maxInboundBytes`) because Postmark delivers attachments base64'd inside
+  the webhook JSON, up to 35 MB cumulative. Admission caps decide what is
+  *kept*.
+
+## Compose — emailing someone new
+
+Replying happens by itself; **composing is a deliberate act** the model takes
+through a tool, with the recipient validated by *your* code:
+
+```js
+import { composeEmailTool } from 'meteor/10thfloor:agent-channel-email';
+
+tools: [
+  composeEmailTool({
+    serverToken: cfg.serverToken,       // the same thin transport
+    from: 'Agent <agent@ourdomain.com>',
+    inboundAddress: cfg.inboundAddress,
+    recipients: (to) => to.endsWith('@ourco.com'),   // REQUIRED — no permissive default
+    // gate: 'ask' is the DEFAULT: every compose parks for approval
+  }),
+]
+```
+
+- `recipients` is required: `'linked'` (the session owner's linked addresses —
+  "email it to me"), an allowlist array, or a predicate run in trusted code.
+  The model *proposes* `to`; a refusal comes back structured and it routes
+  around it. A policy that throws refuses (fail closed).
+- Args: `{ to, subject, body, attachments?: string[] }` — the last being
+  attachment **ids** from this conversation, session-scoped.
+- **Effectively-once**: the send is receipt-logged under the tool call's id,
+  so a crash-recovery re-run of the tool reports the settled send instead of
+  mailing twice.
+- **A reply to composed mail opens a fresh conversation** — `Reply-To` is the
+  plain inbound address (no thread key) and the mail is stamped
+  `Auto-Submitted: auto-generated`. Routing the recipient's answer into the
+  *composing* session is the channels spec's group-ownership question, open
+  on purpose.
+- Compose is **not a reply path**: the person you are already talking to gets
+  the turn's answer automatically; composing to them delivers twice. The tool
+  description says so to the model.
+
 ## Account linking
 
 Reply (or write) with the bare word **`link`**: the agent answers with a
@@ -134,9 +220,11 @@ header on every mail.
 
 ## Caveats, named
 
-- **HTML-only mail** with an empty plain-text part is a noop (there is no
-  text to send the agent). Postmark supplies `TextBody` for most mail.
-- **Attachments** are ignored in v1.
+- **HTML-only mail** with an empty plain-text part and no attachments is a
+  noop (there is nothing to send the agent). Postmark supplies `TextBody` for
+  most mail.
+- **Inline images** (`ContentID` attachments — signature logos) are skipped
+  inbound and never emitted outbound. HTML bodies are not produced.
 - **Quoted-reply stripping** prefers Postmark's `StrippedTextReply`; the
   package's own stripper (the fallback) is conservative — a stray quoted line
   becomes part of the message rather than the message being lost.
@@ -153,8 +241,10 @@ header on every mail.
 
 ## Exports
 
-`email(options)` — the factory. `emailLens`, `emailTransport`,
-`verifyPostmarkWebhook`, `parsePostmarkInbound`, `isFromAuthenticated`,
-`threadKey`, `replyToFor`, `reSubject`, `stripQuotedReply` — the pieces, plus
-the `EmailEvent` and `EmailDestination` types. Tests:
+`email(options)` — the factory. `composeEmailTool(options)` — the proactive
+compose tool. `emailLens`, `emailTransport`, `verifyPostmarkWebhook`,
+`parsePostmarkInbound`, `isFromAuthenticated`, `threadKey`, `replyToFor`,
+`reSubject`, `stripQuotedReply` — the pieces, plus the `EmailEvent`,
+`EmailDestination`, `ComposeEmailToolOptions` and `ComposeRecipientsPolicy`
+types. Tests:
 `meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent-channel-email`.

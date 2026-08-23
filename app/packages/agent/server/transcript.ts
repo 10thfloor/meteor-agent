@@ -2,16 +2,17 @@ import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections
 import type { AgentMessage } from '../common/types';
 import type { ProviderMessage } from './providers/types';
 import { guardedUpdate, SERVER_ID } from './lease';
+import { attachmentSuffix } from './attachments';
 
 /**
  * The transcript layer: turning the stored message log into what a provider
  * sees, computing per-turn windows, repairing abandoned turns, and the
  * batch-safe boundary walk shared by compaction and forking.
  *
- * A leaf module — it imports only the collections, the message type and the
- * lease guard, so both `compaction.ts` (`batchSafeBoundary`) and `dispatch.ts`
- * (`discardTurn`, `locateBatch`) can depend on it without a cycle back through
- * `loop.ts`.
+ * A leaf module — it imports only the collections, the message type, the
+ * lease guard and the attachment store (itself a leaf), so both
+ * `compaction.ts` (`batchSafeBoundary`) and `dispatch.ts` (`discardTurn`,
+ * `locateBatch`) can depend on it without a cycle back through `loop.ts`.
  */
 
 /**
@@ -29,14 +30,26 @@ import { guardedUpdate, SERVER_ID } from './lease';
  * a result failed treats it differently from one it has to infer failure from.
  * The error OBJECT stays behind: `isError` is a boolean on the wire, and the
  * `{error, reason}` detail is already in the content.
+ *
+ * A USER row carrying attachment refs gains a mechanical suffix — name, type,
+ * size, id per file, pointing at `read_attachment` (email v2 spec §6). This is
+ * REQUEST-VIEW ONLY: the committed row's `content` stays exactly what the
+ * human wrote (plus any admission notes), and the suffix is derived here, the
+ * single boundary, on every call. User rows only — an assistant row's staged
+ * files are already known to the model through the tool results that created
+ * them, and teaching it the bracket syntax as something assistants write would
+ * invite imitation.
  */
 export function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
   return msgs
     .filter((m) => m.role !== 'note')
     .map((m) => {
+      const refs = m.role === 'user' && m.attachments?.length ? m.attachments : null;
       const out: ProviderMessage = {
         role: m.role as ProviderMessage['role'],
-        content: m.content,
+        content: refs
+          ? `${m.content ?? ''}${m.content ? '\n\n' : ''}${attachmentSuffix(refs)}`
+          : m.content,
         toolCalls: m.toolCalls,
         toolCallId: m.toolCallId,
       };

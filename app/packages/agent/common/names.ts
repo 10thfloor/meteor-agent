@@ -9,6 +9,8 @@ export const NAMES = {
   inboundSubmissions: 'agent_inbound_submissions',
   channelLinkTokens: 'agent_channel_link_tokens',
   channelVerdictTokens: 'agent_channel_verdict_tokens',
+  // Attachments (email v2 spec): file bytes in a side store, refs on rows.
+  attachments: 'agent_attachments',
   pubSession: 'agent.session',
   pubSessions: 'agent.sessions',
   mStart: 'agent.start',

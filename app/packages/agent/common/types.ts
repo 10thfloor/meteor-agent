@@ -217,6 +217,22 @@ export interface AgentSession {
 
 export interface AgentToolCall { id: string; name: string; args: unknown }
 
+/**
+ * A file riding a MESSAGE ROW: metadata only — the bytes live in the
+ * `AgentAttachments` store (server/attachments.ts), keyed by `id`. Rows are
+ * read constantly (the loop's history, the publication, the planner's tail
+ * scan), so a row never carries content; `size` is the DECODED byte count.
+ * The model sees exactly these four fields, rendered as a mechanical suffix
+ * at request time, and reads content through the shipped `read_attachment`
+ * tool — bytes never enter a prompt in either direction.
+ */
+export interface AttachmentRef {
+  id: string;
+  name: string;
+  contentType: string;
+  size: number;
+}
+
 export interface AgentMessage {
   _id: string;
   sessionId: string;
@@ -287,6 +303,14 @@ export interface AgentMessage {
    *  own `pricing` fallback accrues to the session total without claiming the
    *  message carries a provider-reported figure. */
   usage?: { input: number; output: number; cost?: number };
+  /**
+   * Files this row carries — REFS only, bytes in the store (see
+   * `AttachmentRef`). Legal on `user` rows (inbound files the channel
+   * admitted) and `assistant` rows (files a tool staged for the turn's reply,
+   * claimed at the turn-final commit). Additive and migration-free, the
+   * `channel`/`parent` idiom.
+   */
+  attachments?: AttachmentRef[];
   createdAt: Date;
 }
 

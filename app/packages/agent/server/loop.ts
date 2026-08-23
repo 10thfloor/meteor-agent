@@ -25,6 +25,7 @@ import { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } from './deltas';
 // from here as public API. Their definitions now live in `./deltas`.
 export { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } from './deltas';
 import { discardTurn, locateBatch, repairUnansweredToolUse } from './transcript';
+import { claimStagedRefs } from './attachments';
 
 // `toProviderMessages` is re-exported for the transcript tests (they destructure
 // it from `./loop`); the three imported above are internal cross-module calls.
@@ -507,10 +508,23 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
+        // The TURN-FINAL row (no toolCalls) claims the session's staged
+        // attachment refs and embeds them — the reply becomes a file-bearing
+        // message (email v2 spec §8). After the seq allocation proved we still
+        // own the lease, before the insert. A crash between claim and insert
+        // strands the claimed refs unstaged and undelivered; the file survives
+        // in the store, the re-run turn's `create` re-stages it idempotently,
+        // and delivery follows the row that actually commits.
+        const staged = (!toolCalls || toolCalls.length === 0)
+          ? await claimStagedRefs(sessionId)
+          : [];
+
         await AgentMessages.insertAsync({
           _id: messageId, sessionId, seq: commitSeq, role: 'assistant',
           content: text, thinking: thinking || undefined,
-          toolCalls, usage, createdAt: new Date(),
+          toolCalls, usage,
+          ...(staged.length > 0 ? { attachments: staged } : {}),
+          createdAt: new Date(),
         });
 
         // The committed message supersedes its deltas; remove them now rather

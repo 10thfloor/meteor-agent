@@ -19,6 +19,7 @@ import {
 } from './hooks';
 import { recordVerdict, sendToSession } from './methods';
 import { registerChannel, type ChannelDef } from './channels/registry';
+import { AgentAttachments, createAttachment, readTool } from './attachments';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -148,6 +149,9 @@ export class Agent {
       try {
         await AgentDeltas.removeAsync({ sessionId });
         await AgentMessages.removeAsync({ sessionId });
+        // A tool may have staged files into the attachment store; a throwaway
+        // session's bytes must not outlive its transcript.
+        await AgentAttachments.removeAsync({ sessionId });
         await AgentSessions.removeAsync({ _id: sessionId });
       } catch (e) {
         console.error(
@@ -351,6 +355,30 @@ export class Agent {
   static channel(kind: string, def: ChannelDef): void {
     registerChannel(kind, def);
   }
+
+  /**
+   * The attachment surface (email v2 spec §7/§8) — STATIC like `Agent.method`,
+   * because files belong to sessions, not to one agent instance.
+   *
+   * `create` is an API for TOOL BODIES, never a model surface: a tool that
+   * builds a report calls it with `ctx.sessionId` (and `ctx.toolCallId` for
+   * crash-safe idempotency), gets back a ref, and `attach: true` stages the
+   * file for the turn's reply — the loop claims staged refs at the turn-final
+   * commit and the reply becomes a file-bearing message.
+   *
+   *   const ref = await Agent.attachments.create({
+   *     sessionId: ctx.sessionId, name: 'summary.csv', contentType: 'text/csv',
+   *     content: csvText, attach: true, toolCallId: ctx.toolCallId,
+   *   });
+   *
+   * `readTool` is the one shipped tool — list it in `tools` like any inline
+   * spec (nothing auto-registers): the model reads a ref's content by id,
+   * session-scoped, text inline and binary as a structured refusal.
+   */
+  static attachments = {
+    create: createAttachment,
+    readTool,
+  };
 
   /**
    * Register a provider implementation under a NAME, so a config can say

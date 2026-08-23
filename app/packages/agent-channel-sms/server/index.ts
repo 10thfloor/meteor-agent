@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  channelKnobs, headerValue, isLinkGesture, safeEqual,
+  attachmentNotice, channelKnobs, headerValue, isLinkGesture, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -115,11 +115,13 @@ export const smsLens: Lens = {
   out(item: DeliveryItem): unknown {
     switch (item.item) {
       case 'reply':
-        return { body: toPlainText(item.text) };
+        // The naming clause: SMS carries no bytes (MMS is future work), so
+        // each file appears as a text line naming it.
+        return { body: `${toPlainText(item.text)}${attachmentNotice(item.attachments)}` };
       case 'status':
         return { body: statusProse(item) };
       case 'overflow':
-        return { body: `${toPlainText(item.head)}${item.url ? ` ${item.url}` : ''}` };
+        return { body: `${toPlainText(item.head)}${item.url ? ` ${item.url}` : ''}${attachmentNotice(item.attachments)}` };
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 300 ? `${args.slice(0, 300)}…` : args;
