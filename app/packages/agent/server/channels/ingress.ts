@@ -144,10 +144,26 @@ async function findOrCreateBinding(
     binding = await ChannelBindings.findOneAsync(bindingId);
     if (!binding) return null;
   } else {
-    // Activity bump: the egress sweep only walks RECENTLY active bindings
-    // (its lookback is what keeps a process's sweep cost proportional to live
-    // conversations, not history), so every inbound event marks its binding.
-    await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
+    // DESTINATION ADOPTION (participants spec §5): a binding whose stored
+    // destination predates knowledge this event carries — the compose
+    // pre-bind's missing rootMessageId — learns it here, through the
+    // channel's own pure merge. Guarded on the stored value so two racing
+    // events converge; a channel without the hook just bumps activity.
+    const merged = def.adoptDestination
+      ? def.adoptDestination(binding.destination, reading.destination)
+      : undefined;
+    if (merged !== undefined) {
+      await ChannelBindings.updateAsync(bindingId, {
+        $set: { destination: merged, updatedAt: new Date() },
+      });
+      binding = (await ChannelBindings.findOneAsync(bindingId)) ?? binding;
+    } else {
+      // Activity bump: the egress sweep only walks RECENTLY active bindings
+      // (its lookback is what keeps a process's sweep cost proportional to
+      // live conversations, not history), so every inbound event marks its
+      // binding.
+      await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
+    }
   }
   return binding;
 }
