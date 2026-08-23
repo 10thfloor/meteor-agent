@@ -1,5 +1,6 @@
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import type { AgentMessage } from '../common/types';
+import type { AgentMessage, SessionParticipant } from '../common/types';
+import { needsAttribution } from '../common/participants';
 import type { ProviderMessage } from './providers/types';
 import { guardedUpdate, SERVER_ID } from './lease';
 import { attachmentSuffix } from './attachments';
@@ -39,23 +40,103 @@ import { attachmentSuffix } from './attachments';
  * files are already known to the model through the tool results that created
  * them, and teaching it the bracket syntax as something assistants write would
  * invite imitation.
+ *
+ * THE VIEW (participants spec §4.4). With no `view` — every 1:1 session, and
+ * every caller that predates rosters — the projection is byte-identical to
+ * what it always was. A rostered turn passes the RUNNING model's view:
+ *
+ *   - its OWN rows keep their roles (assistant stays assistant, its tool rows
+ *     ride along);
+ *   - another model's TURN-FINAL rows (no toolCalls, non-empty text) become
+ *     attributed `user` rows — a provider treats `assistant` as "text I
+ *     produced", so a colleague's words must arrive as input;
+ *   - another model's WORKING — toolCall-bearing assistants, tool rows,
+ *     empty rows — drops: invalid as anyone else's context, and token noise
+ *     (an empty "[name]:" user row is a 400 on some providers);
+ *   - HUMAN rows gain a `[name]: ` prefix only when the roster holds ≥2
+ *     humans or ≥2 models (decision 9) — attribution only when it
+ *     disambiguates, so the 1:1 payload never moves.
+ *
+ * The OMNISCIENT view (`self` absent) is the compaction summarizer's: every
+ * row visible in today's structure, user and turn-final assistant text
+ * prefixed, because any single participant's view drops exactly the working a
+ * summary must fold in.
+ *
+ * Rows older than the `from` field project with fixed defaults: assistant and
+ * tool rows belong to the PRIMARY model, user rows to the owner.
  */
-export function toProviderMessages(msgs: AgentMessage[]): ProviderMessage[] {
-  return msgs
-    .filter((m) => m.role !== 'note')
-    .map((m) => {
-      const refs = m.role === 'user' && m.attachments?.length ? m.attachments : null;
-      const out: ProviderMessage = {
-        role: m.role as ProviderMessage['role'],
-        content: refs
-          ? `${m.content ?? ''}${m.content ? '\n\n' : ''}${attachmentSuffix(refs)}`
-          : m.content,
-        toolCalls: m.toolCalls,
-        toolCallId: m.toolCallId,
-      };
-      if (m.error) out.isError = true;
-      return out;
-    });
+export interface TranscriptView {
+  /** The running model's participant id; absent = the omniscient projection. */
+  self?: string;
+  /** The primary model's participant id — the attribution default for
+   *  `from`-less assistant/tool rows. */
+  primary: string;
+  participants: SessionParticipant[];
+}
+
+export function toProviderMessages(
+  msgs: AgentMessage[], view?: TranscriptView,
+): ProviderMessage[] {
+  const nameOf = view
+    ? (id: string, fallback?: string) =>
+      view.participants.find((p) => p.id === id)?.displayName ?? fallback ?? id
+    : undefined;
+  const prefixing = view ? needsAttribution(view.participants) : false;
+  const out: ProviderMessage[] = [];
+  for (const m of msgs) {
+    if (m.role === 'note') continue;
+
+    if (view && (m.role === 'assistant' || m.role === 'tool')) {
+      const author = m.from?.participant ?? view.primary;
+      const foreign = view.self !== undefined && author !== view.self;
+      if (foreign) {
+        // A colleague's row: its spoken outcome only. Working drops.
+        const turnFinal = m.role === 'assistant'
+          && (!m.toolCalls || m.toolCalls.length === 0)
+          && (m.content ?? '') !== '';
+        if (!turnFinal) continue;
+        out.push({
+          role: 'user',
+          content: `[${nameOf!(author, m.from?.name)}]: ${m.content}`,
+        });
+        continue;
+      }
+      if (view.self === undefined && m.role === 'assistant' && prefixing
+        && (!m.toolCalls || m.toolCalls.length === 0) && (m.content ?? '') !== '') {
+        // Omniscient: the summarizer sees who spoke; structure untouched.
+        out.push({
+          role: 'assistant',
+          content: `[${nameOf!(author, m.from?.name)}]: ${m.content}`,
+          toolCalls: m.toolCalls,
+          toolCallId: m.toolCallId,
+          ...(m.error ? { isError: true } : {}),
+        });
+        continue;
+      }
+    }
+
+    const refs = m.role === 'user' && m.attachments?.length ? m.attachments : null;
+    let content = refs
+      ? `${m.content ?? ''}${m.content ? '\n\n' : ''}${attachmentSuffix(refs)}`
+      : m.content;
+    if (view && prefixing && m.role === 'user') {
+      const name = m.from
+        ? m.from.name
+        : nameOf!(
+          view.participants.find((p) => p.role === 'owner')?.id ?? '', 'user',
+        );
+      content = `[${name}]: ${content ?? ''}`;
+    }
+    const row: ProviderMessage = {
+      role: m.role as ProviderMessage['role'],
+      content,
+      toolCalls: m.toolCalls,
+      toolCallId: m.toolCallId,
+    };
+    if (m.error) row.isError = true;
+    out.push(row);
+  }
+  return out;
 }
 
 /** One assistant's turn, and the seq range its `tool` rows must live in. */

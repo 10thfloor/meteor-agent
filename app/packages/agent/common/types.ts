@@ -61,6 +61,53 @@ export type SessionInc = Partial<Record<SessionCounterPath, number>>;
 
 export interface Usage { input: number; output: number; cost: number }
 
+/**
+ * One member of a session's roster (participants spec §4.1) — a HUMAN
+ * (account-holding or channel-identified) or a MODEL (an agent-registry name).
+ *
+ * The roster is the authorization surface for n:n sessions: absent, the
+ * session is the classic owner-plus-primary pair and behaves bit-for-bit as it
+ * always has; present, it is the COMPLETE list of who may read, write, and
+ * speak. Materialization seeds the owner and the primary model in one
+ * single-winner write, so the array is never a half-roster.
+ */
+export interface SessionParticipant {
+  /**
+   * Derived, stable, collision-is-the-guard:
+   *   humans:  `h:<userId>` (account) | `x:<kind>:<externalUserId>` (channel
+   *            identity) | `h:anon` (the anonymous capability-URL owner)
+   *   models:  `m:<agentName>`
+   * Channel identity components are written exactly as the channel's lens
+   * normalizes them (email: lowercase) — membership is an exact match.
+   */
+  id: string;
+  kind: 'human' | 'model';
+  /** Ownership is a ROLE in the roster, not a parallel system: the owner row
+   *  mirrors `session.userId`. Models are always members. */
+  role: 'owner' | 'member';
+  /** Humans: the linked account, or null for the anonymous owner. Updated by
+   *  link-time reconciliation when a channel-identified member later links. */
+  userId?: string | null;
+  /** Humans who joined via a surface: the channel identity that admits them
+   *  through ingress. A member with an identity and no userId has NO DDP
+   *  capability at all — their standing exists only while ingress vouches for
+   *  the verified sender (the `via` principal, participants spec §4.2). */
+  identity?: { kind: string; externalUserId: string };
+  assurance?: 'none' | 'link' | 'oidc';
+  /** Models: the registry name whose config runs this participant's turns. */
+  agent?: string;
+  /** What attribution renders — prompts, transcripts, the web element. Display
+   *  string discipline applies (control chars stripped, length-capped). */
+  displayName: string;
+  /** The participant id that admitted them; absent on seeded rows. */
+  addedBy?: string;
+  joinedAt: Date;
+}
+
+/** The roster ceiling — a conversation, not a mailing list. Joins past it are
+ *  refused. */
+export const MAX_PARTICIPANTS = 16;
+
 export interface AgentSession {
   _id: string;
   agent: string;
@@ -122,6 +169,18 @@ export interface AgentSession {
      * was authorized and not merely that something was.
      */
     runAs?: string | null;
+    /**
+     * WHICH MODEL PARTICIPANT's turn parked this call (participants spec
+     * decision 6) — the agent-registry name, recorded at PARK time exactly as
+     * `mcpServer` is, because that is the last moment anything knows. Every
+     * resume path (`recordVerdict`, the approval timeout, the watcher) builds
+     * the resumed turn's config from this instead of `session.agent`, so an
+     * approved call parked by an addressee model resumes with that model's
+     * tools rather than answering `unknown-tool` under the primary's. Absent
+     * on primary-model parks (the common case) and on parks written before
+     * the field existed — both fall back to `session.agent`.
+     */
+    agent?: string;
     /**
      * IDENTITY for the wake this verdict schedules, stamped by `writeVerdict`
      * in the same atomic write as the verdict itself.
@@ -211,6 +270,31 @@ export interface AgentSession {
    * so it may ship to the client unprojected.
    */
   channel?: { origin: string; assurance: 'none' | 'link' | 'oidc' };
+  /**
+   * The ROSTER (participants spec §4.1) — absent on the classic 1:1 session,
+   * complete when present (seeded with the owner and the primary model in a
+   * single-winner write). The `channel`/`parent` idiom: optional, additive,
+   * migration-free. Capped at `MAX_PARTICIPANTS`.
+   */
+  participants?: SessionParticipant[];
+  /**
+   * Model-relay hops since the last HUMAN message (participants spec §4.3). A
+   * model's reply that leads with `@<other-model>` schedules that model's turn
+   * and increments this; any human send resets it to 0. At `budget.relay`
+   * (default 4) the relay row still commits and delivers — it just schedules
+   * nothing, and a note-only budget row says why. Absent reads as 0.
+   */
+  relay?: number;
+  /**
+   * The DURABLE relay wake (participants spec decision 7): written in the same
+   * atomic write that allocates the relaying reply's seq, consumed (`$unset`)
+   * by the addressee's turn, cancelled by any human send, and swept by the
+   * watcher — because a bare `deferTurn` from inside a committing turn lands
+   * in exactly the non-durable-wake race `pending.wakeToken` exists for.
+   * `token` is identity, not a boolean, for the same reason the verdict wake
+   * carries one.
+   */
+  pendingRelay?: { agent: string; token: string };
   createdAt: Date;
   updatedAt: Date;
 }
@@ -272,11 +356,16 @@ export interface AgentMessage {
   /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say
    *  "out of tool calls" rather than "budget exhausted" and an operator can
    *  raise the right one. The human-readable half lives in `error.reason`. */
-  budget?: 'turns' | 'toolCalls' | 'spend';
+  budget?: 'turns' | 'toolCalls' | 'spend' | 'relay';
   /** `kind: 'approval'` notes only. Structured, never prose: an approval is
    *  transcript history a UI renders and an audit reads, not a sentence. */
   approved?: boolean;
   by?: string | null;
+  /** `kind: 'approval'` notes in ROSTERED sessions only: the deciding
+   *  member's participant id, so an audit of a group session names which
+   *  member answered rather than a bare account id. Absent on 1:1 sessions
+   *  and on rows written before rosters existed. */
+  byParticipant?: string;
   /** `kind: 'approval'` notes only, and only when the parked tool carried a
    *  `runAs`: the identity the approved call runs under (`null` = the anonymous
    *  service context). Copied from `pending.runAs` so the audit row records WHAT
@@ -311,6 +400,27 @@ export interface AgentMessage {
    * `channel`/`parent` idiom.
    */
   attachments?: AttachmentRef[];
+  /**
+   * WHO wrote this row (participants spec decision 4) — stamped by TRUSTED
+   * CODE only: the DDP send (caller), ingress (the verified channel sender),
+   * the loop (the model that ran the turn), and dispatch (tool rows carry the
+   * running model, so the per-model projection can tell whose working to
+   * drop). Never parsed from text, never settable by a model. Stamped on
+   * every new row regardless of roster — additive and invisible to old
+   * readers — so a roster materialized mid-session attributes history it did
+   * not exist for; rows older than the field project with fixed defaults
+   * (assistant/tool → the primary model, user → the owner).
+   */
+  from?: { participant: string; name: string };
+  /**
+   * The ADDRESSEE (participants spec decision 5): a participant id, stamped
+   * mechanically — from an explicit `extras.to` or a leading `@<agent-name>`
+   * token, matched against the roster's models. Addressing selects which
+   * model's config answers; `to` naming a human is recorded and schedules
+   * nothing. Assistant rows whose `to` names a model are internal
+   * deliberation: the web shows them, channel delivery skips them.
+   */
+  to?: string;
   createdAt: Date;
 }
 
@@ -329,6 +439,11 @@ export interface AgentDelta {
    *  reassemble PARALLEL tool calls instead of splicing their JSON together.
    *  Absent for text/thinking, and for a provider that reports no index. */
   contentIndex?: number;
+  /** WHICH MODEL PARTICIPANT is streaming — stamped on every delta of a
+   *  rostered session's turn so the in-flight row can be attributed before it
+   *  commits (`mergeView` copies the first delta's). Absent on 1:1 sessions,
+   *  whose deltas stay byte-identical to before the field existed. */
+  from?: { participant: string; name: string };
   at: Date;
 }
 

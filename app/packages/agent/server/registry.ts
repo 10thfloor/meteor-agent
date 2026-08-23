@@ -63,6 +63,15 @@ export interface AgentConfig {
      * and runs no timer, so there is nothing in-turn left to enforce it.
      */
     approval?: number;
+    /**
+     * Participants spec decision 7: how many MODEL-TO-MODEL relay hops may
+     * follow one human message before an `@`-addressed reply stops scheduling
+     * its addressee. Default 4. The capped reply still commits and delivers —
+     * a note-only budget row says why nothing answered — and any human
+     * message resets the count. Read from the PRIMARY agent's budget, like
+     * every other purse in a session.
+     */
+    relay?: number;
   };
   maxIterations?: number;
   /** §9 compaction. When the estimated context exceeds `window * compactAt`
@@ -135,6 +144,8 @@ export interface ResolvedBudget {
   /** Passed through unchanged (already a plain ms count). The loop ignores it;
    *  the watcher's sweep is what enforces it. */
   approval?: number;
+  /** The relay-hop cap, validated like the counts. */
+  relay?: number;
 }
 
 /** `'$1.50'` / `'1.50'` / `1.5`, and nothing else. A bare `Number(...)` would
@@ -194,11 +205,13 @@ export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | 
   // an approval would silently never time out — the one failure mode this
   // setting exists to prevent.
   assertCountLimit(budget.approval, 'approval');
+  assertCountLimit(budget.relay, 'relay');
   return {
     turns: budget.turns,
     toolCalls: budget.toolCalls,
     spend: budget.spend === undefined ? undefined : parseSpend(budget.spend),
     approval: budget.approval,
+    relay: budget.relay,
   };
 }
 
@@ -260,7 +273,7 @@ export function getProvider(name: string): Provider | undefined {
  * available, rather than a silent fallback to pi-ai — which would bill a real
  * provider for a config that asked for a mock.
  */
-function resolveProvider(provider: AgentConfig['provider']): Provider {
+export function resolveProvider(provider: AgentConfig['provider']): Provider {
   if (provider === undefined) return piAiProvider();
   if (typeof provider !== 'string') return provider;
   const impl = providers.get(provider);
@@ -341,16 +354,27 @@ export function listAgents(): Array<[string, AgentConfig]> {
  * bad one).
  *
  * `userId` is what `instructions` and every tool's `ctx.userId` see. A child
- * session passes its INHERITED owner, which is the parent's.
+ * session passes its INHERITED owner, which is the parent's — and with a
+ * roster, every entry passes the OWNER, not the triggering member
+ * (participants spec decision 10): a turn always runs as one identity.
+ *
+ * `opts` is the ADDRESSED-TURN composition (participants spec §4.3): the run
+ * is the addressee's config — model, prompt, tools, provider — but
+ * `agentName` names it for stamps and hooks, and `budget` (when given) is the
+ * PRIMARY's, so one purse governs the session whichever model spends it.
  */
-export function buildRunConfig(config: AgentConfig, userId: string | null): RunConfig {
+export function buildRunConfig(
+  config: AgentConfig, userId: string | null,
+  opts?: { agentName?: string; budget?: ResolvedBudget },
+): RunConfig {
   return {
     model: config.model,
     system: buildSystemPrompt(config, { userId }),
     tools: config.tools ?? [],
     provider: resolveProvider(config.provider),
+    ...(opts?.agentName !== undefined ? { agentName: opts.agentName } : {}),
     maxIterations: config.maxIterations,
-    budget: resolveBudget(config.budget),
+    budget: opts?.budget ?? resolveBudget(config.budget),
     pricing: config.pricing,
     retry: config.retry,
     context: config.context,

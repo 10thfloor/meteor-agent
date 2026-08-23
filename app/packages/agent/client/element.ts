@@ -216,10 +216,24 @@ function renderRow(m: ViewMessage, names: Map<string, string>): HTMLElement {
     return row;
   }
 
+  // Attribution (participants spec §4.1): rows in a rostered session carry
+  // `from`, and a group transcript that does not say who is speaking is
+  // unreadable. A small name line above the text; 1:1 sessions carry no
+  // `from` worth showing (the roles already say who spoke) — the stamp is
+  // rendered only when the roster made names meaningful, which the server
+  // signals by stamping deltas/rows in rostered sessions with display names
+  // resolved from the roster.
+  if (m.from && (m.role === 'user' || m.role === 'assistant')) {
+    const speaker = document.createElement('span');
+    speaker.className = 'speaker';
+    speaker.setAttribute('part', 'speaker');
+    speaker.textContent = m.from.name;
+    row.append(speaker);
+  }
   // `truncatedHead` means compaction (or a capped-collection gap) dropped the
   // start of this row's text; the ellipsis says so rather than silently
   // presenting a fragment as the whole message.
-  row.textContent = (m.truncatedHead ? '…' : '') + (m.content ?? '');
+  row.append(document.createTextNode((m.truncatedHead ? '…' : '') + (m.content ?? '')));
   if (m.toolCalls?.length) {
     const calls = document.createElement('span');
     calls.className = 'calls';

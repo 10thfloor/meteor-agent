@@ -58,6 +58,11 @@ export class DeltaWriter {
      * dispatch data — never passed through here at all. `Infinity` disables it.
      */
     private maxToolArgBytes: number = Infinity,
+    /** Streaming attribution (participants spec §4.1): the model participant
+     *  whose turn is streaming, stamped on each delta so the in-flight row
+     *  can be labelled before it commits. Absent for 1:1 sessions, whose
+     *  deltas stay byte-identical to before the field existed. */
+    private from?: { participant: string; name: string },
   ) {
     // The `.catch` is not decoration. A bare `void this.flush()` turns an
     // `insertAsync` rejection into an unhandled promise rejection, which is
@@ -149,6 +154,7 @@ export class DeltaWriter {
               kind: item.kind,
               chunk: item.chunk,
               ...(item.contentIndex === undefined ? {} : { contentIndex: item.contentIndex }),
+              ...(this.from ? { from: this.from } : {}),
               at: new Date(),
             });
           } catch (e) {
