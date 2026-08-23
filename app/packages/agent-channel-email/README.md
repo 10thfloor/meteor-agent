@@ -76,9 +76,11 @@ The webhook mounts at **`/agent/channels/email`**.
   reply — even from a client that drops `References` — comes back carrying the
   key as Postmark's `MailboxHash`. Fallbacks: first `References` entry, then
   `In-Reply-To`, then the message's own id (a new thread). No lookup table.
-- **Identity key — the sender address**, lower-cased. Weak: a `From` header is
-  forgeable unless the receiving provider enforced DKIM/SPF. Fine to
-  recognize; never privileged until linked.
+- **Identity key — the sender address**, lower-cased, and mapped to a linked
+  account **only when the mail passed author-aligned DKIM** (Postmark's
+  SpamAssassin `DKIM_VALID_AU`). A `From` is forgeable SMTP, so an unverified
+  sender stays anonymous and a spoofed `From:` cannot inherit a linked owner's
+  account. The check is fail-closed: no signal ⇒ anonymous.
 - **Audience — `direct`.** Replies go to one address.
 - **Interaction — `link`** when `approvalUrl` is configured (the core mints a
   single-use URL per choice at delivery; the mail carries `Approve: …` /
@@ -98,6 +100,14 @@ once, only while that exact ask is still parked, and indistinguishably fails
 otherwise. The demo app's `/verdict/<token>` page is the reference. Without
 `approvalUrl`, replies of `YES` / `NO` decide the ask through the pipeline's
 reply grammar.
+
+> **Gate redemption behind a user action.** An approval mail carries both
+> single-use URLs in plain text, and mail-security scanners (Defender
+> SafeLinks, Proofpoint, Mimecast) *fetch and execute page JS* on links before
+> the recipient reads the mail. Your `approvalUrl` target must require an
+> explicit click — a Confirm button — before it calls `redeemVerdictToken`;
+> redeem on page load and a scanner silently decides the ask. The demo's
+> `/verdict/<token>` page does exactly this.
 
 ## Account linking
 
@@ -130,6 +140,13 @@ header on every mail.
 - **Quoted-reply stripping** prefers Postmark's `StrippedTextReply`; the
   package's own stripper (the fallback) is conservative — a stray quoted line
   becomes part of the message rather than the message being lost.
+- **Linked identity needs author-aligned DKIM.** Recognizing a *linked* sender
+  relies on Postmark's inbound SpamAssassin verdict carrying `DKIM_VALID_AU`
+  in `X-Spam-Tests`. If the inbound stream has spam checks off, or a sender's
+  domain does not publish aligned DKIM, that sender stays anonymous — safe, but
+  their linked history will not attach. Major providers sign aligned DKIM by
+  default. (SMS/WhatsApp get this for free: the carrier authenticates the
+  number. Email does not, so the channel gates it explicitly.)
 - The webhook's Basic-auth credential is the trust boundary; Postmark also
   publishes inbound IP ranges — an allowlist at your edge is the belt to that
   suspenders.
@@ -137,7 +154,7 @@ header on every mail.
 ## Exports
 
 `email(options)` — the factory. `emailLens`, `emailTransport`,
-`verifyPostmarkWebhook`, `parsePostmarkInbound`, `threadKey`, `replyToFor`,
-`reSubject`, `stripQuotedReply` — the pieces, plus the `EmailEvent` and
-`EmailDestination` types. Tests:
+`verifyPostmarkWebhook`, `parsePostmarkInbound`, `isFromAuthenticated`,
+`threadKey`, `replyToFor`, `reSubject`, `stripQuotedReply` — the pieces, plus
+the `EmailEvent` and `EmailDestination` types. Tests:
 `meteor test-packages --once --driver-package meteortesting:mocha ./packages/agent-channel-email`.

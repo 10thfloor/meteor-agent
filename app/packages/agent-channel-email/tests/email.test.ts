@@ -113,6 +113,39 @@ describe('agent-channel-email', () => {
       assert.equal(stripQuotedReply('Done\n-- \nAda\nSome Corp'), 'Done', 'signature trimmed');
       assert.equal(stripQuotedReply('line one\n> quoted\nline two'), 'line one\nline two', 'quoted lines dropped, rest kept');
       assert.equal(stripQuotedReply('On the whole I agree.\nMore.'), 'On the whole I agree.\nMore.', 'a sentence starting with "On" is not a reply marker');
+      assert.equal(stripQuotedReply('On Mon, Agent wrote:\n> may I refund?\nYES'), 'YES', 'bottom-posted new text under the quote is not swallowed');
+    });
+  });
+
+  describe('sender verification (the linked-account gate)', () => {
+    it('trusts a From only when the mail passed author-aligned DKIM', async () => {
+      const { isFromAuthenticated } = await import('meteor/10thfloor:agent-channel-email');
+      const h = (v: string) => new Map([['x-spam-tests', v]]);
+      assert.isTrue(isFromAuthenticated(h('DKIM_SIGNED,DKIM_VALID,DKIM_VALID_AU,SPF_PASS')));
+      assert.isFalse(isFromAuthenticated(h('DKIM_SIGNED,DKIM_VALID,SPF_PASS')), 'valid but not author-aligned is not enough');
+      assert.isFalse(isFromAuthenticated(h('SPF_PASS')), 'SPF authenticates the envelope return-path, not the From');
+      assert.isFalse(isFromAuthenticated(new Map()), 'no header — fail closed');
+      assert.isFalse(isFromAuthenticated(h('X_DKIM_VALID_AUX')), 'token boundary — no substring match');
+    });
+
+    it('reflects it on the reading, so the pipeline keeps an unverified sender anonymous', async () => {
+      const spoofable = await read(pm());
+      assert.isFalse(spoofable.senderVerified, 'a bare From never resolves to a linked account');
+      const aligned = await read(pm({}, { 'X-Spam-Tests': 'DKIM_VALID_AU' }));
+      assert.isTrue(aligned.senderVerified);
+    });
+  });
+
+  describe('lens.out statuses', () => {
+    it('reads the approval outcome from the structured flags, never the note prose', async () => {
+      const { emailLens } = await import('meteor/10thfloor:agent-channel-email');
+      const dest = { to: 'ada@example.com', subject: 'Re: x', replyKey: 'k' };
+      const body = (extra: object): string =>
+        (emailLens.out({ item: 'status', kind: 'approval', ...extra } as any, dest) as any).TextBody;
+      assert.equal(body({ approved: true }), 'Approved.');
+      assert.equal(body({ approved: false }), 'Denied.');
+      assert.include(body({ approved: false, timedOut: true }), 'timed out',
+        'the flag decides — a timeout is a denial nobody made, and the text must say so');
     });
   });
 
@@ -124,6 +157,21 @@ describe('agent-channel-email', () => {
         destination: { to: 'ada@example.com', subject: 'Re: x', replyKey: 'k' },
         message: (text) => ({ email: 'inbound', body: pm({ TextBody: text }) }),
       });
+    });
+
+    it('pairs each choice label with ITS OWN url, one per line', async () => {
+      const { emailLens } = await import('meteor/10thfloor:agent-channel-email');
+      // assertLensRoundTrip only proves every url is PRESENT; this pins the
+      // label↔url association an index-zip regression would silently break.
+      const out = emailLens.out({
+        item: 'prompt', name: 'orders.refund', args: { id: 9 }, toolCallId: 'tc1',
+        choices: [
+          { token: 'approve', label: 'Approve', url: 'https://app.test/verdict/aaa' },
+          { token: 'deny', label: 'Deny', url: 'https://app.test/verdict/ddd' },
+        ],
+      } as any, { to: 'ada@example.com', subject: 'Re: x', replyKey: 'k' }) as any;
+      assert.include(out.TextBody, 'Approve: https://app.test/verdict/aaa');
+      assert.include(out.TextBody, 'Deny: https://app.test/verdict/ddd');
     });
 
     it('under the menu profile, the reply words round-trip through the pipeline\'s grammar', async () => {
