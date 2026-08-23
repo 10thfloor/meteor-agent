@@ -201,6 +201,20 @@ export class Agent {
     return this.session(sessionId)?.pending;
   }
 
+  /**
+   * Mint a single-use download URL for one attachment ref (participants spec
+   * §7) — call it ON CLICK and navigate immediately: the token lives about a
+   * minute and is burned by the GET, so the URL is a fetch handle, never a
+   * share handle. Rejects `no-attachment` for an id this session does not
+   * hold.
+   */
+  async attachmentUrl(sessionId: string, attachmentId: string): Promise<string> {
+    const token: string = await Meteor.callAsync(
+      NAMES.mAttachmentToken, this.name, sessionId, attachmentId,
+    );
+    return `/agent/attachments/${token}`;
+  }
+
   approve(sessionId: string): Promise<void> {
     return Meteor.callAsync(NAMES.mApprove, this.name, sessionId);
   }

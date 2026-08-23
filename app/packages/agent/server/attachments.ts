@@ -3,6 +3,7 @@ import { Meteor } from 'meteor/meteor';
 import { Mongo } from 'meteor/mongo';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
+import { prettySize } from '../common/format';
 import type { Fields, TypedCollection } from '../common/db';
 import type { AttachmentRef } from '../common/types';
 import type { ChannelAttachment } from '../common/channel-contract';
@@ -128,15 +129,10 @@ export function decodedBase64Size(content: string): number | null {
   return Buffer.from(s, 'base64').length;
 }
 
-/** `18432` → `18 KB`; sizes in admission notes and read refusals. */
-export function prettySize(n: number): string {
-  if (n >= 1024 * 1024) {
-    const mb = n / (1024 * 1024);
-    return `${mb >= 10 ? Math.round(mb) : Math.round(mb * 10) / 10} MB`;
-  }
-  if (n >= 1024) return `${Math.round(n / 1024)} KB`;
-  return `${n} bytes`;
-}
+// Moved to common/ so the element's chips render the same sizes (participants
+// spec §7.3); imported back and re-exported so every existing import site —
+// and this module's own notes — hold unchanged.
+export { prettySize };
 
 const refOf = (row: Pick<AgentAttachment, '_id' | 'name' | 'contentType' | 'size'>): AttachmentRef => ({
   id: row._id, name: row.name, contentType: row.contentType, size: row.size,
