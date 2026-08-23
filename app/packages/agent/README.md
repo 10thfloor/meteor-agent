@@ -1521,6 +1521,67 @@ and TTL reapers on submissions (`at`, 7 days) and both token tables
 Mongo's TTL sweep runs on its own schedule and a token must be dead the
 millisecond it expires).
 
+## Participants — n:n sessions
+
+A session is one human and one model until you say otherwise. Saying
+otherwise is the **roster**: an optional `participants` array on the session
+holding humans (account-holding or channel-identified) and models
+(agent-registry names). Absent, everything behaves exactly as documented
+above; present, it is the authoritative list of who may read, write, approve
+and speak. One transcript, one turn at a time — n:n is membership and
+attribution, not concurrency.
+
+```js
+// Server-side, owner-driven — joins are app decisions, never a DDP cap.
+await Agent.participants.add(sessionId, {
+  id: 'h:' + colleagueId, kind: 'human', role: 'member',
+  userId: colleagueId, displayName: 'Dana',
+});
+await Agent.participants.add(sessionId, {
+  id: 'm:analyst', kind: 'model', role: 'member', agent: 'analyst',
+});
+```
+
+The first join seeds the roster with the owner and the primary model in one
+single-winner write, so it is never a half-list. Members appear in each
+other's `sessions()` lists, may `send`, `fork`, `compact` and answer
+approvals (the agent's `approve` predicate still applies), and every message
+gains a harness-stamped `from` — written from the authenticated source, never
+parsed from text, so a model can never impersonate a colleague.
+`Agent.participants.remove` refuses the owner (ownership transfer is a named
+open question) and tears down the member's channel bindings with them.
+
+**Addressing is mechanical.** A message that starts `@analyst` (or a send
+with `extras.to`) runs that model's config — its prompt, tools and provider —
+under the *primary's* budget: one purse per conversation. A model whose reply
+leads with `@colleague` schedules that colleague's turn — a **relay**,
+durable (`pendingRelay` rides the same atomic write as the commit, the
+watcher sweeps it) and budgeted (`budget.relay`, default 4 hops, reset by any
+human message; the capped reply still delivers, with a note saying why
+nothing answered). Model-addressed replies are internal deliberation: the web
+transcript shows them, channels skip them.
+
+**Channels admit members by policy.** A binding's `admits` — `'opener'` (the
+default, v1's guard verbatim), `'members'` (roster-matched senders, account
+or channel identity), `'linked'` (auto-join for linked accounts, the
+group-thread path) — gates ingress; the roster gates DDP. Member bindings
+(`member: true`, compose's pre-bound recipient) receive outward replies only:
+never prompts, statuses, or capability URLs, and the claim-history sweep
+skips them. The composed-email loop closes on exactly this machinery — see
+the email package's `onReply: 'continue'`.
+
+**Files round out the surface.** Attachment refs on published rows render as
+chips in `<agent-chat>`; a click mints a single-use ~60-second token
+(`agent.attachmentToken`, authorized like the publication) and downloads
+through `/agent/attachments/<token>` — attachment-disposition and nosniff,
+always, so the store can never serve same-origin markup. Images reach a
+vision-capable model one way only: the model calls `read_attachment`, the
+provider's declared capability gates it (failing closed), the bytes ride the
+tool result at request time — after the compaction estimate, strippable by
+an `afterToolResult` hook, degradable when a provider refuses them.
+
+Full design: `docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md`.
+
 ## Scope
 
 **Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**
@@ -1584,6 +1645,15 @@ each one lens + one transport + zero npm dependencies —
 `10thfloor:agent-channel-slack`, `-telegram`, `-whatsapp` and `-sms`, the last
 being the design's stress test (no buttons, no threads: approvals ride the
 receipt-registered "Reply YES/NO" grammar).
+
+The seventh addition is **participants** (see **Participants — n:n
+sessions**): the roster, membership as the authorization primitive, the
+trusted ingress principal for unlinked channel members, mechanical
+`@`-addressing with durable budgeted relays, per-model provider projection
+with attribution, the composed-email loop (`onReply: 'continue'`), chat
+media ingest through the def-owned SSRF-gated fetcher, the download surface,
+approval legibility (`describe` → `pending.display`), and multimodal reads
+behind a provider capability gate.
 
 **The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
 `afterToolResult` are the two seams this package offers an app for changing what

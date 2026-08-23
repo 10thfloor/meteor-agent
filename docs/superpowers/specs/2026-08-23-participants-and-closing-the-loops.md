@@ -1,6 +1,6 @@
 # Participants: n:n sessions, and closing the loops
 
-**Status:** proposed
+**Status:** built (2026-08-23, all eight steps; deviations recorded in §14)
 **Date:** 2026-08-23
 **Depends on:** `2026-08-20-channels-multi-surface-delivery.md` (built), `2026-08-23-email-attachments-and-compose.md` (built)
 
@@ -606,3 +606,32 @@ Build order, each step green before the next:
    on the mock with a declared capability.
 8. **Docs** — READMEs; both prior specs' open questions gain pointers
    here; v2 decision 8's supersession recorded there and here.
+
+## 14. Build deviations
+
+Recorded as built, where the code taught the spec something:
+
+1. **`from` stamps rostered rows only** (decision 2, amended in place): the
+   projection's fixed defaults attribute pre-roster history exactly as an
+   always-stamp would have, so the extra bytes bought nothing and 1:1 rows
+   stay bit-for-bit.
+2. **The media law checks count + content type, not names** (§6.4): Twilio's
+   MMS form fields carry no filename, and a lens cannot preserve what the
+   provider never transmits — mechanical names are the honest translation.
+   The law's corpus is also ONE file, because several surfaces deliver one
+   media per message; multi-file translation is each package's own test.
+3. **`admits` is also a `ChannelDef` knob** — the channel-level default new
+   bindings are stamped with; the binding field remains the authority.
+4. **Destination adoption is a channel-authored hook**
+   (`ChannelDef.adoptDestination`), not a core `$set`: the destination is
+   opaque to the core, and only the channel knows which of its fields may be
+   learned from an inbound event.
+5. **`RemoteAttachment` gained `ref`** beside `url`, and the indirect
+   resolver lives on the def (`media.resolveIndirect`): Telegram needs the
+   bot token to even NAME the resource, so the lens emits the bare file id
+   and the factory — which owns the token — builds both hops.
+6. **`session.ephemeral`** marks `Agent.ask` throwaways so compose's
+   `'continue'` refusal has a fact to read; the alternative was a heuristic.
+7. **The compose thread key is per (session, recipient)**, with the SEND
+   still receipted per tool call: repeat composes share one conversation and
+   one binding rather than multiplying delivery streams.
