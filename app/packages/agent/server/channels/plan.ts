@@ -52,6 +52,12 @@ function overflow(text: string, limit: number, url?: string): DeliveryItem {
 
 function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null {
   if (message.role === 'assistant') {
+    // Internal deliberation (participants spec decision 13): a reply whose
+    // `to` names a MODEL participant is working conversation between
+    // colleagues — the web transcript shows it; channels advance past it.
+    // Without this, two models conferring would mail a human one message per
+    // relay hop.
+    if (message.to?.startsWith('m:')) return null;
     // The turn-final signal: no toolCalls. Empty text is possible (a turn that
     // ended on a refusal note) — nothing to say is nothing to post, UNLESS
     // the row carries attachment refs: a file with no cover note is still a
