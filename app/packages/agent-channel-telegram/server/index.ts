@@ -176,8 +176,43 @@ export const telegramLens: Lens = {
     // messages, so the echo loop cannot form here.
     const m = update.message;
     if (!m || !m.from || m.from.is_bot) return NOOP;
-    const text = String(m.text ?? '').trim();
-    if (text === '') return NOOP;   // photos, stickers, joins — nothing to say yet
+    // Media messages carry their words in `caption`, not `text` (participants
+    // spec §6.3) — a photo with a caption is a message saying the caption.
+    const text = String(m.text ?? (m as any).caption ?? '').trim();
+
+    // Files ride as REFERENCES: the Bot API delivers a `file_id` whose fetch
+    // needs the bot token to even name the resource (getFile, then the
+    // token-in-path download URL) — the factory's media recipe owns both. A
+    // photo is ONE attachment: Telegram's `photo` array is thumbnail sizes of
+    // the same image, and mapping them all would spend the file cap on
+    // duplicates — the largest is the photo.
+    const files: Array<{ name: string; contentType: string; declaredSize?: number; ref: string; indirect: true }> = [];
+    const photo = Array.isArray((m as any).photo) ? (m as any).photo : [];
+    if (photo.length > 0) {
+      const largest = photo.reduce(
+        (a: any, b: any) => ((Number(b?.file_size) || 0) > (Number(a?.file_size) || 0) ? b : a),
+        photo[photo.length - 1],
+      );
+      if (typeof largest?.file_id === 'string') {
+        files.push({
+          name: 'photo.jpg', contentType: 'image/jpeg',
+          ...(Number(largest.file_size) > 0 ? { declaredSize: Number(largest.file_size) } : {}),
+          ref: largest.file_id, indirect: true,
+        });
+      }
+    }
+    const doc = (m as any).document;
+    if (doc && typeof doc.file_id === 'string') {
+      files.push({
+        name: String(doc.file_name ?? 'file'),
+        contentType: String(doc.mime_type ?? 'application/octet-stream'),
+        ...(Number(doc.file_size) > 0 ? { declaredSize: Number(doc.file_size) } : {}),
+        ref: doc.file_id, indirect: true,
+      });
+    }
+    // The sharpened guard: a file with no words is still a message; stickers
+    // and joins still have nothing to say.
+    if (text === '' && files.length === 0) return NOOP;
 
     const envelope = {
       eventId,
@@ -192,7 +227,11 @@ export const telegramLens: Lens = {
     if (isTelegramLinkGesture(text) && m.chat.type === 'private') {
       return { intent: { kind: 'link-request' }, ...envelope };
     }
-    return { intent: { kind: 'message', text }, ...envelope };
+    return {
+      intent: { kind: 'message', text },
+      ...envelope,
+      ...(files.length > 0 ? { attachments: files } : {}),
+    };
   },
 };
 
@@ -262,6 +301,24 @@ export function telegram(options: TelegramChannelOptions): ChannelDef {
     verify: (raw) => verifyTelegramSecret(raw, options.webhookSecret),
     parse: parseTelegramUpdate,
     statuses: options.statuses ?? ['error', 'approval'],
+    // The media recipe (participants spec §6): Telegram is the token-in-path
+    // case — even NAMING the resource needs the bot token (getFile), and the
+    // download URL is `file/bot<TOKEN>/<file_path>`, CONSTRUCTED by the
+    // extractor from the getFile response. Both hops live on api.telegram.org.
+    // Note the Bot API's own getFile ceiling is 20 MB — files past it fail
+    // the fetch and become a note, which is the honest answer.
+    media: {
+      hosts: ['api.telegram.org'],
+      request: (att) => ({
+        url: `https://api.telegram.org/bot${options.botToken}/getFile?file_id=${encodeURIComponent(att.ref ?? '')}`,
+      }),
+      resolveIndirect: (json) => {
+        const r = json as { ok?: unknown; result?: { file_path?: unknown } } | null;
+        const path = r?.ok === true && typeof r.result?.file_path === 'string'
+          ? r.result.file_path : null;
+        return path === null ? null : `https://api.telegram.org/file/bot${options.botToken}/${path}`;
+      },
+    },
     // Every knob the core names, forwarded by one helper — a knob added to
     // ChannelKnobs tomorrow is forwarded here without this file changing.
     ...channelKnobs(options),

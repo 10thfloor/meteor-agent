@@ -179,7 +179,38 @@ describe('agent-channel-telegram', () => {
           };
         },
         message: (text) => messageUpdate({ text }),
+        // The media half (participants spec §6.4): a caption-less document, in
+        // the Bot API's own shape — a file_id needing getFile then the
+        // token-in-path download.
+        mediaMessage: (files) => messageUpdate({
+          text: undefined,
+          document: {
+            file_id: `FILE-${files[0].name}`, file_name: files[0].name,
+            mime_type: files[0].contentType, file_size: 4096,
+          },
+        }),
       });
+    });
+  });
+
+  describe('inbound media (participants spec §6)', () => {
+    it('a photo is ONE reference — the largest size — and the caption is the words', async () => {
+      const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+      const r = telegramLens.in(messageUpdate({
+        text: undefined,
+        caption: 'whiteboard from standup',
+        photo: [
+          { file_id: 'PH-S', file_size: 1200, width: 90, height: 90 },
+          { file_id: 'PH-M', file_size: 24_000, width: 320, height: 320 },
+          { file_id: 'PH-L', file_size: 180_000, width: 1280, height: 1280 },
+        ],
+      }));
+      assert.deepEqual(r.intent, { kind: 'message', text: 'whiteboard from standup' });
+      assert.lengthOf(r.attachments!, 1, 'thumbnail sizes are the SAME image — one file, not four');
+      const att: any = r.attachments![0];
+      assert.equal(att.ref, 'PH-L', 'the largest size is the photo');
+      assert.isTrue(att.indirect);
+      assert.equal(att.contentType, 'image/jpeg');
     });
   });
 

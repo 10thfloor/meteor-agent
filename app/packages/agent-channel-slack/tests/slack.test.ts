@@ -223,7 +223,61 @@ describe('agent-channel-slack', () => {
           slack: 'event',
           envelope: dmEvent({ text }),
         }),
+        // The media half (participants spec §6.4): a file-only DM share, in
+        // Slack's own wire shape — subtype file_share, bytes behind
+        // url_private_download.
+        mediaMessage: (files) => ({
+          slack: 'event',
+          envelope: dmEvent({
+            text: '',
+            subtype: 'file_share',
+            files: files.map((f, i) => ({
+              name: f.name, mimetype: f.contentType, size: 128 + i,
+              url_private_download: `https://files.slack.com/files-pri/T1-F${i}/download`,
+            })),
+          }),
+        }),
       });
+    });
+  });
+
+  describe('inbound media (participants spec §6)', () => {
+    it('translates a file share to remote references; a BOT file share stays a noop', async () => {
+      const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const share = slackLens.in({
+        slack: 'event',
+        envelope: dmEvent({
+          text: 'here you go',
+          subtype: 'file_share',
+          files: [{
+            name: 'report.csv', mimetype: 'text/csv', size: 2048,
+            url_private_download: 'https://files.slack.com/files-pri/T1-F1/download',
+          }],
+        }),
+      });
+      assert.deepEqual(share.intent, { kind: 'message', text: 'here you go' });
+      assert.deepEqual(share.attachments, [{
+        name: 'report.csv', contentType: 'text/csv', declaredSize: 2048,
+        url: 'https://files.slack.com/files-pri/T1-F1/download',
+      }]);
+
+      // The surviving belt: another bot's file share must NOT unlock — the
+      // subtype exception is for humans, and `bot_id` is what says so.
+      const bot = slackLens.in({
+        slack: 'event',
+        envelope: dmEvent({
+          text: '', subtype: 'file_share', bot_id: 'B99',
+          files: [{ name: 'x', mimetype: 'text/plain', url_private_download: 'https://files.slack.com/x' }],
+        }),
+      });
+      assert.equal(bot.intent.kind, 'noop', 'a bot-authored file share is the echo loop wearing an attachment');
+
+      // Other subtypes stay locked.
+      const edit = slackLens.in({
+        slack: 'event',
+        envelope: dmEvent({ text: 'edited', subtype: 'message_changed' }),
+      });
+      assert.equal(edit.intent.kind, 'noop');
     });
   });
 

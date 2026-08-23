@@ -16,5 +16,6 @@ import './watcher.test';
 import './channels.test';
 import './attachments.test';
 import './participants.test';
+import './media.test';
 import './perf.test';
 import './integration.server';

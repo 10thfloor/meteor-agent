@@ -71,10 +71,11 @@ export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 export {
   assertLensRoundTrip, exemplarItems, matchExpectation, attachmentNotice,
   DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
-  encodeVerdictPostback, decodeVerdictPostback,
+  encodeVerdictPostback, decodeVerdictPostback, isRemoteAttachment,
   type ChannelAttachment, type ChannelProfile, type ChannelTransport,
-  type DeliveryItem, type InboundIntent, type InboundReading, type Lens,
-  type PromptChoice, type RoundTripOptions,
+  type DeliveryItem, type InboundAttachment, type InboundIntent,
+  type InboundReading, type Lens, type PromptChoice, type RemoteAttachment,
+  type RoundTripOptions,
 } from '../common/channel-contract';
 export {
   type ChannelDef, type ChannelKnobs, type RawInbound,
