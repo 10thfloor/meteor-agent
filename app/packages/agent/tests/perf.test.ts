@@ -255,9 +255,20 @@ describe('tool_args delta pressure', () => {
         async *stream() {
           for (const c of fourFatCalls()) yield c as any;
           // Same capturing idiom the loop tests use: deltas are deleted at
-          // commit, so snapshot after the flush interval and before 'done'.
-          await new Promise((r) => { setTimeout(r, 300); });
-          captured = await AgentDeltas.find({ sessionId: SESSION }).fetchAsync();
+          // commit, so snapshot before 'done'. POLL rather than sleep a fixed
+          // interval: the writer flushes on a timer, and a slow runner (CI)
+          // can still be mid-flush 300ms in — a fixed sleep captured 342 of
+          // 400 docs there and failed the count assertion for the wrong
+          // reason. The count IS the property under test, so wait until it
+          // reaches the expected 400 (or 3s, after which the assertion below
+          // fails with the real number).
+          for (let i = 0; i < 60; i += 1) {
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 50); });
+            // eslint-disable-next-line no-await-in-loop
+            captured = await AgentDeltas.find({ sessionId: SESSION }).fetchAsync();
+            if (captured.length >= 400) break;
+          }
           yield { kind: 'done', usage: { input: 1, output: 1 } };
         },
       };
