@@ -116,6 +116,9 @@ export function promptItem(
     item: 'prompt',
     name: pending.name,
     args: pending.args,
+    // The park-time legibility line (participants spec §8), passed through
+    // untouched — the planner stays pure; hydration happened at the park.
+    ...(pending.display !== undefined ? { display: pending.display } : {}),
     // Presence, not truthiness: `runAs: null` is the anonymous service
     // context, a fact an approver is entitled to see (see the session type).
     ...('runAs' in pending ? { runAs: pending.runAs } : {}),

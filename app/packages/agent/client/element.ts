@@ -537,8 +537,12 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         // adds nothing to the sentence.
         const runsAs = ask.runAs === undefined
           ? '' : ` — runs as ${ask.runAs ?? 'anonymous'}`;
-        this.ui.approvalText.textContent =
-          `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})${runsAs}`;
+        // The tool's own park-time account (participants spec §8) beats raw
+        // args JSON when the tool supplied one: an approver reads "Email
+        // dana@… — 2 files: report.csv (18 KB)" rather than ref ids.
+        this.ui.approvalText.textContent = ask.display
+          ? `${ask.display}${runsAs}`
+          : `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})${runsAs}`;
       }
     }
 

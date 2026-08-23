@@ -388,6 +388,37 @@ describe('agent-channel-email', () => {
       await tool.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-two' } as any);
       assert.equal(sends.length, 2);
     });
+
+    it('describe shows the approver names and sizes, never ref ids (participants spec §8)', async () => {
+      const { AgentAttachments } = await import('meteor/10thfloor:agent');
+      await (AgentAttachments as any).insertAsync({
+        _id: 'attL1', sessionId: 's-desc', name: 'report.csv', contentType: 'text/csv',
+        size: 18_432, content: b64('a'), origin: 'tool', createdAt: new Date(),
+      });
+      const tool: any = await factory();
+      const display = await tool.describe(
+        { to: 'Dana@OurCo.com', subject: 'Q3 numbers', body: 'Please review the attached figures.', attachments: ['attL1', 'attGone'] },
+        { userId: 'u1', sessionId: 's-desc' },
+      );
+      assert.include(display, 'dana@ourco.com');
+      assert.include(display, '"Q3 numbers"');
+      assert.include(display, 'report.csv (18 KB)', 'names and sizes, resolved session-scoped');
+      assert.include(display, 'attGone (not found)', 'a stale id is said plainly, not guessed at');
+      assert.include(display, 'Please review');
+
+      // The email lens leads with it, args underneath.
+      const { emailLens } = await import('meteor/10thfloor:agent-channel-email');
+      const rendered: any = emailLens.out({
+        item: 'prompt', name: 'compose_email', args: { attachments: ['attL1'] },
+        display: 'Email dana@ourco.com — "Q3 numbers"\nFiles: report.csv (18 KB)',
+        toolCallId: 'tcp',
+        choices: [
+          { token: 'approve', label: 'Approve', match: 'YES' },
+          { token: 'deny', label: 'Deny', match: 'NO' },
+        ],
+      } as any, { subject: 'Re: x' });
+      assert.match(rendered.TextBody, /report\.csv \(18 KB\)[\s\S]*attL1/, 'the display leads; the raw args remain the record');
+    });
   });
 
   describe("onReply: 'continue' — the composed loop (participants spec §5)", () => {

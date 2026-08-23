@@ -113,6 +113,16 @@ export type InlineTool = {
    *  anonymous service context). Privilege escalation by construction —
    *  read THE `runAs` NOTE above before using it. */
   runAs?: string | null;
+  /**
+   * Approval legibility (participants spec §8): a human-readable one-liner of
+   * what THIS call will do, produced at PARK time into `pending.display` —
+   * the approval bar and every channel prompt prefer it over raw args JSON.
+   * May read (compose resolves ref ids to names and sizes); a throw or a
+   * timeout just means no display, never a failed park. Advisory only: `run`
+   * still re-validates everything after the verdict.
+   */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 };
 
 export type AdoptedTool = {
@@ -125,6 +135,9 @@ export type AdoptedTool = {
    *  (your UI's own `Meteor.callAsync` is unaffected). Privilege escalation by
    *  construction — read `RUNAS_NOTE` above before using it. */
   runAs?: string | null;
+  /** See `InlineTool.describe` — the same park-time legibility seam. */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 };
 
 /**
@@ -209,6 +222,12 @@ export interface ResolvedTool {
    *  the session's owner" — and `null` is a real value (anonymous service
    *  context), so every check on it is `!== undefined`, never truthiness. */
   runAs?: string | null;
+  /** `inline` and `adopted` only: the park-time legibility hook
+   *  (participants spec §8). Carried through this projection deliberately —
+   *  dispatch parks off a ResolvedTool, and a field dropped here would be a
+   *  hook that silently never runs. */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 }
 
 export interface ToolResult {
@@ -1087,6 +1106,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         // silently runs the tool as the SESSION's user, which is the reading
         // that grants more access than was written.
         ...(hasRunAs ? { runAs: adopted.runAs ?? null } : {}),
+        ...(typeof adopted.describe === 'function' ? { describe: adopted.describe } : {}),
       };
     }
     const inline = spec as InlineTool;
@@ -1105,6 +1125,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       // See the adopted branch above for why this is a spread and why an
       // undefined value resolves to `null`.
       ...(hasRunAs ? { runAs: inline.runAs ?? null } : {}),
+      ...(typeof inline.describe === 'function' ? { describe: inline.describe } : {}),
     };
   });
 }

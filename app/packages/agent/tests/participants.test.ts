@@ -489,6 +489,90 @@ describe('participants', () => {
     });
   });
 
+  describe('approval legibility (participants spec §8)', () => {
+    it('a tool\'s describe lands on pending.display at park; a broken one costs only the display', async function () {
+      this.timeout(30000);
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { sendToSession } = await import('../server/methods');
+      const { AgentSessions } = await import('../common/collections');
+      await clean();
+
+      // eslint-disable-next-line no-new
+      new Agent('pp-desc', {
+        model: 'mock', instructions: '',
+        tools: [
+          {
+            name: 'send_report',
+            description: 'x',
+            gate: 'ask',
+            args: { type: 'object', properties: {} },
+            describe: async (args: any) => `Send the Q3 report to ${args.to} (2 files, 18 KB)`,
+            run: async () => ({ ok: true }),
+          },
+          {
+            name: 'broken_describe',
+            description: 'x',
+            gate: 'ask',
+            args: { type: 'object', properties: {} },
+            describe: async () => { throw new Error('boom'); },
+            run: async () => ({ ok: true }),
+          },
+        ],
+        provider: mockProvider((req) => {
+          const wantBroken = JSON.stringify(req.messages).includes('use the broken one');
+          return {
+            toolCalls: [{
+              id: wantBroken ? 'd2' : 'd1',
+              name: wantBroken ? 'broken_describe' : 'send_report',
+              args: { to: 'dana@ourco.com' },
+            }],
+          };
+        }),
+      });
+
+      await AgentSessions.insertAsync({
+        _id: 'pd1', agent: 'pp-desc', userId: 'u1', phase: 'idle', model: 'mock',
+        nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+        budgetSpent: { turns: 0, toolCalls: 0 },
+        createdAt: new Date(), updatedAt: new Date(),
+      });
+      await sendToSession('pp-desc', 'pd1', 'send it', 'u1');
+      await waitFor(async () => (await AgentSessions.findOneAsync('pd1'))?.phase === 'awaiting', 'the park');
+      const parked = await AgentSessions.findOneAsync('pd1');
+      assert.equal(
+        parked!.pending?.display,
+        'Send the Q3 report to dana@ourco.com (2 files, 18 KB)',
+        'the approver reads the tool\'s own account, not raw args',
+      );
+
+      // A describe that throws parks anyway, display absent.
+      await AgentSessions.insertAsync({
+        _id: 'pd2', agent: 'pp-desc', userId: 'u1', phase: 'idle', model: 'mock',
+        nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+        budgetSpent: { turns: 0, toolCalls: 0 },
+        createdAt: new Date(), updatedAt: new Date(),
+      });
+      await sendToSession('pp-desc', 'pd2', 'use the broken one', 'u1');
+      await waitFor(async () => (await AgentSessions.findOneAsync('pd2'))?.phase === 'awaiting', 'the second park');
+      const broken = await AgentSessions.findOneAsync('pd2');
+      assert.isUndefined(broken!.pending?.display, 'no display beats no park');
+      assert.equal(broken!.pending?.name, 'broken_describe');
+    });
+
+    it('promptItem passes the display through to the lenses', async () => {
+      const { promptItem } = await import('../server/channels/plan');
+      const item = promptItem({
+        phase: 'awaiting',
+        pending: {
+          toolCallId: 'tcd', name: 'send_report', args: { to: 'x' },
+          display: 'Email dana@ourco.com — "Q3" — report.csv (18 KB)',
+        },
+      } as any, { interact: 'menu' });
+      assert.equal(item!.display, 'Email dana@ourco.com — "Q3" — report.csv (18 KB)');
+    });
+  });
+
   describe('the provider view', () => {
     const now = new Date();
     const row = (partial: Partial<AgentMessage>): AgentMessage => ({

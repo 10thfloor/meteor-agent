@@ -182,6 +182,18 @@ export interface AgentSession {
      */
     agent?: string;
     /**
+     * Approval legibility (participants spec §8): the tool's own one-line
+     * account of what THIS call will do — compose resolves ref ids to names
+     * and sizes — produced by the spec's `describe(args, ctx)` at PARK time
+     * and preferred by the approval bar and every channel's prompt rendering
+     * over raw args JSON. Absent when the tool has no `describe` or it threw
+     * (a broken description must never fail a park). Advisory: `run` still
+     * re-validates everything after the verdict, so a stale display can
+     * approve a call the policy then refuses — the refusal reaches the
+     * model, exactly as today.
+     */
+    display?: string;
+    /**
      * IDENTITY for the wake this verdict schedules, stamped by `writeVerdict`
      * in the same atomic write as the verdict itself.
      *

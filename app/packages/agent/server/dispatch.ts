@@ -324,6 +324,20 @@ export async function dispatchCalls(
     }
 
     if (decision === 'ask') {
+      // Approval legibility (participants spec §8): the tool's own account of
+      // this call, resolved BEFORE the park so the approver reads names and
+      // sizes rather than ref ids. Failure is absence — a broken description
+      // must never fail a park — and the cap keeps a runaway string out of a
+      // published document.
+      let display: string | undefined;
+      if (typeof tool?.describe === 'function') {
+        try {
+          const d = await tool.describe(call.args, { userId: turn.userId, sessionId });
+          if (typeof d === 'string' && d.trim() !== '') {
+            display = d.length > 2000 ? `${d.slice(0, 2000)}…` : d;
+          }
+        } catch { /* no display beats no park */ }
+      }
       // Park by EXITING: no process waits here, no timer runs, nothing is
       // held. The committed assistant plus this marker plus `phase:
       // 'awaiting'` ARE the parked state, so it survives a deploy, a crash and
@@ -351,6 +365,7 @@ export async function dispatchCalls(
               // turn's config from it, so an addressee's approved call cannot
               // resume under the primary's tools.
               agent: turn.agent,
+              ...(display !== undefined ? { display } : {}),
               // MCP only, and only when there is a server to name. The resume
               // needs this to tell "the tool was renamed away" from "its server
               // is down" — see the field's comment in common/types.ts. Spread

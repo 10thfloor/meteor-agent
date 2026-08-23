@@ -269,6 +269,11 @@ export const emailLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {}, null, 2);
         const clamped = args.length > 2000 ? `${args.slice(0, 2000)}…` : args;
+        // The tool's own account of the call (participants spec §8) leads
+        // when the park hydrated one — an approver reads names and sizes
+        // first; the raw args stay underneath as the exact record of what
+        // was asked.
+        const display = item.display ? `${item.display}\n\n` : '';
         const runAs = 'runAs' in item && item.runAs !== undefined
           ? `\n(runs as: ${item.runAs ?? 'anonymous service context'})` : '';
         // Two grammars, chosen by what the planner handed us: `url` on a
@@ -282,7 +287,7 @@ export const emailLens: Lens = {
         }).join('\n');
         return {
           Subject,
-          TextBody: `The agent wants to run ${item.name}:\n\n${clamped}${runAs}\n\n${choices}`,
+          TextBody: `The agent wants to run ${item.name}:\n\n${display}${clamped}${runAs}\n\n${choices}`,
         };
       }
       default:
@@ -670,6 +675,32 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       required: ['to', 'subject', 'body'],
     },
     gate: options.gate ?? 'ask',
+    // Approval legibility (participants spec §8): the approver reads the
+    // recipient, the subject, a head of the body, and each attachment by NAME
+    // and size — resolved session-scoped at park time, so the ref ids stop
+    // leaking into approval prompts. Advisory: `run` re-validates everything
+    // (policy, refs, caps) after the verdict, exactly as before.
+    async describe(args: { to?: string; subject?: string; body?: string; attachments?: string[] }, ctx) {
+      const to = String(args.to ?? '').trim().toLowerCase();
+      const subject = String(args.subject ?? '');
+      const body = String(args.body ?? '');
+      const head = body.length > 200 ? `${body.slice(0, 200)}…` : body;
+      const ids = Array.isArray(args.attachments)
+        ? args.attachments.filter((x): x is string => typeof x === 'string')
+        : [];
+      const names: string[] = [];
+      for (const id of ids) {
+        // eslint-disable-next-line no-await-in-loop
+        const row = await AgentAttachments.findOneAsync({ _id: id, sessionId: ctx.sessionId });
+        names.push(row ? `${row.name} (${prettySize(row.size)})` : `${id} (not found)`);
+      }
+      const filesLine = names.length > 0
+        ? `\nFiles: ${names.join(', ')}` : '';
+      const joins = continueMode
+        ? `\nA send JOINS ${to} to this conversation: they will receive future replies here.`
+        : '';
+      return `Email ${to} — "${subject}"${filesLine}${joins}\n\n${head}`;
+    },
     async run(args: { to: string; subject: string; body: string; attachments?: string[] }, ctx) {
       const to = String(args.to ?? '').trim().toLowerCase();
       if (!EMAIL_SHAPE.test(to)) return { refused: true, reason: 'invalid-recipient' };
