@@ -82,6 +82,10 @@ export class Agent {
       phase: 'idle', model: config.model, nextSeq: 0,
       usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
+      // The throwaway marker: tools that would create standing state pointing
+      // back at this session (compose's 'continue' pre-bind) read it and
+      // refuse — the session is deleted in the finally below.
+      ephemeral: true,
       createdAt: new Date(), updatedAt: new Date(),
     });
 

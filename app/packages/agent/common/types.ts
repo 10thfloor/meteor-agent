@@ -271,6 +271,15 @@ export interface AgentSession {
    */
   channel?: { origin: string; assurance: 'none' | 'link' | 'oidc' };
   /**
+   * THROWAWAY sessions only (`Agent.ask`): this session is deleted the moment
+   * its one turn answers. Stamped so tools that create standing state
+   * pointing back at the session — compose's `onReply: 'continue'` pre-bind
+   * is the canonical case — can refuse: a continued conversation must not
+   * point at a session that is about to vanish (participants spec decision
+   * 20). Additive; absent on every real session.
+   */
+  ephemeral?: true;
+  /**
    * The ROSTER (participants spec §4.1) — absent on the classic 1:1 session,
    * complete when present (seeded with the owner and the primary model in a
    * single-winner write). The `channel`/`parent` idiom: optional, additive,

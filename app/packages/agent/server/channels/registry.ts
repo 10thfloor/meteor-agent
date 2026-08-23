@@ -118,6 +118,18 @@ export interface ChannelDef {
    */
   admits?: 'opener' | 'members' | 'linked';
   /**
+   * DESTINATION ADOPTION (participants spec §5): merge what an admitted
+   * inbound event knows about the conversation's addressing into a binding
+   * whose stored destination is missing it. Email is the motivating case —
+   * a compose pre-bind knows no `rootMessageId` (Postmark's send response
+   * carries its own id, not the RFC header), so without adoption every
+   * subsequent reply ships un-threaded and the conversation shatters in the
+   * recipient's mail client. PURE — bound × incoming → merged, or undefined
+   * for "keep what is stored". The destination stays opaque to the core;
+   * only the channel knows its fields.
+   */
+  adoptDestination?: (bound: unknown, incoming: unknown) => unknown | undefined;
+  /**
    * The webhook body ceiling for THIS surface, when the shared default
    * (`MAX_INBOUND_BYTES`, 1 MB) is too small for the provider's honest
    * payloads. Email needs it: Postmark delivers up to 35 MB of cumulative

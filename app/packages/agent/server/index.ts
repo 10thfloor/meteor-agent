@@ -78,7 +78,7 @@ export {
 } from '../common/channel-contract';
 export {
   type ChannelDef, type ChannelKnobs, type RawInbound,
-  listChannels, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
+  listChannels, getChannel, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
 } from './channels/registry';
 export {
   startEgress, deliverOnce,
@@ -91,7 +91,7 @@ export {
 } from './channels/linking';
 export {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
-  DeliveryReceipts, InboundSubmissions,
+  DeliveryReceipts, InboundSubmissions, insertOrLose,
   type ChannelBinding, type ChannelIdentity, type ChannelLinkToken,
   type ChannelVerdictToken, type DeliveryReceipt, type InboundSubmission,
   type ReceiptExpectation,
