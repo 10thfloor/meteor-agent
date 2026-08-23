@@ -29,4 +29,5 @@ accounts-password
 10thfloor:agent-channel-telegram
 10thfloor:agent-channel-whatsapp
 10thfloor:agent-channel-sms
+10thfloor:agent-channel-email
 ddp-rate-limiter

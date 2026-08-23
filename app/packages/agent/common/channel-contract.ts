@@ -400,12 +400,22 @@ export function assertLensRoundTrip(
     // `menu` profile, prompt choices carry the canonical reply words — the
     // grammar the receipt would register — so the helper tests the item the
     // lens would actually be handed, not a bare one.
+    // Under a `link` profile the worker mints a single-use URL per choice at
+    // delivery; the helper stands in a placeholder so the render can be
+    // checked for carrying every one.
     const item: DeliveryItem = raw.item === 'prompt' && profile.interact === 'menu'
       ? {
         ...raw,
         choices: raw.choices.map((c) => ({ ...c, match: c.match ?? MENU_MATCHES[c.token] })),
       }
-      : raw;
+      : raw.item === 'prompt' && profile.interact === 'link'
+        ? {
+          ...raw,
+          choices: raw.choices.map((c) => ({
+            ...c, url: c.url ?? `https://example.test/verdict/${c.token}-placeholder`,
+          })),
+        }
+        : raw;
     const payload = lens.out(item, destination);
     const empty = payload === null || payload === undefined
       || (Array.isArray(payload) && payload.length === 0);
@@ -416,7 +426,23 @@ export function assertLensRoundTrip(
       );
     }
 
-    if (item.item === 'prompt') {
+    if (item.item === 'prompt' && profile.interact === 'link') {
+      // A `link` surface's affordance is a URL the human opens on the WEB —
+      // there is no inbound event for `in` to read back; the other half of
+      // the round-trip is `redeemVerdictToken`, covered by the core's own
+      // tests. What the lens owes is to RENDER every choice's URL — an
+      // approval mail missing its Deny link is an approval you cannot refuse.
+      const rendered = JSON.stringify(payload);
+      for (const choice of item.choices) {
+        if (!choice.url || !rendered.includes(choice.url)) {
+          throw new Error(
+            `[10thfloor:agent] round-trip failed: the '${choice.token}' choice's URL `
+            + 'does not appear in the rendered prompt. A link-profile lens must carry '
+            + 'every choice\'s url (§8.4).',
+          );
+        }
+      }
+    } else if (item.item === 'prompt') {
       if (!opts.synthesize) {
         throw new Error(
           '[10thfloor:agent] assertLensRoundTrip needs `synthesize` to check the '

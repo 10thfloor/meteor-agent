@@ -2,12 +2,13 @@ import { Meteor } from 'meteor/meteor';
 import { check } from 'meteor/check';
 import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import {
-  Agent, AgentSessions, mockProvider, redeemLinkToken,
+  Agent, AgentSessions, mockProvider, redeemLinkToken, redeemVerdictToken,
 } from 'meteor/10thfloor:agent';
 import { slack } from 'meteor/10thfloor:agent-channel-slack';
 import { telegram } from 'meteor/10thfloor:agent-channel-telegram';
 import { whatsapp } from 'meteor/10thfloor:agent-channel-whatsapp';
 import { sms } from 'meteor/10thfloor:agent-channel-sms';
+import { email } from 'meteor/10thfloor:agent-channel-email';
 
 /**
  * The demo agent behind the chat UI in `client/`.
@@ -80,12 +81,13 @@ new Agent('demo', {
 });
 
 /**
- * Every surface the demo can speak — Slack, Telegram, WhatsApp, SMS — each
- * registered only when settings carry its credentials, so a plain
+ * Every surface the demo can speak — Slack, Telegram, WhatsApp, SMS, email —
+ * each registered only when settings carry its credentials, so a plain
  * `meteor run` stays exactly as it was. Same agent behind all of them; a
  * "refund…" parks ONE approval that renders as buttons on Slack/Telegram/
- * WhatsApp and as "Reply YES/NO" over SMS, and any surface (or the web)
- * decides it — first answer wins.
+ * WhatsApp, as "Reply YES/NO" over SMS, and as single-use Approve/Deny
+ * links in email, and any surface (or the web) decides it — first answer
+ * wins.
  *
  * The linking gesture is shared: the word "link" in a DM on any surface
  * (Telegram also takes /link) answers with /link/<token>, which the web
@@ -134,6 +136,23 @@ if (channelCfg.sms?.accountSid && channelCfg.sms?.authToken && channelCfg.sms?.w
     linkUrl,
   }));
   registeredChannels.push('sms');
+}
+if (channelCfg.email?.serverToken && channelCfg.email?.inboundAddress
+  && channelCfg.email?.webhookUser && channelCfg.email?.webhookPassword) {
+  Agent.channel('email', email({
+    agent: 'demo',
+    serverToken: channelCfg.email.serverToken,
+    from: channelCfg.email.from ?? channelCfg.email.inboundAddress,
+    inboundAddress: channelCfg.email.inboundAddress,
+    webhookUser: channelCfg.email.webhookUser,
+    webhookPassword: channelCfg.email.webhookPassword,
+    linkUrl,
+    // The `link` approval grammar: each Approve / Deny line in an approval
+    // mail is a single-use URL the client page below redeems. Without this
+    // the factory falls back to "Reply YES / NO".
+    approvalUrl: (token) => Meteor.absoluteUrl(`verdict/${token}`),
+  }));
+  registeredChannels.push('email');
 }
 
 // The demo's own methods take a token or a session id. Both are unguessable
@@ -192,6 +211,19 @@ Meteor.methods({
    * the token atomically, writes the identity row, and claims the anonymous
    * conversations that identity created. Returns what the UI needs to say.
    */
+  /**
+   * Decide a parked approval from an approval link — the email channel's
+   * `link` grammar. No login: the token IS the capability, addressed to the
+   * person the prompt was delivered to; the package burns it atomically,
+   * checks it names the CURRENTLY parked ask, and records the verdict as the
+   * session's owner. True when this click decided it; false for unknown,
+   * spent, expired, or stale — one indistinguishable answer, on purpose.
+   */
+  async 'demo.redeemVerdict'(token) {
+    check(token, String);
+    return redeemVerdictToken(token);
+  },
+
   async 'demo.linkChannel'(token) {
     check(token, String);
     if (!this.userId) {

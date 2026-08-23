@@ -18,6 +18,13 @@
         "accountSid": "AC-YOUR-TWILIO-SID",
         "authToken": "YOUR-TWILIO-AUTH-TOKEN",
         "webhookUrl": "https://YOUR-TUNNEL/agent/channels/sms"
+      },
+      "email": {
+        "serverToken": "YOUR-POSTMARK-SERVER-TOKEN",
+        "from": "Agent Demo <demo@yourdomain.com>",
+        "inboundAddress": "YOUR-HASH@inbound.postmarkapp.com",
+        "webhookUser": "hook",
+        "webhookPassword": "A-LONG-RANDOM-SECRET-YOU-INVENT"
       }
     }
   }
