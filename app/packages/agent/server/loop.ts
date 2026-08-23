@@ -30,7 +30,7 @@ import { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } from './deltas';
 // from here as public API. Their definitions now live in `./deltas`.
 export { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } from './deltas';
 import { discardTurn, locateBatch, repairUnansweredToolUse } from './transcript';
-import { claimStagedRefs } from './attachments';
+import { claimStagedRefs, hydrateImageRefs } from './attachments';
 
 // `toProviderMessages` is re-exported for the transcript tests (they destructure
 // it from `./loop`); the three imported above are internal cross-module calls.
@@ -166,6 +166,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   // Both feed the durable-wake check in the outer `finally` — see there.
   let owned = false;
   let resumed = false;
+  // The strip-and-degrade latch (participants spec §9): a provider can refuse
+  // an image the byte gate passed (pixel caps are invisible to a byte check),
+  // and the ref sits on a COMMITTED row — without this, one bad image would
+  // re-hydrate into every future request and 400 the session forever. One
+  // extra attempt, images stripped, text results intact.
+  let imagesStripped = false;
 
   if (running.has(sessionId)) return;   // already running in THIS process
   running.add(sessionId);
@@ -210,6 +216,17 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         await expandMcpTools(resolveTools(config.tools)), config.skills,
       );
       const schemas = toolSchemas(tools);
+
+      // The turn's vision capability (participants spec §9), answered ONCE:
+      // absent surface, absent answer, and any failure all read as NO — the
+      // gate fails closed (see Provider.capabilities). Threaded to every
+      // tool's ctx through the limits bundle.
+      try {
+        const answer = config.provider.capabilities?.imageInput?.(config.model);
+        limits.imageInput = (await answer) === true;
+      } catch {
+        limits.imageInput = false;
+      }
 
       if (!(await repairUnansweredToolUse(sessionId))) return;
 
@@ -379,6 +396,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           interrupted = false;
           let lastPhaseCheck = Date.now();
           let providerError: unknown = null;
+          // Whether THIS attempt's request carried hydrated images — the
+          // strip-and-degrade branch below keys on it (participants spec §9).
+          let attemptHadImages = false;
           // Fresh per attempt: an aborted attempt's signal must not poison its
           // retry, and a signal is single-shot.
           const abort = new AbortController();
@@ -393,6 +413,25 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // preserve: a hook that rebuilds the request wholesale must not be
             // able to silently disable the interrupt — cancellation is the
             // harness's contract with the user, not the extension's.
+            // The COMPACTED view when a compaction note stands; the raw
+            // (note-filtered) transcript otherwise — projected for THIS
+            // model participant when a roster stands (§4.4): its own rows
+            // keep their roles, colleagues' turn-final rows arrive as
+            // attributed user rows, colleagues' working drops.
+            const assembled = assembleContext(history, session.participants?.length ? {
+              self: modelParticipantId(selfAgent),
+              primary: modelParticipantId(session.agent),
+              participants: session.participants,
+            } : undefined);
+            // Image hydration (participants spec §9) — the separate async
+            // step, HERE and only here: after maybeCompact's estimate (base64
+            // in the estimator reads as megatokens and wedges compaction),
+            // never on the summarizer path, and skipped entirely once the
+            // strip-and-degrade latch fired or the model has no vision.
+            let requestHasImages = false;
+            if (limits.imageInput === true && !imagesStripped) {
+              requestHasImages = await hydrateImageRefs(sessionId, history, assembled);
+            }
             const request = await runBeforeProviderRequest({
               model: config.model,
               // The participants block is appended PER ITERATION from the
@@ -402,18 +441,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               system: session.participants?.length
                 ? config.system + participantsBlock(session, selfAgent)
                 : config.system,
-              // The COMPACTED view when a compaction note stands; the raw
-              // (note-filtered) transcript otherwise — projected for THIS
-              // model participant when a roster stands (§4.4): its own rows
-              // keep their roles, colleagues' turn-final rows arrive as
-              // attributed user rows, colleagues' working drops.
-              messages: assembleContext(history, session.participants?.length ? {
-                self: modelParticipantId(selfAgent),
-                primary: modelParticipantId(session.agent),
-                participants: session.participants,
-              } : undefined),
+              messages: assembled,
               tools: schemas,
             }, { agent: selfAgent, sessionId, purpose: 'think' });
+            attemptHadImages = requestHasImages;
             try {
               for await (const chunk of config.provider.stream({
                 ...request, signal: abort.signal,
@@ -492,6 +523,17 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // the user (nothing failed AT them), and the finally preserves a
             // stop if one stands. Returning here is the whole handling.
             if (classification === 'abandon') return;
+            // STRIP-AND-DEGRADE (participants spec §9): a fatal answer to a
+            // request carrying hydrated images gets ONE retry with the images
+            // stripped (text results intact) — pixel caps are invisible to
+            // the byte gate, the offending ref sits on a committed row, and
+            // without this every future request would re-hydrate it and fail
+            // identically. Latched, so a genuinely fatal request cannot loop.
+            if (classification === 'fatal' && attemptHadImages && !imagesStripped) {
+              imagesStripped = true;
+              messageId = Random.id();   // fresh id: the old deltas are gone
+              continue;
+            }
             const hasMoreAttempts = attemptIndex + 1 < retryAttempts;
             if (classification === 'retryable' && hasMoreAttempts) {
               if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;

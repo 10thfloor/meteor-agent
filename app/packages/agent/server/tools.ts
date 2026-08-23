@@ -79,6 +79,23 @@ export interface ToolContext {
    *  behalf: the escalation gives the tool an identity, and this is the only
    *  remaining record of who actually asked. */
   callerUserId?: string | null;
+  /**
+   * Multimodal reads (participants spec §9): whether the RUNNING turn's
+   * provider declared image input for its model — resolved once per turn by
+   * the loop from `Provider.capabilities.imageInput`, absent/false when it
+   * could not be answered (the gate fails closed). `read_attachment` reads it
+   * to decide between attaching an image and the structured refusal.
+   */
+  imageInput?: boolean;
+  /**
+   * The result-attachment collector (participants spec §9): stamp a
+   * session-scoped ref onto THIS call's `tool` row — request-time hydration
+   * then carries the bytes to the provider. Collected refs flow through
+   * `afterToolResult` (the hook may drop them) before the row is written, so
+   * a redaction hook cannot be dodged. Set by both dispatch paths; absent for
+   * a direct `runTool` caller, whose result has no row to stamp.
+   */
+  attachToResult?: (ref: import('../common/types').AttachmentRef) => void;
 }
 
 /* ---------------------------------------------------------------------------
