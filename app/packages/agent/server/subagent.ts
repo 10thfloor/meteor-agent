@@ -365,6 +365,20 @@ export async function runSubagent(
     // than making every reader handle a missing half of the lineage.
     parent: { sessionId: ctx.sessionId, toolCallId: ctx.toolCallId ?? '' },
     depth,
+    // A rostered parent's HUMAN participants carry to the child (participants
+    // spec decision 20) — pubSession's invariant is that a child authorizes
+    // exactly the people the parent authorizes, and with a roster "the
+    // people" are the members. The parent's MODELS do not: the child's own
+    // agent is its only model, seeded here so the roster stays complete.
+    ...(parent.participants?.length ? {
+      participants: [
+        ...parent.participants.filter((p) => p.kind === 'human'),
+        {
+          id: `m:${name}`, kind: 'model' as const, role: 'member' as const,
+          agent: name, displayName: name, joinedAt: new Date(),
+        },
+      ],
+    } : {}),
     createdAt: new Date(),
     updatedAt: new Date(),
   });

@@ -43,6 +43,10 @@ export interface FieldExpr<V> {
   $lt?: V;
   $lte?: V;
   $exists?: boolean;
+  /** Array-field membership queries (the participants roster). The element
+   *  shape is not re-checked here — an `$elemMatch` value is a sub-selector
+   *  over the element type, and the two call sites keep it honest. */
+  $elemMatch?: Record<string, unknown>;
 }
 
 /** A field position in a selector: an exact value, `null` (Mongo matches a
@@ -75,6 +79,8 @@ export type SessionQuery =
   & { [k: `usage.${string}`]:unknown }
   & { [k: `budgetSpent.${string}`]:unknown }
   & { [k: `channel.${string}`]:unknown }
+  & { [k: `participants.${string}`]:unknown }
+  & { [k: `pendingRelay.${string}`]:unknown }
   & {
     $or?: SessionQuery[];
     $and?: SessionQuery[];
@@ -108,11 +114,17 @@ type SessionUnset =
   & { [k: `pending.${string}`]:1 | true };
 
 /** A session modifier: `$set`/`$unset` over known fields plus the counter-only
- *  `$inc` (`SessionInc`). Every field name is checked. */
+ *  `$inc` (`SessionInc`) and the roster's one `$push`. Every field name is
+ *  checked. */
 export interface SessionModifier {
   $set?: SessionSet;
   $unset?: SessionUnset;
   $inc?: SessionInc;
+  /** The roster join (participants spec §4.1) — the only array push the
+   *  package performs, guarded per id at its two call sites. */
+  $push?: { participants?: import('./types').SessionParticipant };
+  /** The roster leave — the mirror of `$push`. */
+  $pull?: { participants?: { id: string } };
 }
 
 // ---- AgentMessages ---------------------------------------------------------

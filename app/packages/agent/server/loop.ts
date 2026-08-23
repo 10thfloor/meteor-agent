@@ -1,6 +1,11 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import { DECIDED_PHASES } from '../common/types';
+import {
+  modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
+} from '../common/participants';
+import { resolveWakeAgent } from './participants';
+import { getAgent, buildRunConfig, resolveBudget } from './registry';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -47,6 +52,15 @@ export interface RunConfig {
   system: string;
   tools: ToolSpec[];
   provider: Provider;
+  /**
+   * WHICH AGENT this turn runs as (participants spec §4.3) — set by
+   * `buildRunConfig` when a turn is addressed to a non-primary model
+   * participant. Absent = the session's own agent, today's behavior. The loop
+   * and dispatch read it for `from` stamps, `pending.agent`, and hook
+   * context; the BUDGET is composed separately (always the primary's — one
+   * purse per conversation).
+   */
+  agentName?: string;
   maxIterations?: number;
   flushMs?: number;
   /** How often the stream loop re-reads the session to honor an interrupt
@@ -64,8 +78,10 @@ export interface RunConfig {
   /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
    *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
    *  `mSend`, not here — by the time a turn runs, the send it would refuse has
-   *  already happened. */
-  budget?: { turns?: number; toolCalls?: number; spend?: number };
+   *  already happened. `relay` caps model-to-model hops (participants spec
+   *  decision 7; default 4). On an ADDRESSED turn this whole bundle is the
+   *  PRIMARY agent's, whatever config the rest of the run came from. */
+  budget?: { turns?: number; toolCalls?: number; spend?: number; relay?: number };
   /** $ per million tokens. The FALLBACK for a provider that reports no cost of
    *  its own; see `accruedCost`. */
   pricing?: { input: number; output: number };
@@ -203,6 +219,18 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // history ends in a `tool` row — the ordinary shape an iteration expects.
       const entry = await AgentSessions.findOneAsync(sessionId);
       if (!entry) return;
+      // WHICH MODEL PARTICIPANT this turn runs as (participants spec §4.3):
+      // the addressed composition's name, else the session's own agent. Every
+      // stamp (`from`, `pending.agent`), the hook context, and the relay
+      // parse read this one value.
+      const selfAgent = config.agentName ?? entry.agent;
+      // Consume a relay addressed to us: the wake this turn IS. Single
+      // consumer by construction — the guarded `$unset` is lease-scoped, and
+      // a relay addressed to a different model is left standing for its own
+      // wake (this turn was something else's — a verdict, a send).
+      if (entry.pendingRelay && entry.pendingRelay.agent === selfAgent) {
+        await guardedUpdate(sessionId, SERVER_ID, { $unset: { pendingRelay: 1 } });
+      }
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit
@@ -242,8 +270,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         } else {
           resumed = true;
           const outcome = await resumeParkedTurn(
-            sessionId, entry.pending, tools, entry.userId, entry.agent,
+            sessionId, entry.pending, tools, entry.userId, selfAgent,
             config.budget, limits, runTurn,
+            entry.participants?.length ? modelFrom(selfAgent) : undefined,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -338,6 +367,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
           const writer = new DeltaWriter(
             sessionId, messageId, msgSeq, flushMs, maxToolArgBytes,
+            // Streaming attribution (participants spec §4.1): rostered turns
+            // stamp the speaker on their deltas so the in-flight row can be
+            // labelled; 1:1 deltas stay byte-identical.
+            session.participants?.length ? modelFrom(selfAgent) : undefined,
           );
           text = '';
           thinking = '';
@@ -361,11 +394,26 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // able to silently disable the interrupt — cancellation is the
             // harness's contract with the user, not the extension's.
             const request = await runBeforeProviderRequest({
-              model: config.model, system: config.system,
+              model: config.model,
+              // The participants block is appended PER ITERATION from the
+              // session just re-read — never baked into `config.system` — so
+              // a roster that changed mid-conversation (compose joining its
+              // recipient) is visible at the next boundary (§4.3).
+              system: session.participants?.length
+                ? config.system + participantsBlock(session, selfAgent)
+                : config.system,
               // The COMPACTED view when a compaction note stands; the raw
-              // (note-filtered) transcript otherwise.
-              messages: assembleContext(history), tools: schemas,
-            }, { agent: session.agent, sessionId, purpose: 'think' });
+              // (note-filtered) transcript otherwise — projected for THIS
+              // model participant when a roster stands (§4.4): its own rows
+              // keep their roles, colleagues' turn-final rows arrive as
+              // attributed user rows, colleagues' working drops.
+              messages: assembleContext(history, session.participants?.length ? {
+                self: modelParticipantId(selfAgent),
+                primary: modelParticipantId(session.agent),
+                participants: session.participants,
+              } : undefined),
+              tools: schemas,
+            }, { agent: selfAgent, sessionId, purpose: 'think' });
             try {
               for await (const chunk of config.provider.stream({
                 ...request, signal: abort.signal,
@@ -501,11 +549,30 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // Cost rides the SAME atomic write that allocates the seq and accrues
         // the tokens — no second write, and no window in which a committed
         // message exists whose cost the spend budget has not yet seen.
+        // A RELAY (participants spec decision 7): a rostered turn-final reply
+        // whose leading `@` names another model participant schedules that
+        // model's turn. Parsed BEFORE the seq allocation so the durable wake
+        // (`pendingRelay`) rides the SAME atomic write — a bare defer from
+        // inside a committing turn lands in exactly the non-durable-wake race
+        // the verdict machinery documents. Over the cap, the reply still
+        // commits and delivers; it just schedules nothing, and the note below
+        // says why.
+        const turnFinal = !toolCalls || toolCalls.length === 0;
+        const roster = session.participants?.length ? session.participants : null;
+        const relayHit = turnFinal && roster
+          ? resolveRelay(text, session, selfAgent) : null;
+        const relayCount = session.relay ?? 0;
+        const relayCap = config.budget?.relay ?? 4;
+        const relaying = relayHit !== null && relayCount < relayCap;
+
         const commitSeq = await allocateSeq(sessionId, {
           'usage.input': usage.input,
           'usage.output': usage.output,
           'usage.cost': accruedCost(usage, config.pricing),
-        });
+        }, relaying ? {
+          pendingRelay: { agent: relayHit!.agent, token: Random.id() },
+          relay: relayCount + 1,
+        } : undefined);
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
         // The TURN-FINAL row (no toolCalls) claims the session's staged
@@ -515,7 +582,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // strands the claimed refs unstaged and undelivered; the file survives
         // in the store, the re-run turn's `create` re-stages it idempotently,
         // and delivery follows the row that actually commits.
-        const staged = (!toolCalls || toolCalls.length === 0)
+        //
+        // A RELAY-ADDRESSED reply claims nothing (participants spec decision
+        // 13): it is internal deliberation the channel planner skips, and a
+        // file claimed onto it would be silently undeliverable. The refs stay
+        // staged for the eventual outward reply.
+        const staged = (turnFinal && !relayHit)
           ? await claimStagedRefs(sessionId)
           : [];
 
@@ -524,8 +596,33 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           content: text, thinking: thinking || undefined,
           toolCalls, usage,
           ...(staged.length > 0 ? { attachments: staged } : {}),
+          // Attribution (decision 4) on ROSTERED rows only — a 1:1 row stays
+          // byte-identical and projects under the primary default. The
+          // addressee is stamped whenever a relay resolved — capped relays
+          // included, so the transcript still shows who was asked even when
+          // nothing was scheduled.
+          ...(roster ? { from: modelFrom(selfAgent) } : {}),
+          ...(relayHit ? { to: relayHit.id } : {}),
           createdAt: new Date(),
         });
+
+        // The capped relay's explanation — note-ONLY, deliberately not
+        // `commitBudgetNote`, which stops the session: a conversation that
+        // hit its hop limit is idle and answerable, not wedged (decision 7).
+        if (relayHit && !relaying) {
+          const noteSeq = await allocateSeq(sessionId);
+          if (noteSeq !== null) {
+            await AgentMessages.insertAsync({
+              _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'budget',
+              budget: 'relay',
+              error: {
+                error: 'budget-exhausted',
+                reason: 'Relay budget reached — a human message resets it.',
+              },
+              createdAt: new Date(),
+            });
+          }
+        }
 
         // The committed message supersedes its deltas; remove them now rather
         // than letting them accumulate. Without this, subscribing to an old
@@ -536,6 +633,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         await AgentDeltas.removeAsync({ messageId });
 
         if (!toolCalls || toolCalls.length === 0) {
+          // A reply that scheduled a relay ends this turn — the addressee's
+          // wake is durable (`pendingRelay`) and the wind-down self-check
+          // fires it in-process; the watcher is the cross-crash net.
+          if (relaying) return;
           // A send that landed mid-stream committed a user message this turn
           // never saw (its history was read before the interjection). Ending
           // the turn here would strand that message unanswered until the user
@@ -543,7 +644,20 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           const interjected = await AgentMessages.findOneAsync({
             sessionId, role: 'user', seq: { $gt: historyMaxSeq },
           });
-          if (interjected) continue;
+          if (interjected) {
+            // Rostered sessions RE-RESOLVE the interjection's addressee
+            // (participants spec §4.3): its own deferred wake was dropped by
+            // the running/lease guards, and continuing here would answer a
+            // message mechanically addressed to a colleague under the wrong
+            // config. Ending the turn hands it to the wind-down self-check,
+            // which wakes the right model. Same-addressee interjections keep
+            // today's continue.
+            if (roster) {
+              const target = resolveAddressee(interjected.content, interjected.to, session);
+              if (target && target.agent !== selfAgent) return;
+            }
+            continue;
+          }
           return;
         }
 
@@ -552,10 +666,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
         const outcome = await dispatchCalls(sessionId, toolCalls, tools, {
           userId: session.userId,
-          agent: session.agent,
+          agent: selfAgent,
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,
+          ...(roster ? { from: modelFrom(selfAgent) } : {}),
         }, config.budget, limits, runTurn);
         // A park exits the turn with the batch deliberately unanswered; an
         // abandonment has already erased it. Only a fully answered batch may
@@ -599,14 +714,46 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     // `awaiting` means the batch re-parked on its NEXT gate (nobody's verdict to
     // spend), and `stopped` means an interrupt outranks the verdict until a
     // send clears it: neither is ours to wake.
-    if (owned && !resumed) {
+    if (owned) {
       const after = await AgentSessions.findOneAsync(sessionId).catch(() => null);
       // 'error' belongs in this exclusion list for the same reason it is in
       // the finally's terminal list: a failed turn is not ours to wake, and
       // the two lists disagreeing was itself a reviewed defect.
-      if (after?.pending?.verdict
+      const wakeable = after
         && !DECIDED_PHASES.includes(after.phase)
-        && !running.has(sessionId)) {
+        && !running.has(sessionId);
+      // THREE wake kinds now feed one self-check (participants spec §4.3):
+      //   - a standing VERDICT (the original case; still excluded for a run
+      //     that itself resumed one, which would otherwise rescue itself
+      //     forever);
+      //   - a standing RELAY — the wake this turn's own commit scheduled, or
+      //     one left by a turn that died after writing it;
+      //   - an UNANSWERED ADDRESSED TAIL (rostered sessions only): a send
+      //     addressed to a different model landed mid-turn, its own deferred
+      //     wake was dropped by the running/lease guards, and the interjection
+      //     branch deliberately ended this turn instead of answering it under
+      //     the wrong config. Restricted to a tail whose addressee is NOT the
+      //     model this turn ran as, so a classic maxIterations exhaustion
+      //     still ends quietly.
+      const verdictWake = !!(wakeable && !resumed && after.pending?.verdict);
+      const relayWake = !!(wakeable && after.pendingRelay);
+      let tailWake = false;
+      if (wakeable && !verdictWake && !relayWake
+        && after.participants?.length && !after.pending) {
+        const [lastUser] = await AgentMessages.find(
+          { sessionId, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+        ).fetchAsync().catch(() => [] as never[]);
+        if (lastUser) {
+          const [lastAssistant] = await AgentMessages.find(
+            { sessionId, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
+          ).fetchAsync().catch(() => [] as never[]);
+          if (!lastAssistant || lastAssistant.seq < lastUser.seq) {
+            const target = resolveAddressee(lastUser.content, lastUser.to, after);
+            tailWake = !!target && target.agent !== (config.agentName ?? after.agent);
+          }
+        }
+      }
+      if (verdictWake || relayWake || tailWake) {
         // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
         // with every verdict, so this is identity where the old re-check had
         // only a boolean: a verdict consumed, the batch re-parked on its next
@@ -617,7 +764,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // Undefined only for a verdict written before the field existed, where
         // the comparison degrades to the old boolean form rather than
         // stranding the session.
-        const wakeToken = after.pending.wakeToken;
+        const wakeToken = after!.pending?.wakeToken;
+        const relayToken = after!.pendingRelay?.token;
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
         // plumbing and calls in), and the only thing `defer` would add is an
@@ -629,15 +777,50 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           void (async () => {
             // Re-read INSIDE the deferred callback, not before it: the
             // legitimate resume can start AND finish between the check above
-            // and this timer firing. It spends the verdict; a woken run that
-            // then finds no `pending` would fall straight into the think loop
-            // and make a provider call nobody asked for — a charge, and an
-            // assistant row appended to a turn the user considered finished.
+            // and this timer firing. It spends the verdict (or consumes the
+            // relay); a woken run that then finds nothing standing would fall
+            // straight into the think loop and make a provider call nobody
+            // asked for — a charge, and an assistant row appended to a turn
+            // the user considered finished. Each wake kind re-verifies its own
+            // condition by IDENTITY where one exists (the verdict token, the
+            // relay token), and the tail wake re-derives from the transcript.
             const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
-            if (!still?.pending?.verdict
-              || still.pending.wakeToken !== wakeToken
-              || DECIDED_PHASES.includes(still.phase) || running.has(sessionId)) return;
-            await runTurn(sessionId, config);
+            if (!still || DECIDED_PHASES.includes(still.phase) || running.has(sessionId)) return;
+            if (verdictWake) {
+              if (!still.pending?.verdict || still.pending.wakeToken !== wakeToken) return;
+            } else if (relayWake) {
+              if (still.pendingRelay?.token !== relayToken) return;
+            } else {
+              const [tailUser] = await AgentMessages.find(
+                { sessionId, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+              ).fetchAsync();
+              const [tailAssistant] = await AgentMessages.find(
+                { sessionId, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
+              ).fetchAsync();
+              if (!tailUser || (tailAssistant && tailAssistant.seq > tailUser.seq)) return;
+            }
+            // The woken turn runs as the participant the durable state names
+            // (participants spec decision 6) — the parked turn's model, the
+            // relay's addressee, the tail's addressee — composed with the
+            // PRIMARY's budget and the OWNER's identity, exactly as
+            // `deferResolvedTurn` composes it for the recovery paths.
+            const agentName = await resolveWakeAgent(still);
+            // The SAME config when the wake belongs to the model this run
+            // already was — which is every 1:1 wake, and what lets a test's
+            // hand-built RunConfig (mock provider included) survive its own
+            // verdict wake. A different addressee builds fresh from the
+            // registry: the addressee's config, the primary's budget.
+            if (agentName === (config.agentName ?? still.agent)) {
+              await runTurn(sessionId, config);
+              return;
+            }
+            const primary = getAgent(still.agent);
+            if (!primary) return;
+            const target = agentName === still.agent ? primary : getAgent(agentName);
+            if (!target) return;
+            await runTurn(sessionId, buildRunConfig(target, still.userId, target === primary
+              ? undefined
+              : { agentName, budget: resolveBudget(primary.budget) }));
           })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
           });

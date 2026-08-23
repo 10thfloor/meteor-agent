@@ -106,6 +106,18 @@ export {
   sanitizeAttachmentName, prettySize,
   type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions,
 } from './attachments';
+// Participants (participants spec): `Agent.participants` is the blessed door
+// (agent.ts); the pure helpers are exported for channel packages (compose's
+// pre-bind derives ids with them) and for hosts that build invite flows. The
+// server-side `via` principal type rides along for trusted callers of
+// `sendToSession`.
+export {
+  humanParticipantId, identityParticipantId, modelParticipantId,
+  participantByIdentity, participantByUserId, resolveAddressee,
+  participantsBlock, sanitizeDisplayName, needsAttribution,
+} from '../common/participants';
+export type { ViaIdentity } from './methods';
+export type { TranscriptView } from './transcript';
 
 /**
  * This process's boot watcher, or null when the settings or the environment

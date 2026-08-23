@@ -156,9 +156,12 @@ export type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
 
 interface TurnAnchor {
   userId: string | null;
-  /** The session's agent name — half of every hook's ctx. Read off the session
-   *  document rather than threaded through `RunConfig`: a CHILD session's
-   *  agent is the child's, and the session is the only place that is true. */
+  /** The RUNNING agent's name — half of every hook's ctx, the park's
+   *  `pending.agent`, and (for a child session) the child's own agent. With
+   *  the participants model this is the ADDRESSEE on an addressed turn
+   *  (`RunConfig.agentName`), which is exactly why hooks and parks follow it:
+   *  an addressee's turn runs the addressee's hook chain and resumes as the
+   *  addressee (participants spec decision 6). */
   agent: string;
   /** The committed assistant carrying the `tool_use`s — the discard anchor. */
   messageId: string;
@@ -166,6 +169,10 @@ interface TurnAnchor {
   /** EVERY call id of that assistant, not just the ones still to run: a
    *  discard has to take the whole batch's results with it. */
   batchIds: string[];
+  /** Attribution for the batch's `tool` rows (participants spec decision 4):
+   *  present exactly when the session has a roster, so the per-model
+   *  projection can tell whose working to drop. */
+  from?: { participant: string; name: string };
 }
 
 /**
@@ -225,6 +232,7 @@ export async function dispatchCalls(
       toolCallId: call.id,
       content: row.content,
       error: row.error,
+      ...(turn.from ? { from: turn.from } : {}),
       createdAt: new Date(),
     });
     return true;
@@ -338,6 +346,11 @@ export async function dispatchCalls(
             phase: 'awaiting',
             pending: {
               toolCallId: call.id, name: call.name, args: call.args, requestedAt: new Date(),
+              // WHICH MODEL parked (participants spec decision 6), recorded at
+              // park time like `mcpServer` — the resume paths build the woken
+              // turn's config from it, so an addressee's approved call cannot
+              // resume under the primary's tools.
+              agent: turn.agent,
               // MCP only, and only when there is a server to name. The resume
               // needs this to tell "the tool was renamed away" from "its server
               // is down" — see the field's comment in common/types.ts. Spread
@@ -407,6 +420,7 @@ export async function dispatchCalls(
       // The handle on the child transcript. Present even for a parked or failed
       // child — that session is exactly what a human needs to open.
       childSessionId,
+      ...(turn.from ? { from: turn.from } : {}),
       createdAt: new Date(),
     });
   }
@@ -434,6 +448,9 @@ export async function resumeParkedTurn(
   budget: RunConfig['budget'],
   limits: DispatchLimits,
   runTurn: RunTurn,
+  /** The rostered session's attribution stamp (participants spec decision 4)
+   *  — the RESUMING model's, which decision 6 guarantees is the parker's. */
+  from?: { participant: string; name: string },
 ): Promise<DispatchOutcome> {
   const msgs = await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
   const batch = locateBatch(msgs, pending.toolCallId);
@@ -457,6 +474,7 @@ export async function resumeParkedTurn(
     messageId: assistant._id,
     assistantSeq: assistant.seq,
     batchIds: calls.map((c) => c.id),
+    ...(from ? { from } : {}),
   };
   const abandon = async (): Promise<DispatchOutcome> => {
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
@@ -586,6 +604,7 @@ export async function resumeParkedTurn(
       content: row.content,
       error: row.error,
       childSessionId,
+      ...(from ? { from } : {}),
       createdAt: new Date(),
     });
   }
