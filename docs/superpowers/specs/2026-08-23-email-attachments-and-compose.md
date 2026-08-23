@@ -30,7 +30,7 @@ Three parts, then: **attachments ride the existing vocabulary** (additive, no ne
 | 5 | **Bytes are base64 strings end to end** | Postmark emits base64 inbound and demands it outbound; the contract is isomorphic (no `Buffer`); Mongo stores a 6.7 MB string in one document without ceremony. Decoding to binary and back would buy nothing but a dependency on Node globals in the wrong module. |
 | 6 | **Compose depends on the transport, not on the channel registration** | The reactive channel and the proactive tool are independent consumers of one thin shim. An app can register either without the other. This is the tool/channel line, drawn structurally. |
 | 7 | **The recipient is a policy decision made by app code** | §7's rule survives contact with compose: the model *proposes* `to`; an app-authored `recipients` policy validates it in trusted code, and the tool gates `'ask'` by default. A tool argument is still not an authorization boundary. |
-| 8 | **A reply to a composed mail opens a fresh conversation** | Routing it into the composer's session would admit a second human into a single-owner session — §3/§15's group-ownership question, which this spec refuses to answer by accident. V2 composed mail replies-to the plain inbound address; the recipient's answer starts their own thread, the normal inbound path, zero new machinery. |
+| 8 | **A reply to a composed mail opens a fresh conversation** | Routing it into the composer's session would admit a second human into a single-owner session — §3/§15's group-ownership question, which this spec refuses to answer by accident. V2 composed mail replies-to the plain inbound address; the recipient's answer starts their own thread, the normal inbound path, zero new machinery. **Superseded on opt-in** by the participants spec (§5 there): `onReply: 'continue'` mints the key and pre-binds; `'fresh'` — this decision — remains the default. |
 | 9 | **Every lens must account for attachments; only email carries them** | The round-trip law grows one clause: a rendered item's attachments must each appear by NAME in the payload — as a real provider attachment or as a textual notice ("file attached: report.csv — view on the web"). Degrade per item, downward from the full row (§8.5); never silently vanish a file. |
 
 ## 3. What's in scope
@@ -222,11 +222,31 @@ The email package's own tests add: parse of a Postmark inbound with attachments 
 
 ## 14. Open questions
 
-- **Closing the composed loop.** Letting the recipient's reply continue the *composing* conversation is the group-ownership question (§15 of the channels spec) — one session, two humans, per-message attribution. When that lands, compose mints a thread key and pre-binds; decision 8 is written to be superseded.
-- **Media on the chat channels.** Slack files and MMS arrive as provider-hosted URLs, not webhook bytes — ingesting them needs a fetch step admission can afford (size-check before download). The contract's `ChannelAttachment` holds; the lens envelope may want a lazy variant.
-- **A web download surface.** The transcript UI showing "report.csv" wants a click. For an owned session that is a login-gated route; for an anonymous session the URL-is-credential rule (§12 there) applies. Unspecified.
-- **Approval legibility for compose.** The parked prompt shows attachment *ids*; an approver would rather see names and sizes. The prompt item is generic core; hydrating display metadata into it is a small, separate decision.
-- **Multimodal reads.** `read_attachment` refuses binary today. Handing an image to a vision-capable model is a provider-abstraction question (pi-ai), not a channel one — but this store is where the image would come from.
+**All five answered** by `2026-08-23-participants-and-closing-the-loops.md`
+(built) — the participants spec, whose roster/membership model is the
+group-ownership answer this section was waiting on:
+
+- ~~**Closing the composed loop.**~~ **Answered** (§5 there): `onReply:
+  'continue'` mints the thread key decision 8 withheld (derived from session
+  + recipient), pre-binds member-shaped, and joins the recipient to the
+  roster. Decision 8's `'fresh'` remains the default; the supersession is
+  opt-in, exactly as this section predicted.
+- ~~**Media on the chat channels.**~~ **Answered** (§6 there): the lens
+  envelope grew its lazy variant (`RemoteAttachment` — URL or provider ref,
+  declared size, an indirect hop) and CORE fetches under a channel-authored
+  host allowlist with the size check before the download. All four chat
+  lenses translate.
+- ~~**A web download surface.**~~ **Answered** (§7 there): a click-minted,
+  single-use ~60s token through a roster-aware DDP method, served with
+  attachment-disposition + nosniff — one flow for owned and anonymous
+  sessions, so the URL-is-credential rule never meets a standing URL.
+- ~~**Approval legibility for compose.**~~ **Answered** (§8 there): tool
+  specs grew `describe(args, ctx)`, hydrated into `pending.display` at park
+  time; compose's shows names and sizes.
+- ~~**Multimodal reads.**~~ **Answered** (§9 there): a
+  `Provider.capabilities.imageInput` gate (pi-ai answers from its catalog,
+  failing closed), image blocks on tool results, request-time hydration —
+  and this store is indeed where the image comes from.
 
 ## 15. Next steps
 
