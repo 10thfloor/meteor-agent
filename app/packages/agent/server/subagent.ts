@@ -1,6 +1,7 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import { modelFrom } from '../common/participants';
 import { buildRunConfig, getAgent } from './registry';
 import { guardedUpdate, SERVER_ID } from './lease';
 import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
@@ -421,6 +422,14 @@ export async function runSubagent(
       seq: before.nextSeq,
       role: 'user',
       content: prompt,
+      // In a ROSTERED child (≥2 copied humans) the from-less user default
+      // attributes to the owner — but this text is the PARENT MODEL's
+      // delegation, and a projection reading "[Mackenzie]: <instructions
+      // Mackenzie never wrote>" is a reviewer-confirmed mislabel. The
+      // parent model's id is outside the child's roster; the projection's
+      // nameOf falls back to the stamp's own name.
+      ...(parent.participants?.length
+        ? { from: modelFrom(parent.agent) } : {}),
       createdAt: new Date(),
     });
 

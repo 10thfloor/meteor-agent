@@ -92,6 +92,10 @@ describe('participants', () => {
       assert.deepEqual(resolveAddressee('hello', 'analyst', session), { id: 'm:analyst', agent: 'analyst' });
       // The leading token, exactly once, only at the head.
       assert.deepEqual(resolveAddressee('@analyst check this', undefined, session), { id: 'm:analyst', agent: 'analyst' });
+      // Sentence punctuation after the name still addresses — the class
+      // admits '.'/'-' for dotted agent names, so the miss retries trimmed.
+      assert.deepEqual(resolveAddressee('@analyst. Can you review?', undefined, session), { id: 'm:analyst', agent: 'analyst' });
+      assert.deepEqual(resolveAddressee('@analyst— thoughts?', undefined, session), { id: 'm:analyst', agent: 'analyst' });
       assert.isNull(resolveAddressee('ask @analyst later', undefined, session), 'mid-text mentions are speech');
       assert.isNull(resolveAddressee('@nobody hi', undefined, session), 'an unmatched @name is just text');
       assert.isNull(resolveAddressee('plain text', undefined, session));
@@ -343,6 +347,99 @@ describe('participants', () => {
       assert.include(analystSystem, 'analyst instructions', 'the addressee runs its own config');
       assert.include(analystSystem, 'You are "pp-analyst"', 'the participants block rides the prompt');
       assert.include(analystSystem, 'owner (human, owner)');
+    });
+
+    it('an addressed message landing MID-STREAM still reaches its addressee (durable handoff)', async function () {
+      this.timeout(30000);
+      const { Agent } = await import('../server/agent');
+      const { sendToSession } = await import('../server/methods');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await clean();
+
+      // The primary streams SLOWLY, so the interjection lands mid-stream —
+      // the ordering whose bare-seq tail check read "answered" the moment
+      // the primary's own reply committed (the reviewer-confirmed strand).
+      const slow: Provider = {
+        async *stream(req) {
+          // Which MODEL is this request for? The instructions lead the
+          // system prompt (the participants block is appended after), so the
+          // prefix is the discriminator — the roster listing mentions both
+          // names in both prompts.
+          if (req.system.startsWith('you are pp-mid-b')) {
+            for (const ch of 'b saw it') yield { kind: 'text', chunk: ch };
+            yield { kind: 'done', usage: { input: 1, output: 8 } };
+            return;
+          }
+          for (const ch of 'a slow reply from the primary') {
+            // eslint-disable-next-line no-await-in-loop
+            await new Promise((r) => { setTimeout(r, 12); });
+            yield { kind: 'text', chunk: ch };
+          }
+          yield { kind: 'done', usage: { input: 1, output: 10 } };
+        },
+      };
+      // eslint-disable-next-line no-new
+      new Agent('pp-mid-a', { model: 'mock', instructions: 'you are pp-mid-a', tools: [], provider: slow });
+      // eslint-disable-next-line no-new
+      new Agent('pp-mid-b', { model: 'mock', instructions: 'you are pp-mid-b', tools: [], provider: slow });
+
+      await seedRostered('pmid1', 'pp-mid-a', 'u1', [model('pp-mid-b')]);
+      await sendToSession('pp-mid-a', 'pmid1', 'go', 'u1');
+      await waitFor(async () => (await AgentSessions.findOneAsync('pmid1'))?.phase === 'streaming', "A's stream starting");
+      // Lands mid-stream: B's own deferred turn drops on the running guard.
+      await sendToSession('pp-mid-a', 'pmid1', '@pp-mid-b check this', 'u1');
+
+      await waitFor(async () => !!(await AgentMessages.findOneAsync({
+        sessionId: 'pmid1', role: 'assistant', content: 'b saw it',
+      })), "the addressee answering the mid-stream interjection", 20000);
+      const reply = await AgentMessages.findOneAsync({ sessionId: 'pmid1', role: 'assistant', content: 'b saw it' });
+      assert.deepEqual(reply!.from, { participant: 'm:pp-mid-b', name: 'pp-mid-b' });
+    });
+
+    it('a message QUEUED behind an approval reaches its addressee, not the resuming model', async function () {
+      this.timeout(30000);
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { sendToSession, recordVerdict } = await import('../server/methods');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      await clean();
+
+      let toolRan = false;
+      // eslint-disable-next-line no-new
+      new Agent('pp-q-prime', {
+        model: 'mock', instructions: '',
+        tools: [{
+          name: 'gated', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { toolRan = true; return { ok: true }; },
+        }],
+        provider: mockProvider((req) => (req.messages.some((m) => m.role === 'tool')
+          ? { text: 'prime finished its batch' }
+          : { toolCalls: [{ id: 'q1', name: 'gated', args: {} }] })),
+      });
+      // eslint-disable-next-line no-new
+      new Agent('pp-q-c', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => ({ text: 'c answered the queued ask' })),
+      });
+
+      await seedRostered('pq1', 'pp-q-prime', 'u1', [model('pp-q-c')]);
+      await sendToSession('pp-q-prime', 'pq1', 'do the gated thing', 'u1');
+      await waitFor(async () => (await AgentSessions.findOneAsync('pq1'))?.phase === 'awaiting', 'the park');
+
+      // Queued while awaiting: C's deferred turn exits on the pending gate.
+      await sendToSession('pp-q-prime', 'pq1', '@pp-q-c summarize the contract', 'u1');
+      await recordVerdict({ userId: 'u1' }, 'pp-q-prime', 'pq1', 'approved');
+
+      await waitFor(async () => !!(await AgentMessages.findOneAsync({
+        sessionId: 'pq1', role: 'assistant', content: 'c answered the queued ask',
+      })), "the queued addressee's turn", 20000);
+      assert.isTrue(toolRan, "the approved call still ran under the resuming model");
+      const cReply = await AgentMessages.findOneAsync({
+        sessionId: 'pq1', role: 'assistant', content: 'c answered the queued ask',
+      });
+      assert.deepEqual(cReply!.from, { participant: 'm:pp-q-c', name: 'pp-q-c' },
+        'the queued @-message was never answered by the model that happened to be resuming');
     });
   });
 
