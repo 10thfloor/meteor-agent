@@ -148,6 +148,10 @@ export type DeliveryItem =
     item: 'prompt';
     name: string;
     args: unknown;
+    /** The tool's own one-line account of the call (participants spec §8),
+     *  hydrated at park time — a lens renders it ABOVE (or instead of) the
+     *  raw args, so an approver reads names and sizes, not ref ids. */
+    display?: string;
     runAs?: string | null;
     toolCallId: string;
     choices: PromptChoice[];
