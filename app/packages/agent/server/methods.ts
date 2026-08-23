@@ -19,6 +19,7 @@ import {
   participantByUserId, resolveAddressee,
 } from '../common/participants';
 import { resolveWakeAgent } from './participants';
+import { issueAttachmentToken } from './downloads';
 
 /**
  * A VERIFIED channel identity, vouched for by trusted server code — the
@@ -726,6 +727,28 @@ export function registerMethods(): void {
       if (refusal) throw new Meteor.Error('busy', refusal);
       if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
       return outcome === 'compacted';
+    },
+
+    /**
+     * Mint a single-use download token for one attachment ref (participants
+     * spec §7). Authorized exactly like the publication — owner, account
+     * member, the anonymous capability — then the ref must exist IN THIS
+     * session. The browser GETs `/agent/attachments/<token>` within the
+     * minute; the same 404 answers a wrong id and a wrong session, so a
+     * caller learns nothing about refs it cannot reach.
+     */
+    async [NAMES.mAttachmentToken](
+      this: any, agent: string, sessionId: string, attachmentId: string,
+    ) {
+      check(agent, String);
+      check(sessionId, String);
+      check(attachmentId, String);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      await requireSession(agent, sessionId, this.userId ?? null);
+      const token = await issueAttachmentToken(sessionId, attachmentId);
+      if (!token) throw new Meteor.Error('no-attachment', 'Attachment not found');
+      return token;
     },
 
     async [NAMES.mApprove](this: any, agent: string, sessionId: string) {

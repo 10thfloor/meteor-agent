@@ -6,6 +6,7 @@ import {
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
 import { AgentAttachments } from './attachments';
+import { AttachmentDownloadTokens } from './downloads';
 import { NAMES } from '../common/names';
 
 /**
@@ -138,6 +139,14 @@ export async function ensureIndexes(): Promise<void> {
     {
       collection: ChannelVerdictTokens,
       name: NAMES.channelVerdictTokens,
+      keys: { expiresAt: 1 },
+      options: { expireAfterSeconds: 0 },
+    },
+    // Download tokens (participants spec §7): ~60s single-use capabilities;
+    // redemption checks `expiresAt` itself — this TTL is only the janitor.
+    {
+      collection: AttachmentDownloadTokens,
+      name: NAMES.attachmentTokens,
       keys: { expiresAt: 1 },
       options: { expireAfterSeconds: 0 },
     },

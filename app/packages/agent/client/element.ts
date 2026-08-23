@@ -1,6 +1,7 @@
 import { Tracker } from 'meteor/tracker';
 import { Agent } from './agent';
 import type { Phase, ViewMessage } from '../common/types';
+import { prettySize } from '../common/format';
 
 /**
  * `<agent-chat>` — the packaged UI.
@@ -110,6 +111,21 @@ const FRAME = `
   .message.note { align-self: center; text-align: center; font-size: 0.8rem; opacity: 0.6; }
   .message.note.error { color: var(--_danger); opacity: 0.9; }
   .calls { display: block; font-size: 0.8rem; opacity: 0.7; font-family: ui-monospace, monospace; }
+  /* Attribution (participants spec §4.1): the speaker line a rostered row
+     carries. Absent on 1:1 rows, so nothing changes for the classic pair. */
+  .speaker { display: block; font-size: 0.72rem; opacity: 0.65; font-weight: 600; }
+  /* Attachment chips (participants spec §7.3): one per ref, click-to-mint. */
+  .attachments { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.35rem; }
+  .attachment {
+    font-size: 0.78rem; padding: 0.15rem 0.5rem; border-radius: 0.5rem;
+    border: 1px solid color-mix(in srgb, var(--_fg) 25%, transparent);
+    background: color-mix(in srgb, var(--_fg) 6%, var(--_bg));
+    color: inherit; cursor: pointer;
+  }
+  .message.user .attachment {
+    border-color: color-mix(in srgb, #fff 45%, transparent);
+    background: color-mix(in srgb, #fff 15%, transparent);
+  }
 
   .approval {
     display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem 1rem;
@@ -185,7 +201,10 @@ function noteText(m: ViewMessage): string {
   return m.error?.reason ?? m.kind ?? '';
 }
 
-function renderRow(m: ViewMessage, names: Map<string, string>): HTMLElement {
+function renderRow(
+  m: ViewMessage, names: Map<string, string>,
+  download?: (attachmentId: string) => void,
+): HTMLElement {
   const row = document.createElement('div');
   // `part` and `class` carry the same tokens: the class drives the sheet
   // above, the part exposes the identical hook to the host page. Note rows add
@@ -242,6 +261,25 @@ function renderRow(m: ViewMessage, names: Map<string, string>): HTMLElement {
       .map((c) => ` → ${c.name}(${JSON.stringify(c.args)})`)
       .join('');
     row.append(calls);
+  }
+  // Attachment chips (participants spec §7.3): the refs already ride the
+  // published row; the click MINTS a single-use download URL and navigates —
+  // the server's attachment-disposition means the page never leaves. All
+  // text through textContent, like every other row part.
+  if (m.attachments?.length && download) {
+    const wrap = document.createElement('span');
+    wrap.className = 'attachments';
+    wrap.setAttribute('part', 'attachments');
+    for (const ref of m.attachments) {
+      const chip = document.createElement('button');
+      chip.type = 'button';
+      chip.className = 'attachment';
+      chip.setAttribute('part', 'attachment');
+      chip.textContent = `📎 ${ref.name} (${prettySize(ref.size)})`;
+      chip.addEventListener('click', () => download(ref.id));
+      wrap.append(chip);
+    }
+    row.append(wrap);
   }
   return row;
 }
@@ -466,7 +504,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         ? (client.messages(sid).fetch() as ViewMessage[])
         : [];
       const names = toolNames(rows);
-      const nodes: HTMLElement[] = rows.map((m) => renderRow(m, names));
+      // The chip's mint-and-navigate: a click-time capability, never a
+      // standing URL (participants spec §7.3). `assign` on an
+      // attachment-disposition response downloads without navigating away.
+      const download = client && sid
+        ? (attachmentId: string) => {
+          void client.attachmentUrl(sid, attachmentId)
+            .then((url) => { window.location.assign(url); })
+            .catch((e) => { console.warn('[agent-chat] download refused:', e); });
+        }
+        : undefined;
+      const nodes: HTMLElement[] = rows.map((m) => renderRow(m, names, download));
       if (this.failure) nodes.push(failureRow(this.failure));
       this.ui.messages.replaceChildren(...nodes);
       this.ui.messages.scrollTop = this.ui.messages.scrollHeight;

@@ -11,6 +11,8 @@ export const NAMES = {
   channelVerdictTokens: 'agent_channel_verdict_tokens',
   // Attachments (email v2 spec): file bytes in a side store, refs on rows.
   attachments: 'agent_attachments',
+  // Downloads (participants spec §7): minted, single-use capability tokens.
+  attachmentTokens: 'agent_attachment_tokens',
   pubSession: 'agent.session',
   pubSessions: 'agent.sessions',
   mStart: 'agent.start',
@@ -20,6 +22,7 @@ export const NAMES = {
   mApprove: 'agent.approve',
   mDeny: 'agent.deny',
   mCompact: 'agent.compact',
+  mAttachmentToken: 'agent.attachmentToken',
 } as const;
 
 /** Capped collection size in bytes. Sized for ~200 concurrent streaming turns. */

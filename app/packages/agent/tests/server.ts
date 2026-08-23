@@ -17,5 +17,6 @@ import './channels.test';
 import './attachments.test';
 import './participants.test';
 import './media.test';
+import './downloads.test';
 import './perf.test';
 import './integration.server';
