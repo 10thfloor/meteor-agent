@@ -27,6 +27,11 @@ import type { Provider, ProviderChunk, ProviderMessage, ProviderRequest } from '
 
 /** pi-ai `TextContent`. */
 interface PiAiTextContent { type: 'text'; text: string }
+/** pi-ai `ImageContent` (types.d.ts) — base64 `data` + `mimeType`, legal on
+ *  user messages and tool results. The harness sends it only on tool results
+ *  (participants spec decision 13: images enter context through
+ *  `read_attachment` alone). */
+interface PiAiImageContent { type: 'image'; data: string; mimeType: string }
 /** pi-ai `ToolCall` content block. Note `arguments`, not `args`. */
 interface PiAiToolCallContent {
   type: 'toolCall'; id: string; name: string; arguments: Record<string, any>;
@@ -50,7 +55,8 @@ export type PiAiMessage =
     }
   | {
       role: 'toolResult'; toolCallId: string; toolName: string;
-      content: PiAiTextContent[]; isError: boolean; timestamp: number;
+      content: Array<PiAiTextContent | PiAiImageContent>;
+      isError: boolean; timestamp: number;
     };
 
 export interface PiAiTool { name: string; description: string; parameters: unknown }
@@ -167,7 +173,15 @@ function toPiAiMessage(
       role: 'toolResult',
       toolCallId: m.toolCallId ?? '',
       toolName: toolNames.get(m.toolCallId ?? '') ?? '',
-      content: [{ type: 'text', text: m.content ?? '' }],
+      content: [
+        { type: 'text', text: m.content ?? '' },
+        // Multimodal reads (participants spec §9): hydrated image blocks ride
+        // the tool result — pi-ai's ToolResultMessage.content accepts
+        // ImageContent (types.d.ts), matching field-for-field.
+        ...(m.images ?? []).map((i): PiAiImageContent => ({
+          type: 'image', data: i.data, mimeType: i.mimeType,
+        })),
+      ],
       // The transcript's `error` field, carried this far by the loop's
       // `toProviderMessages` as `ProviderMessage.isError`. pi-ai's
       // ToolResultMessage requires the flag, so an absent one is `false` —
@@ -284,6 +298,27 @@ export function createPiAiProvider(
   options?: Record<string, unknown>,
 ): Provider {
   return {
+    capabilities: {
+      /**
+       * The catalog's own answer (participants spec §9): pi-ai's `Model.input`
+       * declares modalities per model (`("text" | "image")[]`). Anything that
+       * cannot be answered — a malformed model string, a model the catalog
+       * lacks, a resolver failure — is NO: the gate fails closed, because
+       * pi-ai downgrades images to text placeholders for non-vision models
+       * and fail-open would quietly contradict the read tool's result text.
+       */
+      async imageInput(model: string): Promise<boolean> {
+        try {
+          const slash = model.indexOf('/');
+          if (slash <= 0 || slash === model.length - 1) return false;
+          const models = await resolveModels();
+          const m: any = models.getModel(model.slice(0, slash), model.slice(slash + 1));
+          return Array.isArray(m?.input) && m.input.includes('image');
+        } catch {
+          return false;
+        }
+      },
+    },
     async *stream(req: ProviderRequest): AsyncIterable<ProviderChunk> {
       const { provider, modelId, context } = toPiAiRequest(req);
       const models = await resolveModels();

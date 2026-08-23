@@ -35,6 +35,10 @@ export type RunTurn = (sessionId: string, config: RunConfig) => Promise<void>;
 export interface DispatchLimits {
   maxResultChars: number;
   canUse?: RunConfig['canUse'];
+  /** The turn's resolved vision capability (participants spec §9) — answered
+   *  once per turn by the loop from `Provider.capabilities.imageInput`,
+   *  handed to every tool's ctx. Absent = false = the gate fails closed. */
+  imageInput?: boolean;
 }
 
 /**
@@ -397,9 +401,15 @@ export async function dispatchCalls(
       return 'parked';
     }
 
+    // The result-attachment collector (participants spec §9): refs a tool
+    // stamps onto its own result — read_attachment's image path — collected
+    // per call and surfaced to the hook chain below with the power to drop.
+    const resultRefs: import('../common/types').AttachmentRef[] = [];
     const dispatched = tool
       ? await dispatchTool(tool, call.args, {
         userId: turn.userId, sessionId, toolCallId: call.id,
+        ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
+        attachToResult: (ref) => { resultRefs.push(ref); },
       }, runTurn)
       : {
         result: {
@@ -412,7 +422,12 @@ export async function dispatchCalls(
     // before the row is written, so a hook sees the whole result and its
     // replacement is what gets truncated, stored, published and sent to the
     // model. A throwing hook leaves `dispatched.result` standing — see hooks.ts.
-    const result = await runAfterToolResult(dispatched.result, call, hookCtx);
+    // `resultAttachments` rides the ctx MUTABLE: a redaction hook that cannot
+    // drop the image would be a hook the bytes dodge.
+    const result = await runAfterToolResult(dispatched.result, call, {
+      ...hookCtx,
+      ...(resultRefs.length > 0 ? { resultAttachments: resultRefs } : {}),
+    });
 
     // Same atomic allocation as the commit: `agent.send` can interject between
     // tool results, and read-then-$inc would hand both writers the same seq.
@@ -436,6 +451,9 @@ export async function dispatchCalls(
       // child — that session is exactly what a human needs to open.
       childSessionId,
       ...(turn.from ? { from: turn.from } : {}),
+      // What SURVIVED the hook chain — request-time hydration reads these
+      // refs off the committed row (participants spec §9).
+      ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
     });
   }
@@ -523,6 +541,11 @@ export async function resumeParkedTurn(
     const tool = tools.find((t) => t.name === call.name);
     let result: ToolResult;
     let childSessionId: string | undefined;
+    // The same per-call collector the streaming path builds (participants
+    // spec §9) — the approved-park resume constructs its own ctx, and a
+    // collector forgotten here would be a read that silently attaches
+    // nothing after a human said yes.
+    const resultRefs: import('../common/types').AttachmentRef[] = [];
     // A `canUse` refusal at resume dispatched nothing, so — like a denial — it
     // must cost no tool budget. Tracked here rather than re-derived from
     // `result.error.error` (a hook may have rewritten it) below.
@@ -594,15 +617,19 @@ export async function resumeParkedTurn(
       // anything.
       ({ result, childSessionId } = await dispatchTool(tool, call.args, {
         userId, sessionId, toolCallId: call.id,
+        ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
+        attachToResult: (ref) => { resultRefs.push(ref); },
       }, runTurn));
     }
 
     // The same `afterToolResult` seam the streaming path runs, at the same
     // point (before truncation, before the row): an approved tool's output, a
     // denial and an `mcp-unavailable` all reach the transcript through here, so
-    // a redaction hook cannot be dodged by parking a call.
+    // a redaction hook cannot be dodged by parking a call — collected result
+    // attachments included (mutable, droppable — see the hook ctx).
     result = await runAfterToolResult(result, call, {
       agent, sessionId, userId,
+      ...(resultRefs.length > 0 ? { resultAttachments: resultRefs } : {}),
     });
 
     // A denied call — or one refused by `canUse` — was never dispatched, so it
@@ -620,6 +647,7 @@ export async function resumeParkedTurn(
       error: row.error,
       childSessionId,
       ...(from ? { from } : {}),
+      ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
     });
   }

@@ -416,9 +416,11 @@ export interface AgentMessage {
   /**
    * Files this row carries — REFS only, bytes in the store (see
    * `AttachmentRef`). Legal on `user` rows (inbound files the channel
-   * admitted) and `assistant` rows (files a tool staged for the turn's reply,
-   * claimed at the turn-final commit). Additive and migration-free, the
-   * `channel`/`parent` idiom.
+   * admitted), `assistant` rows (files a tool staged for the turn's reply,
+   * claimed at the turn-final commit), and `tool` rows (an image
+   * `read_attachment` attached to its result, participants spec §9 — the
+   * refs request-time hydration loads bytes for). Additive and
+   * migration-free, the `channel`/`parent` idiom.
    */
   attachments?: AttachmentRef[];
   /**

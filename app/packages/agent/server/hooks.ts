@@ -71,6 +71,15 @@ export interface ToolResultHookContext {
    *  hook usually wants it: what may be shown to a signed-in owner is not what
    *  may be shown to an anonymous capability-URL session. */
   userId: string | null;
+  /**
+   * Multimodal reads (participants spec §9): refs the tool attached to its
+   * result — MUTABLE, deliberately: a redaction hook that rewrites the text
+   * must also be able to drop the image (splice the array), or the bytes
+   * would ride to the provider behind the redaction. Present at both
+   * dispatch sites whenever the call collected any; what survives the hook
+   * chain is what the tool row carries and what hydration later loads.
+   */
+  resultAttachments?: import('../common/types').AttachmentRef[];
 }
 
 /** The call a result answers, exactly as the model asked for it. */

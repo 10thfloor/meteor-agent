@@ -18,5 +18,6 @@ import './attachments.test';
 import './participants.test';
 import './media.test';
 import './downloads.test';
+import './multimodal.test';
 import './perf.test';
 import './integration.server';
