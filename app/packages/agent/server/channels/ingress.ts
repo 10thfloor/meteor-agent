@@ -2,7 +2,11 @@ import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentSessions } from '../../common/collections';
 import { getAgent } from '../registry';
-import { recordVerdict, sendToSession } from '../methods';
+import { recordVerdict, sendToSession, type ViaIdentity } from '../methods';
+import {
+  humanParticipantId, participantByIdentity, participantByUserId,
+} from '../../common/participants';
+import { addParticipant } from '../participants';
 import {
   ChannelBindings, DeliveryReceipts, InboundSubmissions, insertOrLose,
   type ChannelBinding,
@@ -130,6 +134,9 @@ async function findOrCreateBinding(
       assurance: identity?.assurance ?? 'none',
       ...(reading.externalUserId !== undefined
         ? { externalUserId: reading.externalUserId } : {}),
+      // The channel's declared admission posture for NEW conversations
+      // (participants spec decision 11); absent reads 'opener', v1 verbatim.
+      ...(def.admits !== undefined ? { admits: def.admits } : {}),
       deliveredSeq: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -273,6 +280,81 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   }
 }
 
+/** What an admitted event acts as: the resolved account (or null), plus the
+ *  trusted `via` principal when the sender's standing is a channel identity
+ *  in the roster rather than an account. */
+type Admission = { userId: string | null; via?: ViaIdentity } | 'refused';
+
+/**
+ * The admission precedence (participants spec decision 11), one order:
+ *
+ *   1. An ANONYMOUS conversation admits only its recorded opener — v1's
+ *      guard, verbatim, before anything else and regardless of `admits`.
+ *      It fires regardless of `audience`: email's conversationRef is a THREAD
+ *      key, so a Cc'd or reply-all party lands on the opener's binding with a
+ *      different `From`, and admitting them would be impersonation by
+ *      proximity (approving someone else's parked ask). The rare legitimate
+ *      case — the opener replying from a second address before linking — is
+ *      refused too: the safe direction, resolved the moment they link.
+ *   2. The OWNER — a resolved account equal to the binding's — passes as
+ *      today.
+ *   3. A NON-OWNER passes only through a `members`/`linked` binding, and only
+ *      through the roster: an account member by their userId, a
+ *      channel-identified member through the trusted `via` principal —
+ *      REGARDLESS of `senderVerified`, deliberately (participants spec §5):
+ *      most legitimate mail lacks author-aligned DKIM, and requiring it would
+ *      silently strand the composed loop. What the tradeoff costs is one
+ *      attributed, powerless message from a From-spoofer who also knows the
+ *      reply key; what verification still gates is ACCOUNT resolution, above.
+ *   4. `admits: 'linked'` grows the roster: a sender with a LINKED identity
+ *      auto-joins as a member on first message (the group-thread acquisition
+ *      path), capped by the roster like any join.
+ *   5. Everyone else settles — including, under the default `'opener'`, a
+ *      roster member: the binding gates ingress, the roster gates DDP.
+ */
+async function admitSender(
+  kind: string, binding: ChannelBinding, reading: InboundReading,
+  identity: { userId: string; assurance: 'link' | 'oidc' } | null,
+): Promise<Admission> {
+  const sender = reading.externalUserId;
+
+  if (binding.userId === null) {
+    const opener = binding.externalUserId;
+    if (opener !== undefined && sender !== opener) return 'refused';
+    return { userId: identity?.userId ?? null };
+  }
+
+  if (identity && identity.userId === binding.userId) {
+    return { userId: identity.userId };
+  }
+
+  const admits = binding.admits ?? 'opener';
+  if (admits === 'opener' || sender === undefined) return 'refused';
+
+  const session = await AgentSessions.findOneAsync(binding.sessionId);
+  if (!session) return 'refused';
+
+  if (identity && participantByUserId(session, identity.userId)) {
+    return { userId: identity.userId };
+  }
+  if (participantByIdentity(session, kind, sender)) {
+    return { userId: identity?.userId ?? null, via: { kind, externalUserId: sender } };
+  }
+  if (admits === 'linked' && identity) {
+    const joined = await addParticipant(binding.sessionId, {
+      id: humanParticipantId(identity.userId),
+      kind: 'human',
+      role: 'member',
+      userId: identity.userId,
+      assurance: identity.assurance,
+      identity: { kind, externalUserId: sender },
+      displayName: sender,
+    });
+    if (joined) return { userId: identity.userId };
+  }
+  return 'refused';
+}
+
 async function route(
   kind: string, def: ChannelDef, reading: InboundReading,
 ): Promise<InboundResponse> {
@@ -300,42 +382,15 @@ async function route(
   const binding = await bindConversation(kind, def, reading.conversationRef, reading, identity);
   if (!binding) return { status: 200 };
 
-  // The identity the agent-facing calls run under: the SENDER's resolved
-  // account, or null (anonymous) — and never the binding's owner as a
-  // fallback. An earlier draft fell back to `binding.userId`, which would have
-  // let any unlinked participant in a group thread act AS the linked owner
-  // (send, approve) — impersonation by proximity. Fail closed instead:
-  // `requireSession` stays the authority, an unlinked sender on an owned
-  // conversation gets `no-session`, which settles as 200 below. The channel
-  // is a courier, not an authority.
-  const userId = identity?.userId ?? null;
-
-  // Anonymous conversation: only the OPENER may drive it. `requireSession`
-  // scopes OWNED sessions, but an anonymous (`userId: null`) session matches
-  // every unlinked caller — so anyone who can reach the conversation could
-  // send into it or press Approve on someone else's ask. The binding recorded
-  // who opened it; until someone links, that is the only party with standing.
-  // Settled silently: a refusal posted into the thread is itself a spam channel.
-  //
-  // This fires regardless of `audience`. It was once gated on
-  // `audience === 'group'`, on the assumption that a `direct` surface's
-  // conversationRef embeds the sender — true for SMS/WhatsApp/Slack-DM/
-  // Telegram-DM, where a different sender is a different binding, so the guard
-  // never trips for them either way. EMAIL breaks that assumption: its
-  // conversationRef is a THREAD key, and a Cc'd or reply-all party lands on the
-  // opener's binding with a different `From`. Dropping the audience condition
-  // closes that "impersonation by proximity" (approving someone else's parked
-  // ask, injecting messages into their session) without changing any
-  // provider-keyed surface. A rare legitimate case — the opener replying from
-  // a second address before linking — is refused too: the safe direction, and
-  // it resolves the moment they link.
-  const opener = binding.externalUserId;
-  if (
-    binding.userId === null
-    && opener !== undefined && reading.externalUserId !== opener
-  ) {
-    return { status: 200 };
-  }
+  // ADMISSION (participants spec decision 11): one precedence order decides
+  // who this event acts as — or that it acts as nobody and settles. `via` is
+  // the trusted ingress principal for a channel-identified member; `userId`
+  // is everything requireSession's equality (and membership branch) needs for
+  // the rest. 'refused' settles silently: a refusal posted into the thread is
+  // itself a spam channel.
+  const admission = await admitSender(kind, binding, reading, identity);
+  if (admission === 'refused') return { status: 200 };
+  const { userId, via } = admission;
 
   try {
     if (intent.kind === 'message') {
@@ -372,7 +427,14 @@ async function route(
       if (text === '' && !refs) return { status: 200 };
       await sendToSession(
         binding.agent, binding.sessionId, text, userId,
-        refs ? { attachments: refs } : undefined,
+        (refs || via) ? {
+          ...(refs ? { attachments: refs } : {}),
+          // The trusted principal (participants spec decision 12): a
+          // channel-identified member's standing, vouched for by this
+          // admission, for exactly this send. Verdict branches never carry
+          // it — channel-identified members cannot answer approvals.
+          ...(via ? { via } : {}),
+        } : undefined,
       );
       return { status: 200 };
     }

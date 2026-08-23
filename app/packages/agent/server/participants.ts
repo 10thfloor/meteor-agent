@@ -5,6 +5,7 @@ import {
 import {
   humanParticipantId, modelParticipantId, resolveAddressee, sanitizeDisplayName,
 } from '../common/participants';
+import { ChannelBindings } from './channels/collections';
 
 /**
  * Roster mutation and wake resolution (participants spec §4.1, §4.3) — the
@@ -132,10 +133,12 @@ export async function addParticipant(
  * evaporated would break every anchor the scalar owner holds. Returns whether
  * a row was removed.
  *
- * Binding teardown rides with it: a channel-identified member's `member:
- * true` bindings are deleted by the channels layer (step 2 wires it through
- * `Agent.participants.remove`); the roster removal here is what makes ingress
- * refuse their next event either way, because admission reads the roster.
+ * Binding teardown rides with it: the member's `member: true` bindings are
+ * DELETED — egress consults only bindings, so removal without teardown would
+ * keep mailing the departed member every future reply forever. The roster
+ * removal is what makes ingress refuse their next event, because admission
+ * reads the roster; a live web subscription is revoked on reconnect (the
+ * publication authorizes at subscribe time — named and accepted, §4.6).
  */
 export async function removeParticipant(
   sessionId: string, participantId: string,
@@ -153,6 +156,9 @@ export async function removeParticipant(
     { _id: sessionId },
     { $pull: { participants: { id: participantId } }, $set: { updatedAt: new Date() } },
   );
+  if (n === 1) {
+    await ChannelBindings.removeAsync({ sessionId, member: true, participant: participantId });
+  }
   return n === 1;
 }
 

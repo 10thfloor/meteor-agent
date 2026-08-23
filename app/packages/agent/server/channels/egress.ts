@@ -109,11 +109,15 @@ export async function advanceCursor(
 
 /** §8.5's audience rule for the overflow/web link: an OWNED session's URL is
  *  login-gated and may go anywhere; an anonymous session's URL IS the
- *  credential (§12) and may only be sent to a single-recipient destination. */
+ *  credential (§12) and may only be sent to a single-recipient destination.
+ *  A MEMBER binding gets no URL at all (participants spec decision 14): for
+ *  an anonymous session the URL is owner-equivalent capability, and mailing
+ *  it to a composed-to outsider would hand them send, interrupt and approve. */
 function overflowUrlFor(
   def: ChannelDef, binding: ChannelBinding, session: AgentSession,
 ): string | undefined {
   if (!def.sessionUrl) return undefined;
+  if (binding.member) return undefined;
   if (session.userId === null && binding.audience !== 'direct') return undefined;
   return def.sessionUrl(session);
 }
@@ -313,7 +317,10 @@ export async function deliverBinding(
   ).fetchAsync();
 
   const planned = planItems(tail, {
-    statuses: def.statuses,
+    // Member bindings receive outward replies and overflow ONLY (participants
+    // spec decision 14): status notes are the owner's operational telemetry
+    // (errors, approval outcomes), not a correspondent's business.
+    statuses: binding.member ? undefined : def.statuses,
     profile: def.profile,
     overflowUrl: overflowUrlFor(def, binding, session),
   });
@@ -340,7 +347,13 @@ export async function deliverBinding(
   // The parked ask, once per ask: the receipt suffix carries the toolCallId,
   // so a re-park of a DIFFERENT call is a new receipt and a re-sweep of the
   // same one is a settled no-op.
-  const prompt = promptItem(session, def.profile);
+  //
+  // NEVER to a member binding (participants spec decision 14): on a
+  // link-interact channel the prompt carries live single-use Approve/Deny
+  // URLs whose redemption records the verdict AS THE OWNER — mailing those
+  // to a composed-to outsider would hand an assurance-none correspondent
+  // approval authority over the session's gated tools.
+  const prompt = binding.member ? null : promptItem(session, def.profile);
   if (prompt) {
     // `link` channels mint the per-choice verdict URLs here — LAZILY, as a
     // thunk deliverOnce runs only on its POST path. Each token is a live

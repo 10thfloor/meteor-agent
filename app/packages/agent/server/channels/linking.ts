@@ -144,8 +144,15 @@ export async function linkIdentity(
   // Matched on the binding's RECORDED opener, not on `conversationRef`: the
   // ref names a conversation (a Slack thread), not a person, and only for
   // person-keyed surfaces like SMS do the two coincide.
+  //
+  // MEMBER bindings are excluded (participants spec decision 14): a compose
+  // pre-bind records the RECIPIENT as its externalUserId — they opened that
+  // conversation, but as a member of someone else's session — and claiming it
+  // would hand them the composing session's ownership the moment they link.
+  // (The pre-bind also pins `userId` to the composing owner, so the null
+  // filter cannot match it — this exclusion is the belt to that brace.)
   const orphaned = await ChannelBindings.find({
-    kind, externalUserId, userId: null,
+    kind, externalUserId, userId: null, member: { $ne: true },
   }).fetchAsync();
   for (const binding of orphaned) {
     // eslint-disable-next-line no-await-in-loop
@@ -165,6 +172,33 @@ export async function linkIdentity(
       },
     );
   }
+
+  // Roster reconciliation (participants spec §4.2): a channel-identified
+  // MEMBER who proves an account gains DDP standing — their roster rows learn
+  // the `userId` and assurance, without the session changing owners. The
+  // array-filtered update touches exactly the matching human rows; sessions
+  // without such a row match nothing and pay nothing.
+  await AgentSessions.rawCollection().updateMany(
+    {
+      participants: {
+        $elemMatch: {
+          kind: 'human', 'identity.kind': kind, 'identity.externalUserId': externalUserId,
+        },
+      },
+    },
+    {
+      $set: {
+        'participants.$[p].userId': userId,
+        'participants.$[p].assurance': effective,
+        updatedAt: new Date(),
+      },
+    },
+    {
+      arrayFilters: [{
+        'p.kind': 'human', 'p.identity.kind': kind, 'p.identity.externalUserId': externalUserId,
+      }],
+    },
+  );
 
   const linked = await ChannelIdentities.findOneAsync(_id);
   return linked ?? row;

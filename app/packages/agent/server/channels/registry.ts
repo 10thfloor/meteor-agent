@@ -110,6 +110,14 @@ export interface ChannelDef {
    */
   attachments?: false | { maxFileBytes?: number; maxFiles?: number; maxTotalBytes?: number };
   /**
+   * The admission policy NEW bindings of this channel are stamped with
+   * (participants spec decision 11) — see `ChannelBinding.admits`. Default
+   * `'opener'`, v1's posture. A group-thread deployment that wants every
+   * linked workspace member speaking sets `'linked'`; compose's pre-bind
+   * writes `'members'` on its own binding regardless of this knob.
+   */
+  admits?: 'opener' | 'members' | 'linked';
+  /**
    * The webhook body ceiling for THIS surface, when the shared default
    * (`MAX_INBOUND_BYTES`, 1 MB) is too small for the provider's honest
    * payloads. Email needs it: Postmark delivers up to 35 MB of cumulative
@@ -130,7 +138,7 @@ export interface ChannelDef {
 export type ChannelKnobs = Pick<
   ChannelDef,
   'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
-  | 'attachments' | 'maxInboundBytes'
+  | 'attachments' | 'maxInboundBytes' | 'admits'
 >;
 
 /** The value-side twin of `ChannelKnobs`, and its totality check: the keys a
@@ -139,7 +147,7 @@ export type ChannelKnobs = Pick<
  *  option in four packages. */
 export const CHANNEL_KNOB_KEYS = [
   'statuses', 'onUncertainDelivery', 'sessionUrl', 'linkUrl', 'throttle',
-  'attachments', 'maxInboundBytes',
+  'attachments', 'maxInboundBytes', 'admits',
 ] as const satisfies ReadonlyArray<keyof ChannelKnobs>;
 
 /** The knobs PRESENT on `options`, and nothing else — what a tier-1 factory
@@ -196,6 +204,11 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   if (def.maxInboundBytes !== undefined
     && !(Number.isFinite(def.maxInboundBytes) && def.maxInboundBytes > 0)) {
     throw new Error(`[10thfloor:agent] channel "${kind}": def.maxInboundBytes must be a positive number`);
+  }
+  if (def.admits !== undefined && !['opener', 'members', 'linked'].includes(def.admits)) {
+    throw new Error(
+      `[10thfloor:agent] channel "${kind}": def.admits must be 'opener', 'members' or 'linked'`,
+    );
   }
   if (def.onUncertainDelivery === 'reconcile' && typeof def.transport.reconcile !== 'function') {
     throw new Error(
