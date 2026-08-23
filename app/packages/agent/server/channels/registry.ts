@@ -1,6 +1,8 @@
 import { timingSafeEqual } from 'crypto';
 import type { AgentMessage, AgentSession } from '../../common/types';
-import type { ChannelProfile, ChannelTransport, Lens } from '../../common/channel-contract';
+import type {
+  ChannelProfile, ChannelTransport, Lens, RemoteAttachment,
+} from '../../common/channel-contract';
 
 /**
  * The channel registry (channels spec §10): a static `Agent.channel(kind, def)`
@@ -130,6 +132,23 @@ export interface ChannelDef {
    */
   adoptDestination?: (bound: unknown, incoming: unknown) => unknown | undefined;
   /**
+   * The remote-media recipe (participants spec §6): how core turns a lens's
+   * `RemoteAttachment` references into bytes. `hosts` is the SSRF boundary —
+   * an exact-match https allowlist AUTHORED BY THE CHANNEL, never derived
+   * from the event; every fetched URL (first hop, indirect hop, redirect
+   * targets) must match it. `request` builds the credentialed fetch (the
+   * factory closes over its secrets — the lens never carries one); default:
+   * the attachment's own `url`, no headers. `resolveIndirect` extracts — or
+   * constructs, Telegram's token-in-path case — the second hop's URL from
+   * the first response's JSON. A channel whose lens emits remote attachments
+   * without this recipe drops every file with a visible note.
+   */
+  media?: {
+    hosts: string[];
+    request?: (att: RemoteAttachment) => { url: string; headers?: Record<string, string> };
+    resolveIndirect?: (json: unknown) => string | null;
+  };
+  /**
    * The webhook body ceiling for THIS surface, when the shared default
    * (`MAX_INBOUND_BYTES`, 1 MB) is too small for the provider's honest
    * payloads. Email needs it: Postmark delivers up to 35 MB of cumulative
@@ -220,6 +239,17 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   if (def.admits !== undefined && !['opener', 'members', 'linked'].includes(def.admits)) {
     throw new Error(
       `[10thfloor:agent] channel "${kind}": def.admits must be 'opener', 'members' or 'linked'`,
+    );
+  }
+  // A media recipe without a real allowlist would make the fetcher an open
+  // proxy — the "half-specified knob" failure again, on an SSRF surface.
+  if (def.media !== undefined && !(
+    Array.isArray(def.media.hosts) && def.media.hosts.length > 0
+    && def.media.hosts.every((h) => typeof h === 'string' && h !== '')
+  )) {
+    throw new Error(
+      `[10thfloor:agent] channel "${kind}": def.media.hosts must be a non-empty `
+      + 'array of hostnames — it is the fetcher\'s SSRF allowlist',
     );
   }
   if (def.onUncertainDelivery === 'reconcile' && typeof def.transport.reconcile !== 'function') {

@@ -156,7 +156,37 @@ describe('agent-channel-whatsapp', () => {
           };
         },
         message: (text) => ({ wa: 'event', body: textEvent({ text: { body: text } }) }),
+        // The media half (participants spec §6.4): a caption-less document, in
+        // the Cloud API's own shape — a media ID needing the two-hop fetch.
+        mediaMessage: (files) => ({
+          wa: 'event',
+          body: textEvent({
+            type: 'document', text: undefined,
+            document: {
+              id: `media-${files[0].name}`, filename: files[0].name,
+              mime_type: files[0].contentType, file_size: 4096,
+            },
+          }),
+        }),
       });
+    });
+  });
+
+  describe('inbound media (participants spec §6)', () => {
+    it('translates an image with a caption to a message plus an indirect reference', async () => {
+      const { whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
+      const r = whatsappLens.in({
+        wa: 'event',
+        body: textEvent({
+          type: 'image', text: undefined,
+          image: { id: 'MEDIA123', mime_type: 'image/jpeg', sha256: 'x', caption: 'the whiteboard' },
+        }),
+      });
+      assert.deepEqual(r.intent, { kind: 'message', text: 'the whiteboard' }, 'the caption is the words');
+      const att: any = r.attachments![0];
+      assert.equal(att.ref, 'MEDIA123', 'a bare media id — the factory recipe builds the credentialed lookup');
+      assert.isTrue(att.indirect, 'two hops: the lookup JSON names the real target');
+      assert.equal(att.contentType, 'image/jpeg');
     });
   });
 

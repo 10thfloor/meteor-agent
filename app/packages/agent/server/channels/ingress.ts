@@ -14,6 +14,7 @@ import {
 } from './collections';
 import { LINK_GESTURE, matchExpectation, type InboundReading } from '../../common/channel-contract';
 import { admitInboundAttachments } from '../attachments';
+import { resolveInboundAttachments } from './media';
 import type { AttachmentRef } from '../../common/types';
 import { deliverOnce } from './egress';
 import { issueLinkToken, resolveIdentity } from './linking';
@@ -429,15 +430,28 @@ async function route(
       // files — or dropped files whose notes are the whole story) is a
       // MESSAGE now; only an event with no text, no files kept and nothing to
       // report settles without a send.
+      //
+      // REMOTE references resolve first (participants spec §6): the chat
+      // surfaces deliver URLs and ids, not bytes, and the size-gated fetch
+      // under the def's `media` recipe happens here — AFTER the admission
+      // claim (a provider retry during a slow fetch collides there and
+      // settles) and inside route's own note-not-throw discipline. Total
+      // fetch time may exceed a chat provider's ack deadline; the claim
+      // absorbs the duplicate retries.
       let text = intent.text;
       let refs: AttachmentRef[] | undefined;
       if (def.attachments !== false && reading.attachments?.length) {
+        const capBase = def.attachments || undefined;
+        const resolved = await resolveInboundAttachments(
+          reading.attachments, def.media, capBase,
+        );
         const admitted = await admitInboundAttachments(
-          binding.sessionId, reading.attachments, def.attachments || undefined,
+          binding.sessionId, resolved.files, capBase,
         );
         if (admitted.refs.length > 0) refs = admitted.refs;
-        if (admitted.notes.length > 0) {
-          text = [text, ...admitted.notes].filter((s) => s !== '').join('\n');
+        const notes = [...resolved.notes, ...admitted.notes];
+        if (notes.length > 0) {
+          text = [text, ...notes].filter((s) => s !== '').join('\n');
         }
       }
       if (text === '' && !refs) return { status: 200 };
