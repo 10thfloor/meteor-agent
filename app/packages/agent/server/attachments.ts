@@ -385,16 +385,43 @@ export async function admitInboundAttachments(
  */
 export async function hydrateImageRefs(
   sessionId: string,
-  rows: Array<Pick<AgentMessage, 'role' | 'toolCallId' | 'attachments'>>,
+  rows: Array<Pick<AgentMessage, 'role' | 'toolCallId' | 'attachments' | 'kind' | 'seq' | 'upto'>>,
   messages: import('./providers/types').ProviderMessage[],
 ): Promise<boolean> {
+  // The compaction cut, replicated inline (importing `latestCompaction` would
+  // close a module cycle through transcript.ts): rows the newest note
+  // summarized away have NO assembled twin, and — because tool-call ids are
+  // only unique within one provider response (the mock reuses `t1` every
+  // turn) — letting them pair would attach a dead row's bytes to a LIVE
+  // row's result.
+  let upto = -1;
+  for (let i = rows.length - 1; i >= 0; i -= 1) {
+    const r = rows[i];
+    if (r.role === 'note' && r.kind === 'compaction' && typeof r.upto === 'number') {
+      upto = r.upto;
+      break;
+    }
+  }
+
+  // OCCURRENCE pairing, not first-match (a reviewer-confirmed mis-attach):
+  // both sides walk in order, and the Nth surviving tool row with a given
+  // id pairs with the Nth assembled tool message carrying it — the same
+  // window discipline every other id consumer in the package applies.
+  const queues = new Map<string, import('./providers/types').ProviderMessage[]>();
+  for (const m of messages) {
+    if (m.role !== 'tool' || !m.toolCallId) continue;
+    const q = queues.get(m.toolCallId);
+    if (q) q.push(m);
+    else queues.set(m.toolCallId, [m]);
+  }
+
   let attached = false;
   for (const row of rows) {
-    if (row.role !== 'tool' || !row.toolCallId || !row.attachments?.length) continue;
+    if (row.role !== 'tool' || !row.toolCallId || row.seq <= upto) continue;
+    const target = queues.get(row.toolCallId)?.shift();
+    if (!row.attachments?.length) continue;
     const imageRefs = row.attachments.filter((r) => /^image\//i.test(r.contentType));
-    if (imageRefs.length === 0) continue;
-    const target = messages.find((m) => m.role === 'tool' && m.toolCallId === row.toolCallId);
-    if (!target) continue;
+    if (imageRefs.length === 0 || !target) continue;
     for (const ref of imageRefs) {
       // eslint-disable-next-line no-await-in-loop
       const stored = await AgentAttachments.findOneAsync({ _id: ref.id, sessionId });

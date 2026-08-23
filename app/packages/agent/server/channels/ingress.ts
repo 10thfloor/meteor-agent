@@ -145,26 +145,13 @@ async function findOrCreateBinding(
     binding = await ChannelBindings.findOneAsync(bindingId);
     if (!binding) return null;
   } else {
-    // DESTINATION ADOPTION (participants spec §5): a binding whose stored
-    // destination predates knowledge this event carries — the compose
-    // pre-bind's missing rootMessageId — learns it here, through the
-    // channel's own pure merge. Guarded on the stored value so two racing
-    // events converge; a channel without the hook just bumps activity.
-    const merged = def.adoptDestination
-      ? def.adoptDestination(binding.destination, reading.destination)
-      : undefined;
-    if (merged !== undefined) {
-      await ChannelBindings.updateAsync(bindingId, {
-        $set: { destination: merged, updatedAt: new Date() },
-      });
-      binding = (await ChannelBindings.findOneAsync(bindingId)) ?? binding;
-    } else {
-      // Activity bump: the egress sweep only walks RECENTLY active bindings
-      // (its lookback is what keeps a process's sweep cost proportional to
-      // live conversations, not history), so every inbound event marks its
-      // binding.
-      await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
-    }
+    // Activity bump: the egress sweep only walks RECENTLY active bindings
+    // (its lookback is what keeps a process's sweep cost proportional to live
+    // conversations, not history), so every inbound event marks its binding.
+    // Destination ADOPTION deliberately does NOT happen here: this runs
+    // before admission, and a refused stranger must not get to set a
+    // conversation's threading root (see `route`).
+    await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
   }
   return binding;
 }
@@ -338,6 +325,21 @@ async function admitSender(
   if (binding.userId === null) {
     const opener = binding.externalUserId;
     if (opener !== undefined && sender !== opener) return 'refused';
+    // On a MEMBER binding (or one that admits beyond its opener) the opener
+    // is by construction NOT the session's owner — compose's pre-bound
+    // recipient on an anonymous composing session lands exactly here — and
+    // returning a bare null would make `sendToSession` fall through to the
+    // OWNER's roster row when stamping `from` (a reviewer-confirmed
+    // mis-attribution). Hand the roster match its `via` principal so the
+    // speech is stamped as theirs. Ordinary anonymous conversations (no
+    // member flag, opener-only) skip the session read entirely.
+    if (sender !== undefined
+      && (binding.member || (binding.admits !== undefined && binding.admits !== 'opener'))) {
+      const session = await AgentSessions.findOneAsync(binding.sessionId);
+      if (session && participantByIdentity(session, kind, sender)) {
+        return { userId: identity?.userId ?? null, via: { kind, externalUserId: sender } };
+      }
+    }
     return { userId: identity?.userId ?? null };
   }
 
@@ -408,6 +410,23 @@ async function route(
   const admission = await admitSender(kind, binding, reading, identity);
   if (admission === 'refused') return { status: 200 };
   const { userId, via } = admission;
+
+  // DESTINATION ADOPTION (participants spec §5) — AFTER admission, a
+  // reviewer-confirmed ordering: a binding whose stored destination predates
+  // knowledge this event carries (the compose pre-bind's missing
+  // rootMessageId) learns it through the channel's own pure merge — but only
+  // from a sender the conversation actually admits. Adopting before the
+  // guard let any stranger holding the reply key permanently set the
+  // thread's root and subject with a message that was then refused.
+  if (def.adoptDestination) {
+    const merged = def.adoptDestination(binding.destination, reading.destination);
+    if (merged !== undefined) {
+      await ChannelBindings.updateAsync(binding._id, {
+        $set: { destination: merged, updatedAt: new Date() },
+      });
+      binding.destination = merged;
+    }
+  }
 
   try {
     if (intent.kind === 'message') {

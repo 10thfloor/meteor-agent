@@ -97,7 +97,16 @@ export function resolveAddressee(
   }
   const m = LEADING_MENTION.exec(text ?? '');
   if (!m) return null;
-  const hit = models.find((p) => p.agent === m[1]);
+  const exact = models.find((p) => p.agent === m[1]);
+  if (exact) return { id: exact.id, agent: exact.agent! };
+  // "@analyst." — the class admits '.' and '-' for dotted agent names, so
+  // sentence punctuation rides into the capture. A token that matches no
+  // model retries with trailing punctuation trimmed: a real agent name the
+  // roster lacks cannot END in it, so the trim can only recover an address,
+  // never invent one.
+  const trimmed = m[1].replace(/[.-]+$/, '');
+  if (trimmed === m[1] || trimmed === '') return null;
+  const hit = models.find((p) => p.agent === trimmed);
   return hit ? { id: hit.id, agent: hit.agent! } : null;
 }
 

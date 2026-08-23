@@ -57,7 +57,13 @@ export function registerPublications(): void {
       // could read it learns nothing but could echo it back to confuse the
       // wind-down self-check.
       AgentSessions.find(
-        { _id: sessionId }, { fields: { lease: 0, 'pending.wakeToken': 0 } },
+        // `pendingRelay.token` joins the exclusions for exactly the
+        // wakeToken's reason: it is the IDENTITY of a scheduled wake, pure
+        // server bookkeeping, and a client that could read it learns nothing
+        // but could echo it to confuse the self-check. The `agent` half may
+        // ship — "a colleague's turn is scheduled" is renderable state.
+        { _id: sessionId },
+        { fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 } },
       ),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
@@ -99,7 +105,7 @@ export function registerPublications(): void {
       {
         sort: { updatedAt: -1 },
         limit: 100,
-        fields: { lease: 0, 'pending.wakeToken': 0 },
+        fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 },
       },
     );
   });

@@ -1,7 +1,8 @@
 import { createHash, randomBytes } from 'crypto';
 import {
   Agent, AgentAttachments, AgentSessions, ChannelBindings,
-  DEFAULT_ATTACHMENT_CAPS, channelKnobs, deliverOnce, getChannel, headerValue,
+  DEFAULT_ATTACHMENT_CAPS, MAX_PARTICIPANTS, channelKnobs, deliverOnce,
+  getChannel, headerValue,
   insertOrLose, isLinkGesture, prettySize, resolveIdentity, safeEqual,
   type ChannelAttachment, type ChannelDef, type ChannelKnobs, type ChannelProfile,
   type ChannelTransport, type DeliveryItem, type Gate, type InboundReading,
@@ -760,6 +761,22 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
               + 'or compose from a real conversation.',
           };
         }
+        // Roster capacity, BEFORE the send (a reviewer-confirmed phantom): a
+        // full roster with the binding still inserted would mail the
+        // recipient every future reply while silently refusing every answer
+        // they send — told they joined, never actually admitted.
+        const alreadyMember = session.participants?.some(
+          (p) => p.identity?.kind === kind && p.identity.externalUserId === to,
+        ) ?? false;
+        if (!alreadyMember
+          && (session.participants?.length ?? 0) >= MAX_PARTICIPANTS) {
+          return {
+            refused: true,
+            reason: 'roster-full',
+            detail: `This conversation already has ${MAX_PARTICIPANTS} participants; `
+              + 'nobody else can join it. Send without onReply, or remove a participant first.',
+          };
+        }
         // The deliveredSeq SNAPSHOT rides this read, BEFORE the send: the
         // recipient's mailbox starts at the composed message, never the
         // session's backlog.
@@ -826,7 +843,7 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
             createdAt: new Date(),
             updatedAt: new Date(),
           });
-          await Agent.participants.add(ctx.sessionId, {
+          const joinedId = await Agent.participants.add(ctx.sessionId, {
             id: `x:${kind}:${to}`,
             kind: 'human',
             role: 'member',
@@ -835,6 +852,16 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
             assurance: 'none',
             displayName: to,
           }, { by: `m:${composing.agent}` });
+          if (joinedId === null) {
+            // The pre-check makes this a racing-joins case only, but a
+            // phantom must still not exist: without the roster row the
+            // binding would deliver forever while refusing every reply.
+            await ChannelBindings.removeAsync(`${kind}:${replyKey}`);
+            return {
+              sent: true, to, subject: destination.subject, joined: false,
+              note: 'roster-full — the mail was sent, but replies will open a fresh conversation',
+            };
+          }
         }
         return {
           sent: true, to, subject: destination.subject,

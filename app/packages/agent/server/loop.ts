@@ -4,7 +4,7 @@ import { DECIDED_PHASES } from '../common/types';
 import {
   modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
 } from '../common/participants';
-import { resolveWakeAgent } from './participants';
+import { resolveWakeAgent, unansweredAddressee } from './participants';
 import { getAgent, buildRunConfig, resolveBudget } from './registry';
 import type { Provider } from './providers/types';
 import {
@@ -241,13 +241,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // stamp (`from`, `pending.agent`), the hook context, and the relay
       // parse read this one value.
       const selfAgent = config.agentName ?? entry.agent;
-      // Consume a relay addressed to us: the wake this turn IS. Single
-      // consumer by construction — the guarded `$unset` is lease-scoped, and
-      // a relay addressed to a different model is left standing for its own
-      // wake (this turn was something else's — a verdict, a send).
-      if (entry.pendingRelay && entry.pendingRelay.agent === selfAgent) {
-        await guardedUpdate(sessionId, SERVER_ID, { $unset: { pendingRelay: 1 } });
-      }
+      // A relay addressed to us is the wake this turn IS — but it is NOT
+      // consumed here (a reviewer-confirmed window): consumption at entry
+      // meant a crash anywhere in this turn's first provider call dropped
+      // the marker, and recovery — finding no durable addressee — resumed
+      // the PRIMARY against a history ending in a colleague's question. The
+      // marker is cleared by this turn's FIRST COMMIT (`allocateSeq`'s
+      // `$unset` rides the same atomic write), so the whole pre-commit
+      // stretch stays recoverable as the right model.
+      const consumingRelay = entry.pendingRelay?.agent === selfAgent;
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit
@@ -285,6 +287,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           }
           if (!(await guardedUpdate(sessionId, SERVER_ID, { $unset: { pending: 1 } }))) return;
         } else {
+          // WHOSE park is this (decision 6)? A queued ADDRESSED send's
+          // deferred turn runs as its addressee and can reach a
+          // verdict-carrying park first — and resuming a COLLEAGUE's batch
+          // under this turn's toolset answers a human-approved call with
+          // `unknown-tool`. Only the parking model's turn consumes the
+          // verdict; anyone else's wake leaves it standing for the resume
+          // that `recordVerdict` already scheduled via `pending.agent` (and
+          // this turn's own wind-down self-check re-fires it if that resume
+          // was the one that got dropped).
+          if ((entry.pending.agent ?? entry.agent) !== selfAgent) return;
           resumed = true;
           const outcome = await resumeParkedTurn(
             sessionId, entry.pending, tools, entry.userId, selfAgent,
@@ -327,6 +339,30 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
         let history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+
+        // QUEUED ADDRESSED MESSAGES re-resolve at the iteration top
+        // (participants spec §4.3, a reviewer-confirmed miss): a message
+        // addressed to a colleague can enter this turn's history without
+        // passing the interjection branch — queued while the session was
+        // awaiting an approval, or landed between tool-batch iterations —
+        // and answering it under THIS config would be the wrong model
+        // speaking. The handoff is durable (`pendingRelay`, the same marker
+        // a model relay writes) so the wind-down self-check and the
+        // watcher's sweep both know who is owed the turn.
+        if (session.participants?.length) {
+          const tail = [...history].reverse().find((m) => m.role === 'user');
+          if (tail) {
+            const target = resolveAddressee(tail.content, tail.to, session);
+            if (target && target.agent !== selfAgent
+              && !history.some((m) => m.role === 'assistant' && m.seq > tail.seq
+                && (m.from?.participant ?? modelParticipantId(session.agent)) === target.id)) {
+              await guardedUpdate(sessionId, SERVER_ID, {
+                $set: { pendingRelay: { agent: target.agent, token: Random.id() } },
+              });
+              return;
+            }
+          }
+        }
 
         // §9: compact BEFORE this iteration's provider call, so the call that
         // would have overflowed is the one that benefits. A committed note
@@ -614,7 +650,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         }, relaying ? {
           pendingRelay: { agent: relayHit!.agent, token: Random.id() },
           relay: relayCount + 1,
-        } : undefined);
+        } : undefined,
+        // The relay's CONSUMPTION (decision 7): the addressee's first commit
+        // clears the marker it answers — never turn entry, so a crash before
+        // any commit leaves the wake standing for recovery. A commit that
+        // itself relays onward OVERWRITES instead (the $set above).
+        !relaying && consumingRelay ? { pendingRelay: 1 } : undefined);
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
         // The TURN-FINAL row (no toolCalls) claims the session's staged
@@ -691,12 +732,20 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // (participants spec §4.3): its own deferred wake was dropped by
             // the running/lease guards, and continuing here would answer a
             // message mechanically addressed to a colleague under the wrong
-            // config. Ending the turn hands it to the wind-down self-check,
-            // which wakes the right model. Same-addressee interjections keep
-            // today's continue.
+            // config. The handoff is DURABLE (a reviewer-confirmed strand:
+            // the bare tail predicate reads this exact ordering — our reply
+            // committed after the interjection — as answered): the same
+            // `pendingRelay` marker a model relay writes, fired by the
+            // wind-down self-check and swept by the watcher. Same-addressee
+            // interjections keep today's continue.
             if (roster) {
               const target = resolveAddressee(interjected.content, interjected.to, session);
-              if (target && target.agent !== selfAgent) return;
+              if (target && target.agent !== selfAgent) {
+                await guardedUpdate(sessionId, SERVER_ID, {
+                  $set: { pendingRelay: { agent: target.agent, token: Random.id() } },
+                });
+                return;
+              }
             }
             continue;
           }
@@ -782,18 +831,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       let tailWake = false;
       if (wakeable && !verdictWake && !relayWake
         && after.participants?.length && !after.pending) {
-        const [lastUser] = await AgentMessages.find(
-          { sessionId, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
-        ).fetchAsync().catch(() => [] as never[]);
-        if (lastUser) {
-          const [lastAssistant] = await AgentMessages.find(
-            { sessionId, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
-          ).fetchAsync().catch(() => [] as never[]);
-          if (!lastAssistant || lastAssistant.seq < lastUser.seq) {
-            const target = resolveAddressee(lastUser.content, lastUser.to, after);
-            tailWake = !!target && target.agent !== (config.agentName ?? after.agent);
-          }
-        }
+        // ADDRESSEE-AWARE (a reviewer-confirmed strand): "any assistant row
+        // after the user row" reads a colleague-addressed interjection as
+        // answered the moment OUR OWN reply commits — the helper counts only
+        // an answer FROM the addressee.
+        const owed = await unansweredAddressee(after).catch(() => null);
+        tailWake = !!owed && owed.agent !== (config.agentName ?? after.agent);
       }
       if (verdictWake || relayWake || tailWake) {
         // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
@@ -833,13 +876,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             } else if (relayWake) {
               if (still.pendingRelay?.token !== relayToken) return;
             } else {
-              const [tailUser] = await AgentMessages.find(
-                { sessionId, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
-              ).fetchAsync();
-              const [tailAssistant] = await AgentMessages.find(
-                { sessionId, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
-              ).fetchAsync();
-              if (!tailUser || (tailAssistant && tailAssistant.seq > tailUser.seq)) return;
+              // Re-verify the tail with the same addressee-aware predicate
+              // the check above used.
+              if (!(await unansweredAddressee(still).catch(() => null))) return;
             }
             // The woken turn runs as the participant the durable state names
             // (participants spec decision 6) — the parked turn's model, the

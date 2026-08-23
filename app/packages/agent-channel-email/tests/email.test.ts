@@ -478,6 +478,44 @@ describe('agent-channel-email', () => {
       assert.equal(sends.length, 0, 'a correspondence nobody can answer is never opened');
     });
 
+    it("refuses 'continue' when the roster is full — no phantom correspondents", async () => {
+      await cleanLoop();
+      const { Agent, mockProvider, ChannelBindings, AgentSessions } = await import('meteor/10thfloor:agent');
+      const { composeEmailTool, email } = await import('meteor/10thfloor:agent-channel-email');
+      const { fetchImpl, sends } = fakePostmark();
+      new (Agent as any)('email-loop-agent', {
+        model: 'mock', instructions: '', provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      (Agent as any).channel('em-full', email({
+        agent: 'email-loop-agent', serverToken: 't', from: 'a@ourco.com',
+        inboundAddress: 'inbound@ourco.com', webhookUser: 'hook', webhookPassword: 'pw',
+        fetchImpl,
+      } as any));
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'], onReply: 'continue', kind: 'em-full', fetchImpl,
+      } as any);
+
+      const now = new Date();
+      await seedComposing('sc-full', 'email-loop-agent', {
+        participants: Array.from({ length: 16 }, (_, i) => ({
+          id: i === 0 ? 'h:owner-1' : `h:u${i}`,
+          kind: 'human', role: i === 0 ? 'owner' : 'member',
+          userId: i === 0 ? 'owner-1' : `u${i}`, displayName: `p${i}`, joinedAt: now,
+        })),
+      });
+      const out: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 's', body: 'b' },
+        { userId: 'owner-1', sessionId: 'sc-full', toolCallId: 'tc-full' } as any,
+      );
+      assert.isTrue(out.refused);
+      assert.equal(out.reason, 'roster-full');
+      assert.equal(sends.length, 0, 'refused BEFORE the mail, so nobody is told they joined');
+      assert.equal(await (ChannelBindings as any).find({ kind: 'em-full' }).countAsync(), 0);
+      const session: any = await (AgentSessions as any).findOneAsync('sc-full');
+      assert.lengthOf(session.participants, 16, 'the roster is untouched');
+    });
+
     it("refuses 'continue' in throwaway and subagent-child sessions", async () => {
       await cleanLoop();
       const { Agent, mockProvider } = await import('meteor/10thfloor:agent');
@@ -579,6 +617,34 @@ describe('agent-channel-email', () => {
       const again: any = await (AgentSessions as any).findOneAsync('sc1');
       assert.lengthOf(
         again.participants.filter((p: any) => p.id === 'x:em-loop:dana@ourco.com'), 1,
+      );
+
+      // A STRANGER'S EARLY REPLY must not teach the binding its threading
+      // root: adoption runs only for ADMITTED senders (a refused message
+      // that still set the thread's one-shot root would let anyone holding
+      // the reply key hijack threading before the recipient ever spoke).
+      await handleInbound('em-loop', {
+        headers: { authorization: `Basic ${Buffer.from('hook:pw').toString('base64')}` },
+        rawBody: JSON.stringify({
+          MessageID: 'pm-eve-1',
+          FromFull: { Email: 'eve@evil.test', Name: 'Eve' },
+          From: 'eve@evil.test',
+          To: 'inbound+hash@ourco.com',
+          ToFull: [{ Email: 'inbound@ourco.com', MailboxHash: key }],
+          MailboxHash: key,
+          Subject: 'Invoice overdue',
+          TextBody: 'pay here',
+          StrippedTextReply: 'pay here',
+          Headers: [
+            { Name: 'Message-ID', Value: '<e1@evil.test>' },
+            { Name: 'In-Reply-To', Value: '<evil-root@evil.test>' },
+          ],
+        }),
+      });
+      const unadopted: any = await (ChannelBindings as any).findOneAsync(`em-loop:${key}`);
+      assert.isUndefined(
+        (unadopted.destination as any).rootMessageId,
+        "a refused stranger's message sets nothing",
       );
 
       // THE REPLY — unverified From (the common case), carrying the key as

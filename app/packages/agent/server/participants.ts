@@ -169,6 +169,44 @@ export async function listParticipants(sessionId: string): Promise<SessionPartic
 }
 
 /**
+ * The newest user row's ADDRESSEE, iff that addressee has not answered it —
+ * the shared "unanswered tail" predicate (decision 6). ADDRESSEE-AWARE,
+ * which is the load-bearing part: an addressed interjection is typically
+ * followed by the RUNNING model's own reply at a higher seq, so "any
+ * assistant row after the user row" reads answered when the addressee never
+ * spoke (a reviewer-confirmed strand). For an addressed row, only an
+ * assistant row FROM that addressee counts as its answer; for an unaddressed
+ * row, any assistant row does (the primary's business, today's rule). Null =
+ * nothing owed.
+ */
+export async function unansweredAddressee(
+  session: AgentSession,
+): Promise<{ id: string; agent: string } | null> {
+  if (!session.participants?.length) return null;
+  const [lastUser] = await AgentMessages.find(
+    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+  ).fetchAsync();
+  if (!lastUser) return null;
+  const hit = resolveAddressee(lastUser.content, lastUser.to, session);
+  if (hit) {
+    const [answer] = await AgentMessages.find(
+      { sessionId: session._id, role: 'assistant', seq: { $gt: lastUser.seq } },
+      { sort: { seq: -1 }, limit: 50 },
+    ).fetchAsync().then((rows) => rows.filter(
+      (m) => (m.from?.participant ?? `m:${session.agent}`) === hit.id,
+    ));
+    return answer ? null : hit;
+  }
+  const [lastAssistant] = await AgentMessages.find(
+    { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
+  ).fetchAsync();
+  if (!lastAssistant || lastAssistant.seq < lastUser.seq) {
+    return { id: modelParticipantId(session.agent), agent: session.agent };
+  }
+  return null;
+}
+
+/**
  * WHICH AGENT should answer a wake of this session (decision 6) — resolved
  * from durable state at wake time, never trusted from the argument a caller
  * happened to hold:
@@ -176,9 +214,11 @@ export async function listParticipants(sessionId: string): Promise<SessionPartic
  *   1. `pending.agent` — a parked (or verdict-carrying) turn belongs to the
  *      model that parked it.
  *   2. `pendingRelay.agent` — a scheduled relay belongs to its addressee.
- *   3. The newest UNANSWERED user row's addressee (rostered sessions): a send
- *      addressed to a non-primary model whose deferred turn was dropped by
- *      the running/lease guards must not be answered by the primary.
+ *   3. The newest user row's UNANSWERED addressee (rostered sessions,
+ *      addressee-aware — see `unansweredAddressee`): a send addressed to a
+ *      non-primary model whose deferred turn was dropped by the running/
+ *      lease guards must not be answered by the primary, even when the
+ *      running model's own reply committed after it.
  *   4. A mid-flight addressed turn's own tail: the newest assistant row still
  *      carrying unanswered toolCalls names its author in `from` — orphan
  *      recovery must resume that batch as that model.
@@ -189,17 +229,12 @@ export async function resolveWakeAgent(session: AgentSession): Promise<string> {
   if (session.pendingRelay?.agent) return session.pendingRelay.agent;
   if (!session.participants?.length) return session.agent;
 
-  const [lastUser] = await AgentMessages.find(
-    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
-  ).fetchAsync();
+  const owed = await unansweredAddressee(session);
+  if (owed) return owed.agent;
+
   const [lastAssistant] = await AgentMessages.find(
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
-
-  if (lastUser && (!lastAssistant || lastAssistant.seq < lastUser.seq)) {
-    const hit = resolveAddressee(lastUser.content, lastUser.to, session);
-    return hit?.agent ?? session.agent;
-  }
   if (lastAssistant?.toolCalls?.length && lastAssistant.from) {
     const owner = session.participants.find(
       (p) => p.id === lastAssistant.from!.participant && p.kind === 'model',

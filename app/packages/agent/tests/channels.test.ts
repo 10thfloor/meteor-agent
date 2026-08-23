@@ -1369,6 +1369,44 @@ describe('channels', () => {
       assert.equal(binding.userId, null, 'the member binding was never claimed');
     });
 
+    it("an ANONYMOUS session's member binding attributes the sender's own row, never the owner's", async () => {
+      await registerTestChannel();
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const now = new Date();
+      // The compose-'continue'-from-an-anonymous-session shape: null owner,
+      // the recipient on the roster, a member binding whose OPENER is the
+      // recipient. The anonymous-opener branch admits them — and must hand
+      // the roster its via principal, or their speech stamps as the owner's.
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'san1',
+        participants: [
+          { id: 'h:anon', kind: 'human', role: 'owner', userId: null, displayName: 'owner', joinedAt: now },
+          { id: 'm:channel-agent', kind: 'model', role: 'member', agent: 'channel-agent', displayName: 'channel-agent', joinedAt: now },
+          {
+            id: 'x:test:dana-ext', kind: 'human', role: 'member', userId: null,
+            identity: { kind: 'test', externalUserId: 'dana-ext' },
+            assurance: 'none', displayName: 'dana-ext', joinedAt: now,
+          },
+        ],
+      } as any);
+      await seedBinding('test:anon-reply-key', {
+        sessionId: 'san1', member: true, admits: 'members',
+        externalUserId: 'dana-ext', userId: null, audience: 'direct',
+      });
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({
+        type: 'msg', text: 'my reply', id: 'an1', user: 'dana-ext', convo: 'anon-reply-key', senderVerified: false,
+      }));
+      const row = await AgentMessages.findOneAsync({ sessionId: 'san1', role: 'user', content: 'my reply' });
+      assert.isDefined(row, 'the recipient-opener was admitted');
+      assert.deepEqual(
+        row!.from, { participant: 'x:test:dana-ext', name: 'dana-ext' },
+        "the reply is the RECIPIENT's speech — not silently attributed to the anonymous owner",
+      );
+    });
+
     it('removing a participant tears down their member bindings', async () => {
       await registerTestChannel();
       const { AgentSessions } = await import('../common/collections');
