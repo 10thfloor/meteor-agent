@@ -94,23 +94,37 @@ function messageIds(value: string | undefined): string[] {
  * noop nobody can explain.
  */
 export function stripQuotedReply(text: string): string {
-  let body = text.replace(/\r\n/g, '\n');
+  const body = text.replace(/\r\n/g, '\n');
   const markers = [
     /^On\b[^\n]{0,120}(?:\n[^\n]{0,120})?wrote:\s*$/m,
     /^-{2,}\s*Original Message\s*-{2,}\s*$/im,
     /^_{5,}\s*$/m,
     /^From:\s.+\n(?:Sent|Date):\s.+$/m,
   ];
-  let cut = body.length;
-  for (const re of markers) {
+  // Drop `>`-quoted lines and a trailing "-- " signature from a block of text.
+  const dropQuotesAndSig = (s: string): string => {
+    const lines = s.split('\n').filter((l) => !/^\s*>/.test(l));
+    const sig = lines.findIndex((l) => l === '-- ');
+    return (sig >= 0 ? lines.slice(0, sig) : lines).join('\n').trim();
+  };
+
+  // TOP-POSTED — the common case: the new words sit ABOVE the first reply
+  // marker. Cut at the earliest marker and keep what's before it.
+  const cut = markers.reduce((c, re) => {
     const m = re.exec(body);
-    if (m && m.index < cut) cut = m.index;
-  }
-  body = body.slice(0, cut);
-  const lines = body.split('\n').filter((l) => !/^\s*>/.test(l));
-  const sig = lines.findIndex((l) => l === '-- ');
-  const kept = sig >= 0 ? lines.slice(0, sig) : lines;
-  return kept.join('\n').trim();
+    return m && m.index < c ? m.index : c;
+  }, body.length);
+  const above = dropQuotesAndSig(body.slice(0, cut));
+  if (above !== '') return above;
+
+  // BOTTOM-POSTED — the quote (and its "On … wrote:" / "From:/Sent:"
+  // attribution line) comes first with the new text UNDERNEATH, so cutting at
+  // the marker left nothing. Delete the marker lines themselves and keep
+  // whatever unquoted text remains below. This is the case the old code lost:
+  // a reply is a message, and a "YES" bottom-posted under the quote must not
+  // vanish into a noop nobody can explain (or an unanswerable approval).
+  const withoutMarkers = markers.reduce((s, re) => s.replace(re, ''), body);
+  return dropQuotesAndSig(withoutMarkers);
 }
 
 // ---- Status prose ----------------------------------------------------------
@@ -181,6 +195,26 @@ export interface EmailDestination {
   subject: string;
   rootMessageId?: string;
   replyKey: string;
+}
+
+/**
+ * Whether the mail's `From` was authenticated by the receiving provider —
+ * the gate on letting this sender resolve to a LINKED account (a raw From is
+ * forgeable SMTP; an unverified one must stay anonymous, per the header
+ * comment). Postmark exposes no dedicated auth field: it runs SpamAssassin on
+ * inbound mail and reports the verdicts in `X-Spam-Tests` (a comma/space
+ * list). `DKIM_VALID_AU` is the token that matters — a DKIM signature that is
+ * valid AND aligned to the AUTHOR (the From domain), i.e. the From was not
+ * forged. `SPF_PASS` is deliberately NOT accepted: SPF authenticates the
+ * envelope return-path, not the header From, so it does not prove the From a
+ * human reads (and a spoofer's own domain passes its own SPF). An absent
+ * header — SpamAssassin disabled on the stream, or a provider that does not
+ * emit it — reads as UNVERIFIED: fail closed, the sender is treated
+ * anonymously and simply cannot inherit a linked account (see the README).
+ */
+export function isFromAuthenticated(headers: Map<string, string>): boolean {
+  const tests = headers.get('x-spam-tests') ?? '';
+  return /(^|[,\s])DKIM_VALID_AU([,\s]|$)/.test(tests);
 }
 
 /** Automated senders and automated mail — the surface's echo rule. */
@@ -274,6 +308,10 @@ export const emailLens: Lens = {
       // the RFC Message-ID is the fallback for a provider that lacks one.
       eventId: String(b.MessageID ?? ownId ?? ''),
       externalUserId: from,
+      // A raw From is forgeable; the core may only resolve it to a LINKED
+      // account when the provider authenticated it (author-aligned DKIM).
+      // Unverified mail still routes — it just stays anonymous.
+      senderVerified: isFromAuthenticated(headers),
       conversationRef: key,
       destination,
       audience: 'direct' as const,
@@ -321,6 +359,12 @@ export function emailTransport(options: EmailTransportOptions): ChannelTransport
         MessageStream: options.messageStream ?? 'outbound',
         Headers: [
           ...(root ? [{ Name: 'In-Reply-To', Value: root }, { Name: 'References', Value: root }] : []),
+          // RFC 3834: mark our own replies as machine-generated. A well-behaved
+          // remote auto-responder suppresses replying to auto-submitted mail,
+          // and our OWN inbound `isAutomated` reads this exact header — so a
+          // reply that loops back to us is dropped and the ping-pong the header
+          // comment promises "never forms" actually cannot.
+          { Name: 'Auto-Submitted', Value: 'auto-replied' },
           { Name: 'X-Agent-Receipt', Value: opts.idempotencyKey },
         ],
       };
@@ -365,6 +409,13 @@ export interface EmailChannelOptions extends ChannelKnobs {
 export function email(options: EmailChannelOptions): ChannelDef {
   for (const k of ['agent', 'serverToken', 'from', 'inboundAddress', 'webhookUser', 'webhookPassword'] as const) {
     if (!options?.[k]) throw new Error(`[agent-channel-email] email({ ${k} }) is required`);
+  }
+  // Shape, not just presence: the inbound address's plus-hash is how every
+  // reply threads back, so a value with no local-part@domain would silently
+  // un-thread the channel (and Postmark rejects a malformed Reply-To on the
+  // first send). Fail at construction, where the fix is obvious.
+  if (options.inboundAddress.lastIndexOf('@') < 1) {
+    throw new Error('[agent-channel-email] email({ inboundAddress }) must be a full address (local-part@domain) — its plus-hash is how replies thread back');
   }
   return {
     agent: options.agent,
