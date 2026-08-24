@@ -1,11 +1,13 @@
 import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
-import { DECIDED_PHASES } from '../common/types';
+import { DECIDED_PHASES, type ResolvedMemory } from '../common/types';
+import { memoryBlock, memoryHint } from './memory';
+import { withMemoryTools } from './memory-tools';
 import {
   modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
-import { getAgent, buildRunConfig, resolveBudget } from './registry';
+import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -105,6 +107,12 @@ export interface RunConfig {
    *  the built-in `skill` tool and what it can load. Absent or empty = no
    *  loader tool at all. */
   skills?: Skill[];
+  /** Durable recall (memory spec), resolved at define() time and threaded
+   *  here from the PRIMARY's config — beside `budget`, on purpose: an
+   *  addressed turn to a colleague that declared no memory of its own must
+   *  still see the conversation's memory, or recall would differ by whoever
+   *  was @-mentioned. Absent = no tools, no block, no writes. */
+  memory?: ResolvedMemory;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -212,10 +220,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // could put two tools named `skill` in front of a provider that rejects
       // duplicates outright. Appending here makes the collision visible, and
       // `withSkillTool` resolves it in the app's favor with one warning.
-      const tools = withSkillTool(
+      const baseTools = withSkillTool(
         await expandMcpTools(resolveTools(config.tools)), config.skills,
       );
-      const schemas = toolSchemas(tools);
 
       // The turn's vision capability (participants spec §9), answered ONCE:
       // absent surface, absent answer, and any failure all read as NO — the
@@ -241,6 +248,34 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // stamp (`from`, `pending.agent`), the hook context, and the relay
       // parse read this one value.
       const selfAgent = config.agentName ?? entry.agent;
+      // Memory tools are appended HERE rather than beside `withSkillTool`
+      // because they need `selfAgent`: each closes over the running model's
+      // participant id, which is the `by` stamp on everything it remembers.
+      // Suppressed for subagent children and `Agent.ask` throwaways by
+      // SESSION rather than config (spec decision 20) — a child's transcript
+      // folds back into the parent, which is the memory-bearing conversation,
+      // and a throwaway is deleted.
+      const memoryOn = config.memory && !entry.parent && !entry.ephemeral
+        ? config.memory : undefined;
+      const tools = withMemoryTools(
+        baseTools,
+        memoryOn
+          ? {
+            config: memoryOn,
+            by: modelParticipantId(selfAgent),
+            agent: selfAgent,
+            userId: entry.userId,
+          }
+          : undefined,
+      );
+      const schemas = toolSchemas(tools);
+      // The turn's hint, cached by the seq of the user row it answers (spec
+      // §6): system assembly runs per retry ATTEMPT inside the per-iteration
+      // loop, so an uncached hint would re-run its aggregation on every
+      // attempt of every iteration. Recomputed only when an interjection or a
+      // compaction re-read changes which user row is newest.
+      let hintSeq = -1;
+      let hintTitles: string[] = [];
       // A relay addressed to us is the wake this turn IS — but it is NOT
       // consumed here (a reviewer-confirmed window): consumption at entry
       // meant a crash anywhere in this turn's first provider call dropped
@@ -459,6 +494,30 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               primary: modelParticipantId(session.agent),
               participants: session.participants,
             } : undefined);
+            // The memory block (spec §6). The LISTING is a direct findAsync,
+            // rebuilt here so a fact this turn just saved — or one a colleague
+            // saved a moment ago — is visible immediately, without waiting on
+            // mongot to index it. The HINT is the expensive half and is cached
+            // by the seq of the user row it answers, so it costs one
+            // aggregation per turn rather than one per retry attempt.
+            let memoryText = '';
+            if (memoryOn) {
+              if (memoryOn.hints) {
+                const lastUser = [...history].reverse().find((m) => m.role === 'user');
+                if (lastUser && hintSeq !== lastUser.seq) {
+                  hintSeq = lastUser.seq;
+                  hintTitles = await memoryHint(lastUser.content ?? '', {
+                    userId: session.userId, agent: selfAgent, config: memoryOn,
+                  });
+                }
+              }
+              memoryText = await memoryBlock({
+                userId: session.userId,
+                agent: selfAgent,
+                config: memoryOn,
+                ...(hintTitles.length ? { hint: hintTitles } : {}),
+              });
+            }
             // Image hydration (participants spec §9) — the separate async
             // step, HERE and only here: after maybeCompact's estimate (base64
             // in the estimator reads as megatokens and wedges compaction),
@@ -474,9 +533,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               // session just re-read — never baked into `config.system` — so
               // a roster that changed mid-conversation (compose joining its
               // recipient) is visible at the next boundary (§4.3).
-              system: session.participants?.length
+              system: (session.participants?.length
                 ? config.system + participantsBlock(session, selfAgent)
-                : config.system,
+                : config.system) + memoryText,
               messages: assembled,
               tools: schemas,
             }, { agent: selfAgent, sessionId, purpose: 'think' });
@@ -901,7 +960,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             if (!target) return;
             await runTurn(sessionId, buildRunConfig(target, still.userId, target === primary
               ? undefined
-              : { agentName, budget: resolveBudget(primary.budget) }));
+              : {
+                agentName,
+                budget: resolveBudget(primary.budget),
+                ...memoryOpt(primary),
+              }));
           })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
           });

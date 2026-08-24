@@ -1,7 +1,9 @@
 import { Meteor } from 'meteor/meteor';
 import { check } from 'meteor/check';
 import { NAMES } from '../common/names';
-import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
+import {
+  AgentDeltas, AgentMemories, AgentMessages, AgentSessions,
+} from '../common/collections';
 
 export function registerPublications(): void {
   Meteor.publish(NAMES.pubSession, async function (agent: string, sessionId: string) {
@@ -107,6 +109,28 @@ export function registerPublications(): void {
         limit: 100,
         fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 },
       },
+    );
+  });
+
+  /**
+   * What this app remembers (memory spec §5) — the publication that makes
+   * memory the user's data rather than the model's black box.
+   *
+   * Own PERSON rows plus the shared WORK pool. Work memory is published to any
+   * signed-in subscriber on purpose: it is app knowledge with the same standing
+   * as the system prompt, and its provenance (`by`) is what makes it auditable.
+   * An anonymous subscriber gets nothing — there is no anonymous person store
+   * (decision 13), and the work pool is not a public endpoint.
+   */
+  Meteor.publish(NAMES.pubMemories, function pubMemories() {
+    if (this.userId === null) return this.ready();
+    return AgentMemories.find(
+      { $or: [{ userId: this.userId }, { scope: 'app' }] } as any,
+      // Sized above the default caps it serves (200 person + 500 app): a
+      // limit BELOW them hides the oldest memories from the page while they
+      // still count toward the cap — a user told the store is full, looking
+      // at a list that cannot show them what to delete.
+      { sort: { at: -1 }, limit: 1000 },
     );
   });
 }

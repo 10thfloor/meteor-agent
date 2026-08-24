@@ -13,6 +13,8 @@ export const NAMES = {
   attachments: 'agent_attachments',
   // Downloads (participants spec §7): minted, single-use capability tokens.
   attachmentTokens: 'agent_attachment_tokens',
+  // Memory (memory spec): durable recall about people and about the work.
+  memories: 'agent_memories',
   pubSession: 'agent.session',
   pubSessions: 'agent.sessions',
   mStart: 'agent.start',
@@ -23,6 +25,17 @@ export const NAMES = {
   mDeny: 'agent.deny',
   mCompact: 'agent.compact',
   mAttachmentToken: 'agent.attachmentToken',
+  pubMemories: 'agent.memories',
+  // The UI caps (memory spec decision 7). Registered ONCE behind a latch at
+  // the first memory-declaring define(); dotted names are DDP-only — the
+  // model-facing tools use underscored, provider-safe names.
+  // Namespaced like every other method this package registers. Bare
+  // `memory.save` is a name a host app plausibly already owns — and
+  // `Meteor.methods` throws on a duplicate, so the collision would be a boot
+  // failure the moment an app added `memory: true`.
+  mMemorySave: 'agent.memorySave',
+  mMemorySearch: 'agent.memorySearch',
+  mMemoryForget: 'agent.memoryForget',
 } as const;
 
 /** Capped collection size in bytes. Sized for ~200 concurrent streaming turns. */

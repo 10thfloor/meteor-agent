@@ -1,0 +1,962 @@
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meteor Agent Harness</title>
+<meta name="description" content="10thfloor:agent — durable AI agents built into your Meteor app. The transcript is a Mongo collection, streaming is a capped collection, tools are Meteor methods.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
+
+<style>
+/* ══════════════════════════════════════════════════════════
+   Palette derived from Meteor's own design tokens, observed in
+   the official docs stylesheet (v3-docs.meteor.com):
+     --vp-c-bg            #101926   deep blue-black ground
+     --vp-c-bg-alt        #0a0f1f   deeper navy surface
+     --vp-c-meteor-red-1  #BF212E   brand red
+     --vp-c-orange-1      #FF6A3E   hot orange (the trail)
+   Dark-first, because Meteor's own identity is.
+   ══════════════════════════════════════════════════════════ */
+:root {
+  --bg: #101926;
+  --surface: #0a0f1f;
+  --card: #152034;
+  --card-2: #1a2740;
+  --border: #243449;
+  --border-soft: #1b2841;
+
+  --accent: #FF6A3E;
+  --accent-deep: #BF212E;
+  --accent-hover: #FF8A5C;
+  --accent-soft: rgba(255, 106, 62, 0.13);
+  --on-accent: #1a0d08;
+
+  --text: #e8ecf2;
+  --text-2: #8b9bb4;
+  --text-3: #5b6b84;
+
+  --code-bg: #0a0f1f;
+  --code-border: #1b2841;
+  --kw: #c792ea;
+  --str: #a5d66f;
+  --fn: #82aaff;
+  --cm: #566d8c;
+  --num: #ffb27a;
+  --op: #89ddff;
+
+  /* Functional only — participant identity inside the mockup. */
+  --p-human: #6196cc;
+  --p-model: #FF6A3E;
+  --p-alt: #a78bfa;
+
+  --nav-bg: rgba(16, 25, 38, 0.82);
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    --bg: #ffffff;
+    --surface: #f6f7f9;
+    --card: #f4f6f8;
+    --card-2: #eef1f5;
+    --border: #dfe3ea;
+    --border-soft: #e8ebf0;
+
+    --accent: #BF212E;
+    --accent-deep: #7F141D;
+    --accent-hover: #A01A24;
+    --accent-soft: rgba(191, 33, 46, 0.09);
+    --on-accent: #ffffff;
+
+    --text: #101926;
+    --text-2: #55637a;
+    --text-3: #8794a8;
+
+    --code-bg: #f6f7f9;
+    --code-border: #e2e6ed;
+    --kw: #8250df;
+    --str: #1a7f37;
+    --fn: #0550ae;
+    --cm: #8794a8;
+    --num: #bc4c00;
+    --op: #0a7d8c;
+
+    --p-human: #0550ae;
+    --p-model: #BF212E;
+    --p-alt: #6b3fd4;
+
+    --nav-bg: rgba(255, 255, 255, 0.85);
+  }
+}
+
+:root[data-theme="light"] {
+  --bg: #ffffff;
+  --surface: #f6f7f9;
+  --card: #f4f6f8;
+  --card-2: #eef1f5;
+  --border: #dfe3ea;
+  --border-soft: #e8ebf0;
+  --accent: #BF212E;
+  --accent-deep: #7F141D;
+  --accent-hover: #A01A24;
+  --accent-soft: rgba(191, 33, 46, 0.09);
+  --on-accent: #ffffff;
+  --text: #101926;
+  --text-2: #55637a;
+  --text-3: #8794a8;
+  --code-bg: #f6f7f9;
+  --code-border: #e2e6ed;
+  --kw: #8250df;
+  --str: #1a7f37;
+  --fn: #0550ae;
+  --cm: #8794a8;
+  --num: #bc4c00;
+  --op: #0a7d8c;
+  --p-human: #0550ae;
+  --p-model: #BF212E;
+  --p-alt: #6b3fd4;
+  --nav-bg: rgba(255, 255, 255, 0.85);
+}
+
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+body {
+  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
+}
+
+/* ── The motif: a meteor trail. Red igniting into orange, at rest
+      horizontally in the streak and raked to 18° behind the hero. ── */
+.streak {
+  height: 3px;
+  background: linear-gradient(90deg,
+    transparent 4%, var(--accent-deep) 26%, var(--accent) 52%,
+    var(--accent-deep) 74%, transparent 96%);
+}
+
+.nav {
+  position: sticky; top: 0; z-index: 100;
+  background: var(--nav-bg);
+  backdrop-filter: blur(14px);
+  border-bottom: 1px solid var(--border);
+}
+.nav-inner {
+  max-width: 1140px; margin: 0 auto; padding: 0 24px;
+  height: 58px; display: flex; align-items: center; justify-content: space-between;
+}
+.nav-brand {
+  font-family: 'Instrument Sans', system-ui, sans-serif;
+  font-weight: 700; font-size: 0.98rem; color: var(--text);
+  text-decoration: none; letter-spacing: -0.01em;
+}
+.nav-brand span { color: var(--accent); }
+.nav-links { display: flex; gap: 22px; align-items: center; }
+.nav-links a {
+  font-size: 0.875rem; font-weight: 500; color: var(--text-2);
+  text-decoration: none; transition: color 0.15s;
+}
+.nav-links a:hover { color: var(--text); }
+.nav-gh { display: inline-flex; align-items: center; gap: 6px; }
+.nav-gh svg { width: 17px; height: 17px; fill: currentColor; }
+
+.container { max-width: 1140px; margin: 0 auto; padding: 0 24px; }
+.section { padding: 76px 0; }
+.section + .section { border-top: 1px solid var(--border); }
+
+h1, h2, h3 {
+  font-family: 'Instrument Sans', system-ui, sans-serif;
+  text-wrap: balance; letter-spacing: -0.025em; line-height: 1.15;
+}
+h2 { font-size: clamp(1.55rem, 3vw, 2.05rem); font-weight: 600; margin-bottom: 14px; }
+h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -0.015em; }
+
+.section-lead {
+  font-size: 1.02rem; color: var(--text-2);
+  max-width: 62ch; line-height: 1.7; margin-bottom: 34px;
+}
+
+/* ══ HERO ══ */
+.hero { padding: 68px 0 64px; position: relative; overflow: hidden; }
+.hero::before {
+  content: ''; position: absolute;
+  top: -140px; right: -180px; width: 900px; height: 620px;
+  background:
+    radial-gradient(ellipse 46% 52% at 62% 44%, rgba(255,106,62,0.16), transparent 70%),
+    radial-gradient(ellipse 38% 44% at 78% 62%, rgba(191,33,46,0.13), transparent 72%);
+  transform: rotate(-18deg);
+  pointer-events: none; z-index: 0;
+}
+.hero .container { position: relative; z-index: 1; }
+.hero-grid { display: grid; gap: 52px; align-items: center; }
+@media (min-width: 980px) {
+  .hero-grid { grid-template-columns: minmax(0, 1.05fr) minmax(0, 1fr); }
+}
+
+.eyebrow {
+  display: inline-flex; align-items: center; gap: 9px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.74rem; font-weight: 500;
+  text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--text-2); margin-bottom: 20px;
+}
+.eyebrow-mark {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+}
+.eyebrow-chip {
+  padding: 2px 7px; border-radius: 4px;
+  background: var(--card); border: 1px solid var(--border);
+  color: var(--text-3); letter-spacing: 0.04em;
+}
+
+.hero h1 {
+  font-size: clamp(2.1rem, 4.6vw, 3.15rem);
+  font-weight: 700; margin-bottom: 20px; max-width: 15ch;
+}
+
+.hero-deck {
+  font-size: clamp(1.02rem, 1.6vw, 1.16rem);
+  color: var(--text-2); max-width: 54ch;
+  line-height: 1.68; margin-bottom: 26px;
+}
+.hero-deck code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.88em; color: var(--text);
+  background: var(--card); padding: 1px 5px; border-radius: 4px;
+}
+
+/* The thesis, demoted from manifesto to spec line. */
+.thesis {
+  display: flex; flex-wrap: wrap;
+  border: 1px solid var(--border); border-radius: 9px;
+  overflow: hidden; margin-bottom: 28px; max-width: 560px;
+}
+.thesis-item {
+  flex: 1 1 50%; padding: 11px 14px;
+  border-right: 1px solid var(--border-soft);
+  border-bottom: 1px solid var(--border-soft);
+  font-family: 'JetBrains Mono', monospace; font-size: 0.775rem;
+  color: var(--text-3); line-height: 1.45;
+}
+.thesis-item:nth-child(2n) { border-right: none; }
+.thesis-item:nth-last-child(-n+2) { border-bottom: none; }
+.thesis-item b { display: block; color: var(--text); font-weight: 500; }
+
+.hero-actions {
+  display: flex; gap: 11px; flex-wrap: wrap;
+  align-items: center; margin-bottom: 22px;
+}
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  font-family: 'Instrument Sans', system-ui, sans-serif;
+  font-size: 0.9rem; font-weight: 600;
+  padding: 10px 18px; border-radius: 8px;
+  text-decoration: none; border: 1px solid transparent;
+  cursor: pointer; transition: background 0.15s, border-color 0.15s;
+}
+.btn-primary { background: var(--accent); color: var(--on-accent); }
+.btn-primary:hover { background: var(--accent-hover); }
+.btn-ghost {
+  background: transparent; color: var(--text);
+  border-color: var(--border);
+}
+.btn-ghost:hover { border-color: var(--text-3); }
+.btn-ghost svg { width: 16px; height: 16px; fill: currentColor; }
+
+.copy-cmd {
+  display: inline-flex; align-items: center; gap: 10px;
+  background: var(--code-bg); border: 1px solid var(--code-border);
+  border-radius: 8px; padding: 9px 14px;
+  font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+  color: var(--text); cursor: pointer; transition: border-color 0.15s;
+}
+.copy-cmd:hover { border-color: var(--text-3); }
+.copy-cmd .sigil { color: var(--text-3); user-select: none; }
+.copy-cmd .ico { width: 14px; height: 14px; stroke: var(--text-3); fill: none; stroke-width: 2; }
+.copy-cmd.copied { border-color: var(--accent); }
+.copy-cmd.copied .ico { stroke: var(--accent); }
+
+.proof {
+  display: flex; flex-wrap: wrap; gap: 8px 14px;
+  font-size: 0.8rem; color: var(--text-3);
+}
+.proof span { display: inline-flex; align-items: center; gap: 8px; }
+.proof span + span::before {
+  content: ''; width: 3px; height: 3px; border-radius: 50%;
+  background: var(--text-3); opacity: 0.55;
+}
+
+/* ══ Pillars — own band, below the hero ══ */
+.band-label {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.72rem; text-transform: uppercase;
+  letter-spacing: 0.11em; color: var(--text-3); margin-bottom: 20px;
+}
+.pillars { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 18px; }
+.pillar {
+  background: var(--card); border: 1px solid var(--border);
+  border-radius: 11px; padding: 24px;
+}
+.pillar-tag {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em;
+  color: var(--text-3); margin-bottom: 12px; display: block;
+}
+.pillar p { color: var(--text-2); font-size: 0.9rem; line-height: 1.65; }
+
+/* ══ Code ══ */
+.code-block {
+  background: var(--code-bg); border: 1px solid var(--code-border);
+  border-radius: 9px; overflow: hidden; margin: 16px 0;
+}
+.code-header {
+  display: flex; align-items: center; gap: 8px;
+  padding: 9px 16px; border-bottom: 1px solid var(--code-border);
+  font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: var(--text-3);
+}
+.code-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: 0.45; }
+.code-block pre {
+  padding: 16px; overflow-x: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.815rem; line-height: 1.62; color: var(--text);
+}
+.kw { color: var(--kw); } .str { color: var(--str); } .fn { color: var(--fn); }
+.cm { color: var(--cm); font-style: italic; } .num { color: var(--num); } .op { color: var(--op); }
+
+/* ══ Quickstart ══ */
+.quickstart { display: grid; grid-template-columns: 1fr; gap: 26px; }
+@media (min-width: 820px) { .quickstart { grid-template-columns: 1fr 1fr; } }
+.qs-step h3 { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.qs-num {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 24px; height: 24px; border-radius: 6px;
+  background: var(--card-2); color: var(--text-2);
+  font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; font-weight: 500;
+  flex-shrink: 0;
+}
+.qs-step > p { color: var(--text-2); font-size: 0.885rem; line-height: 1.6; }
+
+/* ══ Features ══ */
+.features-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(250px, 1fr)); gap: 14px; }
+.feature {
+  padding: 20px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface);
+  transition: border-color 0.2s;
+}
+.feature:hover { border-color: var(--text-3); }
+.feature h3 { font-size: 0.96rem; margin-bottom: 6px; }
+.feature p { color: var(--text-2); font-size: 0.85rem; line-height: 1.6; }
+.feature code {
+  font-family: 'JetBrains Mono', monospace; font-size: 0.85em;
+  color: var(--text); background: var(--card); padding: 1px 4px; border-radius: 3px;
+}
+
+/* ══ Channels ══ */
+.channels-strip { display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 28px; }
+.channel-badge {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 9px 16px; background: var(--card);
+  border: 1px solid var(--border); border-radius: 8px;
+  font-size: 0.875rem; font-weight: 500; color: var(--text);
+}
+.channel-dot { width: 7px; height: 7px; border-radius: 50%; }
+
+/* ══ The standing memory block — a PROMPT excerpt, not code ══ */
+.memblock {
+  background: var(--code-bg);
+  border: 1px solid var(--code-border);
+  border-left: 2px solid var(--accent);
+  border-radius: 0 9px 9px 0;
+  padding: 18px 20px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.79rem;
+  line-height: 1.75;
+  overflow-x: auto;
+}
+.memblock .mb-h { color: var(--accent); font-weight: 500; }
+.memblock .mb-sec { color: var(--text); display: block; margin-top: 10px; }
+.memblock .mb-row { color: var(--text-2); display: block; }
+.memblock .mb-by { color: var(--text-3); }
+.memblock .mb-hint { color: var(--text); display: block; margin-top: 10px; }
+.memblock .mb-foot {
+  color: var(--text-3); display: block; margin-top: 10px;
+  padding-top: 10px; border-top: 1px solid var(--border-soft);
+}
+.mem-caption {
+  font-size: 0.8rem; color: var(--text-3); margin-top: 10px; line-height: 1.6;
+}
+
+/* ══ Conversation mockup ══ */
+.conversation {
+  background: var(--surface); border: 1px solid var(--border);
+  border-radius: 12px; overflow: hidden;
+}
+.conv-header {
+  padding: 12px 18px; border-bottom: 1px solid var(--border);
+  font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+  color: var(--text-2); display: flex; align-items: center; gap: 7px;
+}
+.conv-header-hash { color: var(--text-3); }
+.conv-msg { display: grid; grid-template-columns: 32px 1fr; gap: 11px; padding: 13px 18px; }
+.conv-msg + .conv-msg { border-top: 1px solid var(--border-soft); }
+.conv-avatar {
+  width: 32px; height: 32px; border-radius: 7px;
+  display: flex; align-items: center; justify-content: center;
+  font-family: 'Instrument Sans', sans-serif; font-size: 0.72rem;
+  font-weight: 700; color: #fff; flex-shrink: 0;
+}
+.av-human { background: var(--p-human); }
+.av-model { background: var(--p-model); }
+.av-alt   { background: var(--p-alt); }
+.conv-name {
+  font-family: 'Instrument Sans', sans-serif; font-weight: 600;
+  font-size: 0.84rem; margin-bottom: 3px;
+  display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
+}
+.conv-badge {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.6rem; font-weight: 500; text-transform: uppercase;
+  letter-spacing: 0.06em; padding: 2px 5px; border-radius: 3px;
+  background: var(--card-2); color: var(--text-3);
+}
+.conv-text { font-size: 0.845rem; color: var(--text-2); line-height: 1.58; }
+.conv-text .mention { color: var(--accent); font-weight: 500; }
+
+/* ══ n:n ══ */
+.nn-layout { display: grid; gap: 38px; align-items: start; }
+@media (min-width: 940px) { .nn-layout { grid-template-columns: 1fr 1fr; } }
+.nn-features { list-style: none; display: flex; flex-direction: column; gap: 9px; margin-bottom: 22px; }
+.nn-features li {
+  position: relative; padding-left: 17px;
+  font-size: 0.885rem; color: var(--text-2); line-height: 1.65;
+}
+.nn-features li::before {
+  content: ''; position: absolute; left: 0; top: 8px;
+  width: 5px; height: 5px; border-radius: 50%;
+  background: var(--text-3);
+}
+.nn-features code {
+  font-family: 'JetBrains Mono', monospace; font-size: 0.85em;
+  color: var(--text); background: var(--card); padding: 1px 4px; border-radius: 3px;
+}
+
+/* ══ Docs ══ */
+.doc-card {
+  display: block; padding: 20px; border-radius: 10px;
+  border: 1px solid var(--border); background: var(--surface);
+  text-decoration: none; transition: border-color 0.2s;
+}
+.doc-card:hover { border-color: var(--text-3); }
+.doc-card h3 { color: var(--text); }
+.doc-card p { color: var(--text-2); font-size: 0.85rem; line-height: 1.6; }
+
+.footer { padding: 34px 0; border-top: 1px solid var(--border); color: var(--text-3); font-size: 0.83rem; }
+.footer-inner { display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 14px; }
+.footer a { color: var(--text-2); text-decoration: none; }
+.footer a:hover { color: var(--text); }
+
+a:focus-visible, button:focus-visible {
+  outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px;
+}
+
+@media (max-width: 700px) {
+  .hero { padding: 48px 0 44px; }
+  .section { padding: 52px 0; }
+  .nav-links .hide-sm { display: none; }
+  .hero-actions .btn, .hero-actions .copy-cmd { width: 100%; justify-content: center; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+</style>
+
+<div class="streak"></div>
+
+<nav class="nav">
+  <div class="nav-inner">
+    <a href="#" class="nav-brand">10thfloor<span>:</span>agent</a>
+    <div class="nav-links">
+      <a href="#quickstart" class="hide-sm">Quickstart</a>
+      <a href="#features" class="hide-sm">Features</a>
+      <a href="#channels" class="hide-sm">Channels</a>
+      <a href="#nn" class="hide-sm">Group sessions</a>
+      <a href="#memory" class="hide-sm">Memory</a>
+      <a href="https://github.com/10thfloor/meteor-agent" class="nav-gh">
+        <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+        GitHub
+      </a>
+    </div>
+  </div>
+</nav>
+
+<!-- ══ HERO ══ -->
+<section class="hero">
+  <div class="container hero-grid">
+    <div>
+      <div class="eyebrow">
+        <span class="eyebrow-mark"></span>
+        Meteor package
+        <span class="eyebrow-chip">v0.1.0</span>
+      </div>
+
+      <h1>Durable AI agents, built into your Meteor app.</h1>
+
+      <p class="hero-deck">
+        A server-side agent harness where sessions, transcripts, streaming, tools and
+        approvals all live in Mongo &mdash; so agents survive deploys, crashes and
+        reconnects like everything else in your app. Register a tool once and your UI
+        and the model call the same function, scoped by <code>this.userId</code>.
+      </p>
+
+      <div class="thesis">
+        <div class="thesis-item"><b>transcript</b> a Mongo collection</div>
+        <div class="thesis-item"><b>streaming</b> a capped collection</div>
+        <div class="thesis-item"><b>tools</b> Meteor methods</div>
+        <div class="thesis-item"><b>authorization</b> this.userId</div>
+      </div>
+
+      <div class="hero-actions">
+        <a href="#quickstart" class="btn btn-primary">Get started</a>
+        <a href="https://github.com/10thfloor/meteor-agent" class="btn btn-ghost">
+          <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
+          GitHub
+        </a>
+        <button type="button" class="copy-cmd" id="copyBtn" aria-label="Copy install command">
+          <span class="sigil">$</span>
+          <span id="cmdText">meteor add 10thfloor:agent</span>
+          <svg class="ico" viewBox="0 0 24 24" id="copyIco">
+            <rect x="9" y="9" width="13" height="13" rx="2"/>
+            <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
+          </svg>
+        </button>
+      </div>
+
+      <div class="proof">
+        <span>Meteor 3.5+</span>
+        <span>MIT</span>
+        <span>TypeScript</span>
+        <span>555 tests</span>
+        <span>No external orchestrator</span>
+      </div>
+    </div>
+
+    <!-- The product, not an abstraction. -->
+    <div class="conversation">
+      <div class="conv-header"><span class="conv-header-hash">#</span> support-desk</div>
+      <div class="conv-msg">
+        <div class="conv-avatar av-human">MK</div>
+        <div>
+          <div class="conv-name">Mackenzie</div>
+          <div class="conv-text">Hey, I got charged twice for order #8812</div>
+        </div>
+      </div>
+      <div class="conv-msg">
+        <div class="conv-avatar av-model">S</div>
+        <div>
+          <div class="conv-name">support <span class="conv-badge">tool call</span></div>
+          <div class="conv-text">
+            Order #8812: one charge of $49.99. Let me check with our data team.<br><br>
+            <span class="mention">@analyst</span> can you verify the charge history?
+          </div>
+        </div>
+      </div>
+      <div class="conv-msg">
+        <div class="conv-avatar av-alt">A</div>
+        <div>
+          <div class="conv-name">analyst <span class="conv-badge">relay</span></div>
+          <div class="conv-text">
+            One successful charge on June 3. The second is a pending auth hold &mdash; it
+            clears in 3&ndash;5 days.<br><br>
+            <span class="mention">@support</span> it's a hold, not a double charge.
+          </div>
+        </div>
+      </div>
+      <div class="conv-msg">
+        <div class="conv-avatar av-model">S</div>
+        <div>
+          <div class="conv-name">support <span class="conv-badge">relay</span></div>
+          <div class="conv-text">Good news &mdash; you weren't charged twice. Your bank placed a temporary hold that clears within 3&ndash;5 business days.</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══ Pillars ══ -->
+<section class="section">
+  <div class="container">
+    <div class="band-label">Why it exists</div>
+    <div class="pillars">
+      <div class="pillar">
+        <span class="pillar-tag">Durability</span>
+        <h3>Crashes don't lose work</h3>
+        <p>Lease and heartbeat, atomic seq allocation, repair-on-entry. If the server dies mid-sentence, the next one picks up where it left off.</p>
+      </div>
+      <div class="pillar">
+        <span class="pillar-tag">Channels</span>
+        <h3>One agent, five surfaces</h3>
+        <p>Slack, email, SMS, WhatsApp, Telegram. Each verifies webhooks, ingests media, and threads replies. The agent definition never changes.</p>
+      </div>
+      <div class="pillar">
+        <span class="pillar-tag">Participants</span>
+        <h3>n humans &times; n models</h3>
+        <p>Multiple people and multiple models in one session, with per-message attribution, @-mention addressing, and durable model-to-model relays.</p>
+      </div>
+      <div class="pillar">
+        <span class="pillar-tag">Memory</span>
+        <h3>Recall the user can read</h3>
+        <p>Durable facts about the person and about the work, in a collection your UI can show, edit, and delete. Semantic search, no second database.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══ Quickstart ══ -->
+<section class="section" id="quickstart">
+  <div class="container">
+    <h2>Up and running</h2>
+    <p class="section-lead">Five steps from an empty file to two agents collaborating in a Slack thread. Every block below is real API, not pseudocode.</p>
+    <div class="quickstart">
+
+      <div class="qs-step">
+        <h3><span class="qs-num">1</span> Define the agent</h3>
+        <p>A name, a model, instructions, and tools. The registry entry lives on the server; the name is shared with the client.</p>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> server/agents.ts</div>
+<pre><span class="kw">import</span> { <span class="fn">Agent</span> } <span class="kw">from</span> <span class="str">'meteor/10thfloor:agent'</span>;
+
+<span class="kw">const</span> Support <span class="op">=</span> <span class="kw">new</span> <span class="fn">Agent</span>(<span class="str">'support'</span>);
+
+Support.<span class="fn">define</span>({
+  model: <span class="str">'anthropic/claude-sonnet-5'</span>,
+  instructions: <span class="str">'You help with customer orders.'</span>,
+  tools: [<span class="str">'orders.lookup'</span>],
+  budget: { turns: <span class="num">20</span>, toolCalls: <span class="num">40</span> },
+});</pre>
+        </div>
+      </div>
+
+      <div class="qs-step">
+        <h3><span class="qs-num">2</span> Give it a tool</h3>
+        <p>Co-registration defines the Meteor method and the tool at once &mdash; your UI and the model call the same code through the same schema.</p>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> server/orders.ts</div>
+<pre><span class="kw">export const</span> lookup <span class="op">=</span> Agent.<span class="fn">method</span>(<span class="str">'orders.lookup'</span>, {
+  description: <span class="str">'Look up an order by id'</span>,
+  args: {
+    type: <span class="str">'object'</span>,
+    properties: { id: { type: <span class="str">'string'</span> } },
+    required: [<span class="str">'id'</span>],
+  },
+  <span class="fn">run</span>(args) {
+    <span class="cm">// `this` is the method invocation, so</span>
+    <span class="cm">// this.userId scopes the query to the caller</span>
+    <span class="kw">return</span> Orders.<span class="fn">findOneAsync</span>({
+      _id: args.id,
+      userId: <span class="kw">this</span>.userId,
+    });
+  },
+});
+
+Support.<span class="fn">define</span>({ <span class="op">...</span>, tools: [lookup] });  <span class="cm">// the model</span>
+<span class="kw">await</span> Meteor.<span class="fn">callAsync</span>(<span class="str">'orders.lookup'</span>, { id });  <span class="cm">// your UI</span></pre>
+        </div>
+      </div>
+
+      <div class="qs-step">
+        <h3><span class="qs-num">3</span> Drop in the UI</h3>
+        <p>One custom element renders the whole chat: streaming tokens, tool calls, approval buttons, compaction notes.</p>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> client/main.ts</div>
+<pre><span class="kw">import</span> { <span class="fn">defineAgentChat</span> } <span class="kw">from</span>
+  <span class="str">'meteor/10thfloor:agent'</span>;
+
+Meteor.<span class="fn">startup</span>(() <span class="op">=></span> {
+  <span class="fn">defineAgentChat</span>();
+});</pre>
+        </div>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> client/app.html</div>
+<pre><span class="op">&lt;</span><span class="fn">agent-chat</span> agent<span class="op">=</span><span class="str">"support"</span><span class="op">&gt;&lt;/</span><span class="fn">agent-chat</span><span class="op">&gt;</span></pre>
+        </div>
+      </div>
+
+      <div class="qs-step">
+        <h3><span class="qs-num">4</span> Connect a channel</h3>
+        <p>The same agent, now reachable on Slack. The channel package handles signature verification, parsing, and delivery.</p>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> server/channels.ts</div>
+<pre><span class="kw">import</span> { <span class="fn">slack</span> } <span class="kw">from</span>
+  <span class="str">'meteor/10thfloor:agent-channel-slack'</span>;
+
+Agent.<span class="fn">channel</span>(<span class="str">'slack'</span>, <span class="fn">slack</span>({
+  agent: <span class="str">'support'</span>,
+  botToken: process.env.<span class="fn">SLACK_BOT_TOKEN</span>,
+  signingSecret: process.env.<span class="fn">SLACK_SIGNING_SECRET</span>,
+  admits: <span class="str">'linked'</span>,
+}));</pre>
+        </div>
+      </div>
+
+      <div class="qs-step">
+        <h3><span class="qs-num">5</span> Add a colleague</h3>
+        <p>Register a second agent and add it to the session roster. Now users can @-mention either one in the same thread.</p>
+        <div class="code-block">
+          <div class="code-header"><span class="code-dot"></span> server/agents.ts</div>
+<pre><span class="kw">const</span> Analyst <span class="op">=</span> <span class="kw">new</span> <span class="fn">Agent</span>(<span class="str">'analyst'</span>);
+
+Analyst.<span class="fn">define</span>({
+  model: <span class="str">'anthropic/claude-sonnet-5'</span>,
+  instructions: <span class="str">'You answer data questions.'</span>,
+  tools: [<span class="str">'analytics.query'</span>],
+});
+
+<span class="kw">await</span> Agent.participants.<span class="fn">add</span>(sessionId, {
+  id: <span class="str">'m:analyst'</span>,
+  kind: <span class="str">'model'</span>,
+  role: <span class="str">'member'</span>,
+  agent: <span class="str">'analyst'</span>,
+});</pre>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<!-- ══ Features ══ -->
+<section class="section" id="features">
+  <div class="container">
+    <h2>What's in the box</h2>
+    <p class="section-lead">Everything needed to run production agents inside a Meteor app &mdash; no external orchestrator, no second database, no separate deploy.</p>
+    <div class="features-grid">
+      <div class="feature">
+        <h3>Tools</h3>
+        <p>Five kinds: Meteor methods, inline functions, co-registered pairs, subagents, and MCP servers. Model arguments are checked against the full JSON Schema.</p>
+      </div>
+      <div class="feature">
+        <h3>Approval gates</h3>
+        <p><code>gate: 'ask'</code> parks the turn for a human. Budgets cap turns, tool calls, and spend; unanswered approvals time out and auto-deny.</p>
+      </div>
+      <div class="feature">
+        <h3>Streaming</h3>
+        <p>Token deltas through a capped collection &mdash; O(chunk) on the wire, not O(n&sup2;). Merged client-side into one ordered cursor.</p>
+      </div>
+      <div class="feature">
+        <h3>Compaction</h3>
+        <p>Past the context threshold, older turns are summarized. The model's view shrinks; the transcript keeps every row and your UI keeps rendering it.</p>
+      </div>
+      <div class="feature">
+        <h3>Channels</h3>
+        <p>Slack, email, SMS, WhatsApp, Telegram. Media ingest runs through host allowlists, size gates, and redirect-safe fetching.</p>
+      </div>
+      <div class="feature">
+        <h3>Participants</h3>
+        <p>Rosters up to 16. Membership is the authorization; attribution is stamped by the harness, never by a model.</p>
+      </div>
+      <div class="feature">
+        <h3>Memory</h3>
+        <p>Durable recall in a Mongo collection. Semantic search through <code>mongot</code>, degrading to text and regex rather than failing a turn.</p>
+      </div>
+      <div class="feature">
+        <h3>Subagents</h3>
+        <p>Another agent behind a tool call, with composed budgets, a depth guard, and its own child transcript.</p>
+      </div>
+      <div class="feature">
+        <h3>Forking</h3>
+        <p>Branch a conversation at a batch-safe point. The fork copies transcript and roster; the source continues untouched.</p>
+      </div>
+      <div class="feature">
+        <h3>Recovery</h3>
+        <p>A watcher sweeps for sessions holding dead leases after a deploy, an OOM, or a SIGKILL, and re-runs the turn.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══ Channels ══ -->
+<section class="section" id="channels">
+  <div class="container">
+    <h2>Five surfaces, one agent</h2>
+    <p class="section-lead">Register a channel and the agent is reachable there. Each package owns webhook verification, event parsing, delivery, and media ingest &mdash; the agent definition stays exactly the same.</p>
+    <div class="channels-strip">
+      <div class="channel-badge"><span class="channel-dot" style="background:#E01E5A"></span> Slack</div>
+      <div class="channel-badge"><span class="channel-dot" style="background:#6196cc"></span> Email</div>
+      <div class="channel-badge"><span class="channel-dot" style="background:#25D366"></span> WhatsApp</div>
+      <div class="channel-badge"><span class="channel-dot" style="background:#0088CC"></span> Telegram</div>
+      <div class="channel-badge"><span class="channel-dot" style="background:#8b9bb4"></span> SMS</div>
+    </div>
+    <div class="code-block">
+      <div class="code-header"><span class="code-dot"></span> server/channels.ts</div>
+<pre><span class="kw">import</span> { <span class="fn">Agent</span> } <span class="kw">from</span> <span class="str">'meteor/10thfloor:agent'</span>;
+<span class="kw">import</span> { <span class="fn">slack</span> } <span class="kw">from</span> <span class="str">'meteor/10thfloor:agent-channel-slack'</span>;
+<span class="kw">import</span> { <span class="fn">email</span> } <span class="kw">from</span> <span class="str">'meteor/10thfloor:agent-channel-email'</span>;
+
+Agent.<span class="fn">channel</span>(<span class="str">'slack'</span>, <span class="fn">slack</span>({
+  agent: <span class="str">'support'</span>,
+  botToken: process.env.<span class="fn">SLACK_BOT_TOKEN</span>,
+  signingSecret: process.env.<span class="fn">SLACK_SIGNING_SECRET</span>,
+  admits: <span class="str">'linked'</span>,   <span class="cm">// linked accounts auto-join a thread</span>
+}));
+
+Agent.<span class="fn">channel</span>(<span class="str">'email'</span>, <span class="fn">email</span>({
+  agent: <span class="str">'support'</span>,
+  domain: <span class="str">'support.example.com'</span>,
+  postmark: { serverToken: process.env.<span class="fn">POSTMARK_TOKEN</span> },
+}));</pre>
+    </div>
+  </div>
+</section>
+
+<!-- ══ n:n ══ -->
+<section class="section" id="nn">
+  <div class="container">
+    <h2>Group sessions</h2>
+    <p class="section-lead">A session holds up to 16 participants in any mix of humans and models. The roster is the authorization: on it, you can read and write; off it, ingress settles the event silently.</p>
+    <div class="nn-layout">
+      <div>
+        <ul class="nn-features">
+          <li>Per-message <code>from</code> attribution, stamped by the harness from the authenticated source &mdash; a model can never claim to be someone else</li>
+          <li><code>@analyst</code> routes the turn to that model, running its config against the primary's budget</li>
+          <li>A model reply starting with <code>@colleague</code> schedules a durable relay, written atomically with the commit</li>
+          <li>The relay counter resets on every human message, so agents cannot loop forever</li>
+          <li>Each model sees colleagues' spoken conclusions, not their tool calls</li>
+          <li>Compaction uses an omniscient view, so summaries preserve every speaker</li>
+        </ul>
+      </div>
+      <div>
+        <div class="code-block" style="margin-top:0">
+          <div class="code-header"><span class="code-dot"></span> the participants API</div>
+<pre><span class="cm">// Add a model to the conversation</span>
+<span class="kw">await</span> Agent.participants.<span class="fn">add</span>(sessionId, {
+  id: <span class="str">'m:analyst'</span>,
+  kind: <span class="str">'model'</span>,
+  role: <span class="str">'member'</span>,
+  agent: <span class="str">'analyst'</span>,
+}, { by: <span class="str">'m:support'</span> });
+
+<span class="cm">// Add a human by channel identity</span>
+<span class="kw">await</span> Agent.participants.<span class="fn">add</span>(sessionId, {
+  id: <span class="str">'x:slack:U024BE7LH'</span>,
+  kind: <span class="str">'human'</span>,
+  role: <span class="str">'member'</span>,
+  identity: {
+    kind: <span class="str">'slack'</span>,
+    externalUserId: <span class="str">'U024BE7LH'</span>,
+  },
+  displayName: <span class="str">'Dana'</span>,
+});
+
+<span class="cm">// Read the roster, or remove someone</span>
+<span class="cm">// (the owner can't be removed)</span>
+<span class="kw">const</span> roster <span class="op">=</span> <span class="kw">await</span>
+  Agent.participants.<span class="fn">list</span>(sessionId);
+<span class="kw">await</span> Agent.participants.<span class="fn">remove</span>(
+  sessionId, <span class="str">'m:analyst'</span>);</pre>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+
+<!-- ══ Memory ══ -->
+<section class="section" id="memory">
+  <div class="container">
+    <h2>Memory</h2>
+    <p class="section-lead">An agent that only knows this conversation forgets the person the moment it ends. <code>memory: true</code> gives it durable recall &mdash; about the people it serves, and about the work itself &mdash; as a Mongo collection your UI can read.</p>
+    <div class="nn-layout">
+      <div>
+        <ul class="nn-features">
+          <li><b>Memory follows the human, not the model.</b> The store is keyed by <code>userId</code> alone, and a turn always runs as the session owner &mdash; so what <code>support</code> learns, <code>analyst</code> recalls</li>
+          <li><b>Work memory</b> (<code>scope: 'app'</code>) carries no <code>userId</code> at all: one pool, read by every agent in every session</li>
+          <li>Promoting a fact there is an <b>approval</b> &mdash; and so is deleting one</li>
+          <li>Nothing enters context invisibly: every recall is a <code>memory_search</code> tool row in the transcript</li>
+          <li>Search degrades rather than failing a turn &mdash; vector, then text, then regex</li>
+          <li>Your UI subscribes to the same collection, so the user holds the delete button</li>
+        </ul>
+        <div class="code-block" style="margin-top:0">
+          <div class="code-header"><span class="code-dot"></span> server/agents.ts</div>
+<pre>Support.<span class="fn">define</span>({
+  model: <span class="str">'anthropic/claude-sonnet-5'</span>,
+  instructions: <span class="str">'You help with customer orders.'</span>,
+  memory: { scopes: [<span class="str">'user'</span>, <span class="str">'app'</span>] },
+});
+
+<span class="cm">// The user's memory page — same collection, same rules</span>
+Meteor.<span class="fn">subscribe</span>(<span class="str">'agent.memories'</span>);
+<span class="kw">await</span> Meteor.<span class="fn">callAsync</span>(<span class="str">'agent.memoryForget'</span>, { id });</pre>
+        </div>
+      </div>
+
+      <div>
+        <div class="memblock">
+<span class="mb-h">## Memory</span>
+<span class="mb-sec">About this person (7 remembered):</span>
+<span class="mb-row">- prefers email over Slack for billing</span>
+<span class="mb-row">- dispute #8812 was an auth hold, not a double charge <span class="mb-by">[pinned]</span></span>
+<span class="mb-sec">About this work (3 remembered):</span>
+<span class="mb-row">- orders table soft-deletes; filter deletedAt: null <span class="mb-by">[learned by m:analyst]</span></span>
+<span class="mb-hint">Possibly relevant to the latest message: dispute #8812 was an auth hold</span>
+<span class="mb-foot">Use memory_search to recall details, memory_save to remember something new.</span>
+        </div>
+        <p class="mem-caption">
+          What the model actually sees, rebuilt every iteration. <b>Titles only</b> &mdash; the listing is an index, so ten memories cost ten lines rather than ten paragraphs. Details arrive through a tool call the transcript records. The last line is the harness's own once-per-turn search against the newest message: it names what might be relevant and never pastes it in.
+        </p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- ══ Docs ══ -->
+<section class="section">
+  <div class="container">
+    <h2>Documentation</h2>
+    <div class="features-grid">
+      <a class="doc-card" href="https://github.com/10thfloor/meteor-agent/blob/main/app/packages/agent/README.md">
+        <h3>Package README &rarr;</h3>
+        <p>The full reference. Every config key, every method, every note kind. Start here when you know what you're looking for.</p>
+      </a>
+      <a class="doc-card" href="https://github.com/10thfloor/meteor-agent/blob/main/docs/by-example.md">
+        <h3>By example &rarr;</h3>
+        <p>Every capability as code you can paste, in the order you would actually build it. Failure modes shown as often as happy paths.</p>
+      </a>
+      <a class="doc-card" href="https://github.com/10thfloor/meteor-agent/blob/main/app/packages/agent/n-n-slack-tutorial.md">
+        <h3>Multi-agent Slack tutorial &rarr;</h3>
+        <p>A hands-on build of two agents in one Slack thread: roster management, @-addressing, and relay hand-offs.</p>
+      </a>
+    </div>
+  </div>
+</section>
+
+<footer class="footer">
+  <div class="container footer-inner">
+    <span>10thfloor:agent &mdash; a durable agent harness for Meteor 3.5+</span>
+    <span><a href="https://github.com/10thfloor/meteor-agent">GitHub</a></span>
+  </div>
+</footer>
+
+<script>
+  (function () {
+    var btn = document.getElementById('copyBtn');
+    var ico = document.getElementById('copyIco');
+    var CHECK = '<polyline points="20 6 9 17 4 12"/>';
+    var COPY = '<rect x="9" y="9" width="13" height="13" rx="2"/>'
+             + '<path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>';
+    btn.addEventListener('click', function () {
+      var text = document.getElementById('cmdText').textContent;
+      var done = function () {
+        btn.classList.add('copied');
+        ico.innerHTML = CHECK;
+        setTimeout(function () {
+          btn.classList.remove('copied');
+          ico.innerHTML = COPY;
+        }, 1600);
+      };
+      if (navigator.clipboard && navigator.clipboard.writeText) {
+        navigator.clipboard.writeText(text).then(done, function () {});
+      }
+    });
+  })();
+</script>

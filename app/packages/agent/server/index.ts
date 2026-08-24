@@ -6,7 +6,9 @@ import { registerPublications } from './publications';
 import { registerMethods } from './methods';
 import { applyRateLimits } from './rate-limits';
 import { listAgents } from './registry';
-import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
+import {
+  AgentSessions, AgentMessages, AgentDeltas, AgentMemories,
+} from '../common/collections';
 import { startWatcher, type Watcher } from './watcher';
 import {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
@@ -20,7 +22,20 @@ import { startEgress, type EgressWorker } from './channels/egress';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
-export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
+// Memory (memory spec): the core, its types, and the test seam. The DDP
+// methods and the inline tools are registered by `define()`, not exported —
+// an app reaches the store through `Agent.memory`.
+export {
+  saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint,
+  readSelector, _setMemorySearch, _activeRung, _forceRegexRung,
+  type SaveArgs, type SaveResult, type ForgetResult, type SearchRung,
+  type ListedMemories,
+} from './memory';
+export { MEMORY_TOOL_NAMES } from './tools';
+export { resolveMemory } from './registry';
+export {
+  AgentSessions, AgentMessages, AgentDeltas, AgentMemories,
+} from '../common/collections';
 export { mergeView } from '../common/merge';
 // `Agent.provider` / `Agent.compact` are the doors to the provider registry and
 // to manual compaction; the underlying `registerProvider` / `compactSession`
@@ -195,6 +210,10 @@ function denyAllClientWrites(): void {
     // would be an exfiltration primitive through the GET route (participants
     // spec §7.1) — the full link-token idiom includes this belt.
     AttachmentDownloadTokens,
+    // Memory: a forged client insert would let anyone write the shared work
+    // pool the model reads on every turn — prompt injection with a write
+    // primitive. Legitimate writes go through the methods and the core.
+    AgentMemories,
   ]) {
     (c as any).deny(deny);
   }

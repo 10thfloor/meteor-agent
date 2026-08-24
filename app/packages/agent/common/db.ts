@@ -1,6 +1,6 @@
 import type { Mongo } from 'meteor/mongo';
 import type {
-  AgentDelta, AgentMessage, AgentSession, SessionInc,
+  AgentDelta, AgentMemory, AgentMessage, AgentSession, SessionInc,
 } from './types';
 
 /**
@@ -170,6 +170,29 @@ export interface DeltaModifier {
   $unset?: { [K in keyof AgentDelta]?: 1 | true };
 }
 
+// ---- AgentMemories ---------------------------------------------------------
+
+/** A selector over a memory row. Flat fields only — memory rows carry no
+ *  nested query paths — plus the logical combinators the ladder's `$or`
+ *  (person rows OR app rows) needs. */
+export type MemoryQuery =
+  & Fields<AgentMemory>
+  & {
+    $or?: MemoryQuery[];
+    $and?: MemoryQuery[];
+    $nor?: MemoryQuery[];
+  };
+
+/** A memory selector: a plain `_id` string, or a query object. */
+export type MemorySelector = string | MemoryQuery;
+
+/** Memory rows are updated on the deliberate-upsert path only (`key`), so the
+ *  modifier is a narrow `$set` over the row's own fields. */
+export interface MemoryModifier {
+  $set?: { [K in keyof AgentMemory]?: AgentMemory[K] };
+  $unset?: { [K in keyof AgentMemory]?: 1 | true };
+}
+
 // ---- The facade ------------------------------------------------------------
 
 /** The subset of find/update options the package passes. Kept minimal on
@@ -206,3 +229,4 @@ export interface TypedCollection<T extends { _id: string }, Sel, Mod>
 export type SessionsCollection = TypedCollection<AgentSession, SessionSelector, SessionModifier>;
 export type MessagesCollection = TypedCollection<AgentMessage, MessageSelector, MessageModifier>;
 export type DeltasCollection = TypedCollection<AgentDelta, DeltaSelector, DeltaModifier>;
+export type MemoriesCollection = TypedCollection<AgentMemory, MemorySelector, MemoryModifier>;

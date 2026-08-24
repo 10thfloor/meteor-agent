@@ -136,7 +136,9 @@ const FRAME = `
   /* The display:flex above beats the UA's [hidden] { display: none } — without
      this rule the approval bar renders even when nothing is pending. */
   .approval[hidden] { display: none; }
-  .approval-text { flex: 1; }
+  /* The summary leads and the exact record follows on its own lines, so the
+     newline between them has to survive rendering. */
+  .approval-text { flex: 1; white-space: pre-wrap; word-break: break-word; }
 
   .composer {
     display: flex; gap: 0.5rem; padding: 0.75rem 1rem;
@@ -537,12 +539,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         // adds nothing to the sentence.
         const runsAs = ask.runAs === undefined
           ? '' : ` — runs as ${ask.runAs ?? 'anonymous'}`;
-        // The tool's own park-time account (participants spec §8) beats raw
-        // args JSON when the tool supplied one: an approver reads "Email
-        // dana@… — 2 files: report.csv (18 KB)" rather than ref ids.
+        // The tool's own park-time account (participants spec §8) LEADS, and
+        // the exact arguments follow it — the shape every channel lens
+        // already uses. Rendering the summary INSTEAD of the args left the
+        // approver with no access to the record they are authorizing, which
+        // matters most for the tools that summarize hardest: a memory
+        // promotion shows 300 marked characters of a fact that may be 2000.
+        const argsJson = JSON.stringify(ask.args, null, 2) ?? '';
+        const clamped = argsJson.length > 2000 ? `${argsJson.slice(0, 2000)}…` : argsJson;
         this.ui.approvalText.textContent = ask.display
-          ? `${ask.display}${runsAs}`
-          : `The agent wants to run ${ask.name}(${JSON.stringify(ask.args)})${runsAs}`;
+          ? `${ask.display}${runsAs}\n\n${clamped}`
+          : `The agent wants to run ${ask.name}(${clamped})${runsAs}`;
       }
     }
 

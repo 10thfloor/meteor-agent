@@ -1,5 +1,12 @@
+import {
+  MEMORY_MAX_APP_DEFAULT, MEMORY_MAX_DEFAULT, MEMORY_SCOPES,
+  type MemoryConfig, type MemoryScope, type ResolvedMemory,
+} from '../common/types';
 import type { Provider } from './providers/types';
-import { validateSkills, type Skill, type ToolSpec } from './tools';
+import {
+  assertMemoryNamesFree, validateSkills, type Skill, type ToolSpec,
+} from './tools';
+import { ensureMemoryMethods } from './memory-methods';
 import type { RunConfig } from './loop';
 import { piAiProvider } from './providers/piai';
 
@@ -9,6 +16,10 @@ export interface AgentConfig {
   model: string;
   instructions: string | string[] | ((ctx: { userId: string | null }) => string);
   tools?: ToolSpec[];
+  /** Durable recall (memory spec). `true` takes every default; absent means
+   *  no memory tools, no standing block, and no writes — today's behavior,
+   *  bit-for-bit. */
+  memory?: MemoryConfig;
   /**
    * On-demand prompt fragments. Each skill's `name` and `description` are
    * appended to the system prompt as a listing; its `content` is NOT — the
@@ -306,6 +317,83 @@ function assertFiniteNumber(value: unknown, field: string, opts: { min?: number;
   }
 }
 
+/**
+ * The `memory` block, resolved and frozen at define() time (the `budget`
+ * idiom) so the loop and the tools read settled values rather than
+ * re-deriving defaults per turn. Undefined in, undefined out: no memory
+ * configured means no tools, no block, no writes — bit-for-bit today.
+ *
+ * Unknown keys THROW. `memory: { hint: false }` silently leaving hints on is
+ * exactly the class of typo the define()-time posture exists to catch, and
+ * this is a brand-new option surface with no back-compat to preserve.
+ */
+export function resolveMemory(memory?: MemoryConfig): ResolvedMemory | undefined {
+  if (memory === undefined || memory === false) return undefined;
+  const m = memory === true ? {} : memory;
+  if (typeof m !== 'object' || m === null || Array.isArray(m)) {
+    throw new Error(
+      '[10thfloor:agent] memory must be true or an options object; '
+      + `got ${JSON.stringify(memory)}`,
+    );
+  }
+  const known = ['hints', 'max', 'maxApp', 'index', 'scopes', 'search'];
+  for (const key of Object.keys(m)) {
+    if (!known.includes(key)) {
+      throw new Error(
+        `[10thfloor:agent] memory has an unknown key "${key}"; `
+        + `expected ${known.join('/')}`,
+      );
+    }
+  }
+
+  assertCountLimit(m.max, 'max');
+  assertCountLimit(m.maxApp, 'maxApp');
+  assertCountLimit(m.index?.pinned, 'index.pinned');
+  assertCountLimit(m.index?.recent, 'index.recent');
+  if (m.search !== undefined && typeof m.search !== 'function') {
+    throw new Error(
+      '[10thfloor:agent] memory.search must be a function '
+      + '(query, ctx) => AgentMemory[]; '
+      + `got ${JSON.stringify(m.search)}`,
+    );
+  }
+
+  let hints: ResolvedMemory['hints'] = { minScore: 0.6 };
+  if (m.hints === false) hints = false;
+  else if (typeof m.hints === 'object' && m.hints !== null) {
+    assertFiniteNumber(m.hints.minScore, 'memory.hints.minScore', { min: 0, max: 1 });
+    hints = { minScore: m.hints.minScore ?? 0.6 };
+  }
+
+  // 'user' is implied and always present: person memory is the default scope,
+  // and a config naming only 'app' means "also app", not "no person store".
+  const requested = m.scopes ?? ['user'];
+  if (!Array.isArray(requested) || requested.length === 0) {
+    throw new Error(
+      '[10thfloor:agent] memory.scopes must be a non-empty array of '
+      + `${MEMORY_SCOPES.join('/')}; got ${JSON.stringify(m.scopes)}`,
+    );
+  }
+  for (const sc of requested) {
+    if (!MEMORY_SCOPES.includes(sc)) {
+      throw new Error(
+        `[10thfloor:agent] memory.scopes has an unknown scope "${sc}"; `
+        + `expected ${MEMORY_SCOPES.join('/')}`,
+      );
+    }
+  }
+  const scopes = Array.from(new Set<MemoryScope>(['user', ...requested]));
+
+  return {
+    hints,
+    max: m.max ?? MEMORY_MAX_DEFAULT,
+    maxApp: m.maxApp ?? MEMORY_MAX_APP_DEFAULT,
+    index: { pinned: m.index?.pinned ?? 5, recent: m.index?.recent ?? 10 },
+    scopes,
+    ...(m.search ? { search: m.search } : {}),
+  };
+}
+
 export function defineAgent(name: string, config: AgentConfig): void {
   // Validate BEFORE registering, so a bad config leaves no half-usable agent
   // behind: a config error is a startup error, not a runtime one.
@@ -318,7 +406,23 @@ export function defineAgent(name: string, config: AgentConfig): void {
   assertFiniteNumber(config.retry?.maxDelayMs, 'retry.maxDelayMs', { min: 0 });
   assertFiniteNumber(config.maxResultChars, 'maxResultChars', { min: 1 });
   validateSkills(config.skills);
+  const memory = resolveMemory(config.memory);
+  // The three model-facing names are reserved the way SKILL_TOOL_NAME is: a
+  // collision is decidable here, at define time, where the operator can see it.
+  if (memory) assertMemoryNamesFree(config.tools);
   registry.set(name, config);
+  // Registering the UI caps is LATCHED, not per-agent: Meteor.methods throws
+  // on a duplicate name and defineAgent is re-entrant (hot reload redefines
+  // every agent), so a second memory-declaring agent would crash the server.
+  if (memory) {
+    ensureMemoryMethods(() => {
+      for (const [n, c] of registry.entries()) {
+        const r = resolveMemory(c.memory);
+        if (r) return { config: r, agent: n };
+      }
+      return { agent: '' };
+    });
+  }
 }
 
 export function getAgent(name: string): AgentConfig | undefined {
@@ -363,9 +467,22 @@ export function listAgents(): Array<[string, AgentConfig]> {
  * `agentName` names it for stamps and hooks, and `budget` (when given) is the
  * PRIMARY's, so one purse governs the session whichever model spends it.
  */
+/**
+ * The addressed-turn memory option, in ONE place.
+ *
+ * Three hand-written copies of `resolveMemory(primary.memory) ? { memory: … }`
+ * is what let the live `agent.send` path drift and lose the threading
+ * entirely — the bug decision 19 exists to prevent, reintroduced by
+ * duplication. Every addressed defer builds its opts through this.
+ */
+export function memoryOpt(config: AgentConfig): { memory?: ResolvedMemory } {
+  const mem = resolveMemory(config.memory);
+  return mem ? { memory: mem } : {};
+}
+
 export function buildRunConfig(
   config: AgentConfig, userId: string | null,
-  opts?: { agentName?: string; budget?: ResolvedBudget },
+  opts?: { agentName?: string; budget?: ResolvedBudget; memory?: ResolvedMemory },
 ): RunConfig {
   return {
     model: config.model,
@@ -389,6 +506,19 @@ export function buildRunConfig(
     // go the other way for the opposite reason: they are per-agent by
     // definition, so they belong to the config.
     skills: config.skills,
+    // Memory follows the PRIMARY, not the addressee (spec decision 19), the
+    // same side of the line as `budget`. An addressed turn to a colleague that
+    // declared no memory of its own must still see the conversation's memory,
+    // or §8's "identical recall whichever agent is addressed" is false.
+    // Memory follows the PRIMARY (spec decision 19): an addressed turn is
+    // handed the primary's resolved bundle through `opts`, the same way it is
+    // handed the primary's budget. With no `opts` this IS the primary's turn,
+    // so its own config answers — which is what makes every non-addressed
+    // wake path (ask, subagent, recovery, the self-check) work untouched.
+    ...(() => {
+      const mem = opts?.memory ?? resolveMemory(config.memory);
+      return mem ? { memory: mem } : {};
+    })(),
   };
 }
 

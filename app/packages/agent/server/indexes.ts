@@ -1,6 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import type { Mongo } from 'meteor/mongo';
-import { AgentMessages, AgentSessions } from '../common/collections';
+import { AgentMemories, AgentMessages, AgentSessions } from '../common/collections';
 import {
   ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
   DeliveryReceipts, InboundSubmissions,
@@ -55,7 +55,9 @@ export async function ensureIndexes(): Promise<void> {
   const specs: Array<{
     collection: Pick<Mongo.Collection<any>, 'createIndexAsync'>;
     name: string;
-    keys: Record<string, 1 | -1>;
+    // `'text'` joins the union for the memory fallback rung — a text index
+    // is the ladder's middle rung and the driver takes it on the same call.
+    keys: Record<string, 1 | -1 | 'text'>;
     options?: Record<string, unknown>;
   }> = [
     {
@@ -171,6 +173,52 @@ export async function ensureIndexes(): Promise<void> {
       keys: { createdAt: 1 } as Record<string, 1 | -1>,
       options: { expireAfterSeconds: Math.round(retentionDays * 24 * 60 * 60) },
     }] : []),
+    // ---- Memory (memory spec §4) ----
+    // Person/agent rows: the standing block's read and the per-(user, scope)
+    // cap count both come in on this one.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { userId: 1, scope: 1, at: -1 },
+    },
+    // The APP pool needs its own: app rows carry no `userId`, so the compound
+    // index above cannot serve the work section, the pool's cap count, or the
+    // publication's app clause — all three would collection-scan without this.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { scope: 1, at: -1 },
+    },
+    // The ladder's middle rung. Non-fatal if the deployment refuses it (the
+    // loop below warns and moves on) — search then degrades to the regex rung,
+    // which is exactly what the ladder exists to make survivable.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { text: 'text' },
+    },
+    // The keyed-upsert identity, UNIQUE and partial. Check-then-insert alone
+    // is a race: the user edits a fact on the memory page while an in-flight
+    // turn saves the same `key`, both read "no existing row", both insert, and
+    // the key that exists to guarantee one row has produced two. The index is
+    // what makes the write single-winner; `saveMemory` catches the duplicate
+    // and converts the loss into the update it meant to do.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { scope: 1, userId: 1, agent: 1, key: 1 },
+      options: {
+        unique: true,
+        partialFilterExpression: { key: { $exists: true } },
+      },
+    },
+    // Opt-in decay: sparse, so rows without `expiresAt` are simply not in it.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { expiresAt: 1 },
+      options: { sparse: true, expireAfterSeconds: 0 },
+    },
   ];
 
   for (const spec of specs) {
@@ -178,11 +226,28 @@ export async function ensureIndexes(): Promise<void> {
       // eslint-disable-next-line no-await-in-loop
       await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
     } catch (e: any) {
-      console.warn(
-        `[10thfloor:agent] could not create the ${spec.name} index `
-        + `${JSON.stringify(spec.keys)}; the package still works, its queries are just `
-        + `unindexed (grant createIndex, or create it yourself): ${e?.message ?? e}`,
-      );
+      // A UNIQUE index failing is not the same class of problem as a missing
+      // performance index, and must not share its reassuring wording: the
+      // keyed-save race is only closed BY the index, so a build that fails
+      // (the usual cause: duplicate keyed rows already in the collection)
+      // leaves `saveMemory`'s adopt-on-collision branch unreachable and the
+      // race exactly where it was — silently, behind a line that says the
+      // package "still works".
+      if (spec.options?.unique) {
+        console.warn(
+          `[10thfloor:agent] could not create the UNIQUE ${spec.name} index `
+          + `${JSON.stringify(spec.keys)} — keyed memory saves are NOT race-safe until `
+          + 'this builds. The usual cause is duplicate rows already present: remove the '
+          + 'duplicate `key` rows for a given (scope, userId, agent) and restart. '
+          + `Error: ${e?.message ?? e}`,
+        );
+      } else {
+        console.warn(
+          `[10thfloor:agent] could not create the ${spec.name} index `
+          + `${JSON.stringify(spec.keys)}; the package still works, its queries are just `
+          + `unindexed (grant createIndex, or create it yourself): ${e?.message ?? e}`,
+        );
+      }
     }
   }
 }

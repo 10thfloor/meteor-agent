@@ -19,5 +19,6 @@ import './participants.test';
 import './media.test';
 import './downloads.test';
 import './multimodal.test';
+import './memory.test';
 import './perf.test';
 import './integration.server';

@@ -1768,3 +1768,35 @@ export async function runTool(
     return { ok: false, error: { error: 'tool-failed', reason: 'The tool failed to run.' } };
   }
 }
+
+/* ---------------------------------------------------------------------------
+ * Memory tools (memory spec §5)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * The MODEL-facing names. Underscored, not dotted, and deliberately so: the
+ * DDP methods are `memory.save` and friends, but provider tool-name grammars
+ * are narrower than Meteor's method namespace (Anthropic's is
+ * `^[a-zA-Z0-9_-]{1,64}$`), and a dotted tool name is a 400 on the first turn
+ * an agent with memory takes. Two surfaces, two naming rules, one core.
+ */
+export const MEMORY_TOOL_NAMES = ['memory_save', 'memory_search', 'memory_forget'] as const;
+
+/** Reserve the three names against an agent's OWN tools at define() time, the
+ *  way `SKILL_TOOL_NAME` is reserved — a named startup error beats a silent
+ *  shadow discovered when the model's save goes somewhere unexpected. */
+export function assertMemoryNamesFree(tools?: ToolSpec[]): void {
+  if (!tools) return;
+  for (const spec of tools) {
+    const name = typeof spec === 'string'
+      ? spec
+      : (spec as any).name ?? (spec as any).method;
+    if (typeof name === 'string' && (MEMORY_TOOL_NAMES as readonly string[]).includes(name)) {
+      throw new Error(
+        `[10thfloor:agent] this agent declares memory and also a tool named "${name}", `
+        + 'which is one of the reserved memory tool names '
+        + `(${MEMORY_TOOL_NAMES.join(', ')}). Rename your tool.`,
+      );
+    }
+  }
+}
