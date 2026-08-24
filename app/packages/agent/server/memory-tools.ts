@@ -70,6 +70,12 @@ function clip(text: string): string {
 
 export interface MemoryToolOptions {
   config: ResolvedMemory;
+  /** The SESSION's owner. Anonymous sessions cannot write any scope, so the
+   *  tools must not advertise one — offering `'app'` there parked the turn on
+   *  an approval, rendered the model's text into the approval surface, and
+   *  only then answered `no-account`. The block is already honest with the
+   *  model about this; the tool schema should be too. */
+  userId?: string | null;
   /** The RUNNING model's participant id (`m:<agent>`) — the `by` stamp. Never
    *  the speaking human's: the member's id lives on the message `from` and
    *  does not reach a tool body (spec decision 14). */
@@ -79,7 +85,10 @@ export interface MemoryToolOptions {
 }
 
 function saveTool(opts: MemoryToolOptions): ResolvedTool {
-  const canApp = opts.config.scopes.includes('app');
+  const canApp = opts.config.scopes.includes('app') && opts.userId !== null;
+  const offered = opts.userId === null
+    ? opts.config.scopes.filter((sc) => sc !== 'app')
+    : opts.config.scopes;
   return {
     name: 'memory_save',
     description:
@@ -102,7 +111,7 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
         },
         scope: {
           type: 'string',
-          enum: opts.config.scopes,
+          enum: offered,
           description: canApp
             ? '"user" (about this person, the default) or "app" (about the work, shared).'
             : 'Which store to save to.',
@@ -127,11 +136,22 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
     // only: `describe`'s ctx is `{ userId, sessionId }` and it runs before
     // `pending.agent` is written, so the proposing agent is not reachable here
     // — the UI composes "(proposed by X)" from `pending.agent` instead.
-    describe: (args: any) => {
+    describe: async (args: any) => {
       const shown = clip(String(args?.text ?? ''));
-      return args?.scope === 'app'
-        ? `Remember for ALL users: "${shown}"`
-        : `Remember: "${shown}"`;
+      if (args?.scope !== 'app') return `Remember: "${shown}"`;
+      // A keyed app save OVERWRITES an approved row in place. Describing it as
+      // a plain addition asked the human to approve the wrong thing: the prior
+      // text and its proposer are unrecoverable afterwards, and the audit row
+      // records an approval for an addition that was really a replacement.
+      if (typeof args?.key === 'string' && args.key !== '') {
+        const prior = await AgentMemories.findOneAsync(
+          { scope: 'app', key: args.key } as any,
+        );
+        if (prior) {
+          return `Replace for ALL users: "${clip(prior.text)}" → "${shown}"`;
+        }
+      }
+      return `Remember for ALL users: "${shown}"`;
     },
     run: async (args: any, ctx) => saveMemory(args ?? {}, {
       by: opts.by,

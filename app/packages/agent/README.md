@@ -1582,6 +1582,139 @@ an `afterToolResult` hook, degradable when a provider refuses them.
 
 Full design: `docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md`.
 
+## Memory
+
+An agent that only knows this conversation forgets the person the moment it
+ends. `memory` gives it durable recall — about the people it serves, and about
+the work itself — as a Mongo collection your UI can read.
+
+```ts
+Support.define({ ..., memory: true });
+```
+
+That is the whole opt-in. Declaring it registers three model-facing tools
+(`memory_save`, `memory_search`, `memory_forget`) and appends a compact
+listing to the system prompt on every iteration. Omit it and nothing changes:
+no tools, no listing, no writes — today's behavior, bit-for-bit.
+
+**Memory follows the human, not the model.** The default scope is keyed by
+`userId` alone, and a turn always runs as the session owner, so every model
+participant in a session reads the *same* store. What `support` learns,
+`analyst` recalls — sharing is a consequence of the participants model, not a
+second feature.
+
+**Two kinds of memory.** Person memory (`scope: 'user'`) is what the
+deployment knows about one human. Work memory (`scope: 'app'`) is what it has
+learned about its own domain — one pool, no `userId`, read by every agent in
+every session:
+
+```ts
+Support.define({ ..., memory: { scopes: ['user', 'app'] } });
+```
+
+Promoting a fact to the shared pool is an **approval**. The save tool's gate is
+a predicate returning `'ask'` for app scope and `'auto'` otherwise, so a human
+sees the exact text before it becomes something every session reads. Deleting
+from the pool asks too — the forget gate reads the row's scope, because its
+arguments carry none. Replace either gate like any other if your risk appetite
+differs.
+
+**Recall is legible.** Nothing enters the model's context invisibly. The
+standing listing is mechanical and reconstructable from the collection; every
+actual recall is a `memory_search` tool row in the transcript, spending
+`toolCalls` like any tool. The harness also runs one mechanical *hint* per
+turn — a single database search against the newest message that appends
+matching titles (never content) to the listing, threshold-gated by `minScore`
+on rungs that report one. Set `hints: false` to turn it off.
+
+```ts
+memory: {
+  hints: { minScore: 0.6 },      // false to disable; one DB search per turn
+  max: 200,                      // person rows per user, per scope
+  maxApp: 500,                   // the shared work pool
+  index: { pinned: 5, recent: 10 },   // what the listing shows
+  scopes: ['user', 'app'],       // 'user' is always implied
+  search: async (q, ctx) => [],  // your own retrieval, wins over every rung
+}
+```
+
+**Your UI reads the same store.** Three DDP methods and one publication make
+"what does this app remember about me" an ordinary Meteor screen:
+
+```ts
+Meteor.subscribe('agent.memories');                      // own rows + the work pool
+await Meteor.callAsync('agent.memoryForget', { id });    // the user's delete button
+await Meteor.callAsync('agent.memorySave', { text: 'call me Mac' });
+```
+
+The client surface is deliberately **narrower** than the model's. Approval
+gates run only inside the turn loop, so they cannot protect a DDP call at all:
+app-scope writes, agent-scope writes, and work-row deletes are refused outright
+over DDP. Shared knowledge is written by an approved agent proposal, or
+server-side:
+
+```ts
+await Agent.memory.save(null, { text: 'orders table soft-deletes', scope: 'app' });
+await Agent.memory.list(userId);
+await Agent.memory.forget(userId, id);
+// Agent-scope rows belong to one named agent, so say which:
+await Agent.memory.save(userId, { text: '…', scope: 'agent' }, { agent: 'support' });
+```
+
+Anonymous sessions write nothing — not personal memory (a store keyed on
+`null` would be one store shared by every anonymous visitor) and not the work
+pool (`approve` is optional, so a gate is no guard there). They still read work
+memory, and the listing says so plainly. Subagent children and `Agent.ask()`
+throwaways get no memory at all: a child's work folds back into its parent,
+which is the memory-bearing conversation.
+
+### Search, and what your database needs
+
+Recall runs down a ladder, and **every rung degrades rather than failing a
+turn**:
+
+| Rung | Needs | Gives |
+|---|---|---|
+| your `search` fn | nothing | whatever you implement |
+| `$vectorSearch` | MongoDB 8.2+ with `mongot` | semantic recall |
+| `$text` | the text index this package creates | keyword ranking |
+| regex + recency | nothing at all | literal matching |
+
+The vector rung uses MongoDB's **automated embedding**: the query string goes
+to the database and `mongot` embeds it at search time, so there is no
+embedding pipeline, no API key, and no index to keep in sync — the operational
+store and the search index are the same collection.
+
+The scope clause runs *inside* the vector stage, so the index must declare its
+filter paths. Provision it exactly like this:
+
+```js
+db.agent_memories.createSearchIndex({
+  name: 'agent_memories_vector',
+  type: 'vectorSearch',
+  definition: {
+    fields: [
+      { type: 'text', path: 'text', model: 'voyage-3-large' },
+      { type: 'filter', path: 'scope' },
+      { type: 'filter', path: 'userId' },
+      { type: 'filter', path: 'agent' },
+    ],
+  },
+});
+```
+
+An index provisioned without those `filter` paths rejects every search — the
+package warns once naming `updateSearchIndex` and falls to `$text`, so recall
+narrows rather than breaking. Capability is probed once and cached, but only a
+genuine "no such stage" answer latches: a mongot that is merely slow to start
+after a deploy is retried, not written off for the life of the process.
+
+Note that vector and full-text search in MongoDB Community are **preview**
+features at the time of writing — the ladder is what makes depending on them
+safe.
+
+Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
+
 ## Scope
 
 **Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**

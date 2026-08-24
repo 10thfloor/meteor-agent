@@ -1057,3 +1057,142 @@ describe('memory — the second review round', () => {
     } finally { restore(); }
   });
 });
+
+describe('memory — review round 3', () => {
+  beforeEach(clean);
+  after(clean);
+
+  it('an ANONYMOUS session cannot delete shared work memory either', async () => {
+    const { saveMemory, forgetMemory } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const app = await saveMemory(
+      { text: 'approved shared fact', scope: 'app' },
+      { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+    );
+    // Writes to the pool are accountable; deletions from it must be too, or
+    // the closed half of the hole is the only half that was closed.
+    const r = await forgetMemory((app as any).id, {
+      userId: null, agent: 's', allowApp: true,
+    });
+    assert.isFalse(r.ok);
+    assert.equal((r as any).error, 'no-account');
+    assert.equal(await AgentMemories.find({} as any).countAsync(), 1);
+  });
+
+  it('does not offer "app" to a session that could never write it', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const anon = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: null,
+    }).find((t) => t.name === 'memory_save')!;
+    assert.deepEqual((anon.args as any).properties.scope.enum, ['user'],
+      'offering app parks a turn and renders the text into an approval that must fail');
+    assert.notInclude(anon.description, 'require human approval');
+
+    const signedIn = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: 'u1',
+    }).find((t) => t.name === 'memory_save')!;
+    assert.includeMembers((signedIn.args as any).properties.scope.enum, ['user', 'app']);
+  });
+
+  it('describes a keyed app save as a REPLACEMENT, showing what it overwrites', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const { saveMemory } = await import('../server/memory');
+    await saveMemory(
+      { text: 'refunds over $500 need a manager', scope: 'app', key: 'refund-policy' },
+      { by: 'm:analyst', userId: 'u1', agent: 'analyst', config: CONFIG },
+    );
+    const [save] = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: 'u1',
+    });
+    const shown = await save.describe!(
+      { text: 'refunds are auto-approved', scope: 'app', key: 'refund-policy' }, {} as any,
+    );
+    assert.include(shown, 'Replace for ALL users');
+    assert.include(shown, 'need a manager', 'the approver must see what is being lost');
+    assert.include(shown, 'auto-approved');
+  });
+
+  it('Agent.memory refuses an unknown agent and one with no memory', async () => {
+    const { defineAgent } = await import('../server/registry');
+    const { Agent } = await import('../server/agent');
+    defineAgent('r3-has-mem', { model: 'mock', instructions: 'x', memory: true });
+    defineAgent('r3-no-mem', { model: 'mock', instructions: 'x' });
+
+    let a: any = null;
+    try {
+      await Agent.memory.save('u1', { text: 'x' }, { agent: 'r3-nonexistent' });
+    } catch (e) { a = e; }
+    assert.match(String(a?.message), /unknown agent/);
+
+    let b: any = null;
+    try {
+      // Silently filing this under r3-has-mem is the corruption being pinned.
+      await Agent.memory.save('u1', { text: 'x' }, { agent: 'r3-no-mem' });
+    } catch (e) { b = e; }
+    assert.match(String(b?.message), /declares no `memory`/);
+  });
+
+  it('the LIVE @-send threads the primary memory into the colleague turn', async function () {
+    this.timeout(30000);
+    const { defineAgent } = await import('../server/registry');
+    const { sendToSession } = await import('../server/methods');
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+
+    // Capture what actually reaches the provider on the colleague's turn.
+    let colleagueSystem: string | null = null;
+    const capture = {
+      async *stream(req: any) {
+        colleagueSystem = req.system;
+        yield { kind: 'text', chunk: 'ok' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+      },
+    } as any;
+    defineAgent('r3-primary', {
+      model: 'mock', instructions: 'primary', memory: { hints: false }, provider: capture,
+    });
+    // The colleague declares NO memory of its own — the case that broke.
+    defineAgent('r3-colleague', { model: 'mock', instructions: 'colleague', provider: capture });
+
+    const { saveMemory } = await import('../server/memory');
+    await saveMemory(
+      { text: 'MARKER-conversation-memory' },
+      { by: 'm:r3-primary', userId: 'u1', agent: 'r3-primary', config: CONFIG },
+    );
+
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: 'r3-sid', agent: 'r3-primary', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      participants: [
+        { id: 'h:u1', kind: 'human', role: 'owner', userId: 'u1', displayName: 'u', joinedAt: new Date() },
+        { id: 'm:r3-primary', kind: 'model', role: 'member', agent: 'r3-primary', displayName: 'p', joinedAt: new Date() },
+        { id: 'm:r3-colleague', kind: 'model', role: 'member', agent: 'r3-colleague', displayName: 'c', joinedAt: new Date() },
+      ],
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    await sendToSession(
+      'r3-primary', 'r3-sid', '@r3-colleague what do you know about me?', 'u1',
+    );
+    await waitForCond(async () => colleagueSystem !== null, 'the colleague turn to run');
+
+    assert.include(colleagueSystem!, 'colleague', 'the addressee config ran');
+    assert.include(colleagueSystem!, 'MARKER-conversation-memory',
+      'recall must not vanish because a colleague was @-mentioned');
+  });
+});
+
+/** Bounded wait — the addressed turn is deferred and exposes no promise. */
+const waitForCond = async (cond: () => Promise<boolean>, label: string, ms = 15000) => {
+  const deadline = Date.now() + ms;
+  for (;;) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await cond()) return;
+    if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+    // eslint-disable-next-line no-await-in-loop
+    await new Promise((r) => { setTimeout(r, 25); });
+  }
+};

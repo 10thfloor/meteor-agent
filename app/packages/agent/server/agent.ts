@@ -37,10 +37,25 @@ import {
 function memoryConfigFor(
   name?: string,
 ): { config?: ResolvedMemory; agent: string } {
+  // A NAMED agent is strict. Falling through to "the first agent that happens
+  // to declare memory" wrote `billing`'s agent-scope note into `support`'s
+  // private store and read it back out from there — data corruption with no
+  // error and no warning, whose most realistic trigger is benign: removing
+  // `memory` from an agent that used to have it.
   if (name) {
     const c = getAgent(name);
-    const r = c ? resolveMemory(c.memory) : undefined;
-    if (r) return { config: r, agent: name };
+    if (!c) {
+      throw new Error(`[10thfloor:agent] Agent.memory: unknown agent "${name}".`);
+    }
+    const r = resolveMemory(c.memory);
+    if (!r) {
+      throw new Error(
+        `[10thfloor:agent] Agent.memory: agent "${name}" declares no \`memory\`, so it `
+        + 'has no store. Add `memory` to its config, or omit the { agent } option to '
+        + 'use the app\'s person store.',
+      );
+    }
+    return { config: r, agent: name };
   }
   for (const [n, c] of listAgents()) {
     const r = resolveMemory(c.memory);

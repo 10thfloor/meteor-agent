@@ -7,7 +7,7 @@ import {
   modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
-import { getAgent, buildRunConfig, resolveBudget, resolveMemory } from './registry';
+import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -260,7 +260,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       const tools = withMemoryTools(
         baseTools,
         memoryOn
-          ? { config: memoryOn, by: modelParticipantId(selfAgent), agent: selfAgent }
+          ? {
+            config: memoryOn,
+            by: modelParticipantId(selfAgent),
+            agent: selfAgent,
+            userId: entry.userId,
+          }
           : undefined,
       );
       const schemas = toolSchemas(tools);
@@ -958,8 +963,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               : {
                 agentName,
                 budget: resolveBudget(primary.budget),
-                ...(resolveMemory(primary.memory)
-                  ? { memory: resolveMemory(primary.memory)! } : {}),
+                ...memoryOpt(primary),
               }));
           })().catch((e) => {
             console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);

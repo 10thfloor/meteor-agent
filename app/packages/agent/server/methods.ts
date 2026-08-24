@@ -4,7 +4,7 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
-  getAgent, buildRunConfig, resolveBudget, resolveMemory, type AgentConfig,
+  getAgent, buildRunConfig, resolveBudget, memoryOpt, type AgentConfig,
 } from './registry';
 import { runTurn } from './loop';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
@@ -144,7 +144,7 @@ export async function deferResolvedTurn(session: AgentSession): Promise<boolean>
     // The addressee may declare no memory of its own; the conversation's
     // memory is the PRIMARY's either way (spec decision 19), or recall would
     // differ by whoever was @-mentioned.
-    ...(resolveMemory(primary.memory) ? { memory: resolveMemory(primary.memory)! } : {}),
+    ...memoryOpt(primary),
   });
   return true;
 }
@@ -547,7 +547,7 @@ export async function sendToSession(
         // threading was missed: an addressed colleague that declares no memory
         // of its own fell back to its own absent config, so the conversation's
         // recall vanished exactly when someone was @-mentioned.
-        ...(resolveMemory(config.memory) ? { memory: resolveMemory(config.memory)! } : {}),
+        ...memoryOpt(config),
       });
       return sessionId;
     }

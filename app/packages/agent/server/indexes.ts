@@ -226,11 +226,28 @@ export async function ensureIndexes(): Promise<void> {
       // eslint-disable-next-line no-await-in-loop
       await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
     } catch (e: any) {
-      console.warn(
-        `[10thfloor:agent] could not create the ${spec.name} index `
-        + `${JSON.stringify(spec.keys)}; the package still works, its queries are just `
-        + `unindexed (grant createIndex, or create it yourself): ${e?.message ?? e}`,
-      );
+      // A UNIQUE index failing is not the same class of problem as a missing
+      // performance index, and must not share its reassuring wording: the
+      // keyed-save race is only closed BY the index, so a build that fails
+      // (the usual cause: duplicate keyed rows already in the collection)
+      // leaves `saveMemory`'s adopt-on-collision branch unreachable and the
+      // race exactly where it was — silently, behind a line that says the
+      // package "still works".
+      if (spec.options?.unique) {
+        console.warn(
+          `[10thfloor:agent] could not create the UNIQUE ${spec.name} index `
+          + `${JSON.stringify(spec.keys)} — keyed memory saves are NOT race-safe until `
+          + 'this builds. The usual cause is duplicate rows already present: remove the '
+          + 'duplicate `key` rows for a given (scope, userId, agent) and restart. '
+          + `Error: ${e?.message ?? e}`,
+        );
+      } else {
+        console.warn(
+          `[10thfloor:agent] could not create the ${spec.name} index `
+          + `${JSON.stringify(spec.keys)}; the package still works, its queries are just `
+          + `unindexed (grant createIndex, or create it yourself): ${e?.message ?? e}`,
+        );
+      }
     }
   }
 }

@@ -467,6 +467,19 @@ export function listAgents(): Array<[string, AgentConfig]> {
  * `agentName` names it for stamps and hooks, and `budget` (when given) is the
  * PRIMARY's, so one purse governs the session whichever model spends it.
  */
+/**
+ * The addressed-turn memory option, in ONE place.
+ *
+ * Three hand-written copies of `resolveMemory(primary.memory) ? { memory: … }`
+ * is what let the live `agent.send` path drift and lose the threading
+ * entirely — the bug decision 19 exists to prevent, reintroduced by
+ * duplication. Every addressed defer builds its opts through this.
+ */
+export function memoryOpt(config: AgentConfig): { memory?: ResolvedMemory } {
+  const mem = resolveMemory(config.memory);
+  return mem ? { memory: mem } : {};
+}
+
 export function buildRunConfig(
   config: AgentConfig, userId: string | null,
   opts?: { agentName?: string; budget?: ResolvedBudget; memory?: ResolvedMemory },

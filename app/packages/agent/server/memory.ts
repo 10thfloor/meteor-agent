@@ -142,6 +142,15 @@ function warnMemory(message: string): void {
   console.warn(`[10thfloor:agent] ${message}`);
 }
 
+/** Whether mongot rejected the stage because the index cannot serve the
+ *  `filter` it was given — a configuration answer with a specific remedy,
+ *  distinct from "this server has no vector search at all". */
+function isFilterPathError(e: unknown): boolean {
+  const msg = String((e as Error)?.message ?? e ?? '').toLowerCase();
+  return msg.includes('filter')
+    && (msg.includes('path') || msg.includes('not indexed') || msg.includes('must be indexed'));
+}
+
 /** Mongo's duplicate-key signal, however the driver phrases it. */
 function isDuplicateKey(e: unknown): boolean {
   const err = e as { code?: unknown; message?: unknown };
@@ -338,7 +347,17 @@ export async function searchMemory(
       // every first failure would disable semantic recall for the life of a
       // process whose mongot merely started a few seconds after the app —
       // the ordinary shape of a deploy that restarts both together.
-      if (vectorAvailable === null && isUnsupportedStage(e)) {
+      if (isFilterPathError(e)) {
+        // The most likely misconfiguration, and the one that fails MUTE: the
+        // stage sends a scope `filter`, and an index provisioned before that
+        // (or copied from an older doc) declares no filter paths. Name the
+        // remedy rather than degrading silently forever.
+        warnMemory('the memory vector index does not declare the filter paths this '
+          + 'package needs (scope, userId, agent), so every semantic search is being '
+          + 'rejected and recall has fallen back to the text/regex rung. Run '
+          + 'updateSearchIndex on "agent_memories_vector" with the definition in the '
+          + 'README\'s mongot notes.');
+      } else if (vectorAvailable === null && isUnsupportedStage(e)) {
         vectorAvailable = false;
         warnMemory('this deployment cannot run $vectorSearch on the memory store '
           + '(no mongot, or no vector index), so recall is running on the text/regex '
@@ -540,6 +559,19 @@ export async function forgetMemory(
   if (!row) return { ok: true, forgotten: false };
 
   if (row.scope === 'app') {
+    // The unfinished half of the write-side guard. Writes to the shared pool
+    // are accountable to a signed-in account; deletions from it must be too,
+    // or the same self-propose-then-self-approve chain that was closed on the
+    // write side stays open on the destructive one — and destroying approved
+    // knowledge needs no injection payload at all.
+    if (opts.userId === null) {
+      return {
+        ok: false,
+        error: 'no-account',
+        reason: 'Shared work memory cannot be deleted from a session with no '
+          + 'signed-in account: there is nobody to hold accountable for it.',
+      };
+    }
     if (!opts.allowApp) {
       return {
         ok: false,
