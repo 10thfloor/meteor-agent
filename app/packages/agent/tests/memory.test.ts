@@ -1248,3 +1248,100 @@ describe('memory — the approval surface never leaks to an account-less session
     assert.include(shown, 'a shared fact');
   });
 });
+
+describe('memory — the vector readiness probe', () => {
+  beforeEach(clean);
+  after(clean);
+
+  /**
+   * These pin what a live MongoDB 8.2 + mongot actually does, captured by
+   * smoking the real pipeline rather than reasoning about it:
+   *
+   *   no search node        → $listSearchIndexes throws (SearchNotEnabled)
+   *   index never created   → $vectorSearch returns NOTHING and does not throw
+   *   index build FAILED    → "…while in state FAILED"
+   *   filter path undeclared→ "Path 'agent' needs to be indexed as filter"
+   *
+   * The middle one is why readiness is a PROBE: a ladder that waits to be
+   * thrown at never engages for a missing index, and reports the vector rung
+   * working while returning nothing forever.
+   */
+
+  it('falls through to a working rung when the vector rung is not ready', async () => {
+    const { saveMemory, searchMemory, _activeRung, _setMemorySearch } =
+      await import('../server/memory');
+    // Clearing the stub returns the module to UNPROBED, so the real probe runs
+    // against the test database — which has no search node.
+    const restore = _setMemorySearch(null);
+    try {
+      await saveMemory(
+        { text: 'findable without a vector index' },
+        { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+      );
+      const rows = await searchMemory('findable', {
+        userId: 'u1', agent: 's', config: CONFIG,
+      });
+      assert.notEqual(_activeRung(), 'vector',
+        'a deployment with no search node must not report the vector rung');
+      assert.isAtLeast(rows.length, 1, 'and recall must still work');
+    } finally { restore(); }
+  });
+
+  it('an installed stub IS the rung — no probe, and it answers', async () => {
+    const { saveMemory, searchMemory, _activeRung, _setMemorySearch } =
+      await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const restore = _setMemorySearch(
+      async (sel, _q, limit) => AgentMemories.find(sel as any, { limit }).fetchAsync(),
+    );
+    try {
+      await saveMemory(
+        { text: 'via the stubbed vector rung' },
+        { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+      );
+      const rows = await searchMemory('anything', {
+        userId: 'u1', agent: 's', config: CONFIG,
+      });
+      assert.equal(_activeRung(), 'vector');
+      assert.lengthOf(rows, 1);
+    } finally { restore(); }
+  });
+
+  it('a transient throw from a READY rung costs one call, not the process', async () => {
+    const { saveMemory, searchMemory, _activeRung, _setMemorySearch } =
+      await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    let n = 0;
+    const restore = _setMemorySearch(async (sel, _q, limit) => {
+      n += 1;
+      if (n === 1) throw new Error('connection reset by peer');
+      return AgentMemories.find(sel as any, { limit }).fetchAsync();
+    });
+    try {
+      await saveMemory(
+        { text: 'still here' },
+        { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+      );
+      await searchMemory('still', { userId: 'u1', agent: 's', config: CONFIG });
+      const rows = await searchMemory('still', { userId: 'u1', agent: 's', config: CONFIG });
+      assert.equal(_activeRung(), 'vector',
+        'a mongot that restarted under us must not cost the process its rung');
+      assert.lengthOf(rows, 1);
+    } finally { restore(); }
+  });
+
+  it('recognizes the real filter-path error text from a live mongot', async () => {
+    const { searchMemory, _setMemorySearch } = await import('../server/memory');
+    const restore = _setMemorySearch(async () => {
+      // Verbatim from MongoDB 8.2 + mongot.
+      throw new Error("Path 'agent' needs to be indexed as filter");
+    });
+    try {
+      // Degrades rather than throwing, and the warning names updateSearchIndex.
+      const rows = await searchMemory('anything', {
+        userId: 'u1', agent: 's', config: CONFIG,
+      });
+      assert.isArray(rows, 'a definition mismatch must not fail the turn');
+    } finally { restore(); }
+  });
+});

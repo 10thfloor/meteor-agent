@@ -126,10 +126,67 @@ export type SearchRung = 'installed' | 'vector' | 'text' | 'regex';
 
 /** Which rung answered last — read by tests and by the one-time warning. */
 let activeRung: SearchRung | null = null;
-/** `null` = not yet probed. Cached in module state, the `SERVER_ID` idiom:
- *  the answer is a property of the deployment, not of a call. */
-let vectorAvailable: boolean | null = null;
+/**
+ * Why the vector rung is or is not usable here. `null` = not yet probed;
+ * cached in module state (the `SERVER_ID` idiom) because it is a property of
+ * the DEPLOYMENT, not of a call.
+ *
+ * This is a PROBE, not error-message archaeology, and that distinction was
+ * bought the hard way: smoked against a real MongoDB 8.2 + mongot, the three
+ * failure modes we care about produce (a) `SearchNotEnabled` — "requires
+ * additional configuration" — when there is no search node, (b) "while in
+ * state FAILED" when the index exists but never built, and, worst,
+ * (c) **no error at all** when the index simply does not exist: `$vectorSearch`
+ * against an unknown index name returns an EMPTY RESULT SET. A ladder that
+ * waits to be thrown at therefore never engages — it reports the vector rung
+ * working and returns nothing, forever, silently.
+ */
+type VectorReadiness = 'ready' | 'no-search-node' | 'missing-index' | 'index-not-queryable';
+let vectorReadiness: VectorReadiness | null = null;
 let textAvailable: boolean | null = null;
+
+/** The index name the pipeline queries and the probe checks for. */
+const VECTOR_INDEX = 'agent_memories_vector';
+
+/**
+ * Ask the deployment directly whether the vector rung can work, once.
+ *
+ * `$listSearchIndexes` answers all three questions in one call: it throws when
+ * there is no search node at all, returns nothing when the index was never
+ * created, and reports `queryable` when it exists — so no failure mode has to
+ * be inferred from the wording of an error.
+ */
+async function probeVector(): Promise<VectorReadiness> {
+  try {
+    const found = await (AgentMemories as any).rawCollection()
+      .aggregate([{ $listSearchIndexes: { name: VECTOR_INDEX } }]).toArray();
+    if (!Array.isArray(found) || found.length === 0) return 'missing-index';
+    return found[0]?.queryable === true ? 'ready' : 'index-not-queryable';
+  } catch {
+    return 'no-search-node';
+  }
+}
+
+/** The remedy for each answer, named rather than left to the operator. */
+const READINESS_NOTE: Record<Exclude<VectorReadiness, 'ready'>, string> = {
+  'no-search-node':
+    'this deployment has no search node, so $vectorSearch is unavailable and memory '
+    + 'recall is running on the text/regex rung — semantic matches will be missed. '
+    + 'Run MongoDB 8.2+ with mongot (or Atlas) to enable it; see the README.',
+  'missing-index':
+    `the memory vector index "${VECTOR_INDEX}" does not exist, so semantic recall is `
+    + 'running on the text/regex rung. NOTE: an absent index does not error — '
+    + '$vectorSearch simply returns nothing — so this would otherwise look like an '
+    + 'empty memory rather than a missing index. Create it with the createSearchIndex '
+    + 'definition in the README.',
+  'index-not-queryable':
+    `the memory vector index "${VECTOR_INDEX}" exists but is not queryable (it is `
+    + 'still building, or its build FAILED). A FAILED build most often means automated '
+    + 'embedding could not reach its embedding model — a deployment using '
+    + 'automated embedding needs a Voyage API key configured. Recall is on the '
+    + 'text/regex rung until the index reports queryable; check its status with '
+    + 'db.agent_memories.getSearchIndexes().',
+};
 
 const warnedKinds = new Set<string>();
 /** One warn per distinct message kind, keyed on a stable prefix — the
@@ -158,19 +215,6 @@ function isDuplicateKey(e: unknown): boolean {
   return String(err?.message ?? '').includes('E11000');
 }
 
-/** Whether an aggregation error means "this server does not know this stage"
- *  — a capability answer worth caching — as opposed to a connection blip, a
- *  step-down, or a mongot that has not finished starting. Mongo phrases the
- *  former as an unrecognized/unknown pipeline stage. */
-function isUnsupportedStage(e: unknown): boolean {
-  const msg = String((e as Error)?.message ?? e ?? '').toLowerCase();
-  return msg.includes('unrecognized pipeline stage')
-    || msg.includes('unknown pipeline stage')
-    || msg.includes('$vectorsearch is not allowed')
-    || msg.includes('no such index')
-    || msg.includes('index not found');
-}
-
 /** Regex metacharacters, escaped. The package has no such helper, and the
  *  hint path feeds it RAW human text: `order #8812 (dispute` compiles to a
  *  SyntaxError, which inside the per-iteration assembly would take the turn
@@ -188,16 +232,18 @@ export function _setMemorySearch(
     => Promise<AgentMemory[]>) | null,
 ): () => void {
   const prevVector = vectorSearchImpl;
-  const prevAvailable = vectorAvailable;
+  const prevReadiness = vectorReadiness;
   const prevText = textAvailable;
   vectorSearchImpl = fn;
-  vectorAvailable = fn ? true : null;
+  // An installed stub IS the rung, so declare it ready and skip the probe;
+  // clearing it returns the module to unprobed.
+  vectorReadiness = fn ? 'ready' : null;
   textAvailable = null;
   activeRung = null;
   warnedKinds.clear();
   return () => {
     vectorSearchImpl = prevVector;
-    vectorAvailable = prevAvailable;
+    vectorReadiness = prevReadiness;
     textAvailable = prevText;
     activeRung = null;
     warnedKinds.clear();
@@ -213,11 +259,11 @@ export function _activeRung(): SearchRung | null { return activeRung; }
  *  first and the escaping the hint path depends on goes unexercised. Returns
  *  a restore fn. */
 export function _forceRegexRung(): () => void {
-  const prevVector = vectorAvailable;
+  const prevReadiness = vectorReadiness;
   const prevText = textAvailable;
-  vectorAvailable = false;
+  vectorReadiness = 'no-search-node';
   textAvailable = false;
-  return () => { vectorAvailable = prevVector; textAvailable = prevText; };
+  return () => { vectorReadiness = prevReadiness; textAvailable = prevText; };
 }
 
 let vectorSearchImpl:
@@ -336,34 +382,34 @@ export async function searchMemory(
     }
   }
 
-  if (vectorAvailable !== false) {
+  // Probe once, then trust the answer. Anything but `ready` warns with its own
+  // remedy and skips the rung — including `missing-index`, which is the case
+  // that cannot be caught by trying, because it succeeds and returns nothing.
+  if (vectorReadiness === null) {
+    vectorReadiness = await probeVector();
+    if (vectorReadiness !== 'ready') warnMemory(READINESS_NOTE[vectorReadiness]);
+  }
+
+  if (vectorReadiness === 'ready') {
     try {
       const rows = await vectorSearch(sel as any, q, limit);
-      vectorAvailable = true;
       activeRung = 'vector';
       return rows;
     } catch (e) {
-      // A CAPABILITY answer is permanent; a transient one is not. Latching
-      // every first failure would disable semantic recall for the life of a
-      // process whose mongot merely started a few seconds after the app —
-      // the ordinary shape of a deploy that restarts both together.
+      // The index was queryable at probe time, so a throw now is either a
+      // definition mismatch or a transient blip. The filter-path case is the
+      // one worth naming — verified against a live mongot, which phrases it
+      // "Path 'agent' needs to be indexed as filter" — and it is a definition
+      // problem the operator must fix rather than something that will pass.
       if (isFilterPathError(e)) {
-        // The most likely misconfiguration, and the one that fails MUTE: the
-        // stage sends a scope `filter`, and an index provisioned before that
-        // (or copied from an older doc) declares no filter paths. Name the
-        // remedy rather than degrading silently forever.
         warnMemory('the memory vector index does not declare the filter paths this '
           + 'package needs (scope, userId, agent), so every semantic search is being '
-          + 'rejected and recall has fallen back to the text/regex rung. Run '
-          + 'updateSearchIndex on "agent_memories_vector" with the definition in the '
+          + `rejected and recall has fallen back to the text/regex rung. Run `
+          + `updateSearchIndex on "${VECTOR_INDEX}" with the definition in the `
           + 'README\'s mongot notes.');
-      } else if (vectorAvailable === null && isUnsupportedStage(e)) {
-        vectorAvailable = false;
-        warnMemory('this deployment cannot run $vectorSearch on the memory store '
-          + '(no mongot, or no vector index), so recall is running on the text/regex '
-          + 'rung — semantic matches will be missed. See the README\'s mongot notes.');
       }
-      // Anything else: degrade this ONE call and try again next time.
+      // Anything else: degrade this ONE call and try again next time — a
+      // mongot that restarted under us should not cost the process its rung.
     }
   }
 

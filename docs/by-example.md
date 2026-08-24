@@ -1832,6 +1832,27 @@ db.agent_memories.createSearchIndex({
 });
 ```
 
+**Automated embedding needs an embedding-model key.** The `{ type: 'text', …
+model: 'voyage-3-large' }` field above is *automated* embedding: mongot calls
+Voyage to embed, so a deployment without that credential configured builds the
+index to status `FAILED`. `createSearchIndex` still returns success — the build
+is asynchronous — so check it rather than assuming:
+
+```js
+db.agent_memories.getSearchIndexes('agent_memories_vector')[0].queryable;  // must be true
+```
+
+To supply your own vectors instead, index a `vector` field
+(`{ type: 'vector', path: '…', numDimensions: N, similarity: 'cosine' }`) and
+install a `memory.search` function that queries it — the top rung of the ladder
+exists for exactly this.
+
+**A missing index does not error.** `$vectorSearch` against an index name that
+does not exist returns an empty result set rather than throwing, which is why
+readiness is probed with `$listSearchIndexes` at first use instead of inferred
+from a failure. Absent, unbuilt, and no-search-node each get their own warning
+naming their own remedy.
+
 Capability is probed once and cached — but only a genuine "no such stage" answer latches. A `mongot` that
 is merely slow to accept queries after a deploy is retried rather than written off for the life of the
 process, and an index missing the `filter` paths above gets its own warning naming `updateSearchIndex`
