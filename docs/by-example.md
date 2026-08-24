@@ -1716,14 +1716,63 @@ human → sees "Remember for ALL users: «orders table soft-deletes…»" and cl
        ↓ the row lands, stamped by: 'm:support'
 ```
 
-Personal notes run straight through; only promotion to the shared pool asks. It is an ordinary tool gate,
-so replace it if your risk appetite differs:
+Personal notes run straight through; only promotion to the shared pool asks. **Deleting from the pool asks
+too** — `memory_forget` takes `{ id }` and no scope, so its gate reads the row rather than the arguments.
+Writing shared knowledge behind an approval while erasing it ran unattended would be asymmetric in exactly
+the wrong direction.
+
+Both are ordinary tool gates, so you can replace them — but replace the **whole tool**, not just the gate.
+A tool whose name collides with a built-in wins outright and the built-in is skipped, so a fragment
+carrying only `name` and `gate` does not narrow the built-in, it *displaces* it — and since it declares
+none of `run`/`method`/`subagent`/`mcp`, the turn throws when it assembles its tools:
+
+```
+Error: [10thfloor:agent] Tool spec has none of "method", "run", "subagent" and "mcp"
+```
+
+Supply a complete tool instead:
 
 ```ts
-// server — auto-approve work facts with no digits in them, ask otherwise
-tools: [{ name: 'memory_save', gate: ({ args }) => (
-  args.scope !== 'app' ? true : (/\d/.test(args.text) ? 'ask' : true)) }]
+// server — a complete replacement that delegates to the same core
+import { Agent } from 'meteor/10thfloor:agent';
+
+tools: [{
+  name: 'memory_save',
+  description: 'Remember a durable fact.',
+  args: {
+    type: 'object',
+    properties: { text: { type: 'string' }, scope: { type: 'string', enum: ['user', 'app'] } },
+    required: ['text'],
+  },
+  // Auto-approve work facts with no digits in them; ask otherwise.
+  gate: ({ args }) => (args.scope !== 'app' ? true : (/\d/.test(args.text) ? 'ask' : true)),
+  run: (args, ctx) => Agent.memory.save(ctx.userId, { ...args, by: 'app' }),
+}]
 ```
+
+The built-in is skipped with one warning naming which tool took the name.
+
+### A third scope: an agent's private notes
+
+`scope: 'agent'` is a note one agent keeps about one person, invisible to its colleagues — a calibration
+detail rather than shared context:
+
+```ts
+// server
+Support.define({ ..., memory: { scopes: ['user', 'agent'] } });
+```
+
+Because these rows belong to a *named* agent, anything writing one must say which. `Agent.memory` refuses
+to guess, and the DDP surface refuses the scope outright — a client has no agent to name:
+
+```ts
+// server
+await Agent.memory.save('alice', { text: 'prefers terse answers', scope: 'agent' },
+                        { agent: 'support' });   // ← required for scope 'agent'
+```
+
+Omitting `{ agent }` throws rather than filing the note under whichever agent happened to be defined
+first, which is the kind of silent misfiling that reads as data loss.
 
 ### The user's memory page
 
@@ -1737,12 +1786,17 @@ await Meteor.callAsync('agent.memorySave', { text: 'call me Mac' });
 ```
 
 The client surface is deliberately **narrower** than the model's. Approval gates run only inside the turn
-loop, so a DDP `agent.memorySave` with `scope: 'app'` is refused outright — otherwise any signed-in
-account could write the pool that every session's prompt reads:
+loop, so they cannot protect a DDP call at all — which means three things are refused there outright:
+app-scope writes, agent-scope writes, and deleting a work row. Otherwise any signed-in account could write
+the pool that every session's prompt reads:
 
 ```
 Meteor.Error('denied-scope', 'Shared work memory cannot be written from a client; …')
 ```
+
+The methods are namespaced like every other method the package registers (`agent.memorySave`, not
+`memory.save`) — a bare name is one a host app plausibly already owns, and `Meteor.methods` throws on a
+duplicate, so the collision would be a boot failure the moment an app added `memory: true`.
 
 Server code has no such limit, because it is not a client:
 
@@ -1778,8 +1832,10 @@ db.agent_memories.createSearchIndex({
 });
 ```
 
-Capability is probed once and cached; a deployment without `mongot` logs one warning and runs on `$text`.
-A search failure is never a turn failure — that is the point of the ladder.
+Capability is probed once and cached — but only a genuine "no such stage" answer latches. A `mongot` that
+is merely slow to accept queries after a deploy is retried rather than written off for the life of the
+process, and an index missing the `filter` paths above gets its own warning naming `updateSearchIndex`
+instead of degrading silently. A search failure is never a turn failure — that is the point of the ladder.
 
 Bring your own retrieval and it wins over every rung:
 
@@ -1790,14 +1846,20 @@ memory: { search: async (query, { userId, scopes, limit }) => myVectorStore.quer
 
 ### The edges, named
 
-- **Anonymous sessions have no personal store.** A store keyed on `null` would be one store shared by
-  every anonymous visitor. The listing says so and still serves work memory.
+- **Anonymous sessions write nothing.** Not personal memory (a store keyed on `null` would be one store
+  shared by every anonymous visitor) and not the work pool. The gate is no guard there — `approve` is
+  optional, and with none configured the approval check is skipped entirely — so the refusal lives in the
+  core, on the delete path too. They still *read* work memory, and the listing says so plainly.
 - **Subagent children and `Agent.ask()` throwaways get no memory** — a child's work folds back into its
-  parent, which is the memory-bearing conversation.
+  parent, which is the memory-bearing conversation. Checked against the session, not the config.
 - **`by` is the model, not the speaker.** On a model-initiated save it is `m:<agent>`; the human who
   prompted it is on the message's `from`.
 - **Caps refuse, they do not evict.** `max` (200) and `maxApp` (500) return a structured `memory-full` the
   model can route around — and a keyed save still updates in a full store, so corrections never jam.
+- **`key` is single-winner.** A partial unique index backs it, so two concurrent saves of the same key
+  resolve to one row: the loser adopts and updates rather than inserting a duplicate.
+- **`pinned` is tri-state on a keyed save.** Absent leaves the flag alone, `true` sets it, `false` clears
+  it — so an unpin button that reports success actually unpins.
 
 ## Durability: what survives a crash
 
