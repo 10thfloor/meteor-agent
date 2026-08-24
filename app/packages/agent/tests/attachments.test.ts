@@ -34,15 +34,22 @@ describe('attachments', () => {
     });
 
     it('passes a lens that names files and rejects one that vanishes them', async () => {
-      const { assertLensRoundTrip, attachmentNotice } = await import('../common/channel-contract');
+      const {
+        assertLensRoundTrip, attachmentNotice, promptDisplay,
+      } = await import('../common/channel-contract');
       // A minimal MENU lens: prompts render their reply words (the grammar
-      // reads back through `matchExpectation`), and file-bearing items append
-      // the naming line.
+      // reads back through `matchExpectation`) and the tool's own account of
+      // the call (the display clause), and file-bearing items append the
+      // naming line.
       const naming = {
         out: (item: DeliveryItem): unknown => {
           if (item.item === 'reply') return { text: `${item.text}${attachmentNotice(item.attachments)}` };
           if (item.item === 'overflow') return { text: `${item.head}${attachmentNotice(item.attachments)}` };
-          if (item.item === 'prompt') return { text: item.choices.map((c) => c.match ?? c.token).join(' ') };
+          if (item.item === 'prompt') {
+            return {
+              text: `${promptDisplay(item.display)} ${item.choices.map((c) => c.match ?? c.token).join(' ')}`,
+            };
+          }
           return { text: item.kind };
         },
         in: (event: any) => ({ intent: { kind: 'message' as const, text: String(event?.text ?? '') } }),

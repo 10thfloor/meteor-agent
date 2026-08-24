@@ -193,6 +193,41 @@ describe('agent-channel-telegram', () => {
     });
   });
 
+  describe('the display clause', () => {
+    it('leads with the tool’s own account and keeps the args underneath', async () => {
+      const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+      const rendered: any = telegramLens.out({
+        item: 'prompt',
+        name: 'orders.refund',
+        args: { orderId: 'o1' },
+        display: 'Refund order o1 to the original card.',
+        toolCallId: 'tc1',
+        choices: [{ token: 'approve', label: 'Approve' }, { token: 'deny', label: 'Deny' }],
+      }, { chatId: 1 });
+      assert.include(rendered.text, 'Refund order o1 to the original card.');
+      assert.include(rendered.text, 'orderId');
+      assert.isBelow(
+        rendered.text.indexOf('Refund order'), rendered.text.indexOf('orderId'),
+        'the account reads before the arguments it explains',
+      );
+    });
+
+    it('clamps a runaway account rather than letting it eat the 4096 body', async () => {
+      const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');
+      const rendered: any = telegramLens.out({
+        item: 'prompt',
+        name: 'x',
+        args: { a: 1 },
+        display: 'd'.repeat(5000),
+        toolCallId: 'tc1',
+        choices: [{ token: 'approve', label: 'Approve' }, { token: 'deny', label: 'Deny' }],
+      }, { chatId: 1 });
+      assert.isBelow(rendered.text.length, 4096);
+      assert.include(rendered.text, '…');
+      assert.include(rendered.text, 'a', 'the args still render after the clamp');
+    });
+  });
+
   describe('inbound media (participants spec §6)', () => {
     it('a photo is ONE reference — the largest size — and the caption is the words', async () => {
       const { telegramLens } = await import('meteor/10thfloor:agent-channel-telegram');

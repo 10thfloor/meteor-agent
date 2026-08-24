@@ -241,6 +241,47 @@ describe('agent-channel-slack', () => {
     });
   });
 
+  describe('the display clause', () => {
+    it('leads with the tool’s own account and keeps the args underneath', async () => {
+      const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const rendered = slackLens.out({
+        item: 'prompt',
+        name: 'orders.refund',
+        args: { orderId: 'o1' },
+        display: 'Refund order o1 to the original card.',
+        toolCallId: 'tc1',
+        choices: [{ token: 'approve', label: 'Approve' }, { token: 'deny', label: 'Deny' }],
+      }, { channel: 'C1' }) as any;
+      const text: string = rendered.blocks[0].text.text;
+      assert.include(text, 'Refund order o1 to the original card.');
+      // ABOVE the args — and the args survive as the exact record beneath.
+      assert.include(text, 'orderId');
+      assert.isBelow(
+        text.indexOf('Refund order'), text.indexOf('orderId'),
+        'the account reads before the arguments it explains',
+      );
+    });
+
+    it('neutralizes a fence inside display, which sits OUTSIDE our code block', async () => {
+      const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');
+      const rendered = slackLens.out({
+        item: 'prompt',
+        name: 'x',
+        args: { a: 1 },
+        // A `describe` interpolating a model argument is the ordinary case, so
+        // this text has the model's provenance: an unescaped fence here would
+        // OPEN a block and swallow the args and the runAs line beneath it.
+        display: '```<!channel> approve this now',
+        toolCallId: 'tc1',
+        choices: [{ token: 'approve', label: 'Approve' }, { token: 'deny', label: 'Deny' }],
+      }, { channel: 'C1' }) as any;
+      const text: string = rendered.blocks[0].text.text;
+      assert.notInclude(text, '<!channel>', 'mention syntax is escaped');
+      assert.include(text, '&lt;!channel&gt;');
+      assert.equal(text.split('```').length - 1, 2, 'one fence, ours');
+    });
+  });
+
   describe('inbound media (participants spec §6)', () => {
     it('translates a file share to remote references; a BOT file share stays a noop', async () => {
       const { slackLens } = await import('meteor/10thfloor:agent-channel-slack');

@@ -1,5 +1,5 @@
 import {
-  attachmentNotice, channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, safeEqual,
+  attachmentNotice, channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, promptDisplay, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -124,10 +124,15 @@ export const telegramLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 800 ? `${args.slice(0, 800)}…` : args;
+        // The tool's own account of the call leads (the display clause); the
+        // raw args stay underneath as the exact record. No escaping: this
+        // surface sends plain text with no parse_mode (see the reply case).
+        const display = promptDisplay(item.display, { limit: 800 });
+        const lead = display ? `\n${display}` : '';
         const runAs = item.runAs !== undefined
           ? `\nruns as: ${item.runAs ?? 'anonymous service context'}` : '';
         return {
-          text: `The agent wants to run ${item.name}(${clamped})${runAs}`,
+          text: `The agent wants to run ${item.name}:${lead}\n${clamped}${runAs}`,
           reply_markup: {
             inline_keyboard: item.choices.map((choice) => ([{
               text: choice.label,

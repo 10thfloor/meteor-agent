@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  attachmentNotice, channelKnobs, headerValue, isLinkGesture, safeEqual,
+  attachmentNotice, channelKnobs, headerValue, isLinkGesture, promptDisplay, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -125,6 +125,17 @@ export const smsLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 300 ? `${args.slice(0, 300)}…` : args;
+        // The display clause — and on THIS surface the tool's account replaces
+        // the arguments rather than leading them. The contract allows either;
+        // here it is the only honest choice. A 1500-character body carries the
+        // menu and about one sentence, and a JSON fragment clamped at 300 is
+        // neither readable at a glance nor a faithful record of what was asked,
+        // so it earns none of the room it costs. Where no `display` was
+        // hydrated the args still beat silence, so they stay as the fallback.
+        const display = promptDisplay(item.display, { limit: 900 });
+        const what = display
+          ? `${item.name}: ${display}${/[.!?…]$/.test(display) ? '' : '.'}`
+          : `${item.name}(${clamped}).`;
         const runAs = 'runAs' in item && item.runAs !== undefined
           ? ` It runs as ${item.runAs ?? 'the anonymous service context'}.` : '';
         // The reply menu IS the interaction contract: these words came from
@@ -136,7 +147,7 @@ export const smsLens: Lens = {
           .map((c) => `${c.match} to ${c.label.toLowerCase()}`)
           .join(', or ');
         return {
-          body: `The agent wants to run ${item.name}(${clamped}).${runAs} Reply ${menu}.`,
+          body: `The agent wants to run ${what}${runAs} Reply ${menu}.`,
         };
       }
       default:
