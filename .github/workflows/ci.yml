@@ -79,7 +79,20 @@ jobs:
         env:
           TEST_BROWSER_DRIVER: playwright
         # Port 3200 mirrors local convention; any free port works on a runner.
-        run: meteor test-packages --once --port 3200 --driver-package meteortesting:mocha ./packages/agent
+        #
+        # EVERY package, not just the core. The five surface packages were
+        # absent here until the display clause landed, so their lens suites —
+        # the round-trip law included — ran only on developers' machines, and a
+        # lens could drop an affordance without CI noticing. tsconfig has always
+        # type-checked them; that gate catches a bad import, never a bad render.
+        run: >
+          meteor test-packages --once --port 3200 --driver-package meteortesting:mocha
+          ./packages/agent
+          ./packages/agent-channel-slack
+          ./packages/agent-channel-telegram
+          ./packages/agent-channel-whatsapp
+          ./packages/agent-channel-sms
+          ./packages/agent-channel-email
 
   verify-build:
     name: Production bundle verification

@@ -17,10 +17,18 @@ From `app/` (port 3200 — 3000 is often taken; a blocked port hangs silently):
 
 ```bash
 TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 \
-  --driver-package meteortesting:mocha ./packages/agent
+  --driver-package meteortesting:mocha \
+  ./packages/agent \
+  ./packages/agent-channel-slack ./packages/agent-channel-telegram \
+  ./packages/agent-channel-whatsapp ./packages/agent-channel-sms \
+  ./packages/agent-channel-email
 ```
 
-Budget 2–4 minutes. The client half needs Playwright's Chromium
+Every package, and the same list CI runs — keep the two in step. Running the
+core alone passes while a surface package is broken, which is how five lens
+suites came to run only on developers' machines.
+
+Budget 3–5 minutes. The client half needs Playwright's Chromium
 (`npx playwright install chromium`). The two `pending` tests are the live
 smokes: the pi-ai one un-skips itself when `ANTHROPIC_API_KEY` is set, the MCP
 one when `MCP_LIVE_TEST=1` is.
