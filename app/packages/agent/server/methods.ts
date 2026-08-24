@@ -540,7 +540,14 @@ export async function sendToSession(
     const target = getAgent(addressee.agent);
     if (target) {
       deferTurn(sessionId, target, session.userId, {
-        agentName: addressee.agent, budget: resolveBudget(config.budget),
+        agentName: addressee.agent,
+        budget: resolveBudget(config.budget),
+        // Memory follows the PRIMARY here too (decision 19). This is the LIVE
+        // path — a user typing "@analyst …" — and it was the one place the
+        // threading was missed: an addressed colleague that declares no memory
+        // of its own fell back to its own absent config, so the conversation's
+        // recall vanished exactly when someone was @-mentioned.
+        ...(resolveMemory(config.memory) ? { memory: resolveMemory(config.memory)! } : {}),
       });
       return sessionId;
     }

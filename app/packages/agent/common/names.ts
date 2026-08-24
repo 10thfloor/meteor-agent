@@ -29,9 +29,13 @@ export const NAMES = {
   // The UI caps (memory spec decision 7). Registered ONCE behind a latch at
   // the first memory-declaring define(); dotted names are DDP-only — the
   // model-facing tools use underscored, provider-safe names.
-  mMemorySave: 'memory.save',
-  mMemorySearch: 'memory.search',
-  mMemoryForget: 'memory.forget',
+  // Namespaced like every other method this package registers. Bare
+  // `memory.save` is a name a host app plausibly already owns — and
+  // `Meteor.methods` throws on a duplicate, so the collision would be a boot
+  // failure the moment an app added `memory: true`.
+  mMemorySave: 'agent.memorySave',
+  mMemorySearch: 'agent.memorySearch',
+  mMemoryForget: 'agent.memoryForget',
 } as const;
 
 /** Capped collection size in bytes. Sized for ~200 concurrent streaming turns. */

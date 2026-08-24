@@ -53,6 +53,21 @@ function forgetGate(config: ResolvedMemory) {
   };
 }
 
+/** What the approver is shown, with the elision MARKED.
+ *
+ *  A fact may be 2000 characters; the prompt shows 300. Silently cutting made
+ *  the approval dialog a place to hide things — innocuous schema notes for the
+ *  first 300 characters, anything at all after — while the human read what
+ *  looked like the whole text. The marker is the difference between a summary
+ *  and a misrepresentation. */
+const DESCRIBE_CHARS = 300;
+function clip(text: string): string {
+  const t = text.replace(/\s+/g, ' ').trim();
+  return t.length <= DESCRIBE_CHARS
+    ? t
+    : `${t.slice(0, DESCRIBE_CHARS)}… (+${t.length - DESCRIBE_CHARS} more characters)`;
+}
+
 export interface MemoryToolOptions {
   config: ResolvedMemory;
   /** The RUNNING model's participant id (`m:<agent>`) — the `by` stamp. Never
@@ -112,9 +127,12 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
     // only: `describe`'s ctx is `{ userId, sessionId }` and it runs before
     // `pending.agent` is written, so the proposing agent is not reachable here
     // — the UI composes "(proposed by X)" from `pending.agent` instead.
-    describe: (args: any) => (args?.scope === 'app'
-      ? `Remember for ALL users: "${String(args?.text ?? '').slice(0, 300)}"`
-      : `Remember: "${String(args?.text ?? '').slice(0, 300)}"`),
+    describe: (args: any) => {
+      const shown = clip(String(args?.text ?? ''));
+      return args?.scope === 'app'
+        ? `Remember for ALL users: "${shown}"`
+        : `Remember: "${shown}"`;
+    },
     run: async (args: any, ctx) => saveMemory(args ?? {}, {
       by: opts.by,
       userId: ctx?.userId ?? null,
@@ -181,15 +199,18 @@ function forgetTool(opts: MemoryToolOptions): ResolvedTool {
       const row = await AgentMemories.findOneAsync(String(args?.id ?? ''));
       if (!row) return `Forget memory ${String(args?.id ?? '')}`;
       return row.scope === 'app'
-        ? `Forget for ALL users: "${row.text.slice(0, 300)}"`
-        : `Forget: "${row.text.slice(0, 300)}"`;
+        ? `Forget for ALL users: "${clip(row.text)}"`
+        : `Forget: "${clip(row.text)}"`;
     },
     run: async (args: any, ctx) => forgetMemory(String(args?.id ?? ''), {
       userId: ctx?.userId ?? null,
       agent: opts.agent,
-      // The model's own call went through the same gate its save did, so it
-      // may delete shared knowledge; the DDP surface may not (decision 7a).
-      allowApp: true,
+      // Only an agent that can WRITE the shared pool may delete from it, and
+      // only after this tool's gate asked. An agent whose config omits 'app'
+      // short-circuits the gate to auto — so passing `true` unconditionally
+      // let a second agent on the same deployment erase another's approved
+      // work knowledge with no approval anywhere in the path.
+      allowApp: opts.config.scopes.includes('app'),
     }),
   };
 }
@@ -209,14 +230,18 @@ export function withMemoryTools(
   tools: ResolvedTool[], opts?: MemoryToolOptions,
 ): ResolvedTool[] {
   if (!opts) return tools;
-  const taken = MEMORY_TOOL_NAMES.filter((n) => tools.some((t) => t.name === n));
+  const built = [saveTool(opts), searchTool(opts), forgetTool(opts)];
+  // PER NAME, not all-or-nothing. Dropping all three because one collided —
+  // an MCP server advertising `memory_search`, say — left the standing block
+  // still instructing the model to call `memory_save`, a tool no longer in
+  // front of it: an unknown-tool error on every turn that tried to remember.
+  const taken = built.filter((t) => tools.some((x) => x.name === t.name)).map((t) => t.name);
   if (taken.length > 0) {
     warnSkill(
       `this agent's tools already include ${taken.join(', ')}, so the built-in memory `
-      + 'tool(s) of that name are not added — the memory listing in the system prompt '
-      + 'will point at your tool. Rename one of them.',
+      + 'tool(s) of that name are not added — that part of the memory listing in the '
+      + 'system prompt will be served by your tool, or not at all. Rename one of them.',
     );
-    return tools;
   }
-  return [...tools, saveTool(opts), searchTool(opts), forgetTool(opts)];
+  return [...tools, ...built.filter((t) => !taken.includes(t.name))];
 }

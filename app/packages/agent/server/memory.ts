@@ -56,6 +56,17 @@ export function readSelector(
   return clauses.length > 0 ? { $or: clauses } : null;
 }
 
+/** Is this row one the caller may actually see? The predicate form of
+ *  `readSelector`, for filtering rows this module did not fetch itself. */
+export function inScope(
+  row: AgentMemory, scopes: MemoryScope[], userId: string | null, agent: string,
+): boolean {
+  if (row.scope === 'app') return scopes.includes('app');
+  if (userId === null || row.userId !== userId) return false;
+  if (row.scope === 'agent') return scopes.includes('agent') && row.agent === agent;
+  return scopes.includes('user');
+}
+
 /* ---------------------------------------------------------------------------
  * Reads — the standing block
  * ------------------------------------------------------------------------ */
@@ -90,17 +101,15 @@ export async function listForBlock(
     const pins = await AgentMemories.find(
       { ...sel, pinned: true } as any, { sort: { at: -1 }, limit: pinned },
     ).fetchAsync();
-    const pinIds = new Set(pins.map((r) => r._id));
-    // Fetch recent + |pins| and drop the pinned ones rather than excluding by
-    // id in the query: `$nin` over a growing id list is the kind of selector
-    // that degrades quietly, and the extra rows are bounded by `pinned`.
+    // The recent section excludes EVERY pinned row, not just the `pinned` of
+    // them that made the cut. Excluding only the shown ones let overflow pins
+    // fall into the recent fetch and eat its slots — the precise behavior §6
+    // forbids, and with more pins than `recent` the unpinned rows vanished
+    // from the block entirely.
     const rest = await AgentMemories.find(
-      sel as any, { sort: { at: -1 }, limit: recent + pins.length },
+      { ...sel, pinned: { $ne: true } } as any, { sort: { at: -1 }, limit: recent },
     ).fetchAsync();
-    return {
-      rows: [...pins, ...rest.filter((r) => !pinIds.has(r._id)).slice(0, recent)],
-      total,
-    };
+    return { rows: [...pins, ...rest], total };
   };
 
   const personScopes = config.scopes.filter((s) => s !== 'app');
@@ -131,6 +140,26 @@ function warnMemory(message: string): void {
   if (warnedKinds.has(kind)) return;
   warnedKinds.add(kind);
   console.warn(`[10thfloor:agent] ${message}`);
+}
+
+/** Mongo's duplicate-key signal, however the driver phrases it. */
+function isDuplicateKey(e: unknown): boolean {
+  const err = e as { code?: unknown; message?: unknown };
+  if (err?.code === 11000 || err?.code === 11001) return true;
+  return String(err?.message ?? '').includes('E11000');
+}
+
+/** Whether an aggregation error means "this server does not know this stage"
+ *  — a capability answer worth caching — as opposed to a connection blip, a
+ *  step-down, or a mongot that has not finished starting. Mongo phrases the
+ *  former as an unrecognized/unknown pipeline stage. */
+function isUnsupportedStage(e: unknown): boolean {
+  const msg = String((e as Error)?.message ?? e ?? '').toLowerCase();
+  return msg.includes('unrecognized pipeline stage')
+    || msg.includes('unknown pipeline stage')
+    || msg.includes('$vectorsearch is not allowed')
+    || msg.includes('no such index')
+    || msg.includes('index not found');
 }
 
 /** Regex metacharacters, escaped. The package has no such helper, and the
@@ -199,17 +228,29 @@ async function vectorSearch(
   sel: Record<string, unknown>, query: string, limit: number,
 ): Promise<AgentMemory[]> {
   if (vectorSearchImpl) return vectorSearchImpl(sel, query, limit);
+  // `filter` runs INSIDE the vector stage, before its limit. Post-filtering a
+  // global top-N with `$match` was the original shape and it is wrong at any
+  // real scale: with thousands of rows across hundreds of accounts, the top
+  // `limit` nearest neighbours are mostly other people's, so a scoped search
+  // returned a handful of rows or none — recall silently emptying as the
+  // deployment grew. The `$match` stays as a BELT: `filter` depends on the
+  // index declaring those paths, and a misconfigured index must not leak.
   const cursor = await (AgentMemories as any).rawCollection().aggregate([
     {
       $vectorSearch: {
         index: 'agent_memories_vector',
         path: 'text',
         query,
-        numCandidates: Math.max(limit * 10, 50),
+        filter: sel,
+        numCandidates: Math.max(limit * 20, 100),
         limit,
       },
     },
     { $match: sel },
+    // Surface the relevance score so the hint can threshold on it. Without
+    // this the rung returns rows with no score and `minScore` has nothing to
+    // gate — configured, validated, and inert.
+    { $addFields: { score: { $meta: 'vectorSearchScore' } } },
   ]);
   return cursor.toArray() as Promise<AgentMemory[]>;
 }
@@ -269,7 +310,15 @@ export async function searchMemory(
       const rows = await opts.config.search(q, {
         userId: opts.userId, agent: opts.agent, scopes: opts.config.scopes, limit,
       });
-      return Array.isArray(rows) ? rows.slice(0, limit) : [];
+      // The app's rows are re-scoped here, not trusted. An installed fn is a
+      // retrieval strategy, not an authorization decision: the obvious first
+      // draft (`AgentMemories.find({ $text: … })`, since the collection is
+      // exported) has no scope clause at all, and without this belt it would
+      // serve one account's memories to another.
+      return Array.isArray(rows)
+        ? rows.filter((r) => inScope(r, opts.config.scopes, opts.userId, opts.agent))
+          .slice(0, limit)
+        : [];
     } catch (e) {
       // An app's own search throwing is the app's bug, but it must not be the
       // conversation's death. Warn and fall through to the built-in rungs.
@@ -285,14 +334,17 @@ export async function searchMemory(
       activeRung = 'vector';
       return rows;
     } catch (e) {
-      if (vectorAvailable === null) {
+      // A CAPABILITY answer is permanent; a transient one is not. Latching
+      // every first failure would disable semantic recall for the life of a
+      // process whose mongot merely started a few seconds after the app —
+      // the ordinary shape of a deploy that restarts both together.
+      if (vectorAvailable === null && isUnsupportedStage(e)) {
         vectorAvailable = false;
         warnMemory('this deployment cannot run $vectorSearch on the memory store '
           + '(no mongot, or no vector index), so recall is running on the text/regex '
           + 'rung — semantic matches will be missed. See the README\'s mongot notes.');
       }
-      // Already known-available and it still failed: a transient mongot blip.
-      // Degrade this ONE call without un-caching the capability.
+      // Anything else: degrade this ONE call and try again next time.
     }
   }
 
@@ -371,12 +423,21 @@ export async function saveMemory(
         + `available scopes: ${opts.config.scopes.join(', ')}.`,
     };
   }
-  if (scope !== 'app' && opts.userId === null) {
+  if (opts.userId === null) {
+    // The gate is NOT the guard here. `config.approve` is optional, and with
+    // none configured the approval check is skipped entirely — so an anonymous
+    // capability-URL holder could propose an app-scope save and then approve
+    // it themselves, writing the pool every session's system prompt reads.
+    // The core refuses instead, for both scopes and for the same reason:
+    // there is nobody to attribute the write to.
     return {
       ok: false,
       error: 'no-account',
-      reason: 'This conversation has no signed-in account, so there is no personal '
-        + 'memory to save to.',
+      reason: scope === 'app'
+        ? 'Shared work memory cannot be written from a session with no signed-in '
+          + 'account.'
+        : 'This conversation has no signed-in account, so there is no personal '
+          + 'memory to save to.',
     };
   }
 
@@ -391,6 +452,11 @@ export async function saveMemory(
   if (args.key) {
     const existing = await AgentMemories.findOneAsync({ ...clause, key: args.key } as any);
     if (existing) {
+      // `pinned` is TRI-STATE on this path: absent leaves the flag alone,
+      // `true` sets it, `false` CLEARS it. Treating false as absent made the
+      // unpin button on a memory page a silent no-op that still answered
+      // `{ ok: true }` — the user unpins, the UI congratulates them, the row
+      // stays pinned forever.
       await AgentMemories.updateAsync(
         existing._id,
         {
@@ -398,8 +464,9 @@ export async function saveMemory(
             text,
             by: opts.by,
             at: new Date(),
-            ...(args.pinned ? { pinned: true as const } : {}),
+            ...(args.pinned === true ? { pinned: true as const } : {}),
           },
+          ...(args.pinned === false ? { $unset: { pinned: 1 as const } } : {}),
         },
       );
       return { ok: true, id: existing._id, updated: true };
@@ -428,7 +495,28 @@ export async function saveMemory(
     ...(args.key ? { key: args.key } : {}),
     ...(args.pinned ? { pinned: true as const } : {}),
   };
-  await AgentMemories.insertAsync(row);
+  try {
+    await AgentMemories.insertAsync(row);
+  } catch (e) {
+    // The partial unique index on (scope, userId, agent, key) rejected us: a
+    // racer inserted the same key between our lookup and this write. Losing
+    // that race means the row now EXISTS, so do what the key asked for in the
+    // first place and update it. Adopt-on-collision, the insertOrLose idiom.
+    if (args.key && isDuplicateKey(e)) {
+      const winner = await AgentMemories.findOneAsync({ ...clause, key: args.key } as any);
+      if (winner) {
+        await AgentMemories.updateAsync(winner._id, {
+          $set: {
+            text, by: opts.by, at: new Date(),
+            ...(args.pinned === true ? { pinned: true as const } : {}),
+          },
+          ...(args.pinned === false ? { $unset: { pinned: 1 as const } } : {}),
+        });
+        return { ok: true, id: winner._id, updated: true };
+      }
+    }
+    throw e;
+  }
   return { ok: true, id: row._id, updated: false };
 }
 
@@ -496,9 +584,21 @@ export async function memoryHint(
   opts: { userId: string | null; agent: string; config: ResolvedMemory },
 ): Promise<string[]> {
   if (!opts.config.hints) return [];
+  const { minScore } = opts.config.hints;
   try {
     const rows = await searchMemory(query, { ...opts, limit: 3 });
-    return rows.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`);
+    // THRESHOLD-GATED, which is the difference between a hint and noise. The
+    // rungs that report a relevance score (mongot's `$vectorSearch`, surfaced
+    // as `score`) are held to `minScore`; the text and regex rungs have no
+    // comparable number, so for them a match IS the signal and the limit does
+    // the bounding. Without this the block appended three arbitrary titles to
+    // every message, including "thanks, that's all" — the exact noise
+    // `minScore` was configured to prevent.
+    const scored = rows.filter((r) => {
+      const score = (r as { score?: unknown }).score;
+      return typeof score === 'number' ? score >= minScore : true;
+    });
+    return scored.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`);
   } catch {
     // The hint is an optimization. A failure here must never reach the turn:
     // the block still renders, the tool still works, the model just is not
@@ -521,7 +621,17 @@ export async function memoryBlock(opts: {
   /** Titles from the turn's cached hint, already computed. */
   hint?: string[];
 }): Promise<string> {
-  const listed = await listForBlock(opts.userId, opts.agent, opts.config);
+  // Guarded like the hint, and for the same reason: this runs inside the
+  // attempt's try/catch, so an unguarded rejection (a replica-set step-down
+  // mid-count) would be classified as a PROVIDER failure and retried with
+  // backoff — a database blip mis-reported as the model being down. A turn
+  // without its memory listing is a turn; a turn that dies is not.
+  let listed: ListedMemories;
+  try {
+    listed = await listForBlock(opts.userId, opts.agent, opts.config);
+  } catch {
+    return '';
+  }
   const lines: string[] = [];
 
   if (opts.userId === null) {

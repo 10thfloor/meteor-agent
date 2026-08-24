@@ -197,6 +197,21 @@ export async function ensureIndexes(): Promise<void> {
       name: NAMES.memories,
       keys: { text: 'text' },
     },
+    // The keyed-upsert identity, UNIQUE and partial. Check-then-insert alone
+    // is a race: the user edits a fact on the memory page while an in-flight
+    // turn saves the same `key`, both read "no existing row", both insert, and
+    // the key that exists to guarantee one row has produced two. The index is
+    // what makes the write single-winner; `saveMemory` catches the duplicate
+    // and converts the loss into the update it meant to do.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { scope: 1, userId: 1, agent: 1, key: 1 },
+      options: {
+        unique: true,
+        partialFilterExpression: { key: { $exists: true } },
+      },
+    },
     // Opt-in decay: sparse, so rows without `expiresAt` are simply not in it.
     {
       collection: AgentMemories,

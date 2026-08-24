@@ -71,6 +71,17 @@ export function ensureMemoryMethods(resolve: GoverningConfig): void {
           + 'agent and approved by a person.',
         );
       }
+      // Agent-scope rows belong to ONE named agent, and a client names none.
+      // Resolving it to "whichever memory agent was defined first" filed the
+      // note under an arbitrary agent — invisible to the one that should own
+      // it, and visible to one that should not.
+      if (scope === 'agent') {
+        throw new Meteor.Error(
+          'denied-scope',
+          'Agent-private memory belongs to a specific agent and cannot be written '
+          + 'from a client.',
+        );
+      }
       const { config, agent } = governingConfig();
       if (!config) throw new Meteor.Error('no-memory', 'No agent in this app declares memory.');
       const result = await saveMemory(

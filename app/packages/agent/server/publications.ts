@@ -126,7 +126,11 @@ export function registerPublications(): void {
     if (this.userId === null) return this.ready();
     return AgentMemories.find(
       { $or: [{ userId: this.userId }, { scope: 'app' }] } as any,
-      { sort: { at: -1 }, limit: 500 },
+      // Sized above the default caps it serves (200 person + 500 app): a
+      // limit BELOW them hides the oldest memories from the page while they
+      // still count toward the cap — a user told the store is full, looking
+      // at a list that cannot show them what to delete.
+      { sort: { at: -1 }, limit: 1000 },
     );
   });
 }

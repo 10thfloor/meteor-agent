@@ -462,6 +462,15 @@ export class Agent {
           + 'memory store to write to.',
         );
       }
+      // Agent-scope rows are keyed by the agent that owns them, so the caller
+      // must SAY which — falling back to the first memory-declaring agent
+      // filed the note under whoever happened to be defined first.
+      if (args.scope === 'agent' && !opts?.agent) {
+        throw new Error(
+          '[10thfloor:agent] Agent.memory.save with scope "agent" needs the owning '
+          + 'agent: Agent.memory.save(userId, args, { agent: "support" }).',
+        );
+      }
       return saveMemory(args, {
         by: args.by ?? 'app', userId, agent, config,
       });
