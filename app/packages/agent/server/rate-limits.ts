@@ -55,6 +55,16 @@ interface AgentPackageSettings {
      * is the one that runs.
      */
     compacts?: RateLimitEntry;
+    /**
+     * `memory.save` / `memory.search` / `memory.forget` (memory spec).
+     *
+     * Three UI-facing methods on a public DDP surface, and `search` is the one
+     * that matters: on a mongot deployment every call runs an embedding at
+     * query time inside the database, which is real work an unauthenticated-
+     * adjacent flood should not be able to buy in a loop. `save` is bounded by
+     * the store's own cap, but the cap check is itself a query.
+     */
+    memories?: RateLimitEntry;
   };
 }
 
@@ -178,6 +188,14 @@ export function applyRateLimits(settings: unknown): number {
     // round trip) but an operator wants to tune them apart, since a compaction
     // is bookkeeping a UI fires rarely and a send is the product.
     added += addRuleFor(NAMES.mCompact, rateLimit.compacts, 'compacts');
+  }
+  if (rateLimit.memories) {
+    // One entry, three methods — the `approvals` shape: they are one surface
+    // an operator tunes together, and giving `search` its own knob would just
+    // make the cheap methods the way around the expensive one's limit.
+    added += addRuleFor(NAMES.mMemorySave, rateLimit.memories, 'memories');
+    added += addRuleFor(NAMES.mMemorySearch, rateLimit.memories, 'memories');
+    added += addRuleFor(NAMES.mMemoryForget, rateLimit.memories, 'memories');
   }
   return added;
 }

@@ -497,7 +497,15 @@ export function buildRunConfig(
     // same side of the line as `budget`. An addressed turn to a colleague that
     // declared no memory of its own must still see the conversation's memory,
     // or §8's "identical recall whichever agent is addressed" is false.
-    ...(opts?.memory !== undefined ? { memory: opts.memory } : {}),
+    // Memory follows the PRIMARY (spec decision 19): an addressed turn is
+    // handed the primary's resolved bundle through `opts`, the same way it is
+    // handed the primary's budget. With no `opts` this IS the primary's turn,
+    // so its own config answers — which is what makes every non-addressed
+    // wake path (ask, subagent, recovery, the self-check) work untouched.
+    ...(() => {
+      const mem = opts?.memory ?? resolveMemory(config.memory);
+      return mem ? { memory: mem } : {};
+    })(),
   };
 }
 

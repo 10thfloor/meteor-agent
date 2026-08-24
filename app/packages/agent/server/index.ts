@@ -22,6 +22,17 @@ import { startEgress, type EgressWorker } from './channels/egress';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
+// Memory (memory spec): the core, its types, and the test seam. The DDP
+// methods and the inline tools are registered by `define()`, not exported —
+// an app reaches the store through `Agent.memory`.
+export {
+  saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint,
+  readSelector, _setMemorySearch, _activeRung,
+  type SaveArgs, type SaveResult, type ForgetResult, type SearchRung,
+  type ListedMemories,
+} from './memory';
+export { MEMORY_TOOL_NAMES } from './tools';
+export { resolveMemory } from './registry';
 export {
   AgentSessions, AgentMessages, AgentDeltas, AgentMemories,
 } from '../common/collections';

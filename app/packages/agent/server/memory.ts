@@ -456,3 +456,91 @@ export async function forgetMemory(
   const n = await AgentMemories.removeAsync(row._id);
   return { ok: true, forgotten: n === 1 };
 }
+
+/* ---------------------------------------------------------------------------
+ * The standing block (spec §6)
+ * ------------------------------------------------------------------------ */
+
+/** One row as the block shows it: the fact, trimmed to a title. The block is
+ *  an INDEX, not the content — details come through `memory_search`, which is
+ *  the whole reason the block is affordable on every iteration. */
+function title(text: string): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim();
+  return oneLine.length > 120 ? `${oneLine.slice(0, 117)}…` : oneLine;
+}
+
+/**
+ * The hint's search (spec §10): mechanical, harness-run, never a model call.
+ *
+ * Returns TITLES ONLY. Content never enters context this way — the model must
+ * still call `memory_search` — so a bad match costs one line, not a poisoned
+ * turn. Threshold-gated by `minScore` where the rung reports one; the regex
+ * and text rungs have no comparable score, so they contribute their top hits
+ * and the cap does the limiting.
+ */
+export async function memoryHint(
+  query: string,
+  opts: { userId: string | null; agent: string; config: ResolvedMemory },
+): Promise<string[]> {
+  if (!opts.config.hints) return [];
+  try {
+    const rows = await searchMemory(query, { ...opts, limit: 3 });
+    return rows.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`);
+  } catch {
+    // The hint is an optimization. A failure here must never reach the turn:
+    // the block still renders, the tool still works, the model just is not
+    // nudged. "Never fails a turn" is the ladder's promise and this is its
+    // last line of defense.
+    return [];
+  }
+}
+
+/**
+ * Render the memory block appended to the system prompt.
+ *
+ * Returns `''` when there is nothing to say — an empty block is a section
+ * header the model must read on every call that can only ever mean "no".
+ */
+export async function memoryBlock(opts: {
+  userId: string | null;
+  agent: string;
+  config: ResolvedMemory;
+  /** Titles from the turn's cached hint, already computed. */
+  hint?: string[];
+}): Promise<string> {
+  const listed = await listForBlock(opts.userId, opts.agent, opts.config);
+  const lines: string[] = [];
+
+  if (opts.userId === null) {
+    // Anonymous: no person store exists, and saying so is better than the
+    // model discovering it through a refused save.
+    if (listed.work.length === 0) return '';
+  } else if (listed.person.length > 0) {
+    lines.push(`About this person (${listed.personTotal} remembered):`);
+    for (const r of listed.person) {
+      lines.push(`- ${title(r.text)}${r.pinned ? ' [pinned]' : ''}`);
+    }
+  }
+
+  if (listed.work.length > 0) {
+    lines.push(`About this work (${listed.workTotal} remembered):`);
+    for (const r of listed.work) {
+      // Provenance is visible here on purpose: a colleague's approved fact
+      // reads as theirs, which is what makes shared knowledge legible.
+      lines.push(`- ${title(r.text)} [learned by ${r.by}]`);
+    }
+  }
+
+  if (opts.hint && opts.hint.length > 0) {
+    lines.push(`Possibly relevant to the latest message: ${opts.hint.join('; ')}`);
+  }
+
+  if (lines.length === 0 && opts.userId !== null) return '';
+
+  const foot = opts.userId === null
+    ? 'This conversation has no signed-in account, so there is no personal memory; '
+      + 'shared work notes above still apply.'
+    : 'Use memory_search to recall details, memory_save to remember something new.';
+
+  return `\n\n## Memory\n${lines.join('\n')}\n${foot}`;
+}

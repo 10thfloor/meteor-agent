@@ -1,10 +1,13 @@
-import type { AgentSession, SessionInc } from '../common/types';
+import type { AgentSession, ResolvedMemory, SessionInc } from '../common/types';
 import type { SessionQuery } from '../common/db';
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
-import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import {
-  defineAgent, getAgent, buildRunConfig, registerProvider, type AgentConfig,
+  AgentDeltas, AgentMemories, AgentMessages, AgentSessions,
+} from '../common/collections';
+import {
+  defineAgent, getAgent, listAgents, buildRunConfig, registerProvider, resolveMemory,
+  type AgentConfig,
 } from './registry';
 import type { Provider } from './providers/types';
 import { runTurn } from './loop';
@@ -18,11 +21,33 @@ import {
   type HookMap, type HookName,
 } from './hooks';
 import { recordVerdict, sendToSession } from './methods';
+import {
+  forgetMemory, readSelector, saveMemory, type SaveArgs,
+} from './memory';
 import { registerChannel, type ChannelDef } from './channels/registry';
 import { AgentAttachments, createAttachment, readTool } from './attachments';
 import {
   addParticipant, listParticipants, removeParticipant,
 } from './participants';
+
+/** Which memory config governs a server-side `Agent.memory` call. Named agent
+ *  wins; otherwise the first memory-declaring agent, because person memory
+ *  follows the HUMAN and every memory-declaring agent resolves the same store
+ *  (spec decision 2). */
+function memoryConfigFor(
+  name?: string,
+): { config?: ResolvedMemory; agent: string } {
+  if (name) {
+    const c = getAgent(name);
+    const r = c ? resolveMemory(c.memory) : undefined;
+    if (r) return { config: r, agent: name };
+  }
+  for (const [n, c] of listAgents()) {
+    const r = resolveMemory(c.memory);
+    if (r) return { config: r, agent: n };
+  }
+  return { agent: '' };
+}
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -411,6 +436,47 @@ export class Agent {
     add: addParticipant,
     remove: removeParticipant,
     list: listParticipants,
+  };
+
+  /**
+   * The app's own way into the memory store (memory spec §5).
+   *
+   * UNRESTRICTED where the DDP methods are not: this is server code, not a
+   * client, so it may write shared work memory directly — seeding an app's
+   * institutional knowledge at startup is exactly the case the approval flow
+   * exists to govern for MODELS, not for the operator who owns the deployment.
+   *
+   * `Agent.memory.save(null, …)` (or `scope: 'app'`) writes the shared pool;
+   * `Agent.memory.list(null)` reads it.
+   */
+  static memory = {
+    async save(
+      userId: string | null,
+      args: SaveArgs & { by?: string },
+      opts?: { agent?: string },
+    ) {
+      const { config, agent } = memoryConfigFor(opts?.agent);
+      if (!config) {
+        throw new Error(
+          '[10thfloor:agent] no agent in this app declares `memory`, so there is no '
+          + 'memory store to write to.',
+        );
+      }
+      return saveMemory(args, {
+        by: args.by ?? 'app', userId, agent, config,
+      });
+    },
+    async list(userId: string | null, opts?: { agent?: string }) {
+      const { config, agent } = memoryConfigFor(opts?.agent);
+      if (!config) return [];
+      const sel = readSelector(config.scopes, userId, agent);
+      if (!sel) return [];
+      return AgentMemories.find(sel as any, { sort: { at: -1 } }).fetchAsync();
+    },
+    async forget(userId: string | null, id: string, opts?: { agent?: string }) {
+      const { agent } = memoryConfigFor(opts?.agent);
+      return forgetMemory(id, { userId, agent, allowApp: true });
+    },
   };
 
   /**

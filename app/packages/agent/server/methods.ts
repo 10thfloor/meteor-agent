@@ -4,7 +4,7 @@ import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
-  getAgent, buildRunConfig, resolveBudget, type AgentConfig,
+  getAgent, buildRunConfig, resolveBudget, resolveMemory, type AgentConfig,
 } from './registry';
 import { runTurn } from './loop';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
@@ -139,7 +139,12 @@ export async function deferResolvedTurn(session: AgentSession): Promise<boolean>
     return true;
   }
   deferTurn(session._id, addressee, session.userId, {
-    agentName: name, budget: resolveBudget(primary.budget),
+    agentName: name,
+    budget: resolveBudget(primary.budget),
+    // The addressee may declare no memory of its own; the conversation's
+    // memory is the PRIMARY's either way (spec decision 19), or recall would
+    // differ by whoever was @-mentioned.
+    ...(resolveMemory(primary.memory) ? { memory: resolveMemory(primary.memory)! } : {}),
   });
   return true;
 }
