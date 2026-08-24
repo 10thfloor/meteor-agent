@@ -94,6 +94,50 @@ export function attachmentNotice(
   return attachments.map((a) => `\n[file attached: ${escape(a.name)}]`).join('');
 }
 
+/**
+ * The DISPLAY-CLAUSE FLOOR: the tool's own one-line account of a parked call
+ * (participants spec §8), hydrated at park time, rendered by every surface that
+ * shows an approval.
+ *
+ * This exists because raw arguments are not a decision. `{"refs":["a7f3…"]}`
+ * tells an approver nothing; "Send invoice-04.pdf (82 KB) to accounts@acme" is
+ * the thing they are being asked to consent to. A lens renders it ABOVE the raw
+ * args where it has the room, or INSTEAD of them where it does not — on a
+ * 160-character surface a clamped JSON fragment is neither readable nor a
+ * faithful record, so it earns none of the space it costs. What no lens may do
+ * is drop it: that ships an approval prompt the human cannot act on, and it is
+ * mandatory (`assertLensRoundTrip`'s display check).
+ *
+ * Empty string when the park hydrated none, so call sites can render
+ * unconditionally.
+ */
+export function promptDisplay(
+  display: string | undefined,
+  opts: {
+    /** The surface's room for it; clamped with an ellipsis past this. */
+    limit?: number;
+    /** A surface's own text escaping, applied to the line. `display` is
+     *  AUTHORED by an app's `describe`, but it routinely interpolates the
+     *  model's own arguments into itself — so it reaches live markup with
+     *  exactly the provenance of any other model text, and takes the same
+     *  handling. */
+    escape?: (text: string) => string;
+  } = {},
+): string {
+  if (display === undefined) return '';
+  const text = display.trim();
+  if (text === '') return '';
+  const limit = opts.limit ?? 600;
+  const escape = opts.escape ?? ((t: string) => t);
+  if (text.length <= limit) return escape(text);
+  // Never cut a surrogate pair: a lone high surrogate is a payload providers
+  // reject deterministically — the same rule the planner's `overflow` keeps.
+  let end = Math.max(1, limit);
+  const last = text.charCodeAt(end - 1);
+  if (last >= 0xd800 && last <= 0xdbff) end -= 1;
+  return `${escape(text.slice(0, end))}…`;
+}
+
 // ---- Delivery items (§8.2) — what the planner can say ----------------------
 
 /** One choice a prompt offers. `token` is CANONICAL (`approve`/`deny`) — the
@@ -441,7 +485,11 @@ export function expectationsFor(
  *  `assertLensRoundTrip` renders when the caller supplies none. The corpus
  *  carries a FILE-BEARING reply as well as a bare one, so every lens meets a
  *  file and the naming clause below is exercised by default — a surface that
- *  cannot carry bytes must still say the file's name. */
+ *  cannot carry bytes must still say the file's name.
+ *
+ *  The prompt carries a `display` for the same reason: without one in the
+ *  corpus, four shipped lenses dropped it and passed this helper anyway, which
+ *  is precisely the silence the clause below now forbids. */
 export function exemplarItems(): DeliveryItem[] {
   return [
     { item: 'reply', text: 'The order shipped this morning.' },
@@ -460,6 +508,7 @@ export function exemplarItems(): DeliveryItem[] {
       item: 'prompt',
       name: 'orders.refund',
       args: { orderId: 'o1' },
+      display: 'Refund order o1 to the original card.',
       toolCallId: 'tc-exemplar',
       choices: [
         { token: 'approve', label: 'Approve' },
@@ -575,6 +624,27 @@ export function assertLensRoundTrip(
             + '(the naming clause) — silently vanishing a file is forbidden.',
           );
         }
+      }
+    }
+
+    // THE DISPLAY CLAUSE (participants spec §8): a prompt carrying the tool's
+    // own account of the call must SHOW it. The args alone are not a decision —
+    // a lens that renders `{"refs":["a7f3…"]}` and drops the sentence explaining
+    // it has shipped an approval no human can actually answer. Rendering it
+    // above the args or instead of them is the lens's choice; rendering it is
+    // not. (A clamping lens is tolerated below: the opening of the line must
+    // survive, which is what distinguishes a clamp from a drop.)
+    if (item.item === 'prompt' && item.display) {
+      const rendered = JSON.stringify(payload);
+      const opening = item.display.slice(0, 40);
+      if (!rendered.includes(item.display) && !rendered.includes(opening)) {
+        throw new Error(
+          '[10thfloor:agent] round-trip failed: the prompt carried `display` '
+          + `(${JSON.stringify(item.display)}) but it does not appear in the rendered `
+          + 'payload. A lens must render the tool\'s own account of the call — above '
+          + 'the raw args, or instead of them on a surface with no room (the display '
+          + 'clause) — because arguments alone are not a decision.',
+        );
       }
     }
 

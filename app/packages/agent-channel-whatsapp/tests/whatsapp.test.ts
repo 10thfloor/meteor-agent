@@ -205,6 +205,51 @@ describe('agent-channel-whatsapp', () => {
         assert.isAtMost(b.reply.id.length, 256);
       }
     });
+
+    it('keeps the body within the 1024 cap with every part at full stretch', async () => {
+      const { whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
+      const rendered: any = whatsappLens.out({
+        item: 'prompt',
+        // `name` carries no bound of its own, which is why the per-part clamps
+        // are not enough on their own — the Cloud API REJECTS an oversized
+        // body rather than truncating it, losing the approval entirely.
+        name: 'n'.repeat(200),
+        args: { blob: 'a'.repeat(5000) },
+        display: 'd'.repeat(5000),
+        runAs: 'r'.repeat(200),
+        toolCallId: 'tc1',
+        choices: [
+          { token: 'approve', label: 'Approve' },
+          { token: 'deny', label: 'Deny' },
+        ],
+      }, { phoneNumberId: 'PN1', to: '1' });
+      assert.isAtMost(rendered.interactive.body.text.length, 1024);
+      assert.include(rendered.interactive.body.text, 'ddd', 'the account still leads');
+    });
+  });
+
+  describe('the display clause', () => {
+    it('leads with the tool’s own account and keeps the args underneath', async () => {
+      const { whatsappLens } = await import('meteor/10thfloor:agent-channel-whatsapp');
+      const rendered: any = whatsappLens.out({
+        item: 'prompt',
+        name: 'orders.refund',
+        args: { orderId: 'o1' },
+        display: 'Refund order o1 to the original card.',
+        toolCallId: 'tc1',
+        choices: [
+          { token: 'approve', label: 'Approve' },
+          { token: 'deny', label: 'Deny' },
+        ],
+      }, { phoneNumberId: 'PN1', to: '1' });
+      const text: string = rendered.interactive.body.text;
+      assert.include(text, 'Refund order o1 to the original card.');
+      assert.include(text, 'orderId');
+      assert.isBelow(
+        text.indexOf('Refund order'), text.indexOf('orderId'),
+        'the account reads before the arguments it explains',
+      );
+    });
   });
 
   describe('transport', () => {

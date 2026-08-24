@@ -1,6 +1,6 @@
 import { createHmac } from 'crypto';
 import {
-  attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, safeEqual,
+  attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, promptDisplay, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -121,6 +121,11 @@ export function parseWhatsAppRequest(raw: RawInbound): WhatsAppEvent {
 
 const NOOP: InboundReading = { intent: { kind: 'noop' } };
 
+/** The Cloud API's cap on an interactive message's `body.text`. A request over
+ *  it is REJECTED, not truncated, so an approval that overflows is an approval
+ *  the human never sees — the assembled body takes a mechanical clamp. */
+const BODY_MAX = 1024;
+
 export const whatsappLens: Lens = {
   out(item: DeliveryItem): unknown {
     switch (item.item) {
@@ -138,13 +143,29 @@ export const whatsappLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {});
         const clamped = args.length > 600 ? `${args.slice(0, 600)}…` : args;
+        // The tool's own account of the call leads (the display clause); the
+        // raw args stay underneath as the exact record. Clamped to 300 rather
+        // than the args' 600 because both now share one budget: an interactive
+        // message's `body.text` is capped at 1024 characters by the Cloud API
+        // and a request over it is REJECTED, not truncated.
+        const display = promptDisplay(item.display, { limit: 300 });
+        const lead = display ? `\n${display}` : '';
         const runAs = 'runAs' in item && item.runAs !== undefined
           ? `\nruns as: ${item.runAs ?? 'anonymous service context'}` : '';
+        // The per-part clamps keep display and args BOTH visible in the
+        // ordinary case; this is the backstop that keeps a pathological one
+        // deliverable, because `item.name` carries no bound of its own and a
+        // rejected request loses the approval entirely.
+        const body = `The agent wants to run ${item.name}:${lead}\n${clamped}${runAs}`;
         return {
           type: 'interactive',
           interactive: {
             type: 'button',
-            body: { text: `The agent wants to run ${item.name}(${clamped})${runAs}` },
+            // `promptDisplay` reused as the clamp itself, not for its meaning:
+            // it is the one surrogate-safe trim-and-ellipsis in the package and
+            // a second copy here would be a second thing to get wrong.
+            // `BODY_MAX - 1` leaves room for the ellipsis it appends.
+            body: { text: promptDisplay(body, { limit: BODY_MAX - 1 }) },
             action: {
               buttons: item.choices.map((choice) => ({
                 type: 'reply',

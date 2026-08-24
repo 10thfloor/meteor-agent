@@ -131,6 +131,42 @@ describe('agent-channel-sms', () => {
     });
   });
 
+  describe('the display clause', () => {
+    it('renders the tool’s account INSTEAD of the arguments on this surface', async () => {
+      const { smsLens } = await import('meteor/10thfloor:agent-channel-sms');
+      const rendered: any = smsLens.out({
+        item: 'prompt',
+        name: 'orders.refund',
+        args: { orderId: 'o1', reason: 'damaged-in-transit' },
+        display: 'Refund order o1 to the original card.',
+        toolCallId: 'tc1',
+        choices: [
+          { token: 'approve', label: 'Approve', match: 'YES' },
+          { token: 'deny', label: 'Deny', match: 'NO' },
+        ],
+      }, { to: '+1', from: '+2' });
+      assert.include(rendered.body, 'Refund order o1 to the original card.');
+      // The whole point: 1500 characters do not carry both, and the JSON is
+      // the half a texter cannot read.
+      assert.notInclude(rendered.body, 'damaged-in-transit');
+      assert.notInclude(rendered.body, '{');
+      assert.include(rendered.body, 'Reply YES to approve, or NO to deny.');
+      assert.notInclude(rendered.body, '..', 'no doubled terminator after the account');
+    });
+
+    it('falls back to the arguments when the park hydrated no account', async () => {
+      const { smsLens } = await import('meteor/10thfloor:agent-channel-sms');
+      const rendered: any = smsLens.out({
+        item: 'prompt', name: 'orders.refund', args: { orderId: 'o1' }, toolCallId: 'tc1',
+        choices: [
+          { token: 'approve', label: 'Approve', match: 'YES' },
+          { token: 'deny', label: 'Deny', match: 'NO' },
+        ],
+      }, { to: '+1', from: '+2' });
+      assert.include(rendered.body, 'orderId', 'args still beat silence');
+    });
+  });
+
   describe('lens.out statuses', () => {
     it('reads the approval outcome from the structured flags, never the note’s prose', async () => {
       const { smsLens } = await import('meteor/10thfloor:agent-channel-sms');

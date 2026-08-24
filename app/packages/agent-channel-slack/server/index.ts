@@ -1,7 +1,7 @@
 import { createHmac } from 'crypto';
 import {
   attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback,
-  headerValue, isLinkGesture, safeEqual,
+  headerValue, isLinkGesture, promptDisplay, safeEqual,
   type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
@@ -183,6 +183,19 @@ export const slackLens: Lens = {
         const clamped = escapeSlack(args.length > 2000 ? `${args.slice(0, 2000)}…` : args)
           .replace(/```/g, '`​`​`');
         const name = escapeSlack(item.name).replace(/`/g, '‘');
+        // The tool's own account of the call leads (the display clause): an
+        // approver reads names and sizes, not ref ids, and the raw args stay
+        // underneath as the exact record. It takes the SAME hostile-text
+        // handling as the args — `describe` is app-authored but routinely
+        // interpolates the model's arguments — and the fence neutralization
+        // matters more here, not less: this line sits OUTSIDE the code block,
+        // so a fence within it would OPEN one and swallow the args and the
+        // runAs line that follow.
+        const display = promptDisplay(item.display, {
+          limit: 2000,
+          escape: (t: string) => escapeSlack(t).replace(/```/g, '`​`​`'),
+        });
+        const lead = display ? `${display}\n` : '';
         const runAs = item.runAs !== undefined
           ? `\n_runs as ${escapeSlack(String(item.runAs ?? 'anonymous service context'))}_` : '';
         const fallback = `Approval needed: ${name}`;
@@ -193,7 +206,7 @@ export const slackLens: Lens = {
               type: 'section',
               text: {
                 type: 'mrkdwn',
-                text: `The agent wants to run \`${name}\`:\n\`\`\`${clamped}\`\`\`${runAs}`,
+                text: `The agent wants to run \`${name}\`:\n${lead}\`\`\`${clamped}\`\`\`${runAs}`,
               },
             },
             {

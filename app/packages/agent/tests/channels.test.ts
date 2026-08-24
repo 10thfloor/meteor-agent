@@ -43,7 +43,10 @@ function testLens() {
       const menu = item.choices
         .map((c) => (c.match ? `Reply ${c.match} to ${c.label.toLowerCase()}` : c.url ? `${c.label}: ${c.url}` : c.label))
         .join(', ');
-      return { text: `Approve ${item.name}? ${menu}` };
+      // The display clause: a conforming lens shows the tool's own account of
+      // the call, not just the name and the affordances.
+      const account = item.display ? `${item.display} ` : '';
+      return { text: `Approve ${item.name}? ${account}${menu}` };
     },
     in(event: any): InboundReading {
       if (event.type === 'noop') return { intent: { kind: 'noop' } };
@@ -301,6 +304,46 @@ describe('channels', () => {
         }),
         /returned nothing for a 'prompt'/,
       );
+    });
+
+    it('rejects a lens that drops the tool’s account (the display clause)', async () => {
+      const { assertLensRoundTrip } = await import('../common/channel-contract');
+      const lens = testLens();
+      // Renders the name, the args and both affordances — everything except
+      // the one line that tells the human what they are agreeing to. This is
+      // exactly what four shipped lenses did, and it passed until the clause.
+      const silent = {
+        ...lens,
+        out: (item: DeliveryItem) => (item.item === 'prompt'
+          ? {
+            text: `Approve ${item.name}? ${item.choices
+              .map((c) => `Reply ${c.match} to ${c.label.toLowerCase()}`).join(', ')}`,
+          }
+          : lens.out(item)),
+      };
+      assert.throws(
+        () => assertLensRoundTrip(silent, { interact: 'menu' }, {
+          synthesize: (c) => ({ type: 'msg', text: c.match ?? '', id: 'e', user: 'u', convo: 'c' }),
+        }),
+        /carried `display`/,
+      );
+    });
+
+    it('promptDisplay trims, clamps without splitting a surrogate pair, and escapes', async () => {
+      const { promptDisplay } = await import('../common/channel-contract');
+      assert.equal(promptDisplay(undefined), '', 'an unhydrated account renders nothing');
+      assert.equal(promptDisplay('   '), '', 'and so does a blank one');
+      assert.equal(promptDisplay('  hi  '), 'hi');
+      assert.equal(
+        promptDisplay('<b>', { escape: (t) => t.replace(/</g, '&lt;') }), '&lt;b>',
+        'the surface\'s own escaping applies — display carries model text',
+      );
+      const long = promptDisplay('a'.repeat(50), { limit: 10 });
+      assert.equal(long, `${'a'.repeat(10)}…`);
+      // A lone high surrogate is a payload providers reject deterministically,
+      // so the clamp steps back off a pair rather than cutting through it.
+      const pair = promptDisplay(`${'a'.repeat(9)}😀tail`, { limit: 10 });
+      assert.equal(pair, `${'a'.repeat(9)}…`);
     });
 
     it('rejects a lens whose offered affordance does not read back (the one law)', async () => {

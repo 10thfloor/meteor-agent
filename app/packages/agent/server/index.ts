@@ -86,6 +86,7 @@ export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 // reason to call them, and the tests reach them by path.
 export {
   assertLensRoundTrip, exemplarItems, matchExpectation, attachmentNotice,
+  promptDisplay,
   DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
   encodeVerdictPostback, decodeVerdictPostback, isRemoteAttachment,
   type ChannelAttachment, type ChannelProfile, type ChannelTransport,

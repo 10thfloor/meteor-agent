@@ -1315,8 +1315,12 @@ the final authority.
 **The one law, as a test.** `assertLensRoundTrip(lens, profile, opts?)` checks
 **totality** (every item renders to a non-null payload, so no surface silently
 drops an approval ask) and **round-trip** (every affordance `out` offers, `in`
-reads back as the exact canonical intent). It throws with a named failure on
-the first violation and returns quietly when the lens holds:
+reads back as the exact canonical intent), plus two clauses against silence:
+the **naming clause** (a rendered item's attachments each appear by name, so a
+surface that cannot carry bytes still says the file exists) and the **display
+clause** (a prompt carrying `display` shows it — above the raw args, or instead
+of them on a surface with no room). It throws with a named failure on the first
+violation and returns quietly when the lens holds:
 
 ```ts
 assertLensRoundTrip(smsLens, { interact: 'menu' }, {
@@ -1346,6 +1350,8 @@ Lens-author helpers, all exported from `meteor/10thfloor:agent`:
 | `isLinkGesture(text)`, `LINK_GESTURE` | The bare word `link` — exact after trimming, any case — that asks for an account link; the core's own group hint names it, so lenses read it rather than spelling their own. |
 | `VERDICT_FOR` | `{ approve: 'approved', deny: 'denied' }` — one place for which token records which verdict. |
 | `MENU_MATCHES` | `{ approve: 'YES', deny: 'NO' }` — the `menu` grammar's reply words. |
+| `attachmentNotice(attachments, escape?)` | The naming clause's floor: one `[file attached: …]` line per file, for a surface that carries no bytes. Empty string when there is nothing to name, so call sites append unconditionally. |
+| `promptDisplay(display, { limit?, escape? })` | The display clause's floor: the tool's own account of a parked call, trimmed, clamped to the surface's room (never through a surrogate pair) and passed through the surface's own escaping — `describe` is app-authored but routinely interpolates the model's arguments, so it lands in live markup with the same provenance as any other model text. Empty string when the park hydrated none. |
 | `matchExpectation(text, expects)`, `exemplarItems()`, `DELIVERY_ITEM_KINDS` | The pipeline's matching rule, the default corpus, and the closed item list. |
 
 ### Boot
