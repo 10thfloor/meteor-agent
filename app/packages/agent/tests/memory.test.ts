@@ -1196,3 +1196,55 @@ const waitForCond = async (cond: () => Promise<boolean>, label: string, ms = 150
     await new Promise((r) => { setTimeout(r, 25); });
   }
 };
+
+describe('memory — the approval surface never leaks to an account-less session', () => {
+  beforeEach(clean);
+  after(clean);
+
+  it('does not park an anonymous save, and does not echo stored work memory', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const { saveMemory } = await import('../server/memory');
+    await saveMemory(
+      { text: 'SECRET-work-fact', scope: 'app', key: 'k1' },
+      { by: 'm:analyst', userId: 'u1', agent: 'analyst', config: CONFIG },
+    );
+
+    const [save] = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: null,
+    });
+    // Gates read RAW args — schema validation happens after dispatch — so a
+    // fabricated out-of-enum scope reaches the gate even though the tool
+    // never offered it. It must not park a turn that can only be refused.
+    const gate = save.gate as (ctx: any) => boolean | 'ask';
+    assert.equal(gate({ args: { text: 'x', scope: 'app' }, userId: null }), true);
+    // …and describe must not echo the stored fact into that session's
+    // approval surface on the way.
+    const shown = await save.describe!(
+      { text: 'mine', scope: 'app', key: 'k1' }, { userId: null, sessionId: 's' } as any,
+    );
+    assert.notInclude(shown, 'SECRET-work-fact');
+
+    const forget = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: null,
+    }).find((t) => t.name === 'memory_forget')!;
+    const fgate = forget.gate as (ctx: any) => Promise<boolean | 'ask'>;
+    assert.equal(await fgate({ args: { id: 'anything' }, userId: null }), true);
+    const fshown = await forget.describe!(
+      { id: 'anything' }, { userId: null, sessionId: 's' } as any,
+    );
+    assert.notInclude(fshown, 'SECRET-work-fact');
+  });
+
+  it('still asks, and still shows the text, for a signed-in session', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const [save] = withMemoryTools([], {
+      config: CONFIG, by: 'm:s', agent: 's', userId: 'u1',
+    });
+    const gate = save.gate as (ctx: any) => boolean | 'ask';
+    assert.equal(gate({ args: { text: 'x', scope: 'app' }, userId: 'u1' }), 'ask');
+    const shown = await save.describe!(
+      { text: 'a shared fact', scope: 'app' }, { userId: 'u1', sessionId: 's' } as any,
+    );
+    assert.include(shown, 'a shared fact');
+  });
+});

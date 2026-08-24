@@ -185,8 +185,9 @@ export interface AgentSession {
      * Approval legibility (participants spec §8): the tool's own one-line
      * account of what THIS call will do — compose resolves ref ids to names
      * and sizes — produced by the spec's `describe(args, ctx)` at PARK time
-     * and preferred by the approval bar and every channel's prompt rendering
-     * over raw args JSON. Absent when the tool has no `describe` or it threw
+     * and rendered by the approval bar ABOVE the exact args (channels that
+     * carry a prompt do the same), so the summary leads and the record it
+     * summarizes stays available. Absent when the tool has no `describe` or it threw
      * (a broken description must never fail a park). Advisory: `run` still
      * re-validates everything after the verdict, so a stale display can
      * approve a call the policy then refuses — the refusal reaches the

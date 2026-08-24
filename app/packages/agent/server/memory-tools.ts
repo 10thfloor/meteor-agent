@@ -23,7 +23,15 @@ import { MEMORY_TOOL_NAMES, warnSkill, type ResolvedTool } from './tools';
  *
  *  An app replaces this wholesale by declaring its own `gate` — this is an
  *  ordinary tool gate, with no privileged status. */
-function saveGate(ctx: { args: unknown }): boolean | 'ask' {
+function saveGate(ctx: { args: unknown; userId: string | null }): boolean | 'ask' {
+  // A session with no account cannot write ANY scope, so parking one is worse
+  // than useless: it spends a human's attention on a decision whose only
+  // possible outcome is `no-account`, and renders the model's own text into
+  // the approval surface on the way. Gates read the model's RAW arguments —
+  // schema validation happens after dispatch — so a fabricated out-of-enum
+  // `scope: "app"` reaches here even when the tool never offered it. Run it
+  // instead and let the core answer with a refusal the model can route around.
+  if (ctx.userId === null) return true;
   const scope = (ctx.args as { scope?: unknown } | null)?.scope;
   return scope === 'app' ? 'ask' : true;
 }
@@ -44,7 +52,8 @@ function saveGate(ctx: { args: unknown }): boolean | 'ask' {
  * was never going to happen is worse than running it.
  */
 function forgetGate(config: ResolvedMemory) {
-  return async (ctx: { args: unknown }): Promise<boolean | 'ask'> => {
+  return async (ctx: { args: unknown; userId: string | null }): Promise<boolean | 'ask'> => {
+    if (ctx.userId === null) return true;   // see `saveGate`
     if (!config.scopes.includes('app')) return true;
     const id = (ctx.args as { id?: unknown } | null)?.id;
     if (typeof id !== 'string' || id === '') return true;
@@ -136,9 +145,15 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
     // only: `describe`'s ctx is `{ userId, sessionId }` and it runs before
     // `pending.agent` is written, so the proposing agent is not reachable here
     // — the UI composes "(proposed by X)" from `pending.agent` instead.
-    describe: async (args: any) => {
+    describe: async (args: any, ctx) => {
       const shown = clip(String(args?.text ?? ''));
       if (args?.scope !== 'app') return `Remember: "${shown}"`;
+      // The lookup below reads a STORED shared fact and renders it. Do that
+      // only for a caller who could act on it: `describe` runs at park time,
+      // before the core's identity refusal, so without this guard an
+      // anonymous capability-URL holder could have work memory echoed into
+      // their own approval surface by guessing a key.
+      if (ctx?.userId === null) return `Remember for ALL users: "${shown}"`;
       // A keyed app save OVERWRITES an approved row in place. Describing it as
       // a plain addition asked the human to approve the wrong thing: the prior
       // text and its proposer are unrecoverable afterwards, and the audit row
@@ -215,9 +230,13 @@ function forgetTool(opts: MemoryToolOptions): ResolvedTool {
     kind: 'inline',
     // The approver is shown WHAT is being forgotten, not just an opaque id —
     // an id alone is not a decision anyone can make.
-    describe: async (args: any) => {
-      const row = await AgentMemories.findOneAsync(String(args?.id ?? ''));
-      if (!row) return `Forget memory ${String(args?.id ?? '')}`;
+    describe: async (args: any, ctx) => {
+      const id = String(args?.id ?? '');
+      // Same guard as the save describe: no echoing stored text to a session
+      // that cannot delete anything.
+      if (ctx?.userId === null) return `Forget memory ${id}`;
+      const row = await AgentMemories.findOneAsync(id);
+      if (!row) return `Forget memory ${id}`;
       return row.scope === 'app'
         ? `Forget for ALL users: "${clip(row.text)}"`
         : `Forget: "${clip(row.text)}"`;

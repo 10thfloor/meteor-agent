@@ -255,7 +255,8 @@ session — see *Recovery runs itself*; it carries `childSessionId` and
   "starts":     { "count": 5,  "intervalMs": 60000 },
   "interrupts": { "count": 30, "intervalMs": 60000 },
   "approvals":  { "count": 30, "intervalMs": 60000 },
-  "compacts":   { "count": 5,  "intervalMs": 60000 }
+  "compacts":   { "count": 5,  "intervalMs": 60000 },
+  "memories":   { "count": 30, "intervalMs": 60000 }
 } } } }
 ```
 
@@ -267,7 +268,11 @@ multiply the allowance. Two entries govern two methods each: `starts` covers
 session, and `approvals` covers `agent.approve` and `agent.deny` — the same
 decision made two ways, and the one unauthenticated-reachable method that
 *resumes* a turn. Given separate knobs, `deny` would be the cheap way to hammer
-the path `approve` limits. `compacts` covers `agent.compact`: besides `send` it
+the path `approve` limits. `memories` covers the three memory methods together (`agent.memorySave`,
+`agent.memorySearch`, `agent.memoryForget`) — one surface an operator tunes as
+a unit, and giving `search` its own knob would only make the cheap methods the
+way around the expensive one's limit; on a mongot deployment each search runs
+an embedding inside the database. `compacts` covers `agent.compact`: besides `send` it
 is the only method whose every accepted call buys a provider round trip, and no
 turn budget applies to it, so an unlimited one is a cheaper `send` with
 `budget.spend` as its only backstop.
