@@ -205,20 +205,43 @@ describe('memory — the search ladder', () => {
     } finally { restore(); }
   });
 
-  it('never throws on regex metacharacters in raw human text', async () => {
-    const { saveMemory, searchMemory, _setMemorySearch } = await import('../server/memory');
+  it('never throws on regex metacharacters — ON THE REGEX RUNG', async () => {
+    const { saveMemory, searchMemory, _activeRung, _setMemorySearch, _forceRegexRung } =
+      await import('../server/memory');
     const restore = _setMemorySearch(null);
+    // Force the floor: the text index exists in the test database, so without
+    // this the text rung answers and the escaping is never exercised at all.
+    const restoreRung = _forceRegexRung();
     try {
       await saveMemory(
         { text: 'order 8812 dispute resolved' },
         { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
       );
-      // Unescaped, this is a SyntaxError inside the hint path.
+      // Unescaped, this compiles to a SyntaxError inside the hint path and
+      // takes the turn down.
       const rows = await searchMemory('order #8812 (dispute [unclosed', {
         userId: 'u1', agent: 's', config: CONFIG,
       });
-      assert.isArray(rows);
-    } finally { restore(); }
+      assert.equal(_activeRung(), 'regex', 'the floor rung must be the one under test');
+      assert.isAtLeast(rows.length, 1, 'escaped tokens must still match the row');
+      assert.include(rows[0].text, '8812');
+    } finally { restoreRung(); restore(); }
+  });
+
+  it('falls back to recency when every token is too short to match on', async () => {
+    const { saveMemory, searchMemory, _setMemorySearch, _forceRegexRung } =
+      await import('../server/memory');
+    const restore = _setMemorySearch(null);
+    const restoreRung = _forceRegexRung();
+    try {
+      await saveMemory(
+        { text: 'a recent fact' },
+        { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+      );
+      // Tokens of <= 2 chars are dropped; the rung must still answer.
+      const rows = await searchMemory('is a', { userId: 'u1', agent: 's', config: CONFIG });
+      assert.isAtLeast(rows.length, 1, 'a short query must degrade to recency, not to nothing');
+    } finally { restoreRung(); restore(); }
   });
 
   it('prefers an app-installed search fn over every built-in rung', async () => {
@@ -477,5 +500,397 @@ describe('memory — the model surface', () => {
     } as any);
     const row = await AgentMemories.findOneAsync({} as any);
     assert.equal(row?.by, 'm:analyst');
+  });
+});
+
+/* ---------------------------------------------------------------------------
+ * The gaps the branch review named. Each of these fails if the mechanism it
+ * covers is removed — that is the bar, not "a test exists".
+ * ------------------------------------------------------------------------ */
+
+describe('memory — the DDP surface (decision 7a)', () => {
+  beforeEach(clean);
+  after(clean);
+
+  /** Drive the registered handler with a stubbed invocation, the way a DDP
+   *  caller reaches it — there is no other way in, which is the point. */
+  const callMethod = async (name: string, userId: string | null, args: unknown) => {
+    const { Meteor } = await import('meteor/meteor');
+    const handler = (Meteor.server as any).method_handlers[name];
+    assert.isFunction(handler, `${name} must be registered`);
+    return handler.call({ userId }, args);
+  };
+
+  before(async () => {
+    const { defineAgent } = await import('../server/registry');
+    // Declaring memory is what registers the methods.
+    defineAgent('ddp-mem', { model: 'mock', instructions: 'x', memory: { scopes: ['user', 'app'] } });
+  });
+
+  it('REFUSES an app-scope write from a client — the pool the prompt reads', async () => {
+    const { AgentMemories } = await import('../common/collections');
+    let threw: any = null;
+    try {
+      await callMethod('memory.save', 'u1', { text: 'poisoned instruction', scope: 'app' });
+    } catch (e) { threw = e; }
+    assert.isOk(threw, 'an app-scope DDP write must not succeed');
+    assert.equal(threw.error, 'denied-scope');
+    assert.equal(await AgentMemories.find({} as any).countAsync(), 0,
+      'nothing may reach the shared pool through DDP');
+  });
+
+  it('REFUSES deleting a work row from a client', async () => {
+    const { saveMemory } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const app = await saveMemory(
+      { text: 'approved work fact', scope: 'app' },
+      { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+    );
+    let threw: any = null;
+    try {
+      await callMethod('memory.forget', 'u1', { id: (app as any).id });
+    } catch (e) { threw = e; }
+    assert.isOk(threw);
+    assert.equal(threw.error, 'denied-scope');
+    assert.equal(await AgentMemories.find({} as any).countAsync(), 1, 'the row must survive');
+  });
+
+  it('allows a person write and delete by their owner, and refuses anonymous', async () => {
+    const { AgentMemories } = await import('../common/collections');
+    const saved: any = await callMethod('memory.save', 'u1', { text: 'call me Mac' });
+    assert.isTrue(saved.ok);
+    const row = await AgentMemories.findOneAsync({} as any);
+    assert.equal(row?.by, 'h:u1', 'a UI write is attributed to the human, not a model');
+
+    let anon: any = null;
+    try { await callMethod('memory.save', null, { text: 'nope' }); } catch (e) { anon = e; }
+    assert.equal(anon?.error, 'not-authorized');
+
+    const gone: any = await callMethod('memory.forget', 'u1', { id: row!._id });
+    assert.deepEqual(gone, { ok: true, forgotten: true });
+  });
+
+  it('registers ONCE — a second memory-declaring agent must not throw', async () => {
+    const { defineAgent } = await import('../server/registry');
+    const { _memoryMethodsRegistered } = await import('../server/memory-methods');
+    assert.isTrue(_memoryMethodsRegistered());
+    // Meteor.methods throws on a duplicate name; without the latch this is the
+    // line that takes the server down at boot.
+    assert.doesNotThrow(() => defineAgent('ddp-mem-2', {
+      model: 'mock', instructions: 'x', memory: { max: 10 },
+    }));
+    // …and redefining the same agent (hot reload) is equally harmless.
+    assert.doesNotThrow(() => defineAgent('ddp-mem', {
+      model: 'mock', instructions: 'x', memory: true,
+    }));
+  });
+});
+
+describe('memory — the forget gate reads the ROW, not the args', () => {
+  beforeEach(clean);
+  after(clean);
+
+  it('ASKS before forgetting a work row, and runs a personal one straight through', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const { saveMemory } = await import('../server/memory');
+    const tools = withMemoryTools([], { config: CONFIG, by: 'm:s', agent: 's' });
+    const forget = tools.find((t) => t.name === 'memory_forget')!;
+    const gate = forget.gate as (ctx: any) => Promise<boolean | 'ask'>;
+
+    const app = await saveMemory(
+      { text: 'shared, human-approved', scope: 'app' },
+      { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+    );
+    const mine = await saveMemory(
+      { text: 'personal' },
+      { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+    );
+
+    // The bug this pins: forget takes { id } with no scope, so a gate that
+    // reads args.scope resolved 'auto' and let the model erase approved
+    // shared knowledge unasked.
+    assert.equal(await gate({ args: { id: (app as any).id } }), 'ask');
+    assert.equal(await gate({ args: { id: (mine as any).id } }), true);
+    assert.equal(await gate({ args: { id: 'missing' } }), true);
+    assert.equal(await gate({ args: {} }), true);
+  });
+
+  it('describe shows the approver WHAT is being forgotten, not an opaque id', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const { saveMemory } = await import('../server/memory');
+    const tools = withMemoryTools([], { config: CONFIG, by: 'm:s', agent: 's' });
+    const forget = tools.find((t) => t.name === 'memory_forget')!;
+    const app = await saveMemory(
+      { text: 'orders soft-delete', scope: 'app' },
+      { by: 'm:s', userId: 'u1', agent: 's', config: CONFIG },
+    );
+    const shown = await forget.describe!({ id: (app as any).id }, {} as any);
+    assert.include(shown, 'ALL users');
+    assert.include(shown, 'orders soft-delete');
+  });
+
+  it('never asks when the agent has no app scope at all', async () => {
+    const { withMemoryTools } = await import('../server/memory-tools');
+    const tools = withMemoryTools([], { config: PERSON_ONLY, by: 'm:s', agent: 's' });
+    const forget = tools.find((t) => t.name === 'memory_forget')!;
+    const gate = forget.gate as (ctx: any) => Promise<boolean | 'ask'>;
+    assert.equal(await gate({ args: { id: 'anything' } }), true);
+  });
+});
+
+describe('memory — agent scope', () => {
+  beforeEach(clean);
+  after(clean);
+
+  const AGENT_SCOPE = { ...CONFIG, scopes: ['agent'] as Array<'user' | 'agent' | 'app'> };
+
+  it('stamps the agent, and keeps one agent notes out of another view', async () => {
+    const { saveMemory, listForBlock } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const r = await saveMemory(
+      { text: 'this user prefers terse answers', scope: 'agent' },
+      { by: 'm:a', userId: 'u1', agent: 'a', config: AGENT_SCOPE },
+    );
+    assert.isTrue(r.ok);
+    const row = await AgentMemories.findOneAsync({ scope: 'agent' } as any);
+    assert.equal(row?.agent, 'a', 'an agent-scope row must record whose note it is');
+    assert.equal(row?.userId, 'u1');
+
+    const mine = await listForBlock('u1', 'a', AGENT_SCOPE);
+    assert.lengthOf(mine.person, 1);
+    const theirs = await listForBlock('u1', 'b', AGENT_SCOPE);
+    assert.lengthOf(theirs.person, 0, 'agent scope is private to the agent that wrote it');
+  });
+});
+
+describe('memory — the cap under concurrency', () => {
+  beforeEach(clean);
+  after(clean);
+
+  it('bounds growth, and a keyed race still resolves to one row', async () => {
+    const { saveMemory } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const cfg = { ...CONFIG, max: 4 };
+    for (let i = 0; i < cfg.max - 1; i += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      await saveMemory(
+        { text: `filler ${i}` },
+        { by: 'm:s', userId: 'u1', agent: 's', config: cfg },
+      );
+    }
+    // Two parallel tool calls in one assistant message — the real shape.
+    await Promise.all([
+      saveMemory({ text: 'race a' }, { by: 'm:s', userId: 'u1', agent: 's', config: cfg }),
+      saveMemory({ text: 'race b' }, { by: 'm:s', userId: 'u1', agent: 's', config: cfg }),
+    ]);
+    const n = await AgentMemories.find({ scope: 'user' } as any).countAsync();
+    // The cap is a growth bound, not a quota: count-then-insert can overshoot
+    // by the number of in-flight saves. Pinned here so a change is deliberate.
+    assert.isAtLeast(n, cfg.max);
+    assert.isAtMost(n, cfg.max + 1, 'overshoot must stay bounded by concurrency');
+  });
+});
+
+describe('memory — primary-follows threading (decision 19)', () => {
+  it('an addressed colleague runs with the PRIMARY memory, not its own absence', async () => {
+    const { defineAgent, getAgent, buildRunConfig, resolveMemory } =
+      await import('../server/registry');
+    defineAgent('mem-primary', {
+      model: 'mock', instructions: 'x', memory: { max: 7 },
+    });
+    // The colleague declares NO memory of its own.
+    defineAgent('mem-colleague', { model: 'mock', instructions: 'x' });
+
+    const addressed = buildRunConfig(getAgent('mem-colleague')!, 'u1', {
+      agentName: 'mem-colleague',
+      memory: resolveMemory(getAgent('mem-primary')!.memory)!,
+    });
+    assert.isOk(addressed.memory, 'recall must not vanish because a colleague was @-mentioned');
+    assert.equal(addressed.memory!.max, 7);
+
+    // With no opts, an agent's own config answers — every non-addressed wake.
+    assert.equal(buildRunConfig(getAgent('mem-primary')!, 'u1').memory!.max, 7);
+    assert.isUndefined(buildRunConfig(getAgent('mem-colleague')!, 'u1').memory);
+  });
+});
+
+describe('memory — inside a turn', () => {
+  const seed = async (
+    sessionId: string, agent: string, text: string,
+    extra: Record<string, unknown> = {},
+  ) => {
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent, userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 1, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(), ...extra,
+    } as any);
+    await AgentMessages.insertAsync({
+      _id: 'u-msg', sessionId, seq: 0, role: 'user', content: text, createdAt: new Date(),
+    } as any);
+  };
+
+  beforeEach(clean);
+  after(async () => {
+    await clean();
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentMessages.removeAsync({});
+    await AgentDeltas.removeAsync({});
+  });
+
+  it('puts the listing in the system prompt and the tools in front of the model', async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+    const { saveMemory } = await import('../server/memory');
+
+    let seen: any = null;
+    defineAgent('mem-turn', {
+      model: 'mock',
+      instructions: 'You are helpful.',
+      memory: { scopes: ['user', 'app'], hints: false },
+      provider: {
+        async *stream(req: any) {
+          seen = req;
+          yield { kind: 'text', chunk: 'ok' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      } as any,
+    });
+    await saveMemory(
+      { text: 'prefers terse answers' },
+      { by: 'm:mem-turn', userId: 'u1', agent: 'mem-turn', config: CONFIG },
+    );
+    await seed('mt-1', 'mem-turn', 'hi');
+    await runTurn('mt-1', buildRunConfig(getAgent('mem-turn')!, 'u1'));
+
+    assert.include(seen.system, 'You are helpful.');
+    assert.include(seen.system, '## Memory');
+    assert.include(seen.system, 'prefers terse answers');
+    assert.includeMembers(
+      seen.tools.map((t: any) => t.name),
+      ['memory_save', 'memory_search', 'memory_forget'],
+    );
+  });
+
+  it('gives a SUBAGENT CHILD no memory at all (decision 20)', async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+    const { saveMemory } = await import('../server/memory');
+
+    let seen: any = null;
+    defineAgent('mem-child', {
+      model: 'mock',
+      instructions: 'child',
+      memory: true,
+      provider: {
+        async *stream(req: any) {
+          seen = req;
+          yield { kind: 'text', chunk: 'ok' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      } as any,
+    });
+    await saveMemory(
+      { text: 'MARKER-parent-memory' },
+      { by: 'm:mem-child', userId: 'u1', agent: 'mem-child', config: CONFIG },
+    );
+    // A child session — its transcript folds back into the parent, which is
+    // the memory-bearing conversation.
+    await seed('mt-child', 'mem-child', 'do the thing', {
+      parent: { sessionId: 'p1', toolCallId: 't1', agent: 'mem-child' },
+    });
+    await runTurn('mt-child', buildRunConfig(getAgent('mem-child')!, 'u1'));
+
+    assert.notInclude(seen.system, '## Memory');
+    assert.notInclude(seen.system, 'MARKER-parent-memory');
+    assert.notIncludeMembers(seen.tools.map((t: any) => t.name), ['memory_save'],
+      'a child must not be able to write the parent memory');
+  });
+
+  it('gives an EPHEMERAL (Agent.ask) session no memory either', async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+
+    let seen: any = null;
+    defineAgent('mem-eph', {
+      model: 'mock',
+      instructions: 'throwaway',
+      memory: true,
+      provider: {
+        async *stream(req: any) {
+          seen = req;
+          yield { kind: 'text', chunk: 'ok' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      } as any,
+    });
+    await seed('mt-eph', 'mem-eph', 'one shot', { ephemeral: true });
+    await runTurn('mt-eph', buildRunConfig(getAgent('mem-eph')!, 'u1'));
+    assert.notInclude(seen.system, '## Memory');
+    assert.notIncludeMembers(seen.tools.map((t: any) => t.name), ['memory_save']);
+  });
+
+  it('runs the hint ONCE per turn, not once per iteration', async function () {
+    this.timeout(30000);
+    const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
+    const { runTurn } = await import('../server/loop');
+    const { saveMemory, _setMemorySearch } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+
+    let searches = 0;
+    const restore = _setMemorySearch(async (sel, _q, limit) => {
+      searches += 1;
+      return AgentMemories.find(sel as any, { limit }).fetchAsync();
+    });
+    try {
+      let call = 0;
+      defineAgent('mem-hint', {
+        model: 'mock',
+        instructions: 'x',
+        memory: { hints: true },
+        // Two iterations: a tool call, then a final answer.
+        tools: [{
+          name: 'noop',
+          description: 'does nothing',
+          args: { type: 'object', properties: {}, additionalProperties: false },
+          run: async () => 'done',
+        }],
+        provider: {
+          async *stream() {
+            call += 1;
+            if (call === 1) {
+              yield {
+                kind: 'done',
+                usage: { input: 1, output: 1 },
+                toolCalls: [{ id: 'c1', name: 'noop', args: {} }],
+              };
+            } else {
+              yield { kind: 'text', chunk: 'final' };
+              yield { kind: 'done', usage: { input: 1, output: 1 } };
+            }
+          },
+        } as any,
+      });
+      await saveMemory(
+        { text: 'something recallable' },
+        { by: 'm:mem-hint', userId: 'u1', agent: 'mem-hint', config: CONFIG },
+      );
+      await seed('mt-hint', 'mem-hint', 'please recall something');
+      await runTurn('mt-hint', buildRunConfig(getAgent('mem-hint')!, 'u1'));
+
+      assert.isAtLeast(call, 2, 'the turn must have run more than one iteration');
+      // The whole point of the seq-keyed cache: the newest user row does not
+      // change across iterations, so the embedding aggregation runs once.
+      assert.equal(searches, 1,
+        `the hint must run once per turn, not once per iteration (ran ${searches}x)`);
+    } finally { restore(); }
   });
 });

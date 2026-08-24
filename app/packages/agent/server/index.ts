@@ -27,7 +27,7 @@ export { NAMES } from '../common/names';
 // an app reaches the store through `Agent.memory`.
 export {
   saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint,
-  readSelector, _setMemorySearch, _activeRung,
+  readSelector, _setMemorySearch, _activeRung, _forceRegexRung,
   type SaveArgs, type SaveResult, type ForgetResult, type SearchRung,
   type ListedMemories,
 } from './memory';

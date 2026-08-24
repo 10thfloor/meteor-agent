@@ -169,6 +169,19 @@ export function _setMemorySearch(
 /** The active rung, for tests and diagnostics. */
 export function _activeRung(): SearchRung | null { return activeRung; }
 
+/** TEST SEAM, not public API: force the FLOOR rung by declaring the two rungs
+ *  above it unavailable. Without this a suite cannot reach `regexSearch` at
+ *  all — the text index exists in the test database, so the text rung answers
+ *  first and the escaping the hint path depends on goes unexercised. Returns
+ *  a restore fn. */
+export function _forceRegexRung(): () => void {
+  const prevVector = vectorAvailable;
+  const prevText = textAvailable;
+  vectorAvailable = false;
+  textAvailable = false;
+  return () => { vectorAvailable = prevVector; textAvailable = prevText; };
+}
+
 let vectorSearchImpl:
   | ((sel: Record<string, unknown>, query: string, limit: number) => Promise<AgentMemory[]>)
   | null = null;

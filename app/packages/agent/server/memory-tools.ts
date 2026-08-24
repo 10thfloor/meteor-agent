@@ -1,3 +1,4 @@
+import { AgentMemories } from '../common/collections';
 import type { ResolvedMemory } from '../common/types';
 import { MEMORY_TEXT_MAX } from '../common/types';
 import { forgetMemory, saveMemory, searchMemory } from './memory';
@@ -15,16 +16,41 @@ import { MEMORY_TOOL_NAMES, warnSkill, type ResolvedTool } from './tools';
  * `memory-methods.ts` and call the SAME core.
  */
 
-/** Whether an app-scope save must be approved. The default gate is a
- *  PREDICATE, not the `'ask'` literal, because the answer depends on the
- *  model's arguments: promoting a fact to shared work knowledge is the
- *  consent moment (spec §7), while a personal note is not.
+/** Whether a SAVE must be approved. The default gate is a PREDICATE, not the
+ *  `'ask'` literal, because the answer depends on the model's arguments:
+ *  promoting a fact to shared work knowledge is the consent moment (spec §7),
+ *  while a personal note is not.
  *
  *  An app replaces this wholesale by declaring its own `gate` — this is an
  *  ordinary tool gate, with no privileged status. */
-function memoryGate(ctx: { args: unknown }): boolean | 'ask' {
+function saveGate(ctx: { args: unknown }): boolean | 'ask' {
   const scope = (ctx.args as { scope?: unknown } | null)?.scope;
   return scope === 'app' ? 'ask' : true;
+}
+
+/**
+ * Whether a FORGET must be approved — and it cannot be answered from the
+ * arguments, which is why this is its own predicate and not `saveGate`.
+ *
+ * `memory_forget` takes `{ id }` and nothing else: there is no `scope` in the
+ * args to read, so reusing the save gate resolved `'auto'` for every delete
+ * and let a model quietly remove work knowledge a human had approved —
+ * asymmetric in exactly the wrong direction, since writing to the shared pool
+ * asked and erasing from it did not.
+ *
+ * The scope lives on the ROW, so the gate reads the row. A miss (an id that
+ * matches nothing, or someone else's row) resolves `'auto'`: the tool body
+ * answers those as an ordinary no-op, and parking a human on a delete that
+ * was never going to happen is worse than running it.
+ */
+function forgetGate(config: ResolvedMemory) {
+  return async (ctx: { args: unknown }): Promise<boolean | 'ask'> => {
+    if (!config.scopes.includes('app')) return true;
+    const id = (ctx.args as { id?: unknown } | null)?.id;
+    if (typeof id !== 'string' || id === '') return true;
+    const row = await AgentMemories.findOneAsync(id);
+    return row?.scope === 'app' ? 'ask' : true;
+  };
 }
 
 export interface MemoryToolOptions {
@@ -80,7 +106,7 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
       required: ['text'],
       additionalProperties: false,
     },
-    gate: memoryGate,
+    gate: saveGate,
     kind: 'inline',
     // Rendered to the human at the approval prompt. Carries SCOPE and TEXT
     // only: `describe`'s ctx is `{ userId, sessionId }` and it runs before
@@ -147,9 +173,17 @@ function forgetTool(opts: MemoryToolOptions): ResolvedTool {
       required: ['id'],
       additionalProperties: false,
     },
-    gate: memoryGate,
+    gate: forgetGate(opts.config),
     kind: 'inline',
-    describe: (args: any) => `Forget memory ${String(args?.id ?? '')}`,
+    // The approver is shown WHAT is being forgotten, not just an opaque id —
+    // an id alone is not a decision anyone can make.
+    describe: async (args: any) => {
+      const row = await AgentMemories.findOneAsync(String(args?.id ?? ''));
+      if (!row) return `Forget memory ${String(args?.id ?? '')}`;
+      return row.scope === 'app'
+        ? `Forget for ALL users: "${row.text.slice(0, 300)}"`
+        : `Forget: "${row.text.slice(0, 300)}"`;
+    },
     run: async (args: any, ctx) => forgetMemory(String(args?.id ?? ''), {
       userId: ctx?.userId ?? null,
       agent: opts.agent,
