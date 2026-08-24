@@ -1,6 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import type { Mongo } from 'meteor/mongo';
-import { AgentMessages, AgentSessions } from '../common/collections';
+import { AgentMemories, AgentMessages, AgentSessions } from '../common/collections';
 import {
   ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
   DeliveryReceipts, InboundSubmissions,
@@ -55,7 +55,9 @@ export async function ensureIndexes(): Promise<void> {
   const specs: Array<{
     collection: Pick<Mongo.Collection<any>, 'createIndexAsync'>;
     name: string;
-    keys: Record<string, 1 | -1>;
+    // `'text'` joins the union for the memory fallback rung — a text index
+    // is the ladder's middle rung and the driver takes it on the same call.
+    keys: Record<string, 1 | -1 | 'text'>;
     options?: Record<string, unknown>;
   }> = [
     {
@@ -171,6 +173,37 @@ export async function ensureIndexes(): Promise<void> {
       keys: { createdAt: 1 } as Record<string, 1 | -1>,
       options: { expireAfterSeconds: Math.round(retentionDays * 24 * 60 * 60) },
     }] : []),
+    // ---- Memory (memory spec §4) ----
+    // Person/agent rows: the standing block's read and the per-(user, scope)
+    // cap count both come in on this one.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { userId: 1, scope: 1, at: -1 },
+    },
+    // The APP pool needs its own: app rows carry no `userId`, so the compound
+    // index above cannot serve the work section, the pool's cap count, or the
+    // publication's app clause — all three would collection-scan without this.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { scope: 1, at: -1 },
+    },
+    // The ladder's middle rung. Non-fatal if the deployment refuses it (the
+    // loop below warns and moves on) — search then degrades to the regex rung,
+    // which is exactly what the ladder exists to make survivable.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { text: 'text' },
+    },
+    // Opt-in decay: sparse, so rows without `expiresAt` are simply not in it.
+    {
+      collection: AgentMemories,
+      name: NAMES.memories,
+      keys: { expiresAt: 1 },
+      options: { sparse: true, expireAfterSeconds: 0 },
+    },
   ];
 
   for (const spec of specs) {

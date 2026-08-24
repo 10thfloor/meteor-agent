@@ -496,3 +496,93 @@ export interface ViewMessage extends Omit<AgentMessage, 'createdAt'> {
    *  reconstructions, which have not been created yet in any durable sense. */
   createdAt?: Date;
 }
+
+/* ---------------------------------------------------------------------------
+ * Memory (memory spec)
+ * ------------------------------------------------------------------------ */
+
+/**
+ * One remembered fact.
+ *
+ * Two kinds share this row, distinguished by `scope`:
+ *
+ *   - PERSON memory (`'user'`, the default, and `'agent'`) carries a real
+ *     `userId`. Recall follows the HUMAN, not the model: because a turn always
+ *     runs as the session owner (participants decision 10), every model on the
+ *     roster reads the same person store.
+ *   - WORK memory (`'app'`) carries NO `userId` at all. That absence IS the
+ *     sharing, made explicit rather than encoded as a sentinel: one pool, read
+ *     by every agent in every session, written only through an approval.
+ *
+ * `userId` is therefore never `null` — it is a real id or it is absent. The
+ * anonymous rule is untouched: an anonymous session has no person store, and
+ * the standing block says so.
+ */
+export interface AgentMemory {
+  _id: string;
+  /** Present for `'user'`/`'agent'` rows; ABSENT for `'app'` rows. */
+  userId?: string;
+  scope: MemoryScope;
+  /** Present only for `scope: 'agent'` — the registry name whose private
+   *  per-user note this is. */
+  agent?: string;
+  /** The fact itself. This is the field mongot auto-embeds. */
+  text: string;
+  /** Provenance, never authorization (decision 14): a participant id
+   *  (`'m:analyst'`, `'h:xyz'`) or `'app'` for a server-side write. On a
+   *  model-initiated save this is the MODEL's id — the speaking member's id
+   *  lives on the message `from` and never reaches a tool body. */
+  by: string;
+  /** Deliberate-upsert identity. Two saves with the same key over the same
+   *  scope resolve to ONE row (adopt on collision), which is what makes a
+   *  crash-recovery re-run idempotent. */
+  key?: string;
+  /** Always present in the standing block, up to `index.pinned` of them. */
+  pinned?: true;
+  at: Date;
+  /** Opt-in decay, swept by a sparse TTL index. No global forgetting policy. */
+  expiresAt?: Date;
+}
+
+/** Where a memory lives. `'app'` is the shared work pool; the fourth quadrant
+ *  (agent-private, cross-user) is deliberately not built. */
+export type MemoryScope = 'user' | 'agent' | 'app';
+
+export const MEMORY_SCOPES: readonly MemoryScope[] = ['user', 'agent', 'app'];
+
+/** Rows per (user, scope) before a save is refused — the `MAX_PARTICIPANTS`
+ *  move. The app pool gets its own, larger default. */
+export const MEMORY_MAX_DEFAULT = 200;
+export const MEMORY_MAX_APP_DEFAULT = 500;
+
+/** A memory is a fact, not a document. Enforced in the core with a structured
+ *  refusal naming the limit — never a silent truncation. */
+export const MEMORY_TEXT_MAX = 2000;
+
+/** The resolved `memory` config, frozen into the registry entry at define()
+ *  time (the `budget` idiom) so the loop and the tools read settled values. */
+export interface ResolvedMemory {
+  hints: false | { minScore: number };
+  max: number;
+  maxApp: number;
+  index: { pinned: number; recent: number };
+  scopes: MemoryScope[];
+  search?: MemorySearchFn;
+}
+
+/** The app-installed top rung of the search ladder. Wins over every built-in
+ *  rung, including `$vectorSearch`. */
+export type MemorySearchFn = (
+  query: string,
+  ctx: { userId: string | null; agent: string; scopes: MemoryScope[]; limit: number },
+) => Promise<AgentMemory[]> | AgentMemory[];
+
+/** What an app writes in `Agent.define`. `true` takes every default. */
+export type MemoryConfig = boolean | {
+  hints?: boolean | { minScore?: number };
+  max?: number;
+  maxApp?: number;
+  index?: { pinned?: number; recent?: number };
+  scopes?: MemoryScope[];
+  search?: MemorySearchFn;
+};

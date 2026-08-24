@@ -1,0 +1,458 @@
+import { Random } from 'meteor/random';
+import { AgentMemories } from '../common/collections';
+import {
+  MEMORY_TEXT_MAX,
+  type AgentMemory, type MemoryScope, type ResolvedMemory,
+} from '../common/types';
+
+/**
+ * The memory store's core: every rule about who may remember what, how much,
+ * and how it is found. A LEAF module — collections and types only — so the
+ * loop, the tools, the DDP methods and `Agent.memory` can all call in without
+ * a cycle.
+ *
+ * BOTH surfaces funnel here (memory spec decision 7). The model reaches these
+ * functions through per-agent inline tools that close over the resolved config
+ * and the running model's participant id; the UI reaches them through three
+ * global DDP methods whose bodies apply a NARROWER policy first (decision 7a:
+ * gates only run on the loop's dispatch path, so the DDP surface must refuse
+ * app-scope writes itself rather than trust a gate that will never fire).
+ *
+ * The split matters because an adopted Meteor method body receives only the
+ * invocation and its args — no session, no agent name, no config — which is
+ * why "co-registered method" could not carry memory and this core exists.
+ */
+
+/* ---------------------------------------------------------------------------
+ * Scoping
+ * ------------------------------------------------------------------------ */
+
+/** The selector for one scope's rows.
+ *
+ *  `'app'` rows carry NO `userId` — the absence IS the sharing (spec §4), so
+ *  the app clause must not mention the field at all: `{ userId: undefined }`
+ *  would serialize to a match on missing-or-null and quietly pull anonymous
+ *  rows if any ever existed. */
+function scopeClause(
+  scope: MemoryScope, userId: string | null, agent: string,
+): Record<string, unknown> | null {
+  if (scope === 'app') return { scope: 'app' };
+  // Person and agent memory need a real account. An anonymous session has no
+  // person store at all (spec decision 13) — not an empty one, and never a
+  // store keyed by null that every anonymous holder would share.
+  if (userId === null) return null;
+  if (scope === 'agent') return { scope: 'agent', userId, agent };
+  return { scope: 'user', userId };
+}
+
+/** The `$or` over every scope this agent may read. Null when nothing is
+ *  readable (an anonymous session whose config lists only person scopes). */
+export function readSelector(
+  scopes: MemoryScope[], userId: string | null, agent: string,
+): { $or: Array<Record<string, unknown>> } | null {
+  const clauses = scopes
+    .map((s) => scopeClause(s, userId, agent))
+    .filter((c): c is Record<string, unknown> => c !== null);
+  return clauses.length > 0 ? { $or: clauses } : null;
+}
+
+/* ---------------------------------------------------------------------------
+ * Reads — the standing block
+ * ------------------------------------------------------------------------ */
+
+export interface ListedMemories {
+  person: AgentMemory[];
+  work: AgentMemory[];
+  personTotal: number;
+  workTotal: number;
+}
+
+/**
+ * The standing block's read (spec §6): pinned first, then most-recent, split
+ * into the person and work sections so neither can crowd the other out.
+ *
+ * A DIRECT `findAsync`, never the search ladder — that is what makes a fact
+ * saved this turn visible in the next iteration's block and in a colleague's
+ * next turn, without waiting on mongot's change stream to index it.
+ *
+ * Overflow pinned rows do NOT consume recent slots: the caps are per-section
+ * and the totals below tell the model more exist.
+ */
+export async function listForBlock(
+  userId: string | null, agent: string, config: ResolvedMemory,
+): Promise<ListedMemories> {
+  const { pinned, recent } = config.index;
+  const section = async (scopes: MemoryScope[]) => {
+    const sel = readSelector(scopes, userId, agent);
+    if (!sel) return { rows: [] as AgentMemory[], total: 0 };
+    const total = await AgentMemories.find(sel as any).countAsync();
+    if (total === 0) return { rows: [] as AgentMemory[], total };
+    const pins = await AgentMemories.find(
+      { ...sel, pinned: true } as any, { sort: { at: -1 }, limit: pinned },
+    ).fetchAsync();
+    const pinIds = new Set(pins.map((r) => r._id));
+    // Fetch recent + |pins| and drop the pinned ones rather than excluding by
+    // id in the query: `$nin` over a growing id list is the kind of selector
+    // that degrades quietly, and the extra rows are bounded by `pinned`.
+    const rest = await AgentMemories.find(
+      sel as any, { sort: { at: -1 }, limit: recent + pins.length },
+    ).fetchAsync();
+    return {
+      rows: [...pins, ...rest.filter((r) => !pinIds.has(r._id)).slice(0, recent)],
+      total,
+    };
+  };
+
+  const personScopes = config.scopes.filter((s) => s !== 'app');
+  const workScopes = config.scopes.filter((s) => s === 'app');
+  const [p, w] = await Promise.all([section(personScopes), section(workScopes)]);
+  return { person: p.rows, work: w.rows, personTotal: p.total, workTotal: w.total };
+}
+
+/* ---------------------------------------------------------------------------
+ * The search ladder
+ * ------------------------------------------------------------------------ */
+
+export type SearchRung = 'installed' | 'vector' | 'text' | 'regex';
+
+/** Which rung answered last — read by tests and by the one-time warning. */
+let activeRung: SearchRung | null = null;
+/** `null` = not yet probed. Cached in module state, the `SERVER_ID` idiom:
+ *  the answer is a property of the deployment, not of a call. */
+let vectorAvailable: boolean | null = null;
+let textAvailable: boolean | null = null;
+
+const warnedKinds = new Set<string>();
+/** One warn per distinct message kind, keyed on a stable prefix — the
+ *  `warnedGateKinds` latch, verbatim in shape. A degraded rung recurs on
+ *  every turn, and one line per search would bury the notice. */
+function warnMemory(message: string): void {
+  const kind = message.slice(0, 40);
+  if (warnedKinds.has(kind)) return;
+  warnedKinds.add(kind);
+  console.warn(`[10thfloor:agent] ${message}`);
+}
+
+/** Regex metacharacters, escaped. The package has no such helper, and the
+ *  hint path feeds it RAW human text: `order #8812 (dispute` compiles to a
+ *  SyntaxError, which inside the per-iteration assembly would take the turn
+ *  down — precisely what "the ladder never fails a turn" forbids. */
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/** TEST SEAM, not public API: replaces the vector rung so a suite can drive
+ *  the ladder without a mongot. Returns a restore fn, and resets the probe
+ *  cache and the warn latch — `tests/server.ts` runs every suite in one
+ *  process, so a latch armed by one test would silence the next. */
+export function _setMemorySearch(
+  fn: ((sel: Record<string, unknown>, query: string, limit: number)
+    => Promise<AgentMemory[]>) | null,
+): () => void {
+  const prevVector = vectorSearchImpl;
+  const prevAvailable = vectorAvailable;
+  const prevText = textAvailable;
+  vectorSearchImpl = fn;
+  vectorAvailable = fn ? true : null;
+  textAvailable = null;
+  activeRung = null;
+  warnedKinds.clear();
+  return () => {
+    vectorSearchImpl = prevVector;
+    vectorAvailable = prevAvailable;
+    textAvailable = prevText;
+    activeRung = null;
+    warnedKinds.clear();
+  };
+}
+
+/** The active rung, for tests and diagnostics. */
+export function _activeRung(): SearchRung | null { return activeRung; }
+
+let vectorSearchImpl:
+  | ((sel: Record<string, unknown>, query: string, limit: number) => Promise<AgentMemory[]>)
+  | null = null;
+
+/**
+ * `$vectorSearch` with automated embedding (mongot). The query STRING goes to
+ * the pipeline — mongot embeds it at search time — so there is no embedding
+ * call of our own to make, no key to hold, and nothing to keep in sync.
+ *
+ * A deployment without mongot errors on the unknown stage. That is a
+ * capability answer, not a transient one: probe once, cache, and fall down the
+ * ladder for the life of the process.
+ */
+async function vectorSearch(
+  sel: Record<string, unknown>, query: string, limit: number,
+): Promise<AgentMemory[]> {
+  if (vectorSearchImpl) return vectorSearchImpl(sel, query, limit);
+  const cursor = await (AgentMemories as any).rawCollection().aggregate([
+    {
+      $vectorSearch: {
+        index: 'agent_memories_vector',
+        path: 'text',
+        query,
+        numCandidates: Math.max(limit * 10, 50),
+        limit,
+      },
+    },
+    { $match: sel },
+  ]);
+  return cursor.toArray() as Promise<AgentMemory[]>;
+}
+
+async function textSearch(
+  sel: Record<string, unknown>, query: string, limit: number,
+): Promise<AgentMemory[]> {
+  return AgentMemories.find(
+    { ...sel, $text: { $search: query } } as any, { limit },
+  ).fetchAsync();
+}
+
+/** The floor. Always works, on any mongod, with no index at all — which is
+ *  what makes the ladder's promise ("search narrows, never disappears") true
+ *  even on a stock dev database. */
+async function regexSearch(
+  sel: Record<string, unknown>, query: string, limit: number,
+): Promise<AgentMemory[]> {
+  const tokens = query.split(/\s+/).filter((t) => t.length > 2).slice(0, 8);
+  if (tokens.length === 0) {
+    return AgentMemories.find(sel as any, { sort: { at: -1 }, limit }).fetchAsync();
+  }
+  return AgentMemories.find(
+    {
+      $and: [
+        sel,
+        { $or: tokens.map((t) => ({ text: { $regex: escapeRegExp(t), $options: 'i' } })) },
+      ],
+    } as any,
+    { sort: { at: -1 }, limit },
+  ).fetchAsync();
+}
+
+/**
+ * Recall, down the ladder: installed fn → `$vectorSearch` → `$text` → regex.
+ *
+ * Every rung failure DEGRADES rather than throws. A search that takes the turn
+ * down is worse than a search that returns less: the model can route around a
+ * thin answer, but a thrown error inside the hint path kills a conversation
+ * over a database capability nobody chose.
+ */
+export async function searchMemory(
+  query: string,
+  opts: {
+    userId: string | null; agent: string; config: ResolvedMemory; limit?: number;
+  },
+): Promise<AgentMemory[]> {
+  const limit = Math.max(1, Math.min(opts.limit ?? 5, 25));
+  const q = String(query ?? '').trim();
+  if (!q) return [];
+  const sel = readSelector(opts.config.scopes, opts.userId, opts.agent);
+  if (!sel) return [];
+
+  if (opts.config.search) {
+    activeRung = 'installed';
+    try {
+      const rows = await opts.config.search(q, {
+        userId: opts.userId, agent: opts.agent, scopes: opts.config.scopes, limit,
+      });
+      return Array.isArray(rows) ? rows.slice(0, limit) : [];
+    } catch (e) {
+      // An app's own search throwing is the app's bug, but it must not be the
+      // conversation's death. Warn and fall through to the built-in rungs.
+      warnMemory(`the installed memory search fn threw; falling back to the built-in `
+        + `ladder: ${(e as Error)?.message}`);
+    }
+  }
+
+  if (vectorAvailable !== false) {
+    try {
+      const rows = await vectorSearch(sel as any, q, limit);
+      vectorAvailable = true;
+      activeRung = 'vector';
+      return rows;
+    } catch (e) {
+      if (vectorAvailable === null) {
+        vectorAvailable = false;
+        warnMemory('this deployment cannot run $vectorSearch on the memory store '
+          + '(no mongot, or no vector index), so recall is running on the text/regex '
+          + 'rung — semantic matches will be missed. See the README\'s mongot notes.');
+      }
+      // Already known-available and it still failed: a transient mongot blip.
+      // Degrade this ONE call without un-caching the capability.
+    }
+  }
+
+  if (textAvailable !== false) {
+    try {
+      const rows = await textSearch(sel as any, q, limit);
+      textAvailable = true;
+      activeRung = 'text';
+      return rows;
+    } catch {
+      if (textAvailable === null) {
+        textAvailable = false;
+        warnMemory('the memory text index is unavailable, so recall is running on the '
+          + 'regex rung — matching is literal and unranked.');
+      }
+    }
+  }
+
+  activeRung = 'regex';
+  return regexSearch(sel as any, q, limit);
+}
+
+/* ---------------------------------------------------------------------------
+ * Writes
+ * ------------------------------------------------------------------------ */
+
+export interface SaveArgs {
+  text: string;
+  scope?: MemoryScope;
+  key?: string;
+  pinned?: boolean;
+}
+
+export type SaveResult =
+  | { ok: true; id: string; updated: boolean }
+  | { ok: false; error: string; reason: string };
+
+/**
+ * Remember one fact.
+ *
+ * Structured refusals rather than throws for every rule the MODEL can trip
+ * (too long, unknown scope, scope not enabled, no account, pool full): a
+ * refusal the model can read is a refusal it can route around, where a throw
+ * spends a turn on an error note.
+ *
+ * `key` is the deliberate-upsert identity: two saves with the same key over
+ * the same scope resolve to ONE row. That is what makes a crash-recovery
+ * re-run of the tool idempotent — the participants spec's thread-key lesson,
+ * applied to a store the model writes.
+ */
+export async function saveMemory(
+  args: SaveArgs,
+  opts: {
+    by: string; userId: string | null; agent: string; config: ResolvedMemory;
+  },
+): Promise<SaveResult> {
+  const text = String(args?.text ?? '').trim();
+  if (!text) {
+    return { ok: false, error: 'invalid-args', reason: 'A memory needs non-empty "text".' };
+  }
+  if (text.length > MEMORY_TEXT_MAX) {
+    return {
+      ok: false,
+      error: 'too-long',
+      reason: `A memory is a fact, not a document: "text" must be at most `
+        + `${MEMORY_TEXT_MAX} characters (got ${text.length}). Save the fact, not the transcript.`,
+    };
+  }
+
+  const scope = (args?.scope ?? 'user') as MemoryScope;
+  if (!opts.config.scopes.includes(scope)) {
+    return {
+      ok: false,
+      error: 'scope-unavailable',
+      reason: `This agent's memory does not include the "${scope}" scope; `
+        + `available scopes: ${opts.config.scopes.join(', ')}.`,
+    };
+  }
+  if (scope !== 'app' && opts.userId === null) {
+    return {
+      ok: false,
+      error: 'no-account',
+      reason: 'This conversation has no signed-in account, so there is no personal '
+        + 'memory to save to.',
+    };
+  }
+
+  const clause = scopeClause(scope, opts.userId, opts.agent);
+  if (!clause) {
+    return { ok: false, error: 'no-account', reason: 'No memory store for this session.' };
+  }
+
+  // Deliberate upsert. Checked BEFORE the cap so that updating an existing
+  // fact in a full store still works — a full store must not freeze the
+  // corrections the model is most likely to want to make.
+  if (args.key) {
+    const existing = await AgentMemories.findOneAsync({ ...clause, key: args.key } as any);
+    if (existing) {
+      await AgentMemories.updateAsync(
+        existing._id,
+        {
+          $set: {
+            text,
+            by: opts.by,
+            at: new Date(),
+            ...(args.pinned ? { pinned: true as const } : {}),
+          },
+        },
+      );
+      return { ok: true, id: existing._id, updated: true };
+    }
+  }
+
+  const max = scope === 'app' ? opts.config.maxApp : opts.config.max;
+  const count = await AgentMemories.find(clause as any).countAsync();
+  if (count >= max) {
+    return {
+      ok: false,
+      error: 'memory-full',
+      reason: `The "${scope}" memory store already holds its maximum of ${max} entries. `
+        + 'Forget something first, or save with the "key" of the entry this replaces.',
+    };
+  }
+
+  const row: AgentMemory = {
+    _id: Random.id(),
+    scope,
+    text,
+    by: opts.by,
+    at: new Date(),
+    ...(scope === 'app' ? {} : { userId: opts.userId as string }),
+    ...(scope === 'agent' ? { agent: opts.agent } : {}),
+    ...(args.key ? { key: args.key } : {}),
+    ...(args.pinned ? { pinned: true as const } : {}),
+  };
+  await AgentMemories.insertAsync(row);
+  return { ok: true, id: row._id, updated: false };
+}
+
+export type ForgetResult =
+  | { ok: true; forgotten: boolean }
+  | { ok: false; error: string; reason: string };
+
+/**
+ * Forget one fact, by id.
+ *
+ * `allowApp` is the decision-7a knob: the DDP surface passes `false`, because
+ * shared work knowledge arrived through an approval and must not be deletable
+ * by any signed-in client. The model's tool passes `true` — its call went
+ * through the same gate its save did.
+ */
+export async function forgetMemory(
+  id: string,
+  opts: { userId: string | null; agent: string; allowApp: boolean },
+): Promise<ForgetResult> {
+  const row = await AgentMemories.findOneAsync(String(id ?? ''));
+  if (!row) return { ok: true, forgotten: false };
+
+  if (row.scope === 'app') {
+    if (!opts.allowApp) {
+      return {
+        ok: false,
+        error: 'denied-scope',
+        reason: 'Shared work memory cannot be deleted from a client; it is removed by '
+          + 'an approved agent action or server-side.',
+      };
+    }
+  } else if (opts.userId === null || row.userId !== opts.userId) {
+    // Not "not found": a row that exists but belongs to someone else must not
+    // be distinguishable from one that never existed.
+    return { ok: true, forgotten: false };
+  }
+
+  const n = await AgentMemories.removeAsync(row._id);
+  return { ok: true, forgotten: n === 1 };
+}
