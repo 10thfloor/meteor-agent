@@ -25,6 +25,7 @@ from the demo app in [`app/`](../app), it says so.
 | **Forking** — branch a conversation at a batch-safe point | [Forking](#forking) |
 | **Compaction** — the model's view shrinks, the transcript keeps everything | [Compaction](#compaction) |
 | **Skills & hooks** — on-demand prompt fragments; the two extension seams | [Skills](#skills) · [Hooks](#hooks) |
+| **Memory** — durable recall about people and about the work, in a collection your UI can read | [Memory](#memory) |
 | **UI** — `<agent-chat>`, one tag, themable through custom properties and `::part()` | [`<agent-chat>`](#agent-chat) |
 | **Validation** — model arguments checked against full JSON Schema, fail-closed on public endpoints | [Validation](#validation) |
 
@@ -1652,6 +1653,144 @@ Warnings are latched per kind, not per occurrence, so "a hook threw" cannot
 permanently suppress "a hook returned a malformed request". An unknown hook name
 — or a non-function — throws at **registration**: a typo'd hook is a hook that
 silently never runs, and you would find out when your redaction did not happen.
+
+## Memory
+
+An agent with `memory` remembers across conversations — and because the store is a Mongo collection, your
+UI can show the user exactly what it knows and let them delete it.
+
+```ts
+// server
+Support.define({ ..., memory: true });
+```
+
+That is the entire opt-in. Three tools appear (`memory_save`, `memory_search`, `memory_forget`) and a
+compact listing is appended to the system prompt each iteration. Leave `memory` out and nothing changes.
+
+### What the model sees
+
+```
+## Memory
+About this person (3 remembered):
+- prefers email over Slack for anything billing-related
+- order #8812 dispute resolved — auth hold, not a double charge [pinned]
+About this work (2 remembered):
+- orders table soft-deletes; filter deletedAt: null [learned by m:analyst]
+Possibly relevant to the latest message: order #8812 dispute resolved
+Use memory_search to recall details, memory_save to remember something new.
+```
+
+Titles only — the listing is an INDEX. Details come through `memory_search`, which is a normal tool call
+with a normal transcript row, so a UI can show precisely which memories informed an answer.
+
+The last line before the footer is the **hint**: once per turn the harness itself runs one search against
+the newest message and appends matching titles. No model call, no tokens, and content never arrives this
+way. `memory: { hints: false }` turns it off.
+
+### Memory is shared across the agents in a session
+
+```ts
+// server — support saves
+await Agent.memory.save('alice', { text: 'dispute #8812 was an auth hold', by: 'm:support' });
+
+// analyst, addressed later in the SAME session, reads the same store
+```
+
+Person memory is keyed by `userId` alone, and a turn always runs as the session owner, so every model on
+the roster reads one store. This is a consequence of the participants model, not a separate feature —
+see [Participants](#participants--nn-sessions).
+
+### Work memory, and the approval that guards it
+
+```ts
+// server
+Support.define({ ..., memory: { scopes: ['user', 'app'] } });
+```
+
+Now the model can propose facts about the *work* — true for every user, read in every session:
+
+```
+model → memory_save { text: "orders table soft-deletes; filter deletedAt: null", scope: "app" }
+       ↓ the gate returns 'ask' for app scope, so the turn parks
+human → sees "Remember for ALL users: «orders table soft-deletes…»" and clicks Approve
+       ↓ the row lands, stamped by: 'm:support'
+```
+
+Personal notes run straight through; only promotion to the shared pool asks. It is an ordinary tool gate,
+so replace it if your risk appetite differs:
+
+```ts
+// server — auto-approve work facts with no digits in them, ask otherwise
+tools: [{ name: 'memory_save', gate: ({ args }) => (
+  args.scope !== 'app' ? true : (/\d/.test(args.text) ? 'ask' : true)) }]
+```
+
+### The user's memory page
+
+```ts
+// client
+Meteor.subscribe('agent.memories');
+const rows = AgentMemories.find({}, { sort: { at: -1 } }).fetch();
+
+await Meteor.callAsync('memory.forget', { id });   // the delete button
+await Meteor.callAsync('memory.save', { text: 'call me Mac' });
+```
+
+The client surface is deliberately **narrower** than the model's. Approval gates run only inside the turn
+loop, so a DDP `memory.save` with `scope: 'app'` is refused outright — otherwise any signed-in account
+could write the pool that every session's prompt reads:
+
+```
+Meteor.Error('denied-scope', 'Shared work memory cannot be written from a client; …')
+```
+
+Server code has no such limit, because it is not a client:
+
+```ts
+// server — seed institutional knowledge at startup
+await Agent.memory.save(null, { text: 'refunds over $500 need finance sign-off', scope: 'app' });
+```
+
+### Search degrades, it never disappears
+
+| Rung | Needs | Gives |
+|---|---|---|
+| your `search` fn | nothing | whatever you implement |
+| `$vectorSearch` | MongoDB 8.2+ with `mongot` | semantic recall |
+| `$text` | the index this package creates | keyword ranking |
+| regex + recency | nothing | literal matching |
+
+The vector rung uses MongoDB's automated embedding — the query string goes to the database and `mongot`
+embeds it at search time, so there is no pipeline and no key:
+
+```js
+db.agent_memories.createSearchIndex({
+  name: 'agent_memories_vector',
+  type: 'vectorSearch',
+  definition: { fields: [{ type: 'text', path: 'text', model: 'voyage-3-large' }] },
+});
+```
+
+Capability is probed once and cached; a deployment without `mongot` logs one warning and runs on `$text`.
+A search failure is never a turn failure — that is the point of the ladder.
+
+Bring your own retrieval and it wins over every rung:
+
+```ts
+// server
+memory: { search: async (query, { userId, scopes, limit }) => myVectorStore.query(query, limit) }
+```
+
+### The edges, named
+
+- **Anonymous sessions have no personal store.** A store keyed on `null` would be one store shared by
+  every anonymous visitor. The listing says so and still serves work memory.
+- **Subagent children and `Agent.ask()` throwaways get no memory** — a child's work folds back into its
+  parent, which is the memory-bearing conversation.
+- **`by` is the model, not the speaker.** On a model-initiated save it is `m:<agent>`; the human who
+  prompted it is on the message's `from`.
+- **Caps refuse, they do not evict.** `max` (200) and `maxApp` (500) return a structured `memory-full` the
+  model can route around — and a keyed save still updates in a full store, so corrections never jam.
 
 ## Durability: what survives a crash
 
