@@ -148,8 +148,27 @@ export const smsLens: Lens = {
     const p = event as Record<string, string>;
     if (!p || typeof p !== 'object') return NOOP;
     const body = (p.Body ?? '').trim();
+
+    // MMS media ride as REFERENCES (participants spec §6): `MediaUrl<i>` on
+    // api.twilio.com (which 302s to Twilio's CDN — the core fetcher re-checks
+    // the redirect against the factory's host list). Twilio reports no size
+    // up front; the streaming abort is the ceiling.
+    const media: Array<{ name: string; contentType: string; url: string }> = [];
+    const n = Number(p.NumMedia ?? 0) || 0;
+    for (let i = 0; i < n; i += 1) {
+      const url = p[`MediaUrl${i}`];
+      if (typeof url === 'string' && url !== '') {
+        media.push({
+          name: `media-${i + 1}`,
+          contentType: p[`MediaContentType${i}`] ?? 'application/octet-stream',
+          url,
+        });
+      }
+    }
     // A delivery-status callback, not an inbound message — noop by design.
-    if (body === '' || !p.From || !p.To) return NOOP;
+    // The sharpened guard (participants spec §6.3): an image-only MMS is a
+    // MESSAGE, not a noop.
+    if ((body === '' && media.length === 0) || !p.From || !p.To) return NOOP;
 
     const envelope = {
       eventId: p.MessageSid ?? p.SmsSid,
@@ -165,7 +184,11 @@ export const smsLens: Lens = {
     // Everything else is a message — INCLUDING "YES"/"NO": whether those
     // decide a parked approval is the PIPELINE's call, made against the
     // receipt's registered expects (§8.3), never this stateless lens's.
-    return { intent: { kind: 'message', text: body }, ...envelope };
+    return {
+      intent: { kind: 'message', text: body },
+      ...envelope,
+      ...(media.length > 0 ? { attachments: media } : {}),
+    };
   },
 };
 
@@ -237,6 +260,10 @@ export interface SmsChannelOptions extends ChannelKnobs {
   /** Override the default `limit: 1500`. `interact` is fixed at `menu` — the
    *  reply-word grammar is how this lens answers prompts at all. */
   profile?: Pick<ChannelProfile, 'limit'>;
+  /** Set when the Twilio account enforces HTTP auth on media URLs (an account
+   *  setting; media is publicly fetchable by default): the fetcher then sends
+   *  Basic `accountSid:authToken`. */
+  mediaAuth?: boolean;
   /** TEST SEAM, threaded to the transport. */
   fetchImpl?: typeof fetch;
 }
@@ -261,6 +288,22 @@ export function sms(options: SmsChannelOptions): ChannelDef {
     // Note kinds delivered as statuses: the errors a texter must hear about,
     // and the approval outcome that closes a "Reply YES" exchange.
     statuses: options.statuses ?? ['error', 'approval'],
+    // The media recipe (participants spec §6): MediaUrl fetches are anonymous
+    // by default (Basic auth only when the account enforces media auth —
+    // `mediaAuth: true`). The CDN host is NOT contractual Twilio API surface;
+    // it is pinned here as a named maintenance liability — if Twilio moves
+    // its media CDN, this list is the one line that follows it.
+    media: {
+      hosts: ['api.twilio.com', 'media.twiliocdn.com'],
+      ...(options.mediaAuth ? {
+        request: (att) => ({
+          url: att.url ?? '',
+          headers: {
+            authorization: `Basic ${Buffer.from(`${options.accountSid}:${options.authToken}`).toString('base64')}`,
+          },
+        }),
+      } : {}),
+    },
     // Every knob the core names, forwarded by one helper — a knob added to
     // ChannelKnobs tomorrow is forwarded here without this file changing.
     ...channelKnobs(options),

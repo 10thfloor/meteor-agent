@@ -6,6 +6,7 @@ import {
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
 import { AgentAttachments } from './attachments';
+import { AttachmentDownloadTokens } from './downloads';
 import { NAMES } from '../common/names';
 
 /**
@@ -73,6 +74,17 @@ export async function ensureIndexes(): Promise<void> {
       name: NAMES.sessions,
       keys: { phase: 1, 'lease.until': 1 },
     },
+    // The membership clause (participants spec §4.2): `pubSessions`' $or and
+    // every roster-aware requireSession carry
+    // `participants.$elemMatch.userId`, and a multikey index on the path is
+    // what keeps a member's conversation list from scanning every session.
+    // Sparse buys nothing today (see the header) but is free and correct.
+    {
+      collection: AgentSessions,
+      name: NAMES.sessions,
+      keys: { 'participants.userId': 1 },
+      options: { sparse: true },
+    },
     // ---- Channels (channels spec §6) ----------------------------------------
     // The fan-out lookup: a committed row → every binding of its session
     // (the egress observer runs it per insert), and the notify-tool shape.
@@ -127,6 +139,14 @@ export async function ensureIndexes(): Promise<void> {
     {
       collection: ChannelVerdictTokens,
       name: NAMES.channelVerdictTokens,
+      keys: { expiresAt: 1 },
+      options: { expireAfterSeconds: 0 },
+    },
+    // Download tokens (participants spec §7): ~60s single-use capabilities;
+    // redemption checks `expiresAt` itself — this TTL is only the janitor.
+    {
+      collection: AttachmentDownloadTokens,
+      name: NAMES.attachmentTokens,
       keys: { expiresAt: 1 },
       options: { expireAfterSeconds: 0 },
     },

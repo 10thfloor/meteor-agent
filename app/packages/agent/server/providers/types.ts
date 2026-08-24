@@ -15,6 +15,17 @@ export interface ProviderMessage {
    *  `is_error`, which changes how the model treats the block. Set from the
    *  transcript row's `error` field by `toProviderMessages`. */
   isError?: boolean;
+  /**
+   * Multimodal reads (participants spec §9): image blocks riding a `tool`
+   * row's result — the ONE way image bytes reach a model, because
+   * `read_attachment` is the one gate (decision 13: an image is offered as a
+   * ref and read by choice). HYDRATED at request-build time in the loop —
+   * after the compaction estimate, never on the summarizer path — from refs
+   * the read stamped on the committed row; the row itself never carries
+   * bytes. Adapters map them into their tool-result content blocks; the mock
+   * simply exposes them to the script.
+   */
+  images?: Array<{ data: string; mimeType: string }>;
 }
 
 export interface ProviderRequest {
@@ -67,4 +78,16 @@ export type ProviderChunk =
 
 export interface Provider {
   stream(req: ProviderRequest): AsyncIterable<ProviderChunk>;
+  /**
+   * OPTIONAL capability declarations (participants spec §9). `imageInput`
+   * answers "may image blocks ride requests for this model?" — the pi-ai
+   * adapter reads its catalog's input modalities; the mock declares it per
+   * test; a provider that omits the whole surface answers NO by construction:
+   * the gate FAILS CLOSED, because pi-ai silently downgrades images to text
+   * placeholders for non-vision models, and a fail-open would quietly
+   * contradict the read tool's own result text.
+   */
+  capabilities?: {
+    imageInput?: (model: string) => boolean | Promise<boolean>;
+  };
 }

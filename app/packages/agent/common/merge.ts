@@ -62,6 +62,10 @@ export function mergeView(
       truncatedHead: tail[0].seq !== 0,
       deltaCount: tail.length,
       ...(toolArgs ? { toolArgs } : {}),
+      // Streaming attribution (participants spec §4.1): a rostered turn
+      // stamps its speaker on every delta; the in-flight row carries it so
+      // the element can label who is talking before the commit lands.
+      ...(ds[0].from ? { from: ds[0].from } : {}),
     });
   }
 

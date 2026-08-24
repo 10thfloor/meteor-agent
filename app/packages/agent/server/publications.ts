@@ -28,10 +28,21 @@ export function registerPublications(): void {
     // name, not the parent's: a client follows `childSessionId` with
     // `new Agent('<the subagent>').subscribe(childSessionId)`, and the scope
     // check is the same one that stops agent A driving agent B's transcript.
+    // MEMBERSHIP (participants spec §4.2): the owner clause first (the only
+    // one a null caller may ever match — the anonymous rule is the owner's
+    // alone), then the roster clause for signed-in members. The same
+    // two-branch check `requireSession` makes, so the read surface and the
+    // write surface agree about who a session belongs to.
+    const uid = this.userId ?? null;
     const session = await AgentSessions.findOneAsync({
       _id: sessionId,
       agent,
-      userId: this.userId ?? null,
+      $or: [
+        { userId: uid },
+        ...(uid !== null
+          ? [{ participants: { $elemMatch: { kind: 'human', userId: uid } } }]
+          : []),
+      ],
     });
     if (!session) return []; // publishes nothing and marks the sub ready
     return [
@@ -46,7 +57,13 @@ export function registerPublications(): void {
       // could read it learns nothing but could echo it back to confuse the
       // wind-down self-check.
       AgentSessions.find(
-        { _id: sessionId }, { fields: { lease: 0, 'pending.wakeToken': 0 } },
+        // `pendingRelay.token` joins the exclusions for exactly the
+        // wakeToken's reason: it is the IDENTITY of a scheduled wake, pure
+        // server bookkeeping, and a client that could read it learns nothing
+        // but could echo it to confuse the self-check. The `agent` half may
+        // ship — "a colleague's turn is scheduled" is renderable state.
+        { _id: sessionId },
+        { fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 } },
       ),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
@@ -71,14 +88,24 @@ export function registerPublications(): void {
     // once per subagent call. A client that wants a child reaches it the way it
     // learns about it: `childSessionId` on the parent's tool row, then
     // `agent.session`, which serves children without a special case.
+    // A member's conversation list includes sessions they were invited into
+    // (participants spec §4.2) — the `$or` mirrors `requireSession`, and the
+    // `'participants.userId'` index keeps the second clause from scanning.
     return AgentSessions.find(
-      { agent, userId: this.userId, parent: { $exists: false } },
+      {
+        agent,
+        $or: [
+          { userId: this.userId },
+          { participants: { $elemMatch: { kind: 'human', userId: this.userId } } },
+        ],
+        parent: { $exists: false },
+      },
       // `lease` and `pending.wakeToken` omitted here too — see the matching
       // comment on `pubSession`.
       {
         sort: { updatedAt: -1 },
         limit: 100,
-        fields: { lease: 0, 'pending.wakeToken': 0 },
+        fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 },
       },
     );
   });

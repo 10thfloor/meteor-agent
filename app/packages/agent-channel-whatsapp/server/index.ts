@@ -208,8 +208,33 @@ export const whatsappLens: Lens = {
       return { intent: { kind: 'message', text }, ...envelope };
     }
 
-    // Media, reactions, contacts, location — nothing the item vocabulary
-    // carries yet (attachments are the spec's named open question).
+    // MEDIA messages (participants spec §6): the Cloud API delivers a media
+    // ID, not bytes — and not even a URL: the fetch is two credentialed hops
+    // (GET /{media-id} returns JSON whose `url` is the real, minutes-lived
+    // target, both on Meta hosts). The lens emits the bare `ref`; the
+    // factory's media recipe — which owns the token AND the API version —
+    // builds the lookup URL and extracts the second hop. The caption is the
+    // message's words — a photo with a caption is a message either way (the
+    // sharpened guard).
+    const MEDIA_TYPES = ['image', 'document', 'audio', 'video', 'sticker'] as const;
+    if ((MEDIA_TYPES as readonly string[]).includes(String(m.type))) {
+      const media = (m as any)[m.type as string] ?? {};
+      if (typeof media.id !== 'string' || media.id === '') return NOOP;
+      const caption = String(media.caption ?? '').trim();
+      return {
+        intent: { kind: 'message', text: caption },
+        ...envelope,
+        attachments: [{
+          name: String(media.filename ?? `${m.type}`),
+          contentType: String(media.mime_type ?? 'application/octet-stream'),
+          ...(Number(media.file_size) > 0 ? { declaredSize: Number(media.file_size) } : {}),
+          ref: media.id,
+          indirect: true as const,
+        }],
+      };
+    }
+
+    // Reactions, contacts, location — nothing the item vocabulary carries.
     return NOOP;
   },
 };
@@ -305,6 +330,22 @@ export function whatsapp(options: WhatsAppChannelOptions): ChannelDef {
     verify: (raw) => verifyWhatsAppRequest(raw, options.appSecret, options.verifyToken),
     parse: parseWhatsAppRequest,
     statuses: options.statuses ?? ['error', 'approval'],
+    // The media recipe (participants spec §6): hop one is the Graph media
+    // lookup (built here from the ref — the factory owns the token and the
+    // version), hop two is the short-lived lookaside URL the lookup's JSON
+    // names. BOTH are credentialed Meta API calls, so the indirect hop keeps
+    // its Bearer header — unlike a redirect — and both hosts are pinned.
+    media: {
+      hosts: ['graph.facebook.com', 'lookaside.fbsbx.com'],
+      request: (att) => ({
+        url: `https://graph.facebook.com/${options.apiVersion ?? 'v20.0'}/${encodeURIComponent(att.ref ?? '')}`,
+        headers: { authorization: `Bearer ${options.accessToken}` },
+      }),
+      resolveIndirect: (json) => {
+        const url = (json as { url?: unknown } | null)?.url;
+        return typeof url === 'string' && url !== '' ? url : null;
+      },
+    },
     // Every knob the core names, forwarded by one helper — a knob added to
     // ChannelKnobs tomorrow is forwarded here without this file changing.
     ...channelKnobs(options),

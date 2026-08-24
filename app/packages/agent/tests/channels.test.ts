@@ -1175,4 +1175,269 @@ describe('channels', () => {
       assert.isFalse(await redeemVerdictToken(token), 'single-use');
     });
   });
+
+  // ---- Membership admission (participants spec decision 11) ----------------
+
+  describe('membership admission', () => {
+    /** An OWNED conversation: link the owner, open it, return its binding. */
+    const openOwned = async (opts: { convo?: string; owner?: string } = {}) => {
+      const convo = opts.convo ?? 'mconv';
+      const owner = opts.owner ?? 'owner-acct';
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'owner-ext', owner, 'oidc');
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({ type: 'msg', text: 'mine', id: `open-${convo}`, user: 'owner-ext', convo }));
+      const { ChannelBindings } = await import('../server/channels/collections');
+      return (await ChannelBindings.findOneAsync(`test:${convo}`))!;
+    };
+
+    it("the default 'opener' binding refuses even a roster member — the binding gates ingress", async () => {
+      await registerTestChannel();
+      const binding = await openOwned();
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'member-ext', 'member-acct', 'link');
+      const { Agent } = await import('../server/agent');
+      await Agent.participants.add(binding.sessionId, {
+        id: 'h:member-acct', kind: 'human', role: 'member', userId: 'member-acct', displayName: 'Dana',
+      });
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      const { AgentMessages } = await import('../common/collections');
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+      const out = await handleInbound('test', raw({ type: 'msg', text: 'me too', id: 'm1', user: 'member-ext', convo: 'mconv' }));
+      assert.equal(out.status, 200);
+      const after = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+      assert.equal(after, before, "an 'opener' binding admits nobody but the owner — the roster gates DDP, not this surface");
+    });
+
+    it("a 'members' binding admits an account member, attributed", async () => {
+      await registerTestChannel({ admits: 'members' });
+      const binding = await openOwned({ convo: 'mconv2' });
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'member-ext', 'member-acct', 'link');
+      const { Agent } = await import('../server/agent');
+      await Agent.participants.add(binding.sessionId, {
+        id: 'h:member-acct', kind: 'human', role: 'member', userId: 'member-acct', displayName: 'Dana',
+      });
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({ type: 'msg', text: 'from dana', id: 'm2', user: 'member-ext', convo: 'mconv2' }));
+      const { AgentMessages } = await import('../common/collections');
+      const row = await AgentMessages.findOneAsync({ sessionId: binding.sessionId, role: 'user', content: 'from dana' });
+      assert.isDefined(row, "the member's message entered the owner's session");
+      assert.deepEqual(row!.from, { participant: 'h:member-acct', name: 'Dana' });
+    });
+
+    it("a 'members' binding admits a channel-identified member through via — senderVerified false included", async () => {
+      await registerTestChannel({ admits: 'members' });
+      const binding = await openOwned({ convo: 'mconv3' });
+      const { Agent } = await import('../server/agent');
+      await Agent.participants.add(binding.sessionId, {
+        id: 'x:test:dana-ext', kind: 'human', role: 'member', userId: null,
+        identity: { kind: 'test', externalUserId: 'dana-ext' },
+        assurance: 'none', displayName: 'dana-ext',
+      });
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      // The forgeable-sender shape (email): unverified, unlinked — standing
+      // comes from the roster row alone, through the trusted via principal.
+      await handleInbound('test', raw({
+        type: 'msg', text: 'the reply', id: 'm3', user: 'dana-ext', convo: 'mconv3', senderVerified: false,
+      }));
+      const { AgentMessages } = await import('../common/collections');
+      const row = await AgentMessages.findOneAsync({ sessionId: binding.sessionId, role: 'user', content: 'the reply' });
+      assert.isDefined(row, 'the identity member was admitted');
+      assert.deepEqual(row!.from, { participant: 'x:test:dana-ext', name: 'dana-ext' });
+
+      // A NON-member stranger on the same binding still settles.
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+      await handleInbound('test', raw({ type: 'msg', text: 'let me in', id: 'm4', user: 'mallory-ext', convo: 'mconv3' }));
+      assert.equal(
+        await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync(),
+        before, 'a stranger is settled silently',
+      );
+    });
+
+    it("a 'linked' binding auto-joins a LINKED sender as a member; unlinked still settles", async () => {
+      await registerTestChannel({ admits: 'linked' });
+      const binding = await openOwned({ convo: 'mconv4' });
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'colleague-ext', 'colleague-acct', 'oidc');
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({ type: 'msg', text: 'joining in', id: 'm5', user: 'colleague-ext', convo: 'mconv4', group: true }));
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const session = (await AgentSessions.findOneAsync(binding.sessionId))!;
+      const joined = session.participants?.find((p) => p.userId === 'colleague-acct');
+      assert.isDefined(joined, 'the linked sender auto-joined the roster');
+      assert.equal(joined!.role, 'member');
+      assert.equal(joined!.assurance, 'oidc');
+      assert.lengthOf(session.participants!.filter((p) => p.role === 'owner'), 1, 'the seed rode the join');
+      const row = await AgentMessages.findOneAsync({ sessionId: binding.sessionId, role: 'user', content: 'joining in' });
+      assert.isDefined(row, 'and their message landed');
+
+      // An UNLINKED stranger has no path in: 'linked' admits proofs, not claims.
+      const before = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync();
+      await handleInbound('test', raw({ type: 'msg', text: 'anon here', id: 'm6', user: 'rando-ext', convo: 'mconv4', group: true }));
+      assert.equal(
+        await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).countAsync(),
+        before,
+      );
+    });
+
+    it('a member binding receives replies only — no prompts, no statuses, no capability URL', async () => {
+      const { transport } = await registerTestChannel({
+        statuses: ['error'],
+        profile: { interact: 'menu', limit: 40 },
+        sessionUrl: () => 'https://app.test/s/anon',
+      });
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      // An ANONYMOUS session — the case where the URL is the credential.
+      await AgentSessions.insertAsync({ ...sessionBase, _id: 'sm1' } as any);
+      await AgentMessages.insertAsync(msg({ sessionId: 'sm1', seq: 1, content: 'x'.repeat(100) }) as any);
+      await AgentMessages.insertAsync(msg({ sessionId: 'sm1', seq: 2, role: 'note', kind: 'error', reason: 'provider-failed' }) as any);
+      await parkAsk('sm1', 'tc-m');
+      await seedBinding('test:member-conv', {
+        sessionId: 'sm1', member: true, participant: 'x:test:dana-ext', audience: 'direct',
+      });
+
+      const { deliverBinding } = await import('../server/channels/egress');
+      await deliverBinding('test', 'test:member-conv');
+
+      assert.lengthOf(transport.posts, 1, 'exactly the overflow reply — no status, no prompt');
+      const text = transport.posts[0].payload.text as string;
+      assert.include(text, '…', 'the over-limit reply overflowed');
+      assert.notInclude(text, 'https://app.test', 'no capability URL to a member binding');
+      assert.notInclude(JSON.stringify(transport.posts), 'Approve', 'the parked ask never reached the member');
+
+      // The same session through a NORMAL binding still gets the prompt.
+      await seedBinding('test:owner-conv', { sessionId: 'sm1', audience: 'direct' });
+      await deliverBinding('test', 'test:owner-conv');
+      assert.include(JSON.stringify(transport.posts), 'Approve', 'the owner surface still asks');
+    });
+
+    it('deliberation rows — assistant replies addressed to a model — are advanced past', async () => {
+      const { planItems } = await import('../server/channels/plan');
+      const rows = [
+        msg({ sessionId: 's', seq: 1, content: '@analyst your call', to: 'm:analyst' }),
+        msg({ sessionId: 's', seq: 2, content: 'the outward answer' }),
+      ];
+      const planned = planItems(rows, { profile: { interact: 'menu' } });
+      assert.deepEqual(
+        planned.map((p) => p.item?.item ?? null),
+        [null, 'reply'],
+        'colleague-addressed speech never reaches a channel; the human-facing reply does',
+      );
+    });
+
+    it('linking reconciles roster rows and never claims a member binding', async () => {
+      await registerTestChannel();
+      const { AgentSessions } = await import('../common/collections');
+      const now = new Date();
+      // An anonymous COMPOSING session whose roster holds the recipient.
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'sl1',
+        participants: [
+          { id: 'h:anon', kind: 'human', role: 'owner', userId: null, displayName: 'owner', joinedAt: now },
+          { id: 'm:channel-agent', kind: 'model', role: 'member', agent: 'channel-agent', displayName: 'channel-agent', joinedAt: now },
+          {
+            id: 'x:test:dana-ext', kind: 'human', role: 'member', userId: null,
+            identity: { kind: 'test', externalUserId: 'dana-ext' },
+            assurance: 'none', displayName: 'dana-ext', joinedAt: now,
+          },
+        ],
+      } as any);
+      // The compose-shaped member binding: the RECIPIENT is its recorded
+      // opener, the owner is pinned, member is stamped.
+      await seedBinding('test:reply-key', {
+        sessionId: 'sl1', member: true, participant: 'x:test:dana-ext',
+        externalUserId: 'dana-ext', userId: null, admits: 'members',
+      });
+
+      const { linkIdentity } = await import('../server/channels/linking');
+      await linkIdentity('test', 'dana-ext', 'dana-acct', 'link');
+
+      const session = (await AgentSessions.findOneAsync('sl1'))!;
+      assert.equal(session.userId, null, 'the composing session was NOT re-owned to the recipient');
+      const member = session.participants!.find((p) => p.id === 'x:test:dana-ext')!;
+      assert.equal(member.userId, 'dana-acct', 'the roster row learned the account');
+      assert.equal(member.assurance, 'link');
+
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const binding = (await ChannelBindings.findOneAsync('test:reply-key'))!;
+      assert.equal(binding.userId, null, 'the member binding was never claimed');
+    });
+
+    it("an ANONYMOUS session's member binding attributes the sender's own row, never the owner's", async () => {
+      await registerTestChannel();
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const now = new Date();
+      // The compose-'continue'-from-an-anonymous-session shape: null owner,
+      // the recipient on the roster, a member binding whose OPENER is the
+      // recipient. The anonymous-opener branch admits them — and must hand
+      // the roster its via principal, or their speech stamps as the owner's.
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'san1',
+        participants: [
+          { id: 'h:anon', kind: 'human', role: 'owner', userId: null, displayName: 'owner', joinedAt: now },
+          { id: 'm:channel-agent', kind: 'model', role: 'member', agent: 'channel-agent', displayName: 'channel-agent', joinedAt: now },
+          {
+            id: 'x:test:dana-ext', kind: 'human', role: 'member', userId: null,
+            identity: { kind: 'test', externalUserId: 'dana-ext' },
+            assurance: 'none', displayName: 'dana-ext', joinedAt: now,
+          },
+        ],
+      } as any);
+      await seedBinding('test:anon-reply-key', {
+        sessionId: 'san1', member: true, admits: 'members',
+        externalUserId: 'dana-ext', userId: null, audience: 'direct',
+      });
+
+      const { handleInbound } = await import('../server/channels/ingress');
+      await handleInbound('test', raw({
+        type: 'msg', text: 'my reply', id: 'an1', user: 'dana-ext', convo: 'anon-reply-key', senderVerified: false,
+      }));
+      const row = await AgentMessages.findOneAsync({ sessionId: 'san1', role: 'user', content: 'my reply' });
+      assert.isDefined(row, 'the recipient-opener was admitted');
+      assert.deepEqual(
+        row!.from, { participant: 'x:test:dana-ext', name: 'dana-ext' },
+        "the reply is the RECIPIENT's speech — not silently attributed to the anonymous owner",
+      );
+    });
+
+    it('removing a participant tears down their member bindings', async () => {
+      await registerTestChannel();
+      const { AgentSessions } = await import('../common/collections');
+      const now = new Date();
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'sr1',
+        userId: 'owner-1',
+        participants: [
+          { id: 'h:owner-1', kind: 'human', role: 'owner', userId: 'owner-1', displayName: 'owner', joinedAt: now },
+          { id: 'm:channel-agent', kind: 'model', role: 'member', agent: 'channel-agent', displayName: 'channel-agent', joinedAt: now },
+          {
+            id: 'x:test:dana-ext', kind: 'human', role: 'member', userId: null,
+            identity: { kind: 'test', externalUserId: 'dana-ext' },
+            assurance: 'none', displayName: 'dana-ext', joinedAt: now,
+          },
+        ],
+      } as any);
+      await seedBinding('test:dana-thread', {
+        sessionId: 'sr1', member: true, participant: 'x:test:dana-ext', userId: 'owner-1',
+      });
+      await seedBinding('test:owner-thread', { sessionId: 'sr1', userId: 'owner-1' });
+
+      const { Agent } = await import('../server/agent');
+      assert.isTrue(await Agent.participants.remove('sr1', 'x:test:dana-ext'));
+
+      const { ChannelBindings } = await import('../server/channels/collections');
+      assert.isUndefined(await ChannelBindings.findOneAsync('test:dana-thread'), "the member's binding went with them");
+      assert.isDefined(await ChannelBindings.findOneAsync('test:owner-thread'), 'everyone else\'s stayed');
+      const session = (await AgentSessions.findOneAsync('sr1'))!;
+      assert.isUndefined(session.participants!.find((p) => p.id === 'x:test:dana-ext'));
+    });
+  });
 });

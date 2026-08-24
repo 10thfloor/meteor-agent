@@ -232,8 +232,12 @@ export const slackLens: Lens = {
       const ev = envelope.event ?? {};
       // ECHO SUPPRESSION and non-messages: our own posts carry `bot_id`;
       // edits, joins, and other alterations carry `subtype`. Both are noops
-      // BY DESIGN — answering them is the self-reply loop.
-      if (ev.bot_id || ev.subtype) return NOOP;
+      // BY DESIGN — answering them is the self-reply loop. `file_share` is
+      // the ONE subtype unlocked (participants spec §6.3): a human sharing a
+      // file is a message. The `bot_id` belt survives on its own — a BOT's
+      // file share (another bot, a workflow app) stays a noop, or the
+      // self-reply loop reopens wearing an attachment.
+      if (ev.bot_id || (ev.subtype && ev.subtype !== 'file_share')) return NOOP;
       if (ev.type !== 'message' && ev.type !== 'app_mention') return NOOP;
       // Channel chatter without a mention is not addressed to the agent.
       if (ev.type === 'message' && ev.channel_type !== 'im') return NOOP;
@@ -244,8 +248,22 @@ export const slackLens: Lens = {
       // app_mention is a noop.
       if (ev.type === 'app_mention' && String(ev.channel ?? '').startsWith('D')) return NOOP;
 
+      // Files ride as REFERENCES (participants spec §6): Slack's webhook
+      // carries `url_private_download`, not bytes; the core fetches under the
+      // factory's media recipe (Bearer bot token, files.slack.com only). The
+      // lens only translates the event's facts.
+      const files = (Array.isArray((ev as any).files) ? (ev as any).files : [])
+        .filter((f: any) => f && typeof (f.url_private_download ?? f.url_private) === 'string')
+        .map((f: any) => ({
+          name: String(f.name ?? f.title ?? 'file'),
+          contentType: String(f.mimetype ?? 'application/octet-stream'),
+          ...(Number(f.size) > 0 ? { declaredSize: Number(f.size) } : {}),
+          url: String(f.url_private_download ?? f.url_private),
+        }));
       const text = stripMentions(String(ev.text ?? ''));
-      if (text === '') return NOOP;
+      // The sharpened guard (participants spec §6.3): a file with no words is
+      // still a message.
+      if (text === '' && files.length === 0) return NOOP;
       const team = envelope.team_id ?? '';
       // THE CONVERSATION KEY differs by surface shape, and getting it wrong
       // is amnesia: a DM is ONE ongoing conversation (key it by the channel —
@@ -272,6 +290,7 @@ export const slackLens: Lens = {
         conversationRef: dm ? `${team}:${ev.channel}` : `${team}:${ev.channel}:${threadTs}`,
         destination: { channel: ev.channel, ...(dm ? {} : { threadTs }) },
         audience: dm ? 'direct' : 'group',
+        ...(files.length > 0 && !linkRequested ? { attachments: files } : {}),
       };
     }
 
@@ -404,6 +423,17 @@ export function slack(options: SlackChannelOptions): ChannelDef {
     verify: (raw) => verifySlackSignature(raw, options.signingSecret),
     parse: parseSlackRequest,
     statuses: options.statuses ?? ['error', 'approval'],
+    // The media recipe (participants spec §6): Slack file bytes live behind
+    // `url_private_download` on files.slack.com, Bearer-authenticated. The
+    // token lives HERE — the factory closes over it; the lens never carries a
+    // secret.
+    media: {
+      hosts: ['files.slack.com'],
+      request: (att) => ({
+        url: att.url ?? '',
+        headers: { authorization: `Bearer ${options.botToken}` },
+      }),
+    },
     // Every knob the core names, forwarded by one helper — a knob added to
     // ChannelKnobs tomorrow is forwarded here without this file changing.
     ...channelKnobs(options),

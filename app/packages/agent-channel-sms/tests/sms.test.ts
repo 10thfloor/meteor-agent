@@ -86,7 +86,35 @@ describe('agent-channel-sms', () => {
         // same matchExpectation the pipeline uses.
         synthesize: (choice) => inbound({ Body: ` ${choice.match!.toLowerCase()} ` }),
         message: (text) => inbound({ Body: text }),
+        // The media half (participants spec §6.4): an image-only MMS, in
+        // Twilio's own form fields.
+        mediaMessage: (files) => inbound({
+          Body: '',
+          NumMedia: String(files.length),
+          ...Object.fromEntries(files.flatMap((f, i) => [
+            [`MediaUrl${i}`, `https://api.twilio.com/2010-04-01/Accounts/AC1/Messages/SM1/Media/ME${i}`],
+            [`MediaContentType${i}`, f.contentType],
+          ])),
+        }),
       });
+    });
+
+    it('an image-only MMS is a message carrying remote references, named mechanically', async () => {
+      const { smsLens } = await import('meteor/10thfloor:agent-channel-sms');
+      const r = smsLens.in(inbound({
+        Body: '', NumMedia: '2',
+        MediaUrl0: 'https://api.twilio.com/2010-04-01/Accounts/AC1/Messages/SM1/Media/ME0',
+        MediaContentType0: 'image/jpeg',
+        MediaUrl1: 'https://api.twilio.com/2010-04-01/Accounts/AC1/Messages/SM1/Media/ME1',
+        MediaContentType1: 'image/png',
+      }));
+      assert.deepEqual(r.intent, { kind: 'message', text: '' }, 'no words is still a message');
+      assert.deepEqual(
+        r.attachments?.map((a) => [a.name, a.contentType]),
+        [['media-1', 'image/jpeg'], ['media-2', 'image/png']],
+      );
+      // Names are mechanical (Twilio sends none), the URL is the reference.
+      assert.match((r.attachments![0] as any).url, /^https:\/\/api\.twilio\.com\//);
     });
 
     it('renders the registered words into the prompt prose', async () => {

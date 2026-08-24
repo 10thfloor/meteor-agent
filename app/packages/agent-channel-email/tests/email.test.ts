@@ -388,6 +388,322 @@ describe('agent-channel-email', () => {
       await tool.run({ to: 'dana@ourco.com', subject: 's', body: 'b' }, { ...ctx, toolCallId: 'tc-two' } as any);
       assert.equal(sends.length, 2);
     });
+
+    it('describe shows the approver names and sizes, never ref ids (participants spec §8)', async () => {
+      const { AgentAttachments } = await import('meteor/10thfloor:agent');
+      await (AgentAttachments as any).insertAsync({
+        _id: 'attL1', sessionId: 's-desc', name: 'report.csv', contentType: 'text/csv',
+        size: 18_432, content: b64('a'), origin: 'tool', createdAt: new Date(),
+      });
+      const tool: any = await factory();
+      const display = await tool.describe(
+        { to: 'Dana@OurCo.com', subject: 'Q3 numbers', body: 'Please review the attached figures.', attachments: ['attL1', 'attGone'] },
+        { userId: 'u1', sessionId: 's-desc' },
+      );
+      assert.include(display, 'dana@ourco.com');
+      assert.include(display, '"Q3 numbers"');
+      assert.include(display, 'report.csv (18 KB)', 'names and sizes, resolved session-scoped');
+      assert.include(display, 'attGone (not found)', 'a stale id is said plainly, not guessed at');
+      assert.include(display, 'Please review');
+
+      // The email lens leads with it, args underneath.
+      const { emailLens } = await import('meteor/10thfloor:agent-channel-email');
+      const rendered: any = emailLens.out({
+        item: 'prompt', name: 'compose_email', args: { attachments: ['attL1'] },
+        display: 'Email dana@ourco.com — "Q3 numbers"\nFiles: report.csv (18 KB)',
+        toolCallId: 'tcp',
+        choices: [
+          { token: 'approve', label: 'Approve', match: 'YES' },
+          { token: 'deny', label: 'Deny', match: 'NO' },
+        ],
+      } as any, { subject: 'Re: x' });
+      assert.match(rendered.TextBody, /report\.csv \(18 KB\)[\s\S]*attL1/, 'the display leads; the raw args remain the record');
+    });
+  });
+
+  describe("onReply: 'continue' — the composed loop (participants spec §5)", () => {
+    /** A transport-capturing fetch shared by the channel AND the tool. */
+    function fakePostmark() {
+      const sends: any[] = [];
+      const fetchImpl = (async (_url: unknown, init: any) => {
+        sends.push(JSON.parse(init.body));
+        return { ok: true, status: 200, json: async () => ({ MessageID: `pm-${sends.length}`, ErrorCode: 0 }) };
+      }) as unknown as typeof fetch;
+      return { sends, fetchImpl };
+    }
+
+    const cleanLoop = async () => {
+      const {
+        AgentSessions, AgentMessages, ChannelBindings, DeliveryReceipts, InboundSubmissions,
+      } = await import('meteor/10thfloor:agent');
+      await (AgentSessions as any).removeAsync({});
+      await (AgentMessages as any).removeAsync({});
+      await (ChannelBindings as any).removeAsync({});
+      await (DeliveryReceipts as any).removeAsync({});
+      await (InboundSubmissions as any).removeAsync({});
+    };
+
+    /** A REAL (non-throwaway) composing session with some history. */
+    const seedComposing = async (
+      _id: string, agent: string, over: Record<string, unknown> = {},
+    ) => {
+      const { AgentSessions, AgentMessages } = await import('meteor/10thfloor:agent');
+      await (AgentSessions as any).insertAsync({
+        _id, agent, userId: 'owner-1', phase: 'idle', model: 'mock',
+        nextSeq: 5, usage: { input: 0, output: 0, cost: 0 },
+        budgetSpent: { turns: 0, toolCalls: 0 },
+        createdAt: new Date(), updatedAt: new Date(), ...over,
+      });
+      await (AgentMessages as any).insertAsync({
+        _id: `${_id}-old`, sessionId: _id, seq: 4, role: 'assistant',
+        content: 'old backlog the recipient must never receive', createdAt: new Date(),
+      });
+    };
+
+    it("refuses 'continue' when the reply channel is not registered", async () => {
+      await cleanLoop();
+      const { composeEmailTool } = await import('meteor/10thfloor:agent-channel-email');
+      const { fetchImpl, sends } = fakePostmark();
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'], onReply: 'continue', kind: 'em-none', fetchImpl,
+      } as any);
+      await seedComposing('sc0', 'email-loop-agent');
+      const out: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 's', body: 'b' },
+        { userId: 'owner-1', sessionId: 'sc0', toolCallId: 'tc-n1' } as any,
+      );
+      assert.isTrue(out.refused);
+      assert.equal(out.reason, 'reply-channel-unregistered');
+      assert.equal(sends.length, 0, 'a correspondence nobody can answer is never opened');
+    });
+
+    it("refuses 'continue' when the roster is full — no phantom correspondents", async () => {
+      await cleanLoop();
+      const { Agent, mockProvider, ChannelBindings, AgentSessions } = await import('meteor/10thfloor:agent');
+      const { composeEmailTool, email } = await import('meteor/10thfloor:agent-channel-email');
+      const { fetchImpl, sends } = fakePostmark();
+      new (Agent as any)('email-loop-agent', {
+        model: 'mock', instructions: '', provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      (Agent as any).channel('em-full', email({
+        agent: 'email-loop-agent', serverToken: 't', from: 'a@ourco.com',
+        inboundAddress: 'inbound@ourco.com', webhookUser: 'hook', webhookPassword: 'pw',
+        fetchImpl,
+      } as any));
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'], onReply: 'continue', kind: 'em-full', fetchImpl,
+      } as any);
+
+      const now = new Date();
+      await seedComposing('sc-full', 'email-loop-agent', {
+        participants: Array.from({ length: 16 }, (_, i) => ({
+          id: i === 0 ? 'h:owner-1' : `h:u${i}`,
+          kind: 'human', role: i === 0 ? 'owner' : 'member',
+          userId: i === 0 ? 'owner-1' : `u${i}`, displayName: `p${i}`, joinedAt: now,
+        })),
+      });
+      const out: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 's', body: 'b' },
+        { userId: 'owner-1', sessionId: 'sc-full', toolCallId: 'tc-full' } as any,
+      );
+      assert.isTrue(out.refused);
+      assert.equal(out.reason, 'roster-full');
+      assert.equal(sends.length, 0, 'refused BEFORE the mail, so nobody is told they joined');
+      assert.equal(await (ChannelBindings as any).find({ kind: 'em-full' }).countAsync(), 0);
+      const session: any = await (AgentSessions as any).findOneAsync('sc-full');
+      assert.lengthOf(session.participants, 16, 'the roster is untouched');
+    });
+
+    it("refuses 'continue' in throwaway and subagent-child sessions", async () => {
+      await cleanLoop();
+      const { Agent, mockProvider } = await import('meteor/10thfloor:agent');
+      const { composeEmailTool, email } = await import('meteor/10thfloor:agent-channel-email');
+      const { fetchImpl } = fakePostmark();
+      new (Agent as any)('email-loop-agent', {
+        model: 'mock', instructions: '', provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      (Agent as any).channel('em-eph', email({
+        agent: 'email-loop-agent', serverToken: 't', from: 'a@ourco.com',
+        inboundAddress: 'inbound@ourco.com', webhookUser: 'hook', webhookPassword: 'pw',
+        fetchImpl,
+      } as any));
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'], onReply: 'continue', kind: 'em-eph', fetchImpl,
+      } as any);
+
+      await seedComposing('sc-eph', 'email-loop-agent', { ephemeral: true });
+      const eph: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 's', body: 'b' },
+        { userId: 'owner-1', sessionId: 'sc-eph', toolCallId: 'tc-e1' } as any,
+      );
+      assert.equal(eph.reason, 'session-cannot-continue', 'a throwaway cannot hold a correspondence');
+
+      await seedComposing('sc-child', 'email-loop-agent', { parent: { sessionId: 'p1', toolCallId: 'tc' } });
+      const child: any = await tool.run(
+        { to: 'dana@ourco.com', subject: 's', body: 'b' },
+        { userId: 'owner-1', sessionId: 'sc-child', toolCallId: 'tc-e2' } as any,
+      );
+      assert.equal(child.reason, 'session-cannot-continue', "a subagent's private child cannot either");
+    });
+
+    it('mints the key, pre-binds member-shaped, joins the roster — and the reply continues the session', async function () {
+      this.timeout(15000);
+      await cleanLoop();
+      const {
+        Agent, mockProvider, handleInbound, ChannelBindings, AgentSessions, AgentMessages,
+      } = await import('meteor/10thfloor:agent');
+      const { composeEmailTool, email, threadKey, replyToFor } = await import('meteor/10thfloor:agent-channel-email');
+      const { sends, fetchImpl } = fakePostmark();
+
+      new (Agent as any)('email-loop-agent', {
+        model: 'mock', instructions: '', provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      (Agent as any).channel('em-loop', email({
+        agent: 'email-loop-agent', serverToken: 't', from: 'a@ourco.com',
+        inboundAddress: 'inbound@ourco.com', webhookUser: 'hook', webhookPassword: 'pw',
+        fetchImpl,
+      } as any));
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['dana@ourco.com'], onReply: 'continue', kind: 'em-loop', fetchImpl,
+      } as any);
+      await seedComposing('sc1', 'email-loop-agent');
+
+      const out: any = await tool.run(
+        { to: 'Dana@OurCo.com', subject: 'Q3 numbers', body: 'Please review.' },
+        { userId: 'owner-1', sessionId: 'sc1', toolCallId: 'tc-l1' } as any,
+      );
+      assert.isTrue(out.sent);
+      assert.equal(out.joined, 'dana@ourco.com', 'normalized before any derived write');
+
+      // The mail carries the minted key — the mechanism decision 8 withheld.
+      const key = threadKey('compose:sc1:dana@ourco.com');
+      assert.equal(sends[0].ReplyTo, replyToFor('inbound@ourco.com', key));
+      const headers = Object.fromEntries(sends[0].Headers.map((h: any) => [h.Name, h.Value]));
+      assert.equal(headers['Auto-Submitted'], 'auto-generated');
+
+      // The pre-bind: member-shaped, owner-pinned, snapshot-cursored.
+      const binding: any = await (ChannelBindings as any).findOneAsync(`em-loop:${key}`);
+      assert.isDefined(binding, 'the conversation is pre-bound to the composing session');
+      assert.equal(binding.sessionId, 'sc1');
+      assert.equal(binding.userId, 'owner-1', 'pinned — claim-history can never re-own this');
+      assert.isTrue(binding.member);
+      assert.equal(binding.admits, 'members');
+      assert.equal(binding.externalUserId, 'dana@ourco.com');
+      assert.equal(binding.participant, 'x:em-loop:dana@ourco.com');
+      assert.equal(binding.deliveredSeq, 4, 'delivery starts at the composed message, not the backlog');
+      assert.equal((binding.destination as any).subject, 'Re: Q3 numbers');
+
+      // The roster: seeded complete, recipient joined, attributed by the model.
+      const session: any = await (AgentSessions as any).findOneAsync('sc1');
+      const ids = session.participants.map((p: any) => p.id).sort();
+      assert.deepEqual(ids, ['h:owner-1', 'm:email-loop-agent', 'x:em-loop:dana@ourco.com']);
+      assert.equal(
+        session.participants.find((p: any) => p.id === 'x:em-loop:dana@ourco.com').addedBy,
+        'm:email-loop-agent',
+      );
+
+      // A SECOND compose to the same recipient adopts — one conversation, one
+      // binding, one roster row, two mails.
+      await tool.run(
+        { to: 'dana@ourco.com', subject: 'One more thing', body: 'Also this.' },
+        { userId: 'owner-1', sessionId: 'sc1', toolCallId: 'tc-l2' } as any,
+      );
+      assert.equal(sends.length, 2);
+      assert.equal(await (ChannelBindings as any).find({ kind: 'em-loop' }).countAsync(), 1);
+      const again: any = await (AgentSessions as any).findOneAsync('sc1');
+      assert.lengthOf(
+        again.participants.filter((p: any) => p.id === 'x:em-loop:dana@ourco.com'), 1,
+      );
+
+      // A STRANGER'S EARLY REPLY must not teach the binding its threading
+      // root: adoption runs only for ADMITTED senders (a refused message
+      // that still set the thread's one-shot root would let anyone holding
+      // the reply key hijack threading before the recipient ever spoke).
+      await handleInbound('em-loop', {
+        headers: { authorization: `Basic ${Buffer.from('hook:pw').toString('base64')}` },
+        rawBody: JSON.stringify({
+          MessageID: 'pm-eve-1',
+          FromFull: { Email: 'eve@evil.test', Name: 'Eve' },
+          From: 'eve@evil.test',
+          To: 'inbound+hash@ourco.com',
+          ToFull: [{ Email: 'inbound@ourco.com', MailboxHash: key }],
+          MailboxHash: key,
+          Subject: 'Invoice overdue',
+          TextBody: 'pay here',
+          StrippedTextReply: 'pay here',
+          Headers: [
+            { Name: 'Message-ID', Value: '<e1@evil.test>' },
+            { Name: 'In-Reply-To', Value: '<evil-root@evil.test>' },
+          ],
+        }),
+      });
+      const unadopted: any = await (ChannelBindings as any).findOneAsync(`em-loop:${key}`);
+      assert.isUndefined(
+        (unadopted.destination as any).rootMessageId,
+        "a refused stranger's message sets nothing",
+      );
+
+      // THE REPLY — unverified From (the common case), carrying the key as
+      // the mailbox hash: admitted through the roster, attributed, in the
+      // composing session.
+      const reply = {
+        MessageID: 'pm-reply-1',
+        FromFull: { Email: 'dana@ourco.com', Name: 'Dana' },
+        From: 'Dana <dana@ourco.com>',
+        To: 'inbound+hash@ourco.com',
+        ToFull: [{ Email: 'inbound@ourco.com', MailboxHash: key }],
+        MailboxHash: key,
+        Subject: 'Re: Q3 numbers',
+        TextBody: 'Looks good, ship it.',
+        StrippedTextReply: 'Looks good, ship it.',
+        Headers: [
+          { Name: 'Message-ID', Value: '<r1@dana.test>' },
+          { Name: 'In-Reply-To', Value: '<composed-rfc-id@pm.test>' },
+        ],
+      };
+      const res = await handleInbound('em-loop', {
+        headers: { authorization: `Basic ${Buffer.from('hook:pw').toString('base64')}` },
+        rawBody: JSON.stringify(reply),
+      });
+      assert.equal(res.status, 200);
+
+      const row: any = await (AgentMessages as any).findOneAsync({
+        sessionId: 'sc1', role: 'user', content: 'Looks good, ship it.',
+      });
+      assert.isDefined(row, "the recipient's reply CONTINUED the composing session");
+      assert.deepEqual(row.from, { participant: 'x:em-loop:dana@ourco.com', name: 'dana@ourco.com' });
+
+      // Destination adoption: the binding learned its threading root from the
+      // reply, so every later reply we send threads in Dana's client.
+      const adopted: any = await (ChannelBindings as any).findOneAsync(`em-loop:${key}`);
+      assert.equal(
+        (adopted.destination as any).rootMessageId, 'composed-rfc-id@pm.test',
+        'the first admitted reply taught the binding its root',
+      );
+
+      // And a STRANGER carrying the key is still nobody: not the owner, not
+      // in the roster — settled without a row.
+      const before = await (AgentMessages as any).find({ sessionId: 'sc1', role: 'user' }).countAsync();
+      await handleInbound('em-loop', {
+        headers: { authorization: `Basic ${Buffer.from('hook:pw').toString('base64')}` },
+        rawBody: JSON.stringify({
+          ...reply,
+          MessageID: 'pm-mallory-1',
+          FromFull: { Email: 'mallory@evil.test', Name: 'M' },
+          From: 'mallory@evil.test',
+          StrippedTextReply: 'let me in',
+          TextBody: 'let me in',
+        }),
+      });
+      assert.equal(
+        await (AgentMessages as any).find({ sessionId: 'sc1', role: 'user' }).countAsync(),
+        before, 'the reply key routes; the roster admits',
+      );
+    });
   });
 
   describe('email() factory', () => {

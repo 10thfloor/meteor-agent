@@ -20,6 +20,9 @@ import {
 import { recordVerdict, sendToSession } from './methods';
 import { registerChannel, type ChannelDef } from './channels/registry';
 import { AgentAttachments, createAttachment, readTool } from './attachments';
+import {
+  addParticipant, listParticipants, removeParticipant,
+} from './participants';
 
 export class Agent {
   constructor(public readonly name: string, config?: AgentConfig) {
@@ -79,6 +82,10 @@ export class Agent {
       phase: 'idle', model: config.model, nextSeq: 0,
       usage: { input: 0, output: 0, cost: 0 },
       budgetSpent: { turns: 0, toolCalls: 0 },
+      // The throwaway marker: tools that would create standing state pointing
+      // back at this session (compose's 'continue' pre-bind) read it and
+      // refuse — the session is deleted in the finally below.
+      ephemeral: true,
       createdAt: new Date(), updatedAt: new Date(),
     });
 
@@ -378,6 +385,32 @@ export class Agent {
   static attachments = {
     create: createAttachment,
     readTool,
+  };
+
+  /**
+   * The roster surface (participants spec §4.1) — STATIC like
+   * `Agent.attachments`, because membership belongs to sessions, not to one
+   * agent instance, and SERVER-ONLY by design: joins are app-code decisions
+   * (an invite flow, compose's policy-gated recipient), never a DDP cap. The
+   * app that wants a UI for it writes its own owner-gated method over these.
+   *
+   *   await Agent.participants.add(sessionId, {
+   *     id: 'h:'+inviteeId, kind: 'human', role: 'member',
+   *     userId: inviteeId, displayName: 'Dana',
+   *   }, { by: 'h:'+ownerId });
+   *   await Agent.participants.add(sessionId, {
+   *     id: 'm:analyst', kind: 'model', role: 'member', agent: 'analyst',
+   *   });
+   *
+   * `add` seeds the roster (owner + primary model) on first join, adopts an
+   * existing id, and refuses past the 16-participant cap. `remove` refuses
+   * the owner (ownership transfer is a named open question) and is what makes
+   * ingress stop admitting the identity — admission reads the roster.
+   */
+  static participants = {
+    add: addParticipant,
+    remove: removeParticipant,
+    list: listParticipants,
   };
 
   /**

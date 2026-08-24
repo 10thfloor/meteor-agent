@@ -79,6 +79,23 @@ export interface ToolContext {
    *  behalf: the escalation gives the tool an identity, and this is the only
    *  remaining record of who actually asked. */
   callerUserId?: string | null;
+  /**
+   * Multimodal reads (participants spec §9): whether the RUNNING turn's
+   * provider declared image input for its model — resolved once per turn by
+   * the loop from `Provider.capabilities.imageInput`, absent/false when it
+   * could not be answered (the gate fails closed). `read_attachment` reads it
+   * to decide between attaching an image and the structured refusal.
+   */
+  imageInput?: boolean;
+  /**
+   * The result-attachment collector (participants spec §9): stamp a
+   * session-scoped ref onto THIS call's `tool` row — request-time hydration
+   * then carries the bytes to the provider. Collected refs flow through
+   * `afterToolResult` (the hook may drop them) before the row is written, so
+   * a redaction hook cannot be dodged. Set by both dispatch paths; absent for
+   * a direct `runTool` caller, whose result has no row to stamp.
+   */
+  attachToResult?: (ref: import('../common/types').AttachmentRef) => void;
 }
 
 /* ---------------------------------------------------------------------------
@@ -113,6 +130,16 @@ export type InlineTool = {
    *  anonymous service context). Privilege escalation by construction —
    *  read THE `runAs` NOTE above before using it. */
   runAs?: string | null;
+  /**
+   * Approval legibility (participants spec §8): a human-readable one-liner of
+   * what THIS call will do, produced at PARK time into `pending.display` —
+   * the approval bar and every channel prompt prefer it over raw args JSON.
+   * May read (compose resolves ref ids to names and sizes); a throw or a
+   * timeout just means no display, never a failed park. Advisory only: `run`
+   * still re-validates everything after the verdict.
+   */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 };
 
 export type AdoptedTool = {
@@ -125,6 +152,9 @@ export type AdoptedTool = {
    *  (your UI's own `Meteor.callAsync` is unaffected). Privilege escalation by
    *  construction — read `RUNAS_NOTE` above before using it. */
   runAs?: string | null;
+  /** See `InlineTool.describe` — the same park-time legibility seam. */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 };
 
 /**
@@ -209,6 +239,12 @@ export interface ResolvedTool {
    *  the session's owner" — and `null` is a real value (anonymous service
    *  context), so every check on it is `!== undefined`, never truthiness. */
   runAs?: string | null;
+  /** `inline` and `adopted` only: the park-time legibility hook
+   *  (participants spec §8). Carried through this projection deliberately —
+   *  dispatch parks off a ResolvedTool, and a field dropped here would be a
+   *  hook that silently never runs. */
+  describe?: (args: any, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
 }
 
 export interface ToolResult {
@@ -1087,6 +1123,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         // silently runs the tool as the SESSION's user, which is the reading
         // that grants more access than was written.
         ...(hasRunAs ? { runAs: adopted.runAs ?? null } : {}),
+        ...(typeof adopted.describe === 'function' ? { describe: adopted.describe } : {}),
       };
     }
     const inline = spec as InlineTool;
@@ -1105,6 +1142,7 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
       // See the adopted branch above for why this is a spread and why an
       // undefined value resolves to `null`.
       ...(hasRunAs ? { runAs: inline.runAs ?? null } : {}),
+      ...(typeof inline.describe === 'function' ? { describe: inline.describe } : {}),
     };
   });
 }

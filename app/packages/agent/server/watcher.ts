@@ -2,7 +2,7 @@ import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, DECIDED_PHASES, type AgentSession, type SessionInc } from '../common/types';
 import type { SessionQuery } from '../common/db';
 import { getAgent } from './registry';
-import { deferTurn, recordTimeoutVerdict } from './methods';
+import { deferResolvedTurn, recordTimeoutVerdict } from './methods';
 import { isRunning } from './turn-state';
 
 /**
@@ -183,13 +183,16 @@ function warnParentlessOnce(child: AgentSession): void {
   );
 }
 
-function wake(session: AgentSession, why: string): void {
-  const config = getAgent(session.agent);
-  if (!config) {
+async function wake(session: AgentSession, why: string): Promise<void> {
+  // Recovery must resume an addressed turn as the RIGHT model (participants
+  // spec decision 6): `deferResolvedTurn` re-derives the addressee from
+  // durable state — `pending.agent`, a standing relay, the unanswered tail —
+  // and composes it with the primary's budget and the owner's identity. A
+  // false return means the PRIMARY is unregistered, the one case nothing can
+  // recover.
+  if (!(await deferResolvedTurn(session))) {
     warnUnregisteredOnce(session, why);
-    return;
   }
-  deferTurn(session._id, config, session.userId);
 }
 
 /**
@@ -338,9 +341,27 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       }
     }
 
+    // CASE 5 — a standing RELAY nobody consumed (participants spec decision
+    // 7): a model's reply scheduled a colleague's turn, and the process died
+    // (or the in-process self-check lost its race) before the addressee ran.
+    // The same grace period and lease rules as the verdict case, because it
+    // is the same dropped-wake shape with a different durable marker.
+    const relays = await AgentSessions.find({
+      pendingRelay: { $exists: true },
+      phase: { $nin: WAKE_EXCLUDED },
+      updatedAt: { $lt: new Date(now.getTime() - verdictGraceMs) },
+      ...noLiveLease(now),
+    }).fetchAsync();
+    for (const session of relays) {
+      if (!isRunning(session._id) && !toWake.has(session._id)) {
+        toWake.set(session._id, { session, why: 'standing relay' });
+      }
+    }
+
     for (const { session, why } of toWake.values()) {
       if (stopped) return;
-      wake(session, why);
+      // eslint-disable-next-line no-await-in-loop
+      await wake(session, why);
     }
 
     // CASE 2 — an approval nobody answered. The age limit is per AGENT
@@ -426,7 +447,7 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
     if (!session || stopped) return;
     if (!isOrphan(session, new Date())) return;
     if (isRunning(sessionId)) return;
-    wake(session, 'orphan claim');
+    await wake(session, 'orphan claim');
   };
 
   const notice = (sessionId: string): void => {

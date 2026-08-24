@@ -1,7 +1,9 @@
 import { createHash, randomBytes } from 'crypto';
 import {
-  AgentAttachments, DEFAULT_ATTACHMENT_CAPS, channelKnobs, deliverOnce, headerValue,
-  isLinkGesture, prettySize, resolveIdentity, safeEqual,
+  Agent, AgentAttachments, AgentSessions, ChannelBindings,
+  DEFAULT_ATTACHMENT_CAPS, MAX_PARTICIPANTS, channelKnobs, deliverOnce,
+  getChannel, headerValue,
+  insertOrLose, isLinkGesture, prettySize, resolveIdentity, safeEqual,
   type ChannelAttachment, type ChannelDef, type ChannelKnobs, type ChannelProfile,
   type ChannelTransport, type DeliveryItem, type Gate, type InboundReading,
   type InlineTool, type Lens, type RawInbound,
@@ -268,6 +270,11 @@ export const emailLens: Lens = {
       case 'prompt': {
         const args = JSON.stringify(item.args ?? {}, null, 2);
         const clamped = args.length > 2000 ? `${args.slice(0, 2000)}…` : args;
+        // The tool's own account of the call (participants spec §8) leads
+        // when the park hydrated one — an approver reads names and sizes
+        // first; the raw args stay underneath as the exact record of what
+        // was asked.
+        const display = item.display ? `${item.display}\n\n` : '';
         const runAs = 'runAs' in item && item.runAs !== undefined
           ? `\n(runs as: ${item.runAs ?? 'anonymous service context'})` : '';
         // Two grammars, chosen by what the planner handed us: `url` on a
@@ -281,7 +288,7 @@ export const emailLens: Lens = {
         }).join('\n');
         return {
           Subject,
-          TextBody: `The agent wants to run ${item.name}:\n\n${clamped}${runAs}\n\n${choices}`,
+          TextBody: `The agent wants to run ${item.name}:\n\n${display}${clamped}${runAs}\n\n${choices}`,
         };
       }
       default:
@@ -483,6 +490,17 @@ export function email(options: EmailChannelOptions): ChannelDef {
     },
     verify: (raw) => verifyPostmarkWebhook(raw, options.webhookUser, options.webhookPassword),
     parse: parsePostmarkInbound,
+    // Destination adoption (participants spec §5): a compose pre-bind stores
+    // no rootMessageId (Postmark's send response id is not the RFC header),
+    // so the FIRST admitted reply teaches the binding its threading root —
+    // and the re-subjected subject line with it. A destination that already
+    // knows its root keeps it: the thread's root never moves.
+    adoptDestination: (bound: unknown, incoming: unknown) => {
+      const b = (bound ?? {}) as Partial<EmailDestination>;
+      const inc = (incoming ?? {}) as Partial<EmailDestination>;
+      if (b.rootMessageId || !inc.rootMessageId) return undefined;
+      return { ...b, rootMessageId: inc.rootMessageId, subject: inc.subject ?? b.subject };
+    },
     statuses: options.statuses ?? ['error', 'approval'],
     // Postmark delivers up to 35 MB of cumulative attachments base64'd INSIDE
     // the webhook JSON (~47 MB encoded, plus bodies and headroom). The shared
@@ -519,12 +537,14 @@ export type ComposeRecipientsPolicy =
 export interface ComposeEmailToolOptions {
   /** The same thin transport the channel uses — compose depends on the
    *  TRANSPORT, not on the channel registration; an app can list this tool
-   *  with no email channel registered at all (§2 decision 6). */
+   *  with no email channel registered at all (§2 decision 6). `'continue'`
+   *  is the one mode that needs the registration — see `onReply`. */
   serverToken: string;
   from: string;
-  /** Where a recipient's REPLY lands: composed mail replies-to the PLAIN
-   *  inbound address — no thread key — so their answer starts its own fresh
-   *  conversation through the normal inbound path (§2 decision 8). */
+  /** Where a recipient's REPLY lands. `'fresh'` (the default): composed mail
+   *  replies-to the PLAIN inbound address — no thread key — so their answer
+   *  starts its own fresh conversation (email v2 decision 8). `'continue'`
+   *  supersedes it (participants spec §5). */
   inboundAddress: string;
   messageStream?: string;
   fetchImpl?: typeof fetch;
@@ -534,6 +554,27 @@ export interface ComposeEmailToolOptions {
    *  explicitly loosens it. The parked prompt shows `to`, `subject`, `body`
    *  and the ref ids through the existing prompt rendering. */
   gate?: Gate;
+  /**
+   * What a recipient's reply does (participants spec §5, superseding email
+   * v2 decision 8). `'fresh'` (the default): the reply opens its own new
+   * conversation. `'continue'`: the send mints the thread key decision 8
+   * withheld, pre-binds the conversation to the COMPOSING session (a
+   * `member: true` binding — outward replies only, no prompts, no capability
+   * URLs), and joins the recipient to the roster — their reply continues
+   * this session, attributed. NAMED LOUDLY: 'continue' turns the session
+   * into a group conversation; every subsequent outward reply is delivered
+   * to the recipient. It requires the `kind` channel to be REGISTERED (the
+   * reply needs a webhook to arrive through) and refuses — structured,
+   * model-routable — inside throwaway (`Agent.ask`) and subagent-child
+   * sessions, whose lifetimes cannot honor a promised correspondence.
+   */
+  onReply?: 'fresh' | 'continue';
+  /** The registered channel KIND whose webhook carries `'continue'` replies —
+   *  kinds are app-chosen strings, so it cannot be assumed. Default 'email'.
+   *  The registered channel's inboundAddress must be THIS tool's
+   *  `inboundAddress`, or the minted Reply-To points at a webhook that will
+   *  never see the reply. */
+  kind?: string;
   name?: string;
   description?: string;
 }
@@ -604,6 +645,9 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
   // (declared): a crash in the post-confirm window may re-send.
   const def = { transport, lens: emailLens, onUncertainDelivery: 'retry' as const };
 
+  const continueMode = options.onReply === 'continue';
+  const kind = options.kind ?? 'email';
+
   return {
     name: options.name ?? 'compose_email',
     description: options.description
@@ -612,7 +656,12 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       + 'conversing with receives your replies automatically, and composing to them '
       + 'would deliver twice. The recipient must be allowed by the application\'s '
       + 'policy; a refusal comes back as { refused: true } — do not retry the same '
-      + 'address. `attachments` takes ids of files already in this conversation.',
+      + 'address. `attachments` takes ids of files already in this conversation.'
+      + (continueMode
+        ? ' A successful send JOINS the recipient to this conversation: their '
+        + 'replies arrive here, and your future replies — including the one you '
+        + 'write after this call — are delivered to them too.'
+        : ''),
     args: {
       type: 'object',
       properties: {
@@ -627,6 +676,32 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       required: ['to', 'subject', 'body'],
     },
     gate: options.gate ?? 'ask',
+    // Approval legibility (participants spec §8): the approver reads the
+    // recipient, the subject, a head of the body, and each attachment by NAME
+    // and size — resolved session-scoped at park time, so the ref ids stop
+    // leaking into approval prompts. Advisory: `run` re-validates everything
+    // (policy, refs, caps) after the verdict, exactly as before.
+    async describe(args: { to?: string; subject?: string; body?: string; attachments?: string[] }, ctx) {
+      const to = String(args.to ?? '').trim().toLowerCase();
+      const subject = String(args.subject ?? '');
+      const body = String(args.body ?? '');
+      const head = body.length > 200 ? `${body.slice(0, 200)}…` : body;
+      const ids = Array.isArray(args.attachments)
+        ? args.attachments.filter((x): x is string => typeof x === 'string')
+        : [];
+      const names: string[] = [];
+      for (const id of ids) {
+        // eslint-disable-next-line no-await-in-loop
+        const row = await AgentAttachments.findOneAsync({ _id: id, sessionId: ctx.sessionId });
+        names.push(row ? `${row.name} (${prettySize(row.size)})` : `${id} (not found)`);
+      }
+      const filesLine = names.length > 0
+        ? `\nFiles: ${names.join(', ')}` : '';
+      const joins = continueMode
+        ? `\nA send JOINS ${to} to this conversation: they will receive future replies here.`
+        : '';
+      return `Email ${to} — "${subject}"${filesLine}${joins}\n\n${head}`;
+    },
     async run(args: { to: string; subject: string; body: string; attachments?: string[] }, ctx) {
       const to = String(args.to ?? '').trim().toLowerCase();
       if (!EMAIL_SHAPE.test(to)) return { refused: true, reason: 'invalid-recipient' };
@@ -662,10 +737,60 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
         };
       }
 
-      // Decision 8: no thread key. Reply-To is the PLAIN inbound address, so
-      // the recipient's answer opens their own fresh conversation.
+      // `'continue'` preconditions (participants spec §5), checked BEFORE the
+      // send: the reply path must exist (the kind's webhook), and the session
+      // must be one a correspondence can point at — not a throwaway about to
+      // be deleted, not a subagent's private child.
+      let composing: { agent: string; userId: string | null; nextSeq: number } | null = null;
+      if (continueMode) {
+        if (!getChannel(kind)) {
+          return {
+            refused: true,
+            reason: 'reply-channel-unregistered',
+            detail: `onReply 'continue' needs the '${kind}' channel registered — its webhook is where the reply arrives.`,
+          };
+        }
+        const session = await AgentSessions.findOneAsync(ctx.sessionId);
+        if (!session) return { refused: true, reason: 'session-gone' };
+        if (session.ephemeral || session.parent) {
+          return {
+            refused: true,
+            reason: 'session-cannot-continue',
+            detail: 'This session cannot hold a continued correspondence '
+              + '(it is a throwaway or a subagent child); send without onReply, '
+              + 'or compose from a real conversation.',
+          };
+        }
+        // Roster capacity, BEFORE the send (a reviewer-confirmed phantom): a
+        // full roster with the binding still inserted would mail the
+        // recipient every future reply while silently refusing every answer
+        // they send — told they joined, never actually admitted.
+        const alreadyMember = session.participants?.some(
+          (p) => p.identity?.kind === kind && p.identity.externalUserId === to,
+        ) ?? false;
+        if (!alreadyMember
+          && (session.participants?.length ?? 0) >= MAX_PARTICIPANTS) {
+          return {
+            refused: true,
+            reason: 'roster-full',
+            detail: `This conversation already has ${MAX_PARTICIPANTS} participants; `
+              + 'nobody else can join it. Send without onReply, or remove a participant first.',
+          };
+        }
+        // The deliveredSeq SNAPSHOT rides this read, BEFORE the send: the
+        // recipient's mailbox starts at the composed message, never the
+        // session's backlog.
+        composing = { agent: session.agent, userId: session.userId, nextSeq: session.nextSeq };
+      }
+
+      // The thread key `'continue'` mints — and `'fresh'` (decision 8)
+      // withholds. Derived from SESSION + RECIPIENT, never the toolCallId
+      // alone (only unique within one provider response — the attachment
+      // store's deviation-3 lesson): a crash-recovery re-run AND a second
+      // compose to the same address both collide into the SAME conversation.
+      const replyKey = continueMode ? threadKey(`compose:${ctx.sessionId}:${to}`) : '';
       const destination: EmailDestination = {
-        to, subject: String(args.subject ?? ''), replyKey: '',
+        to, subject: String(args.subject ?? ''), replyKey,
       };
       // The receipt id derives from the TOOL CALL: dispatch's crash-recovery
       // re-run collides on it and reads the settled receipt instead of
@@ -684,8 +809,63 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       };
       const outcome = await deliverOnce(binding, item, 'send', { def });
       if (outcome === 'delivered') {
+        // The loop closes on a CONFIRMED send only (participants spec §5) —
+        // an abandoned mail must not leave a phantom participant receiving
+        // every future reply. Both writes are idempotent (derived binding id,
+        // guarded roster push), which is what closes the crash window between
+        // the settled receipt and here: the dispatch re-run completes them.
+        if (continueMode && composing) {
+          await insertOrLose(ChannelBindings, {
+            _id: `${kind}:${replyKey}`,
+            kind,
+            conversationRef: replyKey,
+            // Replies WE send into this conversation thread as "Re:" of the
+            // composed subject; the rootMessageId arrives with the
+            // recipient's first reply (destination adoption, the factory).
+            destination: { to, subject: reSubject(destination.subject), replyKey },
+            audience: 'direct',
+            agent: composing.agent,
+            // The COMPOSING session's owner — pinned so claim-history's
+            // `userId: null` sweep can never re-own this session to the
+            // recipient (its member exclusion is the belt to this brace).
+            userId: composing.userId,
+            sessionId: ctx.sessionId,
+            // The recipient IS this conversation's opener; with `admits:
+            // 'members'` their roster row is what admits their replies.
+            externalUserId: to,
+            assurance: 'none',
+            admits: 'members',
+            member: true,
+            participant: `x:${kind}:${to}`,
+            // Delivery starts at the composed message: everything already in
+            // the session is history the recipient was not part of.
+            deliveredSeq: Math.max(0, composing.nextSeq - 1),
+            createdAt: new Date(),
+            updatedAt: new Date(),
+          });
+          const joinedId = await Agent.participants.add(ctx.sessionId, {
+            id: `x:${kind}:${to}`,
+            kind: 'human',
+            role: 'member',
+            userId: null,
+            identity: { kind, externalUserId: to },
+            assurance: 'none',
+            displayName: to,
+          }, { by: `m:${composing.agent}` });
+          if (joinedId === null) {
+            // The pre-check makes this a racing-joins case only, but a
+            // phantom must still not exist: without the roster row the
+            // binding would deliver forever while refusing every reply.
+            await ChannelBindings.removeAsync(`${kind}:${replyKey}`);
+            return {
+              sent: true, to, subject: destination.subject, joined: false,
+              note: 'roster-full — the mail was sent, but replies will open a fresh conversation',
+            };
+          }
+        }
         return {
           sent: true, to, subject: destination.subject,
+          ...(continueMode ? { joined: to } : {}),
           ...(files.length > 0 ? { attached: files.map((f) => f.name) } : {}),
           ...(missing.length > 0 ? { missingAttachments: missing } : {}),
         };

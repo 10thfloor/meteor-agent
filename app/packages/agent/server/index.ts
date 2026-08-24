@@ -13,6 +13,7 @@ import {
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
 import { AgentAttachments } from './attachments';
+import { AttachmentDownloadTokens, mountDownloadRoute } from './downloads';
 import { listChannels } from './channels/registry';
 import { mountChannelRoutes } from './channels/ingress';
 import { startEgress, type EgressWorker } from './channels/egress';
@@ -71,14 +72,15 @@ export { DEFAULT_MAX_TOOL_ARG_BYTES } from './loop';
 export {
   assertLensRoundTrip, exemplarItems, matchExpectation, attachmentNotice,
   DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
-  encodeVerdictPostback, decodeVerdictPostback,
+  encodeVerdictPostback, decodeVerdictPostback, isRemoteAttachment,
   type ChannelAttachment, type ChannelProfile, type ChannelTransport,
-  type DeliveryItem, type InboundIntent, type InboundReading, type Lens,
-  type PromptChoice, type RoundTripOptions,
+  type DeliveryItem, type InboundAttachment, type InboundIntent,
+  type InboundReading, type Lens, type PromptChoice, type RemoteAttachment,
+  type RoundTripOptions,
 } from '../common/channel-contract';
 export {
   type ChannelDef, type ChannelKnobs, type RawInbound,
-  listChannels, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
+  listChannels, getChannel, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
 } from './channels/registry';
 export {
   startEgress, deliverOnce,
@@ -91,7 +93,7 @@ export {
 } from './channels/linking';
 export {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
-  DeliveryReceipts, InboundSubmissions,
+  DeliveryReceipts, InboundSubmissions, insertOrLose,
   type ChannelBinding, type ChannelIdentity, type ChannelLinkToken,
   type ChannelVerdictToken, type DeliveryReceipt, type InboundSubmission,
   type ReceiptExpectation,
@@ -106,6 +108,26 @@ export {
   sanitizeAttachmentName, prettySize,
   type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions,
 } from './attachments';
+// Participants (participants spec): `Agent.participants` is the blessed door
+// (agent.ts); the pure helpers are exported for channel packages (compose's
+// pre-bind derives ids with them) and for hosts that build invite flows. The
+// server-side `via` principal type rides along for trusted callers of
+// `sendToSession`.
+export {
+  humanParticipantId, identityParticipantId, modelParticipantId,
+  participantByIdentity, participantByUserId, resolveAddressee,
+  participantsBlock, sanitizeDisplayName, needsAttribution,
+} from '../common/participants';
+// Downloads (participants spec §7): the mint for an app's own flows, the
+// handler for a host that mounts its own route, and the collection for
+// operators. Redemption's single-use burn lives inside `handleDownload`.
+export {
+  AttachmentDownloadTokens, issueAttachmentToken, redeemAttachmentToken,
+  handleDownload, mountDownloadRoute, DOWNLOAD_ROUTE,
+  type AttachmentDownloadToken,
+} from './downloads';
+export type { ViaIdentity } from './methods';
+export type { TranscriptView } from './transcript';
 
 /**
  * This process's boot watcher, or null when the settings or the environment
@@ -169,6 +191,10 @@ function denyAllClientWrites(): void {
     InboundSubmissions, ChannelLinkTokens, ChannelVerdictTokens,
     // The attachment store holds raw file bytes — the same lockout, doubly so.
     AgentAttachments,
+    // Download tokens: a forged client insert naming any session's attachment
+    // would be an exfiltration primitive through the GET route (participants
+    // spec §7.1) — the full link-token idiom includes this belt.
+    AttachmentDownloadTokens,
   ]) {
     (c as any).deny(deny);
   }
@@ -237,6 +263,14 @@ Meteor.startup(async () => {
   // `finally`; a boot watcher would fight every one of them — see `UNDER_TEST`.
   if (settings?.watcher !== false && !UNDER_TEST) {
     watcher = startWatcher();
+  }
+
+  // The download route (participants spec §7): its OWN mount, outside the
+  // channels guard — a web app with no channel still downloads its files —
+  // and on every instance, since the GETs are load-balanced like any HTTP.
+  // Not under test: route tests drive `handleDownload` directly.
+  if (!UNDER_TEST) {
+    mountDownloadRoute((WebApp as any).handlers);
   }
 
   // Channels (channels spec §9/§6.4). By this point every app-file

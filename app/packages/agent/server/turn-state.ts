@@ -1,6 +1,7 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import type { AgentSession, SessionInc } from '../common/types';
+import type { SessionSet } from '../common/db';
 import { guardedUpdate, SERVER_ID } from './lease';
 
 /**
@@ -85,6 +86,17 @@ export async function allocateSeq(
   // mistyped path here is a compile error rather than a silently-dropped
   // increment. See `SessionInc`.
   inc: SessionInc = {},
+  // Extra `$set` fields that must ride the SAME atomic write as the seq — the
+  // relay's durable wake (`pendingRelay`, participants spec decision 7) is
+  // the one caller: written any later, a crash between the commit and the
+  // wake would drop the relay forever.
+  set?: SessionSet,
+  // Fields to `$unset` in the same write — the relay's CONSUMPTION: the
+  // addressee's first commit clears the marker it answered, so a crash
+  // anywhere before that commit leaves the wake standing and recovery
+  // resumes the RIGHT model (a reviewer-confirmed window: consuming at turn
+  // entry re-routed a crashed relay to the primary).
+  unset?: { pendingRelay?: 1 },
 ): Promise<number | null> {
   // The driver's declared return is `ModifyResult<AgentSession>`, but with the
   // v5+ default (`includeResultMetadata: false`) `findOneAndUpdate` resolves to
@@ -94,7 +106,11 @@ export async function allocateSeq(
   // `undefined` the way `(before as any).nextSeq` was.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
     { _id: sessionId, 'lease.serverId': SERVER_ID },
-    { $inc: { nextSeq: 1, ...inc } satisfies SessionInc, $set: { updatedAt: new Date() } },
+    {
+      $inc: { nextSeq: 1, ...inc } satisfies SessionInc,
+      $set: { updatedAt: new Date(), ...(set ?? {}) },
+      ...(unset && Object.keys(unset).length > 0 ? { $unset: unset } : {}),
+    },
     { returnDocument: 'before' },
   ) as unknown as AgentSession | null;
   return before ? before.nextSeq : null;

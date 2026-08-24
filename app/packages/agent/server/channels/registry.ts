@@ -1,6 +1,8 @@
 import { timingSafeEqual } from 'crypto';
 import type { AgentMessage, AgentSession } from '../../common/types';
-import type { ChannelProfile, ChannelTransport, Lens } from '../../common/channel-contract';
+import type {
+  ChannelProfile, ChannelTransport, Lens, RemoteAttachment,
+} from '../../common/channel-contract';
 
 /**
  * The channel registry (channels spec §10): a static `Agent.channel(kind, def)`
@@ -110,6 +112,43 @@ export interface ChannelDef {
    */
   attachments?: false | { maxFileBytes?: number; maxFiles?: number; maxTotalBytes?: number };
   /**
+   * The admission policy NEW bindings of this channel are stamped with
+   * (participants spec decision 11) — see `ChannelBinding.admits`. Default
+   * `'opener'`, v1's posture. A group-thread deployment that wants every
+   * linked workspace member speaking sets `'linked'`; compose's pre-bind
+   * writes `'members'` on its own binding regardless of this knob.
+   */
+  admits?: 'opener' | 'members' | 'linked';
+  /**
+   * DESTINATION ADOPTION (participants spec §5): merge what an admitted
+   * inbound event knows about the conversation's addressing into a binding
+   * whose stored destination is missing it. Email is the motivating case —
+   * a compose pre-bind knows no `rootMessageId` (Postmark's send response
+   * carries its own id, not the RFC header), so without adoption every
+   * subsequent reply ships un-threaded and the conversation shatters in the
+   * recipient's mail client. PURE — bound × incoming → merged, or undefined
+   * for "keep what is stored". The destination stays opaque to the core;
+   * only the channel knows its fields.
+   */
+  adoptDestination?: (bound: unknown, incoming: unknown) => unknown | undefined;
+  /**
+   * The remote-media recipe (participants spec §6): how core turns a lens's
+   * `RemoteAttachment` references into bytes. `hosts` is the SSRF boundary —
+   * an exact-match https allowlist AUTHORED BY THE CHANNEL, never derived
+   * from the event; every fetched URL (first hop, indirect hop, redirect
+   * targets) must match it. `request` builds the credentialed fetch (the
+   * factory closes over its secrets — the lens never carries one); default:
+   * the attachment's own `url`, no headers. `resolveIndirect` extracts — or
+   * constructs, Telegram's token-in-path case — the second hop's URL from
+   * the first response's JSON. A channel whose lens emits remote attachments
+   * without this recipe drops every file with a visible note.
+   */
+  media?: {
+    hosts: string[];
+    request?: (att: RemoteAttachment) => { url: string; headers?: Record<string, string> };
+    resolveIndirect?: (json: unknown) => string | null;
+  };
+  /**
    * The webhook body ceiling for THIS surface, when the shared default
    * (`MAX_INBOUND_BYTES`, 1 MB) is too small for the provider's honest
    * payloads. Email needs it: Postmark delivers up to 35 MB of cumulative
@@ -130,7 +169,7 @@ export interface ChannelDef {
 export type ChannelKnobs = Pick<
   ChannelDef,
   'statuses' | 'onUncertainDelivery' | 'sessionUrl' | 'linkUrl' | 'throttle'
-  | 'attachments' | 'maxInboundBytes'
+  | 'attachments' | 'maxInboundBytes' | 'admits'
 >;
 
 /** The value-side twin of `ChannelKnobs`, and its totality check: the keys a
@@ -139,7 +178,7 @@ export type ChannelKnobs = Pick<
  *  option in four packages. */
 export const CHANNEL_KNOB_KEYS = [
   'statuses', 'onUncertainDelivery', 'sessionUrl', 'linkUrl', 'throttle',
-  'attachments', 'maxInboundBytes',
+  'attachments', 'maxInboundBytes', 'admits',
 ] as const satisfies ReadonlyArray<keyof ChannelKnobs>;
 
 /** The knobs PRESENT on `options`, and nothing else — what a tier-1 factory
@@ -196,6 +235,22 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   if (def.maxInboundBytes !== undefined
     && !(Number.isFinite(def.maxInboundBytes) && def.maxInboundBytes > 0)) {
     throw new Error(`[10thfloor:agent] channel "${kind}": def.maxInboundBytes must be a positive number`);
+  }
+  if (def.admits !== undefined && !['opener', 'members', 'linked'].includes(def.admits)) {
+    throw new Error(
+      `[10thfloor:agent] channel "${kind}": def.admits must be 'opener', 'members' or 'linked'`,
+    );
+  }
+  // A media recipe without a real allowlist would make the fetcher an open
+  // proxy — the "half-specified knob" failure again, on an SSRF surface.
+  if (def.media !== undefined && !(
+    Array.isArray(def.media.hosts) && def.media.hosts.length > 0
+    && def.media.hosts.every((h) => typeof h === 'string' && h !== '')
+  )) {
+    throw new Error(
+      `[10thfloor:agent] channel "${kind}": def.media.hosts must be a non-empty `
+      + 'array of hostnames — it is the fetcher\'s SSRF allowlist',
+    );
   }
   if (def.onUncertainDelivery === 'reconcile' && typeof def.transport.reconcile !== 'function') {
     throw new Error(

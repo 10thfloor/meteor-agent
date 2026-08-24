@@ -164,6 +164,12 @@ export async function forkSession(
       // reading is load-bearing here.
       nextSeq: cut + 1,
       forkedFrom: { sessionId: source._id, seq: cut },
+      // The ROSTER travels with the transcript it can read (participants spec
+      // decision 20): a member who forks gets a session they can still open,
+      // and every other member keeps standing in the copy. `relay` and
+      // `pendingRelay` do NOT copy — a fork is idle, and a relay is a live
+      // wake belonging to the source's own turn.
+      ...(source.participants?.length ? { participants: source.participants } : {}),
       createdAt: new Date(),
       updatedAt: new Date(),
     });
@@ -202,7 +208,18 @@ export async function forkSessionById(
   opts?: { atSeq?: number; title?: string; userId?: string | null },
 ): Promise<string> {
   const selector: SessionQuery = { _id: sessionId, agent };
-  if (opts && 'userId' in opts) selector.userId = opts.userId ?? null;
+  if (opts && 'userId' in opts) {
+    // The same membership widening `requireSession` grew (participants spec
+    // §4.2): a signed-in roster MEMBER may fork; the null clause stays the
+    // owner's alone.
+    const uid = opts.userId ?? null;
+    selector.$or = [
+      { userId: uid },
+      ...(uid !== null
+        ? [{ participants: { $elemMatch: { kind: 'human', userId: uid } } }]
+        : []),
+    ];
+  }
   const source = await AgentSessions.findOneAsync(selector);
   if (!source) throw new Meteor.Error('no-session', 'Session not found');
   return forkSession(source, opts);

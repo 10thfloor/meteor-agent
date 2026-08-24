@@ -3,7 +3,9 @@ import { check, Match } from 'meteor/check';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { getAgent, buildRunConfig, type AgentConfig } from './registry';
+import {
+  getAgent, buildRunConfig, resolveBudget, type AgentConfig,
+} from './registry';
 import { runTurn } from './loop';
 import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compaction';
 import { forkSession } from './fork';
@@ -11,7 +13,23 @@ import { MAX_SUBAGENT_DEPTH } from './subagent';
 import {
   ACTIVE_PHASES, type AgentSession, type AttachmentRef, type SessionInc,
 } from '../common/types';
-import type { SessionSet } from '../common/db';
+import type { SessionQuery, SessionSet } from '../common/db';
+import {
+  humanParticipantId, identityParticipantId, participantByIdentity,
+  participantByUserId, resolveAddressee,
+} from '../common/participants';
+import { resolveWakeAgent } from './participants';
+import { issueAttachmentToken } from './downloads';
+
+/**
+ * A VERIFIED channel identity, vouched for by trusted server code — the
+ * ingress principal (participants spec decision 12). Constructible only by
+ * callers of the server-side cores (`sendToSession`'s `extras.via`); never
+ * reachable from a DDP cap. It matches a roster row's `identity` and confers
+ * message-send standing for exactly one event — no DDP capability, no
+ * approval authority, no reads.
+ */
+export interface ViaIdentity { kind: string; externalUserId: string }
 
 /**
  * Authorize BEFORE acting, on every method that touches an existing session.
@@ -25,9 +43,37 @@ import type { SessionSet } from '../common/db';
  *
  * The error is deliberately identical for "no such session" and "not yours":
  * distinguishing them would confirm the existence of another user's session id.
+ *
+ * MEMBERSHIP (participants spec §4.2) widens the match in one query, three
+ * clauses ordered owner-first:
+ *   1. `userId` equality — today's rule, the only clause a rosterless session
+ *      can match, and the only one `userId: null` may EVER match: the
+ *      anonymous rule is the owner's alone, so a null caller on an owned
+ *      group session still gets `no-session`. Fail closed.
+ *   2. A human roster row with this (non-null) userId — an account member.
+ *   3. A human roster row whose `identity` equals the trusted `via` — a
+ *      channel-identified member, vouched for by ingress and reachable from
+ *      no DDP cap.
  */
-export async function requireSession(agent: string, sessionId: string, userId: string | null) {
-  const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, userId });
+export async function requireSession(
+  agent: string, sessionId: string, userId: string | null, via?: ViaIdentity,
+) {
+  const clauses: SessionQuery[] = [{ userId }];
+  if (userId !== null) {
+    clauses.push({ participants: { $elemMatch: { kind: 'human', userId } } });
+  }
+  if (via) {
+    clauses.push({
+      participants: {
+        $elemMatch: {
+          kind: 'human',
+          'identity.kind': via.kind,
+          'identity.externalUserId': via.externalUserId,
+        },
+      },
+    });
+  }
+  const session = await AgentSessions.findOneAsync({ _id: sessionId, agent, $or: clauses });
   if (!session) throw new Meteor.Error('no-session', 'Session not found');
   return session;
 }
@@ -47,15 +93,55 @@ export async function requireSession(agent: string, sessionId: string, userId: s
  * fatal by default on Node >= 15, so a bare `void runTurn(...)` would let one
  * bad provider call take down the whole app server.
  */
-export function deferTurn(sessionId: string, config: AgentConfig, userId: string | null): void {
+export function deferTurn(
+  sessionId: string, config: AgentConfig, userId: string | null,
+  opts?: Parameters<typeof buildRunConfig>[2],
+): void {
   Meteor.defer(() => {
     // `buildRunConfig` is shared with `Agent.ask` and with a subagent's child
     // run, so a turn runs on identical terms however it was started — see the
-    // note there.
-    runTurn(sessionId, buildRunConfig(config, userId)).catch((e) => {
+    // note there. `opts` is the addressed-turn composition (participants spec
+    // §4.3): the addressee's config, the primary's budget.
+    runTurn(sessionId, buildRunConfig(config, userId, opts)).catch((e) => {
       console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
     });
   });
+}
+
+/**
+ * Wake a session as the RIGHT model participant (participants spec decision
+ * 6): resolve the addressee from durable state (`resolveWakeAgent` — the
+ * parked turn's `pending.agent`, a standing relay, the unanswered tail), then
+ * compose the run — the addressee's config, the PRIMARY's budget, the
+ * session's OWNER as the run identity. Every recovery-shaped caller
+ * (`recordVerdict`, the approval timeout, the watcher) goes through this so
+ * an addressed turn can never be resumed under the wrong model's tools.
+ *
+ * Falls back to the primary — with a warning — when the addressee's agent
+ * name is no longer registered: a renamed colleague must not strand the
+ * session, and the primary answering visibly beats nobody answering at all.
+ */
+export async function deferResolvedTurn(session: AgentSession): Promise<boolean> {
+  const primary = getAgent(session.agent);
+  if (!primary) return false;
+  const name = await resolveWakeAgent(session);
+  if (name === session.agent) {
+    deferTurn(session._id, primary, session.userId);
+    return true;
+  }
+  const addressee = getAgent(name);
+  if (!addressee) {
+    console.warn(
+      `[10thfloor:agent] session ${session._id}: addressed model "${name}" is not `
+      + `registered; waking as the primary "${session.agent}" instead`,
+    );
+    deferTurn(session._id, primary, session.userId);
+    return true;
+  }
+  deferTurn(session._id, addressee, session.userId, {
+    agentName: name, budget: resolveBudget(primary.budget),
+  });
+  return true;
 }
 
 /**
@@ -132,6 +218,11 @@ async function writeVerdict(
       _id: Random.id(), sessionId, seq: before.nextSeq,
       role: 'note', kind: 'approval',
       approved: verdict === 'approved', by, reason,
+      // Rostered sessions name the deciding MEMBER, not just an account id —
+      // the group audit question is "which participant answered".
+      ...(before.participants?.length ? {
+        byParticipant: participantByUserId(before, by)?.id ?? humanParticipantId(by),
+      } : {}),
       // AUDIT COMPLETENESS: what was authorized, not merely that someone said
       // yes. A call that runs as `service-account` is a different fact from one
       // that runs as the approver, and the tool spec (the only other place that
@@ -192,7 +283,11 @@ export async function recordTimeoutVerdict(sessionId: string): Promise<boolean> 
   if (!(await writeVerdict(sessionId, 'denied', null, 'approval timed out', true))) {
     return false;
   }
-  deferTurn(sessionId, config, session.userId);
+  // Re-read for the wake: the verdict write mutated `pending`, and the resume
+  // must run as the model that PARKED (`pending.agent` — participants spec
+  // decision 6), under the primary's budget and the owner's identity.
+  const after = await AgentSessions.findOneAsync(sessionId);
+  if (after) await deferResolvedTurn(after);
   return true;
 }
 
@@ -288,7 +383,9 @@ export async function recordVerdict(
   // Ownership says the caller may drive this session; `config.approve` says
   // whether they may answer for it. A four-eyes policy ("not the same person
   // who asked") lives here, and returning false must leave the request
-  // standing for someone who can.
+  // standing for someone who can. The predicate is the PRIMARY agent's even
+  // when an addressee model parked the call — approval policy is a property
+  // of the conversation, not of whichever colleague asked.
   if (config.approve && !(await config.approve({ userId: ctx.userId }))) {
     throw new Meteor.Error('not-allowed', 'You may not answer this approval');
   }
@@ -300,7 +397,11 @@ export async function recordVerdict(
     throw new Meteor.Error('no-pending', 'Nothing is waiting for approval');
   }
 
-  deferTurn(sessionId, config, ctx.userId);
+  // The wake resolves the RUNNING model from `pending.agent` (participants
+  // spec decision 6) and always runs as the session's OWNER (decision 10) —
+  // the approver's identity lives in the audit note, never in the run.
+  const after = await AgentSessions.findOneAsync(sessionId);
+  if (after) await deferResolvedTurn(after);
 }
 
 /**
@@ -319,15 +420,39 @@ export async function recordVerdict(
  */
 export async function sendToSession(
   agent: string, sessionId: string, text: string, userId: string | null,
-  /** Server-side extras a channel's admission supplies (email v2 spec §6):
-   *  REFS to files already inserted into the attachment store. Never reachable
-   *  from the DDP cap — a client cannot hand refs in; only trusted admission
-   *  code that just wrote the bytes can. */
-  extras?: { attachments?: AttachmentRef[] },
+  /** Server-side extras trusted callers supply — never reachable from the DDP
+   *  cap. `attachments`: refs a channel's admission just wrote (email v2 spec
+   *  §6). `via`: the verified channel identity of the sender (participants
+   *  spec decision 12) — ingress only. `to`: an explicit addressee
+   *  (participant id or agent name), overriding the leading-`@` parse. */
+  extras?: { attachments?: AttachmentRef[]; via?: ViaIdentity; to?: string },
 ): Promise<string> {
   const config = getAgent(agent);
   if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
-  await requireSession(agent, sessionId, userId);
+  const session = await requireSession(agent, sessionId, userId, extras?.via);
+  const roster = session.participants;
+
+  // WHO is speaking (participants spec decision 4), resolved from the
+  // AUTHENTICATED source: the trusted `via` identity names its roster row; an
+  // account caller names theirs; the owner (rosterless sessions included) is
+  // the fallback — requireSession already proved one of these matched.
+  const sender = (extras?.via && participantByIdentity(
+    session, extras.via.kind, extras.via.externalUserId,
+  ))
+    ?? participantByUserId(session, userId)
+    ?? roster?.find((p) => p.role === 'owner');
+  const from = sender
+    ? { participant: sender.id, name: sender.displayName }
+    : {
+      participant: extras?.via
+        ? identityParticipantId(extras.via.kind, extras.via.externalUserId)
+        : humanParticipantId(userId),
+      name: extras?.via ? extras.via.externalUserId : 'user',
+    };
+
+  // WHICH MODEL answers (decision 5): explicit `to`, else the leading `@`
+  // token, else the primary — resolved here, mechanically, once.
+  const addressee = resolveAddressee(text, extras?.to, session);
 
   // §9: the turn budget, enforced INSIDE the atomic allocation below, not
   // as a separate read-then-check. `budgetSpent.turns` is only ever $inc'd
@@ -359,7 +484,15 @@ export async function sendToSession(
     turnFilter,
     {
       $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc,
-      $set: { updatedAt: new Date() },
+      // A HUMAN message outranks any pending relay, at any seq, and resets
+      // the hop count (participants spec decision 7) — folded into the same
+      // atomic write as the seq it precedes. Rosterless sessions skip both:
+      // their documents stay byte-identical to before the fields existed.
+      $set: {
+        updatedAt: new Date(),
+        ...(roster?.length ? { relay: 0 } : {}),
+      },
+      ...(roster?.length ? { $unset: { pendingRelay: 1 } } : {}),
     },
     { returnDocument: 'before' },
   ) as unknown as AgentSession | null;
@@ -376,6 +509,13 @@ export async function sendToSession(
     _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
     content: text,
     ...(extras?.attachments?.length ? { attachments: extras.attachments } : {}),
+    // Attribution rides every ROSTERED row (decision 4); a rosterless
+    // session's rows stay byte-identical to before the field existed, and
+    // project under the fixed defaults (user → owner) if a roster ever
+    // materializes. The addressee is stamped only when one actually resolved
+    // — an unmatched `@name` is just text.
+    ...(roster?.length ? { from } : {}),
+    ...(addressee ? { to: addressee.id } : {}),
     createdAt: new Date(),
   });
 
@@ -387,7 +527,24 @@ export async function sendToSession(
     { $set: { phase: 'idle' } },
   );
 
-  deferTurn(sessionId, config, userId);
+  // The wake runs as the OWNER (decision 10) — the sender's standing was
+  // spent above; instructions and tools see one identity per session. An
+  // addressed send composes the addressee's config with the PRIMARY's budget
+  // (§4.3); an unregistered addressee falls back to the primary, visibly.
+  if (addressee && addressee.agent !== agent) {
+    const target = getAgent(addressee.agent);
+    if (target) {
+      deferTurn(sessionId, target, session.userId, {
+        agentName: addressee.agent, budget: resolveBudget(config.budget),
+      });
+      return sessionId;
+    }
+    console.warn(
+      `[10thfloor:agent] session ${sessionId}: addressed model "${addressee.agent}" `
+      + `is not registered; the primary "${agent}" answers instead`,
+    );
+  }
+  deferTurn(sessionId, config, session.userId);
   return sessionId;
 }
 
@@ -570,6 +727,28 @@ export function registerMethods(): void {
       if (refusal) throw new Meteor.Error('busy', refusal);
       if (outcome === 'gone') throw new Meteor.Error('no-session', 'Session not found');
       return outcome === 'compacted';
+    },
+
+    /**
+     * Mint a single-use download token for one attachment ref (participants
+     * spec §7). Authorized exactly like the publication — owner, account
+     * member, the anonymous capability — then the ref must exist IN THIS
+     * session. The browser GETs `/agent/attachments/<token>` within the
+     * minute; the same 404 answers a wrong id and a wrong session, so a
+     * caller learns nothing about refs it cannot reach.
+     */
+    async [NAMES.mAttachmentToken](
+      this: any, agent: string, sessionId: string, attachmentId: string,
+    ) {
+      check(agent, String);
+      check(sessionId, String);
+      check(attachmentId, String);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      await requireSession(agent, sessionId, this.userId ?? null);
+      const token = await issueAttachmentToken(sessionId, attachmentId);
+      if (!token) throw new Meteor.Error('no-attachment', 'Attachment not found');
+      return token;
     },
 
     async [NAMES.mApprove](this: any, agent: string, sessionId: string) {

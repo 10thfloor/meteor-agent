@@ -186,14 +186,44 @@ tools: [
 - **Effectively-once**: the send is receipt-logged under the tool call's id,
   so a crash-recovery re-run of the tool reports the settled send instead of
   mailing twice.
-- **A reply to composed mail opens a fresh conversation** — `Reply-To` is the
-  plain inbound address (no thread key) and the mail is stamped
-  `Auto-Submitted: auto-generated`. Routing the recipient's answer into the
-  *composing* session is the channels spec's group-ownership question, open
-  on purpose.
+- **A reply to composed mail opens a fresh conversation** by default —
+  `Reply-To` is the plain inbound address (no thread key) and the mail is
+  stamped `Auto-Submitted: auto-generated`. `onReply: 'continue'` closes the
+  loop instead — see below.
 - Compose is **not a reply path**: the person you are already talking to gets
   the turn's answer automatically; composing to them delivers twice. The tool
   description says so to the model.
+
+### `onReply: 'continue'` — the composed loop
+
+With `onReply: 'continue'` (and `kind` naming the registered email channel,
+default `'email'`), a successful send **joins the recipient to the
+conversation** (participants spec §5): the mail's `Reply-To` carries a thread
+key derived from *session + recipient* — a crash re-run or a second compose
+to the same address lands in the same conversation — and the send pre-binds
+that key to the composing session as a **member binding**, with the recipient
+on the session's roster.
+
+What that means, plainly:
+
+- **Their replies continue this session**, attributed
+  (`from: dana@ourco.com`), admitted through the roster regardless of DKIM —
+  an unverified reply is one attributed, powerless message; verification
+  still gates account *linking*, exactly as before.
+- **Your future replies are delivered to them too** — including the one the
+  model writes right after composing (its snapshot cursor starts them at the
+  composed message, never the session's backlog). Joining someone is what
+  the default `gate: 'ask'` approval is consenting to, and the approval
+  prompt says so.
+- **They get outward replies only**: never approval prompts, status notes,
+  or capability URLs — and if they later link an account, linking updates
+  their roster row without ever handing them the session.
+- Refused, structured, where a correspondence cannot live: throwaway
+  (`Agent.ask`) sessions, subagent children, and when the `kind` channel is
+  not registered (the reply needs a webhook to arrive through).
+- The first reply also teaches the binding its threading root
+  (`In-Reply-To`/`References` on everything after), so the exchange threads
+  properly in the recipient's mail client.
 
 ## Account linking
 

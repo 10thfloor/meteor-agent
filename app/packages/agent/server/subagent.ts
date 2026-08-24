@@ -1,6 +1,7 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import { modelFrom } from '../common/participants';
 import { buildRunConfig, getAgent } from './registry';
 import { guardedUpdate, SERVER_ID } from './lease';
 import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
@@ -365,6 +366,20 @@ export async function runSubagent(
     // than making every reader handle a missing half of the lineage.
     parent: { sessionId: ctx.sessionId, toolCallId: ctx.toolCallId ?? '' },
     depth,
+    // A rostered parent's HUMAN participants carry to the child (participants
+    // spec decision 20) — pubSession's invariant is that a child authorizes
+    // exactly the people the parent authorizes, and with a roster "the
+    // people" are the members. The parent's MODELS do not: the child's own
+    // agent is its only model, seeded here so the roster stays complete.
+    ...(parent.participants?.length ? {
+      participants: [
+        ...parent.participants.filter((p) => p.kind === 'human'),
+        {
+          id: `m:${name}`, kind: 'model' as const, role: 'member' as const,
+          agent: name, displayName: name, joinedAt: new Date(),
+        },
+      ],
+    } : {}),
     createdAt: new Date(),
     updatedAt: new Date(),
   });
@@ -407,6 +422,14 @@ export async function runSubagent(
       seq: before.nextSeq,
       role: 'user',
       content: prompt,
+      // In a ROSTERED child (≥2 copied humans) the from-less user default
+      // attributes to the owner — but this text is the PARENT MODEL's
+      // delegation, and a projection reading "[Mackenzie]: <instructions
+      // Mackenzie never wrote>" is a reviewer-confirmed mislabel. The
+      // parent model's id is outside the child's roster; the projection's
+      // nameOf falls back to the stamp's own name.
+      ...(parent.participants?.length
+        ? { from: modelFrom(parent.agent) } : {}),
       createdAt: new Date(),
     });
 

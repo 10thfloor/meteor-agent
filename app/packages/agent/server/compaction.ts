@@ -12,7 +12,11 @@ import { runBeforeProviderRequest } from './hooks';
 import {
   accruedCost, allocateSeq, classifyProviderError, running,
 } from './turn-state';
-import { batchSafeBoundary, toProviderMessages } from './transcript';
+import {
+  batchSafeBoundary, toProviderMessages, type TranscriptView,
+} from './transcript';
+import { modelParticipantId } from '../common/participants';
+import { getAgent, resolveProvider } from './registry';
 import type { RunConfig } from './loop';
 
 /**
@@ -44,13 +48,19 @@ export function latestCompaction(
  * leading user message, then every non-note message after the note's `upto`.
  * With no compaction, the whole (note-filtered) transcript. The transcript
  * itself is never touched — compaction changes this view only.
+ *
+ * `view` is the running participant's projection (participants spec §4.4),
+ * threaded straight through to `toProviderMessages`; absent = today's,
+ * byte-identical.
  */
-export function assembleContext(msgs: AgentMessage[]): ProviderMessage[] {
+export function assembleContext(
+  msgs: AgentMessage[], view?: TranscriptView,
+): ProviderMessage[] {
   const c = latestCompaction(msgs);
-  if (!c) return toProviderMessages(msgs);
+  if (!c) return toProviderMessages(msgs, view);
   return [
     { role: 'user', content: `[Earlier conversation, compacted]\n${c.summary}` },
-    ...toProviderMessages(msgs.filter((m) => m.seq > c.upto)),
+    ...toProviderMessages(msgs.filter((m) => m.seq > c.upto), view),
   ];
 }
 
@@ -176,6 +186,38 @@ async function compactNow(
   const head = history.filter(
     (m) => m.role !== 'note' && (!prior || m.seq > prior.upto) && m.seq <= upto,
   );
+
+  // Group sessions summarize through the OMNISCIENT projection (participants
+  // spec §4.4): every participant's speech visible and attributed, because any
+  // single model's view drops exactly the working a summary must fold in — and
+  // the summarizer is not a participant. 1:1 sessions pass no view and stay
+  // byte-identical.
+  const sessionDoc = await AgentSessions.findOneAsync(sessionId);
+  const view: TranscriptView | undefined = sessionDoc?.participants?.length
+    ? {
+      primary: modelParticipantId(sessionDoc.agent),
+      participants: sessionDoc.participants,
+    }
+    : undefined;
+
+  // The summarization is PINNED to the primary agent's model and provider
+  // (§4.4): automatic compaction can fire inside an ADDRESSED turn, and which
+  // model summarizes — and bills — must not depend on which participant's
+  // context happened to overflow. Fall back to the running config when the
+  // primary is unregistered; a summary by the wrong model beats none.
+  let billing = config;
+  if (config.agentName !== undefined && config.agentName !== agent) {
+    const primary = getAgent(agent);
+    if (primary) {
+      billing = {
+        ...config,
+        model: primary.model,
+        provider: resolveProvider(primary.provider),
+        pricing: primary.pricing,
+      };
+    }
+  }
+
   let summary = '';
   let usage = { input: 0, output: 0 } as { input: number; output: number; cost?: number };
   // The summarization is a full provider round trip with no consuming-loop
@@ -196,18 +238,22 @@ async function compactNow(
     // `signal` is re-stamped below for the same reason it is on the think path:
     // cancelling this call is the harness's job, not the hook's.
     const request = await runBeforeProviderRequest({
-      model: config.model,
+      model: billing.model,
       system:
         'You compact conversation history for an agent. Produce a concise brief '
         + 'the agent can continue from, structured as: Goal, Progress, Decisions, '
         + 'Open items. Preserve identifiers, numbers, and constraints exactly. '
+        + (view
+          ? 'Messages may be prefixed with [name]: naming their speaker; preserve '
+            + 'who said and decided what. '
+          : '')
         + 'Output only the brief.',
       messages: [
         ...(prior ? [{
           role: 'user' as const,
           content: `[Earlier conversation, compacted]\n${prior.summary}`,
         }] : []),
-        ...toProviderMessages(head),
+        ...toProviderMessages(head, view),
         { role: 'user' as const, content: 'Compact the conversation above now, as instructed.' },
       ],
       // The head keeps its tool_use/tool_result blocks, and Anthropic rejects
@@ -217,7 +263,7 @@ async function compactNow(
       // chunks accumulate below).
       tools: schemas,
     }, { agent, sessionId, purpose: 'compaction' });
-    for await (const chunk of config.provider.stream({ ...request, signal: abort.signal })) {
+    for await (const chunk of billing.provider.stream({ ...request, signal: abort.signal })) {
       if (chunk.kind === 'text') summary += chunk.chunk;
       else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
     }
@@ -242,7 +288,7 @@ async function compactNow(
   const noteSeq = await allocateSeq(sessionId, {
     'usage.input': usage.input,
     'usage.output': usage.output,
-    'usage.cost': accruedCost(usage, config.pricing),
+    'usage.cost': accruedCost(usage, billing.pricing),
   });
   if (noteSeq === null) return false;
   await AgentMessages.insertAsync({

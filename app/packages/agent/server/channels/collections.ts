@@ -88,6 +88,30 @@ export interface ChannelBinding {
    *  names a thread, not a person). Absent when the first event carried no
    *  sender. */
   externalUserId?: string;
+  /**
+   * WHO this conversation admits beyond its owner (participants spec decision
+   * 11). `'opener'` (the default, absent included) is v1's guard verbatim:
+   * the owner, or — while anonymous — the recorded opener, and nobody else.
+   * `'members'` additionally admits senders whose identity (or resolved
+   * account) matches a roster participant. `'linked'` admits any sender with
+   * a LINKED identity, auto-joining them as a member on first message (the
+   * group-thread acquisition path, capped by the roster). The binding gates
+   * INGRESS; the roster gates DDP — an 'opener' binding refuses a roster
+   * member who is not the opener.
+   */
+  admits?: 'opener' | 'members' | 'linked';
+  /**
+   * A MEMBER binding (participants spec decision 14): a conversation that
+   * reaches one non-owner participant — compose's pre-bound recipient is the
+   * canonical case. Member bindings receive outward replies and overflow
+   * ONLY: never prompt items, never status notes, never a capability URL —
+   * and the claim-history sweep skips them, so a recipient who later links
+   * can never be handed the composing session's ownership.
+   */
+  member?: true;
+  /** The roster participant a `member: true` binding reaches — teardown's
+   *  key: removing the participant deletes their bindings. */
+  participant?: string;
   /** The egress high-water mark: everything at or below this seq has been
    *  HANDLED for THIS surface — posted and receipted, abandoned (the channel's
    *  declared §11 recovery tier or `MAX_DELIVERY_ATTEMPTS`), or planned as

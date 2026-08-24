@@ -36,6 +36,44 @@ export interface ChannelAttachment {
 }
 
 /**
+ * A file the provider delivered as a REFERENCE, not bytes (participants spec
+ * §6) — the chat surfaces' shape: Slack hands a private download URL, Twilio
+ * a media URL, WhatsApp and Telegram an id whose fetch needs credentials to
+ * even name the resource. The LENS stays pure and secret-free (it is a module
+ * constant — it cannot carry a token and must not fetch): it translates the
+ * event's facts into this, and CORE performs the size-gated fetch under the
+ * channel def's `media` recipe — the host allowlist authored by the channel,
+ * never derived from the event.
+ */
+export interface RemoteAttachment {
+  name: string;
+  contentType: string;
+  /** The provider's CLAIM — checked against the per-file cap BEFORE fetching,
+   *  so an honestly-oversized file costs nothing; the streaming abort is what
+   *  handles a lying one. Absent = fetch and find out. */
+  declaredSize?: number;
+  /** The resource, when the event names one directly (https only). */
+  url?: string;
+  /** The provider's file id, when naming the resource itself needs
+   *  credentials (Telegram) — the def's `media.request` builds the URL. */
+  ref?: string;
+  /** Two-step providers (WhatsApp's media lookup, Telegram's getFile): the
+   *  first response is JSON from which the def's `media.resolveIndirect`
+   *  extracts — or constructs — the real target, fetched next with the SAME
+   *  headers (a credentialed, allowlisted provider API call — unlike
+   *  redirects, which strip auth cross-host; both targets are host-checked). */
+  indirect?: true;
+}
+
+/** A lens hands core either bytes (email inlines them in the webhook) or a
+ *  reference (everything else). The discriminant is `content`. */
+export type InboundAttachment = ChannelAttachment | RemoteAttachment;
+
+export function isRemoteAttachment(a: InboundAttachment): a is RemoteAttachment {
+  return typeof (a as ChannelAttachment).content !== 'string';
+}
+
+/**
  * The naming-clause FLOOR for a surface that cannot carry bytes (§8.5's
  * degrade, downward from the full row): one text line per file, appended to
  * the rendered text so the recipient learns the file exists and what it is
@@ -110,6 +148,10 @@ export type DeliveryItem =
     item: 'prompt';
     name: string;
     args: unknown;
+    /** The tool's own one-line account of the call (participants spec §8),
+     *  hydrated at park time — a lens renders it ABOVE (or instead of) the
+     *  raw args, so an approver reads names and sizes, not ref ids. */
+    display?: string;
     runAs?: string | null;
     toolCallId: string;
     choices: PromptChoice[];
@@ -180,13 +222,15 @@ export interface InboundReading {
    *  intents, whose 200 carries no body. */
   respond?: string;
   /**
-   * Files the provider delivered with a `message` intent, already base64 (the
-   * lens passes through what the webhook carried, minus inline/`ContentID`
-   * entries). CAPS ARE NOT THE LENS'S JOB: admission policy is core policy —
-   * the pipeline applies the channel's caps, keeps what passes, stores the
-   * bytes, and notes what it dropped. The lens translates.
+   * Files the provider delivered with a `message` intent — inline base64
+   * (email's webhook carries the bytes) or a `RemoteAttachment` reference
+   * (the chat surfaces — core fetches under the def's `media` recipe,
+   * participants spec §6). CAPS ARE NOT THE LENS'S JOB: admission policy is
+   * core policy — the pipeline applies the channel's caps, keeps what passes,
+   * stores the bytes, and notes what it dropped or could not retrieve. The
+   * lens translates.
    */
-  attachments?: ChannelAttachment[];
+  attachments?: InboundAttachment[];
 }
 
 // ---- The lens itself (§8.3) ------------------------------------------------
@@ -441,6 +485,15 @@ export interface RoundTripOptions {
   /** A plain inbound message event carrying `text`; checked to read back as a
    *  `message` intent with that text. */
   message?: (text: string) => unknown;
+  /**
+   * The MEDIA half of the law (participants spec §6.4): a FILE-ONLY inbound
+   * event — no text, carrying these files in the surface's own wire shape.
+   * Checked to read back as a `message` intent (the sharpened guard: a file
+   * with no words is still a message) whose `attachments` carry every file's
+   * name and contentType. Without this, all four chat translations would ship
+   * on the one seam the contract leaves untested.
+   */
+  mediaMessage?: (files: Array<{ name: string; contentType: string }>) => unknown;
 }
 
 /**
@@ -583,6 +636,42 @@ export function assertLensRoundTrip(
         + `back as ${JSON.stringify(reading.intent)} instead of a 'message' intent `
         + 'carrying its text.',
       );
+    }
+  }
+
+  if (opts.mediaMessage) {
+    // ONE file, deliberately: several surfaces (WhatsApp, a Telegram photo)
+    // deliver exactly one media per message, and the law must hold for them
+    // too. Multi-file translation is each package's own test.
+    const files = [{ name: 'diagram.png', contentType: 'image/png' }];
+    const reading = lens.in(opts.mediaMessage(files));
+    if (reading.intent.kind !== 'message') {
+      throw new Error(
+        '[10thfloor:agent] round-trip failed: a FILE-ONLY inbound event read back '
+        + `as ${JSON.stringify(reading.intent)} — a file with no words is still a `
+        + 'message (the sharpened guard, participants spec §6).',
+      );
+    }
+    // What translation must preserve: the FILE (count) and its TYPE. Not the
+    // name — some wire formats (Twilio's MMS form fields) carry none, and a
+    // lens cannot preserve what the provider never transmits; mechanical
+    // names are the honest translation there.
+    const got = reading.attachments ?? [];
+    if (got.length !== files.length) {
+      throw new Error(
+        `[10thfloor:agent] round-trip failed: the file-only event carried `
+        + `${files.length} file(s) but the reading carries ${got.length}. The lens `
+        + 'must hand every file to admission (participants spec §6.4).',
+      );
+    }
+    for (const f of files) {
+      if (!got.some((a) => a.contentType === f.contentType)) {
+        throw new Error(
+          `[10thfloor:agent] round-trip failed: the file-only event's `
+          + `${f.contentType} file did not survive translation — the reading `
+          + `carries ${JSON.stringify(got.map((a) => a.contentType))}.`,
+        );
+      }
     }
   }
 }
