@@ -1732,13 +1732,13 @@ tools: [{ name: 'memory_save', gate: ({ args }) => (
 Meteor.subscribe('agent.memories');
 const rows = AgentMemories.find({}, { sort: { at: -1 } }).fetch();
 
-await Meteor.callAsync('memory.forget', { id });   // the delete button
-await Meteor.callAsync('memory.save', { text: 'call me Mac' });
+await Meteor.callAsync('agent.memoryForget', { id });   // the delete button
+await Meteor.callAsync('agent.memorySave', { text: 'call me Mac' });
 ```
 
 The client surface is deliberately **narrower** than the model's. Approval gates run only inside the turn
-loop, so a DDP `memory.save` with `scope: 'app'` is refused outright — otherwise any signed-in account
-could write the pool that every session's prompt reads:
+loop, so a DDP `agent.memorySave` with `scope: 'app'` is refused outright — otherwise any signed-in
+account could write the pool that every session's prompt reads:
 
 ```
 Meteor.Error('denied-scope', 'Shared work memory cannot be written from a client; …')
@@ -1767,7 +1767,14 @@ embeds it at search time, so there is no pipeline and no key:
 db.agent_memories.createSearchIndex({
   name: 'agent_memories_vector',
   type: 'vectorSearch',
-  definition: { fields: [{ type: 'text', path: 'text', model: 'voyage-3-large' }] },
+  definition: {
+    fields: [
+      { type: 'text', path: 'text', model: 'voyage-3-large' },
+      { type: 'filter', path: 'scope' },
+      { type: 'filter', path: 'userId' },
+      { type: 'filter', path: 'agent' },
+    ],
+  },
 });
 ```
 

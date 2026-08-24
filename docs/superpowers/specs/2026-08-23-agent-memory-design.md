@@ -340,6 +340,39 @@ The one new infrastructure ask, named honestly in the README:
 | Per-agent silos as default | Overturned: memory follows the human; `agent` scope survives as opt-in |
 | Fourth scope (agent-private, cross-user) | If an agent learns the job, the roster deserves it; `by` preserves credit. YAGNI. |
 
+## 10a. Build deviations (recorded after branch review)
+
+Fourteen defects were confirmed against the built branch; three were
+blockers. The design survived — none touched the data model, the scope
+design, the ladder, or the approval flow — but four of them changed a rule
+the spec had stated, and those are recorded here rather than silently fixed:
+
+1. **Decision 13 was factually wrong** about a default `approve` predicate;
+   the anonymous refusal moved into the core (see the amended row).
+2. **`$vectorSearch` scoping is a pre-filter, not a post-`$match`.** The
+   spec's §6 pipeline ranked the whole collection and filtered afterwards,
+   which returns a handful of the right rows — or none — once a store holds
+   more than one account's worth. The scope clause now rides the stage's
+   `filter`, and the README's index definition declares `scope`, `userId`
+   and `agent` as filter fields. The `$match` stays as a belt.
+3. **The tool-name collision policy is PER NAME.** All-or-nothing dropped
+   three tools when one collided while the standing block kept advertising
+   them — an unknown-tool error on every turn that tried to remember.
+4. **`memory_forget` has its own gate.** It takes `{ id }` and no scope, so
+   the save gate's `args.scope` read resolved `'auto'` for every delete:
+   writing to the shared pool asked, erasing from it did not. The forget
+   gate reads the ROW's scope, and `allowApp` now follows the agent's own
+   scopes rather than being passed unconditionally.
+
+The rest were implementation defects against rules the spec already
+stated correctly: pinned overflow eating recent slots (§6), `minScore`
+validated but never applied (§6), `pinned: false` silently no-op, unmarked
+truncation in `describe` (§7), a transient mongot failure latching the
+vector rung off permanently (§2.11), an installed `search` fn's rows not
+re-scoped, keyed saves racing without a unique index (§2.15), agent-scope
+writes resolving to whichever agent was defined first, unnamespaced DDP
+method names, and a publication limit below the caps it serves.
+
 ## 11. Open questions
 
 - **Per-member stores** in multi-human sessions (saves keyed to a member,
