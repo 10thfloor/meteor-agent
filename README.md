@@ -324,6 +324,52 @@ Support.define({
 The model sees a `## Skills` listing and a `skill` tool. It calls the tool to
 load the content it needs for the current question.
 
+## Memory
+
+Agents that remember — the person, and the work. It is a Mongo collection, so
+your UI can show the user exactly what is stored and let them delete it.
+
+```ts
+// server
+Support.define({ model, instructions, memory: true });
+```
+
+Three tools appear (`memory_save`, `memory_search`, `memory_forget`) and a
+compact listing of what is remembered rides the system prompt — titles only, so
+ten memories cost ten lines and the details arrive through a tool call the
+transcript records. Memory is keyed by **user**, not by agent, so every model in
+a session shares one store: what `support` learns, `analyst` recalls.
+
+Facts about the *work* — true for every user — live in a shared pool that a
+human approves before it lands, and approves again before it is deleted:
+
+```ts
+// server
+Support.define({ model, instructions, memory: { scopes: ['user', 'app'] } });
+```
+
+```
+model → memory_save { text: 'orders table soft-deletes', scope: 'app' }
+       ↓ parks for approval, showing the human what would be shared
+human → Approve  →  every session's agent now knows it, stamped by:'m:support'
+```
+
+Semantic recall comes from MongoDB itself — `$vectorSearch` with automated
+embedding, so there is no embedding pipeline and no second database — and
+degrades to text search and then regex rather than failing a turn. It works on
+a stock dev database and gets better on a real one.
+
+```ts
+// client — the user's memory page is an ordinary subscription
+Meteor.subscribe('agent.memories');
+await Meteor.callAsync('agent.memoryForget', { id });
+```
+
+The client surface is deliberately narrower than the model's: approval gates
+run only inside the turn loop, so writing shared knowledge from a browser is
+refused outright. See the
+[memory spec](docs/superpowers/specs/2026-08-23-agent-memory-design.md).
+
 ## Hooks
 
 Two extension seams: what goes out to the provider, and what comes back from a
@@ -553,7 +599,10 @@ reference — config surface, tools, budgets, gates, subagents, MCP, skills,
 hooks, theming, channels, and the operational notes that matter in production.
 **[by-example.md](docs/by-example.md)** covers the same ground as working
 code — including a failure drill that kills the server mid-stream and watches
-the transcript put itself back together.
+the transcript put itself back together. The design specs behind each release
+live in **[docs/superpowers/specs/](docs/superpowers/specs/)**, each one
+recording the decisions it made and, where a build disagreed with its spec, the
+deviation and why.
 
 ## Requirements
 
@@ -637,6 +686,23 @@ stress test (no buttons, no threads: approvals ride the receipt-registered
 "Reply YES/NO" grammar) — and **[Email/Postmark](app/packages/agent-channel-email/README.md)**,
 where the conversation is a thread recovered statelessly from our own
 Reply-To address and approvals are single-use Approve/Deny links.
+
+The seventh is **participants** — a session generalized to *n* humans and *n*
+models per the
+[participants spec](docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md):
+an optional roster that becomes the authorization primitive, per-message
+attribution stamped by the harness rather than claimed by a model, mechanical
+`@name` addressing, and durable model-to-model relays with their own budget.
+The same release closed the deferred loops — composed email that continues its
+own conversation, chat media ingest behind an allowlisted fetcher, click-minted
+download tokens, tool-authored approval text, and multimodal reads.
+
+The eighth is **memory** — durable recall per the
+[memory spec](docs/superpowers/specs/2026-08-23-agent-memory-design.md):
+a second Mongo collection the user can subscribe to and delete from, person
+memory that follows the human across every agent on a roster, an approval-gated
+shared pool for facts about the work, and a search ladder from `$vectorSearch`
+down to regex that narrows rather than breaking.
 
 CI runs the full suite plus a production-bundle verification on every push.
 
