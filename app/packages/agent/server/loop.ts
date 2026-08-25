@@ -8,6 +8,7 @@ import {
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
 import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
+import { consumeSystemIntent } from './system-turn';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -905,8 +906,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       //     still ends quietly.
       const verdictWake = !!(wakeable && !resumed && after.pending?.verdict);
       const relayWake = !!(wakeable && after.pendingRelay);
+      // A FOURTH kind (system-turn spec §4.6): a standing SYSTEM INTENT —
+      // scheduled work that arrived while this turn held the session, or that
+      // this turn's own commit did not consume. It is the one wake whose
+      // transcript row does not exist yet, which is why its arm below calls
+      // `consumeSystemIntent` rather than `runTurn`: waking straight into the
+      // loop would make a billed provider call against an unchanged transcript
+      // and commit an assistant row answering nothing.
+      const intentWake = !!(wakeable && after.pendingSystem);
       let tailWake = false;
-      if (wakeable && !verdictWake && !relayWake
+      if (wakeable && !verdictWake && !relayWake && !intentWake
         && after.participants?.length && !after.pending) {
         // ADDRESSEE-AWARE (a reviewer-confirmed strand): "any assistant row
         // after the user row" reads a colleague-addressed interjection as
@@ -915,7 +924,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         const owed = await unansweredAddressee(after).catch(() => null);
         tailWake = !!owed && owed.agent !== (config.agentName ?? after.agent);
       }
-      if (verdictWake || relayWake || tailWake) {
+      if (verdictWake || relayWake || intentWake || tailWake) {
         // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
         // with every verdict, so this is identity where the old re-check had
         // only a boolean: a verdict consumed, the batch re-parked on its next
@@ -928,6 +937,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // stranding the session.
         const wakeToken = after!.pending?.wakeToken;
         const relayToken = after!.pendingRelay?.token;
+        const intentToken = after!.pendingSystem?.token;
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
         // plumbing and calls in), and the only thing `defer` would add is an
@@ -952,6 +962,32 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               if (!still.pending?.verdict || still.pending.wakeToken !== wakeToken) return;
             } else if (relayWake) {
               if (still.pendingRelay?.token !== relayToken) return;
+            } else if (intentWake) {
+              // Identity, never presence: a different intent standing here is
+              // somebody else's wake, and consuming it would run a turn this
+              // callback was not scheduled for. This arm must sit BEFORE the
+              // final `else`, which assumes "not verdict, not relay" means
+              // "tail" and would otherwise swallow the intent silently.
+              if (still.pendingSystem?.token !== intentToken) return;
+              // The one wake that MATERIALIZES before it runs — see
+              // `intentWake` above. It also clears its own re-entry: the turn
+              // it dispatches consumes the marker on its first commit.
+              //
+              // The dispatcher is our own `runTurn`, not `deferTurn`: this
+              // module stays free of methods.ts's Meteor plumbing, and the
+              // consume policy is shared without a module cycle by taking the
+              // dispatcher as an argument. Same `setTimeout` + `.catch` shape
+              // the other arms below use.
+              await consumeSystemIntent(sessionId, (id, target, userId, opts) => {
+                setTimeout(() => {
+                  void runTurn(id, buildRunConfig(target, userId, opts)).catch((e) => {
+                    console.error(
+                      `[10thfloor:agent] system turn failed for session ${id}:`, e,
+                    );
+                  });
+                }, 0);
+              });
+              return;
             } else {
               // Re-verify the tail with the same addressee-aware predicate
               // the check above used.

@@ -20,9 +20,8 @@ import {
   clearAgentHooks, clearHooks, registerAgentHook, registerHook,
   type HookMap, type HookName,
 } from './hooks';
-import {
-  recordVerdict, sendToSession, startSystemTurn, type SystemTurnResult,
-} from './methods';
+import { recordVerdict, sendToSession, startSystemTurn } from './methods';
+import type { SystemTurnResult } from './system-turn';
 import {
   forgetMemory, readSelector, saveMemory, type SaveArgs,
 } from './memory';

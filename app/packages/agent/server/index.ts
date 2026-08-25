@@ -147,10 +147,11 @@ export type { ViaIdentity } from './methods';
 // the blessed door; the free function is here for a host that schedules
 // without an Agent handle. `consumeSystemIntent` is exported for the watcher's
 // sweep and for tests — an app has no reason to call it.
+export { startSystemTurn, consumeStandingIntent } from './methods';
 export {
-  startSystemTurn, consumeSystemIntent, systemRowId, systemBudgetClause,
-  SYSTEM_INTENT_TTL_MS, type SystemTurnResult,
-} from './methods';
+  consumeSystemIntent, systemRowId, systemBudgetClause,
+  SYSTEM_INTENT_TTL_MS, type SystemTurnResult, type SystemDispatch,
+} from './system-turn';
 export { systemParticipantId, systemFrom } from '../common/participants';
 export type { TranscriptView } from './transcript';
 

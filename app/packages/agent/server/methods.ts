@@ -11,15 +11,15 @@ import { COMPACT_OVER_BUDGET, COMPACT_REFUSALS, compactSession } from './compact
 import { forkSession } from './fork';
 import { MAX_SUBAGENT_DEPTH } from './subagent';
 import {
-  ACTIVE_PHASES, DECIDED_PHASES,
-  type AgentSession, type AttachmentRef, type SessionInc,
+  ACTIVE_PHASES, type AgentSession, type AttachmentRef, type SessionInc,
 } from '../common/types';
-import { SERVER_ID } from './lease';
-import { isRunning } from './turn-state';
+import {
+  startSystemTurnWith, consumeSystemIntent, type SystemTurnResult,
+} from './system-turn';
 import type { SessionQuery, SessionSet } from '../common/db';
 import {
   humanParticipantId, identityParticipantId, participantByIdentity,
-  participantByUserId, resolveAddressee, systemFrom,
+  participantByUserId, resolveAddressee,
 } from '../common/participants';
 import { resolveWakeAgent } from './participants';
 import { issueAttachmentToken } from './downloads';
@@ -564,232 +564,24 @@ export async function sendToSession(
 }
 
 /* ── System turns ─────────────────────────────────────────────────────────
- * A turn nobody typed. Full design: docs/superpowers/specs/2026-08-25-system-turns.md
+ * The durable machinery lives in `system-turn.ts`, which takes its dispatcher
+ * as an argument so the loop can share one consume policy without importing
+ * this module's Meteor plumbing. This is the public door: `deferTurn` wired in.
  */
 
-/** How long a standing intent may sit before a fresh park may replace it.
- *  Without this, an intent parked onto a session that then halts would refuse
- *  every later firing forever (decision 11). */
-export const SYSTEM_INTENT_TTL_MS = 24 * 60 * 60 * 1000;
-
-export type SystemTurnResult =
-  | { ok: true; ran: true }
-  | { ok: true; ran: false; parked: true }
-  | {
-    ok: false;
-    reason: 'duplicate-key' | 'intent-standing' | 'session-halted'
-      | 'budget-exhausted' | 'no-session' | 'no-agent';
-  };
-
-/** The system row's `_id`, derived so a repeated key can never write a second
- *  row. Keyed on the IDEMPOTENCY KEY when there is one — deriving from the
- *  per-call token would make the guard protect nothing. */
-export function systemRowId(sessionId: string, keyOrToken: string): string {
-  return `sys:${sessionId}:${keyOrToken}`;
-}
-
-/**
- * The system-turn budget bound, as clauses for an enclosing `$and`.
- *
- * Existence-tolerant, and that is not defensive coding: `$lt` does not match a
- * MISSING field, and every session document written before this feature existed
- * has no `budgetSpent.systemTurns` — a bare `$lt` would refuse every system
- * turn on every pre-existing session, silently. Returned as clauses rather than
- * a selector because `noLiveLease` also contributes a bare `$or`, and two of
- * those in one selector destroy each other.
- */
-export function systemBudgetClause(limit?: number): object[] {
-  if (limit === undefined) return [];
-  return [{
-    $or: [
-      { 'budgetSpent.systemTurns': { $exists: false } },
-      { 'budgetSpent.systemTurns': { $lt: limit } },
-    ],
-  }];
-}
-
-/**
- * Materialize a standing intent and dispatch its turn.
- *
- * It does NOT clear the marker and does NOT spend the budget — both ride the
- * turn's first commit (decision 14). `deferTurn` is fire-and-forget and
- * `runTurn` returns silently when the session is already running in this
- * process or another server holds the lease, so a consumer that cleared the
- * marker itself would strand the row it just wrote with nothing left for the
- * sweep to find. Leaving it standing costs a re-consume that the derived `_id`
- * makes harmless.
- *
- * Returns true when a turn was dispatched.
- */
-export async function consumeSystemIntent(sessionId: string): Promise<boolean> {
-  const session = await AgentSessions.findOneAsync(sessionId);
-  const intent = session?.pendingSystem;
-  if (!session || !intent) return false;
-  // Not on a decided session, not while another server owns it, not while this
-  // process is already running the session. Each is re-asserted in the write
-  // below — this read only avoids the work.
-  if (DECIDED_PHASES.includes(session.phase)) return false;
-  if (isRunning(sessionId)) return false;
-  if (session.lease && session.lease.until > new Date()
-    && session.lease.serverId !== SERVER_ID) return false;
-
-  const target = getAgent(intent.agent ?? session.agent);
-  if (!target) return false;
-
-  const rowId = systemRowId(sessionId, intent.key ?? intent.token);
-  const existing = await AgentMessages.findOneAsync(rowId);
-  if (!existing) {
-    const now = new Date();
-    // The atomic claim. Its selector re-asserts every guard the read above
-    // checked, so the write cannot land on a state the read disqualified — and
-    // the token makes it single-winner between two sweeping servers.
-    const before = await AgentSessions.rawCollection().findOneAndUpdate(
-      {
-        _id: sessionId,
-        'pendingSystem.token': intent.token,
-        phase: { $nin: DECIDED_PHASES },
-        $and: [{
-          $or: [
-            { lease: { $exists: false } },
-            { 'lease.until': { $lt: now } },
-            { 'lease.serverId': SERVER_ID },
-          ],
-        }],
-      },
-      { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: now } },
-      { returnDocument: 'before' },
-    ) as unknown as AgentSession | null;
-    if (!before) return false;
-
-    try {
-      await AgentMessages.insertAsync({
-        _id: rowId,
-        sessionId,
-        seq: before.nextSeq,
-        role: 'system',
-        content: intent.prompt,
-        // Unconditional, roster or not (decision 3): a system row is net-new,
-        // so there is no byte-identical 1:1 payload to preserve, and gating it
-        // would drop attribution in exactly the case scheduled work uses.
-        from: systemFrom(intent.source),
-        createdAt: now,
-      });
-    } catch (e: any) {
-      // A duplicate `_id` means another consumer materialized this same intent
-      // between the read and here. Its turn is already dispatched or about to
-      // be; ours has nothing left to write. The allocated seq is a gap, which
-      // the transcript already tolerates.
-      if (e?.code !== 11000) throw e;
-      return false;
-    }
-  }
-
-  // Dispatch naming the target EXPLICITLY. `deferResolvedTurn` resolves from
-  // durable state and cannot honour an intent's `agent`, and by the time it ran
-  // the marker may already be gone.
-  const primary = getAgent(session.agent);
-  if (intent.agent && primary && target !== primary) {
-    deferTurn(sessionId, target, session.userId, {
-      agentName: intent.agent,
-      budget: resolveBudget(primary.budget),
-      ...memoryOpt(primary),
-    });
-  } else {
-    deferTurn(sessionId, target, session.userId);
-  }
-  return true;
-}
-
-/**
- * Start a turn that no person asked for.
- *
- * Server-only and deliberately not a DDP method (decision 16): a system turn
- * has no caller to authorize, and a client-reachable one would start turns that
- * bypass both the turn budget and the rate limiter.
- *
- * Parks a durable intent, then tries to consume it immediately. A busy session
- * — including one parked on an approval, which is the case this exists for —
- * keeps the intent standing until it next goes idle.
- */
 export async function startSystemTurn(
   sessionId: string,
   prompt: string,
   opts?: { key?: string; agent?: string; source?: string },
 ): Promise<SystemTurnResult> {
-  const session = await AgentSessions.findOneAsync(sessionId);
-  if (!session) return { ok: false, reason: 'no-session' };
+  return startSystemTurnWith(deferTurn, sessionId, prompt, opts);
+}
 
-  // An intent naming an unregistered agent is a config bug in the caller, so it
-  // is a hard refusal — NOT the visible primary fallback `deferResolvedTurn`
-  // uses for a renamed colleague. Answering as somebody else would hide it.
-  const target = getAgent(opts?.agent ?? session.agent);
-  if (!target) return { ok: false, reason: 'no-agent' };
-  // The purse is the PRIMARY's, as every other budget in a session is.
-  const primary = getAgent(session.agent);
-
-  // `stopped` and `error` are states a person is meant to see and clear.
-  // Parking into one would stand forever — the sweep excludes those phases —
-  // and, by decision 9, refuse every later firing. Refusing now means the
-  // scheduler learns on its very next tick.
-  if (session.phase === 'stopped' || session.phase === 'error') {
-    return { ok: false, reason: 'session-halted' };
-  }
-
-  const now = new Date();
-  const token = Random.id();
-  const claimed = await AgentSessions.rawCollection().findOneAndUpdate(
-    {
-      _id: sessionId,
-      phase: { $nin: ['stopped', 'error'] },
-      // `Agent.ask`'s throwaway sessions are deleted when the call returns, so
-      // an intent parked on one is unreachable by construction.
-      ephemeral: { $ne: true },
-      ...(opts?.key ? { lastSystemKey: { $ne: opts.key } } : {}),
-      $and: [
-        {
-          $or: [
-            { pendingSystem: { $exists: false } },
-            // A stale intent may be replaced; a live one may not (decision 11).
-            { 'pendingSystem.at': { $lt: new Date(now.getTime() - SYSTEM_INTENT_TTL_MS) } },
-          ],
-        },
-        ...systemBudgetClause(primary?.budget?.systemTurns),
-      ],
-    },
-    {
-      $set: {
-        pendingSystem: {
-          prompt,
-          ...(opts?.agent ? { agent: opts.agent } : {}),
-          ...(opts?.source ? { source: opts.source } : {}),
-          ...(opts?.key ? { key: opts.key } : {}),
-          token,
-          at: now,
-        },
-        ...(opts?.key ? { lastSystemKey: opts.key } : {}),
-        updatedAt: now,
-      },
-    },
-    { returnDocument: 'before' },
-  ) as unknown as AgentSession | null;
-
-  if (!claimed) {
-    // Several clauses can miss and the caller deserves to know which, so the
-    // failure path — and only the failure path — pays for one more read.
-    const now2 = await AgentSessions.findOneAsync(sessionId);
-    if (!now2) return { ok: false, reason: 'no-session' };
-    if (opts?.key && now2.lastSystemKey === opts.key) {
-      return { ok: false, reason: 'duplicate-key' };
-    }
-    if (now2.phase === 'stopped' || now2.phase === 'error') {
-      return { ok: false, reason: 'session-halted' };
-    }
-    if (now2.pendingSystem) return { ok: false, reason: 'intent-standing' };
-    return { ok: false, reason: 'budget-exhausted' };
-  }
-
-  const ran = await consumeSystemIntent(sessionId);
-  return ran ? { ok: true, ran: true } : { ok: true, ran: false, parked: true };
+/** Consume a standing intent, dispatching through `deferTurn`. The watcher's
+ *  sweep and `Agent#systemTurn` both land here; the loop's wind-down passes its
+ *  own dispatcher instead. */
+export async function consumeStandingIntent(sessionId: string): Promise<boolean> {
+  return consumeSystemIntent(sessionId, deferTurn);
 }
 
 export function registerMethods(): void {

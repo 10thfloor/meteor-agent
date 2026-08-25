@@ -168,7 +168,11 @@ export async function forkSession(
       // decision 20): a member who forks gets a session they can still open,
       // and every other member keeps standing in the copy. `relay` and
       // `pendingRelay` do NOT copy — a fork is idle, and a relay is a live
-      // wake belonging to the source's own turn.
+      // wake belonging to the source's own turn. `pendingSystem` and
+      // `lastSystemKey` do not copy for the same reason and one more: a fork is
+      // a different conversation, so it is free to run a schedule slot the
+      // source already ran. (This insert is a whitelist — they are absent by
+      // construction, and named here so the choice reads as one.)
       ...(source.participants?.length ? { participants: source.participants } : {}),
       createdAt: new Date(),
       updatedAt: new Date(),

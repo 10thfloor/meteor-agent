@@ -232,6 +232,17 @@ export async function resolveWakeAgent(session: AgentSession): Promise<string> {
   const owed = await unansweredAddressee(session);
   if (owed) return owed.agent;
 
+  // A standing SYSTEM INTENT names its own target (system-turn spec §4.8).
+  // Consumption dispatches that target explicitly, so this clause matters only
+  // on the RECOVERY path: an orphaned system turn whose row is already
+  // committed would otherwise resume as the primary, under the wrong config.
+  //
+  // Last of the addressed clauses, deliberately. A standing relay is work the
+  // team is already mid-way through, and an unanswered addressee is a person's
+  // open question; a machine's scheduled prompt outranks neither — the same
+  // direction decision 7 runs in.
+  if (session.pendingSystem?.agent) return session.pendingSystem.agent;
+
   const [lastAssistant] = await AgentMessages.find(
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();

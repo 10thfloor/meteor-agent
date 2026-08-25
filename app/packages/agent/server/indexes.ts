@@ -76,6 +76,24 @@ export async function ensureIndexes(): Promise<void> {
       name: NAMES.sessions,
       keys: { phase: 1, 'lease.until': 1 },
     },
+    // The system-intent sweep (CASE 6). Keyed on `pendingSystem.at` — the
+    // field the query RANGES over — rather than on `pendingSystem` itself,
+    // which could not serve the bound and would put app-authored prompt text
+    // in the index key.
+    //
+    // `partialFilterExpression`, not `sparse`: this must stay a single-key
+    // index for sparsity to mean anything (Mongo drops a document from a
+    // COMPOUND sparse index only when it is missing every indexed field, and
+    // every session has the rest), and a partial filter cannot be added later
+    // without dropping the index by name. Without it, CASE 6 scans every live
+    // session every sweep, forever — the debt CASE 5's unindexed `pendingRelay`
+    // query already carries, recorded here so this one does not inherit it.
+    {
+      collection: AgentSessions,
+      name: NAMES.sessions,
+      keys: { 'pendingSystem.at': 1 },
+      options: { partialFilterExpression: { pendingSystem: { $exists: true } } },
+    },
     // The membership clause (participants spec §4.2): `pubSessions`' $or and
     // every roster-aware requireSession carry
     // `participants.$elemMatch.userId`, and a multikey index on the path is
