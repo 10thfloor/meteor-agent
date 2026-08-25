@@ -24,6 +24,30 @@ export declare function modelFrom(agent: string): {
     participant: string;
     name: string;
 };
+/**
+ * `s:<source>` — the id of a NON-HUMAN, non-model origin: the clock, a webhook,
+ * a job runner. System-turn spec decision 2.
+ *
+ * It is deliberately not a roster kind. `participantsBlock` renders every roster
+ * row's `kind` into the prompt and `needsAttribution` counts every non-human row
+ * as a model, so a `kind: 'system'` row would rewrite the system prompt of every
+ * rostered session and flip `[name]: ` prefixing on 1:1 ones. An id outside the
+ * roster resolves through `nameOf`'s fallback instead — the same trick a
+ * subagent's stamp uses.
+ *
+ * The `s:` prefix must stay disjoint from `h:`, `x:` and `m:`: a system origin
+ * that could be mistaken for a human id would be matched by the ownership and
+ * publication checks that key on one.
+ */
+export declare function systemParticipantId(source?: string): string;
+/** The `from` stamp for a system-originated row. Stamped whether or not the
+ *  session has a roster (decision 3) — a system row is net-new, so there is no
+ *  byte-identical 1:1 payload to preserve, and roster-gating it would drop
+ *  attribution in exactly the case scheduled work uses. */
+export declare function systemFrom(source?: string): {
+    participant: string;
+    name: string;
+};
 type Roster = Pick<AgentSession, 'agent' | 'participants'>;
 /** The roster's MODEL rows (with a usable agent name). */
 export declare function modelParticipants(session: Roster): SessionParticipant[];

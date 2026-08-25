@@ -51,6 +51,7 @@ export const DECIDED_PHASES: Phase[] = ['stopped', 'error', 'awaiting'];
 export type SessionCounterPath =
   | 'nextSeq'
   | 'budgetSpent.turns'
+  | 'budgetSpent.systemTurns'
   | 'budgetSpent.toolCalls'
   | 'usage.input'
   | 'usage.output'
@@ -215,7 +216,14 @@ export interface AgentSession {
     wakeToken?: string;
   };
   lease?: { serverId: string; until: Date };
-  budgetSpent: { turns: number; toolCalls: number };
+  /**
+   * `systemTurns` is OPTIONAL where the other two are required: every session
+   * document written before system turns existed has no such field, and the
+   * five insert sites seed only the original two. Read it as
+   * `budgetSpent?.systemTurns ?? 0`, and bound it with a selector that tolerates
+   * its absence — `$lt` does not match a missing field (system-turn spec §4.4).
+   */
+  budgetSpent: { turns: number; toolCalls: number; systemTurns?: number };
   /**
    * SUBAGENT sessions only: which parent session's tool call opened this one.
    * Its presence is what makes a session a CHILD — `agent.sessions` excludes
@@ -317,6 +325,32 @@ export interface AgentSession {
    * carries one.
    */
   pendingRelay?: { agent: string; token: string };
+  /**
+   * System-turn spec decision 8: a turn requested by a non-human origin while
+   * the session was busy. Durable, so a deploy or a crash cannot lose it, and
+   * cleared by the turn's FIRST COMMIT (decision 14) rather than by whoever
+   * dispatched it — `deferTurn` is fire-and-forget and drops silently on a lost
+   * lease, so clearing it outside a turn would strand the row it wrote.
+   *
+   * One per session: a second park is refused rather than queued or
+   * overwritten, which is what lets the first commit clear it without comparing
+   * tokens (decision 9). `token` is identity for the wake re-check, and never
+   * reaches a client — it is excluded from both session publications.
+   * `at` is the intent's OWN age, distinct from the session's shared
+   * `updatedAt`, because the sweep ranges over it.
+   */
+  pendingSystem?: {
+    prompt: string;
+    agent?: string;
+    source?: string;
+    key?: string;
+    token: string;
+    at: Date;
+  };
+  /** The last idempotency key a system turn claimed on this session. One slot:
+   *  it refuses a REPEATED key, and the key-derived row `_id` is what refuses a
+   *  second row for a key the slot has since moved past. */
+  lastSystemKey?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -343,7 +377,7 @@ export interface AgentMessage {
   _id: string;
   sessionId: string;
   seq: number;
-  role: 'user' | 'assistant' | 'tool' | 'note';
+  role: 'user' | 'assistant' | 'tool' | 'note' | 'system';
   content?: string;
   thinking?: string;
   toolCalls?: AgentToolCall[];

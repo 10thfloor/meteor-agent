@@ -203,7 +203,14 @@ function toPiAiMessage(
     }
     return { role: 'assistant', content, usage: zeroUsage(), timestamp: now };
   }
-  return { role: 'user', content: m.content ?? '', timestamp: now };
+  // The remaining legal role is 'user'. The annotation is the backstop: this
+  // function used to end in an unconditional `return { role: 'user', … }`, so a
+  // role the projection failed to normalize — `role: 'system'` reaching here
+  // through `toProviderMessages`'s unchecked cast — was silently relabelled and
+  // presented to the model as a person's words. Now a new member of
+  // `ProviderMessage['role']` fails to compile here instead.
+  const user: 'user' = m.role;
+  return { role: user, content: m.content ?? '', timestamp: now };
 }
 
 /**

@@ -2,7 +2,9 @@ import { AgentMessages, AgentSessions } from '../common/collections';
 import { ACTIVE_PHASES, DECIDED_PHASES, type AgentSession, type SessionInc } from '../common/types';
 import type { SessionQuery } from '../common/db';
 import { getAgent } from './registry';
-import { deferResolvedTurn, recordTimeoutVerdict } from './methods';
+import {
+  consumeStandingIntent, deferResolvedTurn, recordTimeoutVerdict,
+} from './methods';
 import { isRunning } from './turn-state';
 
 /**
@@ -391,6 +393,36 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
       // two sweeps of this same process overlap on it buys nothing.
       // eslint-disable-next-line no-await-in-loop
       await recordTimeoutVerdict(session._id);
+    }
+
+    // CASE 6 — a standing SYSTEM INTENT nobody consumed (system-turn spec
+    // §4.6): scheduled work parked while the session was busy, whose in-process
+    // consume at wind-down never fired — the process died, or the session was
+    // still leased when the intent landed.
+    //
+    // Shaped like CASE 2, NOT like cases 1/3/5. Those collect into `toWake` and
+    // end in a bare `wake()`, which writes nothing because their transcript row
+    // already exists. An intent's row does not: waking it that way would run a
+    // turn against an unchanged transcript and bill a provider call answering
+    // nothing. `consumeStandingIntent` materializes the row first.
+    //
+    // Two sweeps racing one intent resolve inside that call — the claim is
+    // conditional on the intent's token — so no new coordination is needed
+    // here, exactly as the header argues for the cases above. Staleness is
+    // measured on the intent's OWN `at`, not the session's shared `updatedAt`,
+    // which every commit and every roster write bumps.
+    if (stopped) return;
+    const intents = await AgentSessions.find({
+      pendingSystem: { $exists: true },
+      phase: { $nin: WAKE_EXCLUDED },
+      'pendingSystem.at': { $lt: new Date(now.getTime() - verdictGraceMs) },
+      ...noLiveLease(now),
+    }).fetchAsync();
+    for (const session of intents) {
+      if (stopped) return;
+      if (isRunning(session._id)) continue;
+      // eslint-disable-next-line no-await-in-loop
+      await consumeStandingIntent(session._id);
     }
 
     // CASE 4 — a child nothing points at. Last, and awaited: it competes with

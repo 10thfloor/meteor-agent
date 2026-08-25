@@ -65,7 +65,7 @@ export function registerPublications(): void {
         // but could echo it to confuse the self-check. The `agent` half may
         // ship — "a colleague's turn is scheduled" is renderable state.
         { _id: sessionId },
-        { fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 } },
+        { fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0 } },
       ),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
@@ -107,7 +107,7 @@ export function registerPublications(): void {
       {
         sort: { updatedAt: -1 },
         limit: 100,
-        fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0 },
+        fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0 },
       },
     );
   });

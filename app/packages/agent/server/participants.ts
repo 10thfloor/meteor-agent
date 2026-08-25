@@ -227,10 +227,31 @@ export async function unansweredAddressee(
 export async function resolveWakeAgent(session: AgentSession): Promise<string> {
   if (session.pending?.agent) return session.pending.agent;
   if (session.pendingRelay?.agent) return session.pendingRelay.agent;
-  if (!session.participants?.length) return session.agent;
 
-  const owed = await unansweredAddressee(session);
-  if (owed) return owed.agent;
+  // An unanswered addressed tail is a person's open question, and it outranks
+  // the intent below. Guarded rather than short-circuiting the whole function,
+  // because the intent clause must stay reachable on a ROSTERLESS session —
+  // the 1:1 shape scheduled work actually uses. Hoisting the old
+  // `if (!participants?.length) return session.agent;` above it meant an
+  // orphaned system turn on a 1:1 session resumed as the primary, ignoring the
+  // teammate the intent named.
+  if (session.participants?.length) {
+    const owed = await unansweredAddressee(session);
+    if (owed) return owed.agent;
+  }
+
+  // A standing SYSTEM INTENT names its own target (system-turn spec §4.8).
+  // Consumption dispatches that target explicitly, so this clause matters only
+  // on the RECOVERY path: an orphaned system turn whose row is already
+  // committed would otherwise resume under the wrong model's config.
+  //
+  // Last of the addressed clauses, deliberately. A standing relay is work the
+  // team is already mid-way through, and an unanswered addressee is a person's
+  // open question; a machine's scheduled prompt outranks neither — the same
+  // direction decision 7 runs in.
+  if (session.pendingSystem?.agent) return session.pendingSystem.agent;
+
+  if (!session.participants?.length) return session.agent;
 
   const [lastAssistant] = await AgentMessages.find(
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },

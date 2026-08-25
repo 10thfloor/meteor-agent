@@ -144,6 +144,18 @@ export {
   type AttachmentDownloadToken,
 } from './downloads';
 export type { ViaIdentity } from './methods';
+// System turns: a turn nobody typed (system-turn spec). `Agent#systemTurn` is
+// the blessed door; `startSystemTurn` is the free function for a host that
+// schedules without an Agent handle. `consumeStandingIntent` is the watcher's
+// sweep door (deferTurn wired in); `consumeSystemIntent` is the loop's
+// injectable-dispatcher variant, exported for hosts and tests — an app has no
+// reason to call either consumer directly.
+export { startSystemTurn, consumeStandingIntent } from './methods';
+export {
+  consumeSystemIntent, systemRowId, systemBudgetClause,
+  SYSTEM_INTENT_TTL_MS, type SystemTurnResult, type SystemDispatch,
+} from './system-turn';
+export { systemParticipantId, systemFrom } from '../common/participants';
 export type { TranscriptView } from './transcript';
 
 /**

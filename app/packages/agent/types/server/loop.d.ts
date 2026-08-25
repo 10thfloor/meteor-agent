@@ -49,6 +49,7 @@ export interface RunConfig {
      *  PRIMARY agent's, whatever config the rest of the run came from. */
     budget?: {
         turns?: number;
+        systemTurns?: number;
         toolCalls?: number;
         spend?: number;
         relay?: number;

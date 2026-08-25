@@ -83,6 +83,8 @@ export type SessionQuery = Fields<AgentSession> & {
 } & {
     [k: `pendingRelay.${string}`]: unknown;
 } & {
+    [k: `pendingSystem.${string}`]: unknown;
+} & {
     $or?: SessionQuery[];
     $and?: SessionQuery[];
     $nor?: SessionQuery[];

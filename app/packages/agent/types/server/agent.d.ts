@@ -3,6 +3,7 @@ import type { Provider } from './providers/types';
 import { type AdoptedTool, type AgentMethodOptions } from './tools';
 import { type McpServerDef } from './mcp/client';
 import { type HookMap, type HookName } from './hooks';
+import type { SystemTurnResult } from './system-turn';
 import { type SaveArgs } from './memory';
 import { type ChannelDef } from './channels/registry';
 import { createAttachment } from './attachments';
@@ -45,6 +46,27 @@ export declare class Agent {
      * unauthenticated capability-URL session has — so a cron job need not invent
      * one.
      */
+    /**
+     * Start a turn on an existing session that no person asked for — a schedule
+     * fired, a webhook landed, a job runner woke up.
+     *
+     * Server-only, like `ask`, and for the same reason: there is nobody on the
+     * other end. Unlike a `send`, the row it writes is attributed to no person,
+     * spends its own budget line, and does not outrank work the team is already
+     * mid-way through — a busy session parks the request until it next goes idle
+     * rather than dropping it.
+     *
+     * Give it a `key` and the same firing may be replayed safely: a repeated key
+     * runs exactly once. Scheduling itself stays with the caller, which is the
+     * only party that knows what "06:30, local" means.
+     *
+     * Full design: docs/superpowers/specs/2026-08-25-system-turns.md
+     */
+    systemTurn(sessionId: string, prompt: string, opts?: {
+        key?: string;
+        agent?: string;
+        source?: string;
+    }): Promise<SystemTurnResult>;
     ask(text: string, opts?: {
         userId?: string | null;
     }): Promise<string>;

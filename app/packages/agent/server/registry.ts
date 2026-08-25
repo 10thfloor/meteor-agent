@@ -60,6 +60,14 @@ export interface AgentConfig {
    */
   budget?: {
     turns?: number;
+    /**
+     * System-turn spec decision 5: how many turns started by a NON-HUMAN origin
+     * this session permits. A separate purse from `turns` because scheduled work
+     * and human work are tuned separately — and a refusal here refuses the park
+     * outright (decision 6) rather than writing a note and stopping the session,
+     * which would wedge a conversation because a machine ran out of budget.
+     */
+    systemTurns?: number;
     toolCalls?: number;
     /** Dollars, as a number or a `'$1.50'` string. Parsed at define() time. */
     spend?: number | string;
@@ -150,6 +158,8 @@ export interface AgentConfig {
  *  `mSend` compare against. */
 export interface ResolvedBudget {
   turns?: number;
+  /** The system-turn cap, validated like the counts. */
+  systemTurns?: number;
   toolCalls?: number;
   spend?: number;
   /** Passed through unchanged (already a plain ms count). The loop ignores it;
@@ -210,6 +220,7 @@ function assertCountLimit(value: unknown, field: string): void {
 export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | undefined {
   if (!budget) return undefined;
   assertCountLimit(budget.turns, 'turns');
+  assertCountLimit(budget.systemTurns, 'systemTurns');
   assertCountLimit(budget.toolCalls, 'toolCalls');
   // Milliseconds rather than a count, but the same rigor for the same reason: a
   // string `'60000'` compares as a string against a Date arithmetic result and
@@ -219,6 +230,10 @@ export function resolveBudget(budget?: AgentConfig['budget']): ResolvedBudget | 
   assertCountLimit(budget.relay, 'relay');
   return {
     turns: budget.turns,
+    // This literal has no spread, so a key added to the type and to
+    // `assertCountLimit` but not here validates at startup and is `undefined` at
+    // every consumer — a cap that silently never applies.
+    systemTurns: budget.systemTurns,
     toolCalls: budget.toolCalls,
     spend: budget.spend === undefined ? undefined : parseSpend(budget.spend),
     approval: budget.approval,

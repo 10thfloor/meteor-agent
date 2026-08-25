@@ -13,6 +13,9 @@ import { MAX_SUBAGENT_DEPTH } from './subagent';
 import {
   ACTIVE_PHASES, type AgentSession, type AttachmentRef, type SessionInc,
 } from '../common/types';
+import {
+  startSystemTurnWith, consumeSystemIntent, type SystemTurnResult,
+} from './system-turn';
 import type { SessionQuery, SessionSet } from '../common/db';
 import {
   humanParticipantId, identityParticipantId, participantByIdentity,
@@ -558,6 +561,27 @@ export async function sendToSession(
   }
   deferTurn(sessionId, config, session.userId);
   return sessionId;
+}
+
+/* ── System turns ─────────────────────────────────────────────────────────
+ * The durable machinery lives in `system-turn.ts`, which takes its dispatcher
+ * as an argument so the loop can share one consume policy without importing
+ * this module's Meteor plumbing. This is the public door: `deferTurn` wired in.
+ */
+
+export async function startSystemTurn(
+  sessionId: string,
+  prompt: string,
+  opts?: { key?: string; agent?: string; source?: string },
+): Promise<SystemTurnResult> {
+  return startSystemTurnWith(deferTurn, sessionId, prompt, opts);
+}
+
+/** Consume a standing intent, dispatching through `deferTurn`. The watcher's
+ *  sweep and `Agent#systemTurn` both land here; the loop's wind-down passes its
+ *  own dispatcher instead. */
+export async function consumeStandingIntent(sessionId: string): Promise<boolean> {
+  return consumeSystemIntent(sessionId, deferTurn);
 }
 
 export function registerMethods(): void {

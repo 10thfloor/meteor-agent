@@ -57,6 +57,14 @@ export interface AgentConfig {
      */
     budget?: {
         turns?: number;
+        /**
+         * System-turn spec decision 5: how many turns started by a NON-HUMAN origin
+         * this session permits. A separate purse from `turns` because scheduled work
+         * and human work are tuned separately — and a refusal here refuses the park
+         * outright (decision 6) rather than writing a note and stopping the session,
+         * which would wedge a conversation because a machine ran out of budget.
+         */
+        systemTurns?: number;
         toolCalls?: number;
         /** Dollars, as a number or a `'$1.50'` string. Parsed at define() time. */
         spend?: number | string;
@@ -158,6 +166,8 @@ export interface AgentConfig {
  *  `mSend` compare against. */
 export interface ResolvedBudget {
     turns?: number;
+    /** The system-turn cap, validated like the counts. */
+    systemTurns?: number;
     toolCalls?: number;
     spend?: number;
     /** Passed through unchanged (already a plain ms count). The loop ignores it;

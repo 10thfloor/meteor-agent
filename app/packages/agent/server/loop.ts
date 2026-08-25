@@ -8,6 +8,7 @@ import {
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
 import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
+import { consumeSystemIntent, systemRowId } from './system-turn';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -83,7 +84,10 @@ export interface RunConfig {
    *  already happened. `relay` caps model-to-model hops (participants spec
    *  decision 7; default 4). On an ADDRESSED turn this whole bundle is the
    *  PRIMARY agent's, whatever config the rest of the run came from. */
-  budget?: { turns?: number; toolCalls?: number; spend?: number; relay?: number };
+  budget?: {
+    turns?: number; systemTurns?: number; toolCalls?: number;
+    spend?: number; relay?: number;
+  };
   /** $ per million tokens. The FALLBACK for a provider that reports no cost of
    *  its own; see `accruedCost`. */
   pricing?: { input: number; output: number };
@@ -285,6 +289,35 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // `$unset` rides the same atomic write), so the whole pre-commit
       // stretch stays recoverable as the right model.
       const consumingRelay = entry.pendingRelay?.agent === selfAgent;
+      // A standing SYSTEM INTENT is the wake this turn IS, on the same terms
+      // and for the same reason (system-turn spec decision 14): cleared by the
+      // first commit below, not here, so the pre-commit stretch stays
+      // recoverable.
+      //
+      // The latch is the intent's ROW, not the marker's presence. The spec's
+      // first draft latched on presence, reasoning that decision 9 keeps the
+      // standing intent unique — but uniqueness is not evidence that THIS turn
+      // was dispatched to consume it, and the difference is not academic: a
+      // turn resuming an approval, or answering a plain send, starts while an
+      // intent stands and would clear the marker and bill the counter for a
+      // prompt no model ever saw. That destroyed the scheduled turn on exactly
+      // the parked-approval case this feature exists for.
+      //
+      // `consumeSystemIntent` writes the row BEFORE it dispatches, so the row
+      // existing is proof the intent was materialized into this transcript —
+      // which is precisely the condition under which a commit here is
+      // answering it. One primary-key read, and only when a marker stands.
+      const consumingSystem = entry.pendingSystem !== undefined
+        && (await AgentMessages.findOneAsync(
+          systemRowId(sessionId, entry.pendingSystem.key ?? entry.pendingSystem.token),
+        )) !== undefined;
+      // The budget is billed ONCE, on the first commit — not once per commit.
+      // `consumingSystem` is a turn-constant, but the commit below runs once per
+      // provider ITERATION, so a system turn that makes K tool rounds would
+      // $inc `budgetSpent.systemTurns` K+1 times and trip its own bound far too
+      // early. This latch bills on the first successful commit and no more;
+      // the marker clear stays per-commit (idempotent, mirroring the relay).
+      let systemUnbilled = consumingSystem;
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit
@@ -706,6 +739,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           'usage.input': usage.input,
           'usage.output': usage.output,
           'usage.cost': accruedCost(usage, config.pricing),
+          // The system-turn budget is spent HERE rather than at the park
+          // (system-turn spec decision 14), so a turn that was dispatched but
+          // never ran is never billed. The park only checks the bound. Once
+          // per turn, not once per iteration — see `systemUnbilled`.
+          ...(systemUnbilled ? { 'budgetSpent.systemTurns': 1 } : {}),
         }, relaying ? {
           pendingRelay: { agent: relayHit!.agent, token: Random.id() },
           relay: relayCount + 1,
@@ -713,9 +751,17 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // The relay's CONSUMPTION (decision 7): the addressee's first commit
         // clears the marker it answers — never turn entry, so a crash before
         // any commit leaves the wake standing for recovery. A commit that
-        // itself relays onward OVERWRITES instead (the $set above).
-        !relaying && consumingRelay ? { pendingRelay: 1 } : undefined);
+        // itself relays onward OVERWRITES instead (the $set above). A standing
+        // system intent is cleared on the same terms.
+        {
+          ...(!relaying && consumingRelay ? { pendingRelay: 1 as const } : {}),
+          ...(consumingSystem ? { pendingSystem: 1 as const } : {}),
+        });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
+        // A real commit landed and carried the charge; every later commit this
+        // turn makes must not repeat it. (A null return meant a lost lease and
+        // no write, so the latch stays true for a clean single bill on recovery.)
+        systemUnbilled = false;
 
         // The TURN-FINAL row (no toolCalls) claims the session's staged
         // attachment refs and embeds them — the reply becomes a file-bearing
@@ -887,8 +933,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       //     still ends quietly.
       const verdictWake = !!(wakeable && !resumed && after.pending?.verdict);
       const relayWake = !!(wakeable && after.pendingRelay);
+      // A FOURTH kind (system-turn spec §4.6): a standing SYSTEM INTENT —
+      // scheduled work that arrived while this turn held the session, or that
+      // this turn's own commit did not consume. It is the one wake whose
+      // transcript row does not exist yet, which is why its arm below calls
+      // `consumeSystemIntent` rather than `runTurn`: waking straight into the
+      // loop would make a billed provider call against an unchanged transcript
+      // and commit an assistant row answering nothing.
+      const intentWake = !!(wakeable && after.pendingSystem);
       let tailWake = false;
-      if (wakeable && !verdictWake && !relayWake
+      if (wakeable && !verdictWake && !relayWake && !intentWake
         && after.participants?.length && !after.pending) {
         // ADDRESSEE-AWARE (a reviewer-confirmed strand): "any assistant row
         // after the user row" reads a colleague-addressed interjection as
@@ -897,7 +951,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         const owed = await unansweredAddressee(after).catch(() => null);
         tailWake = !!owed && owed.agent !== (config.agentName ?? after.agent);
       }
-      if (verdictWake || relayWake || tailWake) {
+      if (verdictWake || relayWake || intentWake || tailWake) {
         // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
         // with every verdict, so this is identity where the old re-check had
         // only a boolean: a verdict consumed, the batch re-parked on its next
@@ -910,6 +964,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // stranding the session.
         const wakeToken = after!.pending?.wakeToken;
         const relayToken = after!.pendingRelay?.token;
+        const intentToken = after!.pendingSystem?.token;
         // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
         // deliberately free of the Meteor namespace (methods.ts owns that
         // plumbing and calls in), and the only thing `defer` would add is an
@@ -934,6 +989,32 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               if (!still.pending?.verdict || still.pending.wakeToken !== wakeToken) return;
             } else if (relayWake) {
               if (still.pendingRelay?.token !== relayToken) return;
+            } else if (intentWake) {
+              // Identity, never presence: a different intent standing here is
+              // somebody else's wake, and consuming it would run a turn this
+              // callback was not scheduled for. This arm must sit BEFORE the
+              // final `else`, which assumes "not verdict, not relay" means
+              // "tail" and would otherwise swallow the intent silently.
+              if (still.pendingSystem?.token !== intentToken) return;
+              // The one wake that MATERIALIZES before it runs — see
+              // `intentWake` above. It also clears its own re-entry: the turn
+              // it dispatches consumes the marker on its first commit.
+              //
+              // The dispatcher is our own `runTurn`, not `deferTurn`: this
+              // module stays free of methods.ts's Meteor plumbing, and the
+              // consume policy is shared without a module cycle by taking the
+              // dispatcher as an argument. Same `setTimeout` + `.catch` shape
+              // the other arms below use.
+              await consumeSystemIntent(sessionId, (id, target, userId, opts) => {
+                setTimeout(() => {
+                  void runTurn(id, buildRunConfig(target, userId, opts)).catch((e) => {
+                    console.error(
+                      `[10thfloor:agent] system turn failed for session ${id}:`, e,
+                    );
+                  });
+                }, 0);
+              });
+              return;
             } else {
               // Re-verify the tail with the same addressee-aware predicate
               // the check above used.
