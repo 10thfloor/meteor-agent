@@ -30,6 +30,9 @@ export { AgentAttachments, DEFAULT_ATTACHMENT_CAPS, sanitizeAttachmentName, pret
 export { humanParticipantId, identityParticipantId, modelParticipantId, participantByIdentity, participantByUserId, resolveAddressee, participantsBlock, sanitizeDisplayName, needsAttribution, } from '../common/participants';
 export { AttachmentDownloadTokens, issueAttachmentToken, redeemAttachmentToken, handleDownload, mountDownloadRoute, DOWNLOAD_ROUTE, type AttachmentDownloadToken, } from './downloads';
 export type { ViaIdentity } from './methods';
+export { startSystemTurn, consumeStandingIntent } from './methods';
+export { consumeSystemIntent, systemRowId, systemBudgetClause, SYSTEM_INTENT_TTL_MS, type SystemTurnResult, type SystemDispatch, } from './system-turn';
+export { systemParticipantId, systemFrom } from '../common/participants';
 export type { TranscriptView } from './transcript';
 /**
  * This process's boot watcher, or null when the settings or the environment

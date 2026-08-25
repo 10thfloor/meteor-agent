@@ -65,6 +65,7 @@ export declare function classifyProviderError(e: any): 'retryable' | 'fatal' | '
  */
 export declare function allocateSeq(sessionId: string, inc?: SessionInc, set?: SessionSet, unset?: {
     pendingRelay?: 1;
+    pendingSystem?: 1;
 }): Promise<number | null>;
 /** Which limit tripped, and the sentence a UI shows for it. */
 declare const BUDGET_REASONS: {

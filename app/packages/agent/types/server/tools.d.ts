@@ -25,22 +25,6 @@ export interface ToolContext {
      *  a host driving one tool) has no call to name. A subagent needs it: it is
      *  half of the child's `parent` lineage. */
     toolCallId?: string;
-    /**
-     * WHICH AGENT is running this call — the addressee on an addressed turn, the
-     * same value the hook context carries and the park records as
-     * `pending.agent`.
-     *
-     * Optional for the same reason as `toolCallId`: a direct `runTool` caller has
-     * no turn behind it. Every loop dispatch path sets it.
-     *
-     * It exists because a tool in a multi-agent app frequently needs to record
-     * WHO acted — an audit row saying "assessed by" is worth little if it cannot
-     * name the teammate — and until this was added, a tool body was the only
-     * place in the system that could not find out, while hooks and parks both
-     * could. Apps worked around it by hardcoding the agent name per tool, which
-     * silently produced the wrong answer the moment a second agent listed the
-     * same tool.
-     */
     agent?: string;
     /** The SESSION's owner, present only when `runAs` replaced `userId` for this
      *  call. It is what a `runAs` tool checks to decide what it will do on whose
@@ -159,18 +143,15 @@ export type McpTool = {
     gate?: Gate;
 };
 export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | McpTool | string;
-/** `InlineTool`, with `args` remembered so `run` and `describe` can read it. */
 export type TypedInlineTool<S> = {
     name: string;
     description: string;
     args: S;
     run: (args: FromSchema<S>, ctx: ToolContext) => Promise<unknown>;
     gate?: Gate;
-    /** See the `runAs` NOTE above — privilege escalation by construction. */
     runAs?: string | null;
     describe?: (args: FromSchema<S>, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) => string | Promise<string>;
 };
-/** `AdoptedTool`, likewise. */
 export type TypedAdoptedTool<S> = {
     method: string;
     description: string;
@@ -180,31 +161,7 @@ export type TypedAdoptedTool<S> = {
     runAs?: string | null;
     describe?: (args: FromSchema<S>, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) => string | Promise<string>;
 };
-/**
- * Define an inline tool whose `run` and `describe` know their own arguments.
- *
- * ```ts
- * tool({
- *   name: 'lookup_offering',
- *   description: 'Look one up by slug.',
- *   args: {
- *     type: 'object',
- *     properties: { slug: { type: 'string' }, limit: { type: 'integer' } },
- *     required: ['slug'],
- *   },
- *   run: async ({ slug, limit }) => {   // slug: string, limit: number | undefined
- *     return find(slug, limit ?? 10);
- *   },
- * })
- * ```
- *
- * Identity at run time — the spec is returned untouched, so this costs one
- * function call at startup and nothing thereafter. The `const` type parameter
- * is what preserves the literal types inside the schema; without it `'string'`
- * widens to `string` and every property comes back `unknown`.
- */
 export declare function tool<const S>(spec: TypedInlineTool<S>): InlineTool;
-/** `tool()` for an adopted Meteor method — same inference, same erasure. */
 export declare function methodTool<const S>(spec: TypedAdoptedTool<S>): AdoptedTool;
 export interface ResolvedTool {
     name: string;

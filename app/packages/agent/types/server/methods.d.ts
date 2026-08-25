@@ -1,5 +1,6 @@
 import { buildRunConfig, type AgentConfig } from './registry';
 import { type AgentSession, type AttachmentRef } from '../common/types';
+import { type SystemTurnResult } from './system-turn';
 /**
  * A VERIFIED channel identity, vouched for by trusted server code — the
  * ingress principal (participants spec decision 12). Constructible only by
@@ -126,5 +127,14 @@ extras?: {
     via?: ViaIdentity;
     to?: string;
 }): Promise<string>;
+export declare function startSystemTurn(sessionId: string, prompt: string, opts?: {
+    key?: string;
+    agent?: string;
+    source?: string;
+}): Promise<SystemTurnResult>;
+/** Consume a standing intent, dispatching through `deferTurn`. The watcher's
+ *  sweep and `Agent#systemTurn` both land here; the loop's wind-down passes its
+ *  own dispatcher instead. */
+export declare function consumeStandingIntent(sessionId: string): Promise<boolean>;
 export declare function registerMethods(): void;
 //# sourceMappingURL=methods.d.ts.map
