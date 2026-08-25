@@ -1,0 +1,347 @@
+import { type AgentConfig } from './registry';
+import type { Provider } from './providers/types';
+import { type AdoptedTool, type AgentMethodOptions } from './tools';
+import { type McpServerDef } from './mcp/client';
+import { type HookMap, type HookName } from './hooks';
+import { type SaveArgs } from './memory';
+import { type ChannelDef } from './channels/registry';
+import { createAttachment } from './attachments';
+import { addParticipant, listParticipants, removeParticipant } from './participants';
+export declare class Agent {
+    readonly name: string;
+    constructor(name: string, config?: AgentConfig);
+    define(config: AgentConfig): this;
+    /**
+     * §5.4. One question, one answer, no session to manage — and the way agents
+     * COMPOSE.
+     *
+     * The whole conversational surface (`start`/`send`/`subscribe`) exists for a
+     * human watching a transcript. A caller that just needs an answer — a cron
+     * job, a webhook, a Meteor method, or ANOTHER AGENT — has no UI to stream to
+     * and nobody to answer an approval. So this creates a throwaway session,
+     * runs exactly one turn INLINE (awaited, not `Meteor.defer`red, because the
+     * caller is waiting on the string), reads the final assistant message, and
+     * deletes every trace of the session before returning.
+     *
+     * An agent's `ask` is also a legal tool body, so one agent can be another's
+     * specialist with no extra machinery. For agent COMPOSITION, though, prefer a
+     * `{ subagent }` tool spec: it runs the same nested turn but keeps the child
+     * session — a live transcript a client can subscribe to, and one a human can
+     * still answer if it parks. `ask` is for the headless one-shot case, where
+     * there is nothing to watch and nothing to keep.
+     *
+     * It REJECTS rather than returning a half-answer, because a headless caller
+     * has no way to notice a stalled one:
+     *   - `ask-parked` — the turn hit a `gate: 'ask'` tool. There is no human on
+     *     this call path to approve it, and `approve`/`deny` need a session that
+     *     is about to be deleted. Give an ask-gated tool to an interactive agent,
+     *     not to one you `ask`.
+     *   - `ask-failed` — the provider failed terminally (§10), or a budget
+     *     stopped the run (§9, `reason` names which one), or the turn produced no
+     *     assistant message at all.
+     *
+     * `userId` is what the agent's `instructions` function and every tool's
+     * `ctx.userId` see. It defaults to null — the same anonymous owner an
+     * unauthenticated capability-URL session has — so a cron job need not invent
+     * one.
+     */
+    ask(text: string, opts?: {
+        userId?: string | null;
+    }): Promise<string>;
+    /**
+     * Send a message into an EXISTING session and wake a turn — the server-side
+     * form of `agent.send` (channels spec §5.1). A channel webhook, a cron job,
+     * or another agent calls this with a RESOLVED identity; the DDP method is a
+     * cap over the identical core, `sendToSession` (methods.ts), so both run on
+     * the same terms — authorization, the budget folded into the atomic seq
+     * allocation, and the one `deferTurn` wake path.
+     *
+     * `userId` scopes the lookup, always three-field (`{_id, agent, userId}`):
+     * an omitted one defaults to null and scopes to the ANONYMOUS owner — never
+     * to "all sessions" — so the fail-closed guarantee needs no presence test
+     * here. `userId: null` is a real owner (the capability-URL session), not
+     * "denied".
+     *
+     * Note the DDP rate limiter does not see this path (its rules match method
+     * names); the session budget does — it is enforced inside the core. A
+     * server-side caller reachable from outside traffic must bring its own
+     * throttle, as the channel webhook does (§9).
+     */
+    send(sessionId: string, text: string, opts?: {
+        userId?: string | null;
+    }): Promise<string>;
+    /**
+     * Answer a parked approval — the server-side form of `agent.approve`
+     * (channels spec §5.1). The same core the DDP method caps: ownership check,
+     * the agent's own `approve` predicate, the single-winner verdict write, the
+     * audit note, and the wake. Two answerers racing — a webhook and a human,
+     * two webhooks — produce exactly one verdict; the loser gets `no-pending`.
+     */
+    approve(sessionId: string, opts?: {
+        userId?: string | null;
+    }): Promise<void>;
+    /** The deny half of `approve` — same core, same guarantees; `reason`
+     *  reaches the model as the denied tool result. */
+    deny(sessionId: string, reason?: string, opts?: {
+        userId?: string | null;
+    }): Promise<void>;
+    /**
+     * Branch a session into a new one that shares its history up to a point, and
+     * diverges from there. Returns the NEW session's id.
+     *
+     * `atSeq` is clamped DOWN to the nearest batch-safe cut point, so a caller
+     * can pass the seq of any row — including a tool row in the middle of a
+     * batch — without producing a transcript that strands a `tool_use`. It
+     * defaults to the last message: fork the whole conversation.
+     *
+     * The fork is a new ROOT conversation owned by the source's owner, listed by
+     * `agent.sessions` like any other, with zeroed usage and budgets and no
+     * lease. It remembers where it came from in `forkedFrom` and nothing else —
+     * see `forkSession` for the field-by-field reasoning.
+     *
+     * `userId` scopes the lookup for a server-side caller acting on behalf of
+     * someone (a method, a job): give it and a session belonging to anyone else
+     * is `no-session`. Omit it and the source's own owner is used, which is what
+     * a direct server call wants.
+     */
+    fork(sessionId: string, opts?: {
+        atSeq?: number;
+        title?: string;
+        userId?: string | null;
+    }): Promise<string>;
+    /**
+     * §9's compaction, run NOW — regardless of the `context.compactAt` threshold,
+     * which is the entire point of a manual call. Resolves true when a
+     * `kind:'compaction'` note was committed, false when there was nothing worth
+     * compacting (fewer than `context.keep` messages past the last note, or no
+     * legal cut point).
+     *
+     * `Meteor.Error('busy')` when a turn is running or the session is leased: a
+     * compaction writes to the transcript exactly as a turn does, so the two must
+     * not overlap. Wait for `status()` to be `idle` and call again. The same
+     * `busy` — with its own `reason` — refuses a session that is `awaiting` an
+     * approval or sitting in `error`: both are decisions a person makes, and
+     * compaction is bookkeeping that must not overwrite either (see
+     * `compactSession`).
+     *
+     * The threshold is the only thing skipped. Everything else is the automatic
+     * path: the same batch-safe cut, the same summarizer prompt through the same
+     * `beforeProviderRequest` hook (`ctx.purpose === 'compaction'`), the same
+     * usage and cost accrual — and the same silent degrade when the summarization
+     * fails, which surfaces here as `false`.
+     *
+     * `userId` scopes the lookup for a server-side caller acting on someone's
+     * behalf, exactly as `fork`'s does.
+     */
+    compact(sessionId: string, opts?: {
+        userId?: string | null;
+    }): Promise<boolean>;
+    /**
+     * Register a hook for THIS AGENT only — the per-agent half of the extension
+     * surface (server/hooks.ts owns the whole contract).
+     *
+     *   Support.hook('beforeProviderRequest', (req) => ({
+     *     ...req, system: `${req.system}\n\n${supportPlaybook()}`,
+     *   }));
+     *
+     * Identical seams, identical failure handling; the only difference is scope.
+     * It runs when the session's agent is this one — a CHILD session reports the
+     * CHILD's agent, so a subagent's hooks are the subagent's, not its parent's.
+     *
+     * ORDER: every `Agent.hook` (global) runs first, in registration order, then
+     * every hook registered here, in registration order. Specificity, not
+     * privilege: an agent's own hook refines the process-wide policy and gets the
+     * last word, exactly as a later global hook refines an earlier one.
+     *
+     * The agent need not be `define()`d yet — hooks are matched by name at run
+     * time, so registration order across server files does not matter.
+     */
+    hook<N extends HookName>(name: N, fn: HookMap[N]): this;
+    /**
+     * Remove THIS agent's hooks, leaving the global ones and every other agent's
+     * alone. The narrow counterpart of `Agent.clearHooks()`, and a test seam for
+     * the same reason.
+     */
+    clearHooks(): void;
+    /**
+     * §6. Register a Meteor method and get a tool handle for it in one
+     * definition — see `defineAgentMethod`. STATIC because a co-registered method
+     * belongs to the app, not to one agent: any number of agents may list the
+     * handle it returns (or the bare method name), and your UI calls it directly.
+     *
+     *   const lookup = Agent.method('orders.lookup', { description, args, run });
+     *   Support.define({ ..., tools: [lookup] });
+     *   await Meteor.callAsync('orders.lookup', { id });   // same schema, same check
+     */
+    static method(name: string, options: AgentMethodOptions): AdoptedTool;
+    /**
+     * Register a CHANNEL — an external surface (Slack, SMS, email) as an adapter
+     * over the existing machinery (channels spec §10). STATIC and GLOBAL like
+     * `Agent.provider`, and the same registry contract: validated cheaply here,
+     * overwrite-with-warning on re-registration so a dev hot reload does not
+     * throw.
+     *
+     *   // Tier 1 (§8.7): a channel package's factory builds the definition —
+     *   import { sms } from 'meteor/10thfloor:agent-channel-sms';
+     *   Agent.channel('sms', sms({
+     *     agent: 'support', accountSid, authToken, webhookUrl,
+     *   }));
+     *
+     *   // — which is sugar over a plain ChannelDef: one lens ({ out, in }),
+     *   // one transport, one profile, the webhook's verify/parse, and the
+     *   // knobs (statuses, onUncertainDelivery, sessionUrl, linkUrl, throttle).
+     *
+     * Registration is inert by itself: the boot wiring (server/index.ts) mounts
+     * the webhook at `/agent/channels/<kind>` on EVERY instance, and starts the
+     * egress worker — the worker alone gated per kind by
+     * `settings.channels.<kind> !== false` — both skipped under test; the worker
+     * follows the watcher's boot contract.
+     */
+    static channel(kind: string, def: ChannelDef): void;
+    /**
+     * The attachment surface (email v2 spec §7/§8) — STATIC like `Agent.method`,
+     * because files belong to sessions, not to one agent instance.
+     *
+     * `create` is an API for TOOL BODIES, never a model surface: a tool that
+     * builds a report calls it with `ctx.sessionId` (and `ctx.toolCallId` for
+     * crash-safe idempotency), gets back a ref, and `attach: true` stages the
+     * file for the turn's reply — the loop claims staged refs at the turn-final
+     * commit and the reply becomes a file-bearing message.
+     *
+     *   const ref = await Agent.attachments.create({
+     *     sessionId: ctx.sessionId, name: 'summary.csv', contentType: 'text/csv',
+     *     content: csvText, attach: true, toolCallId: ctx.toolCallId,
+     *   });
+     *
+     * `readTool` is the one shipped tool — list it in `tools` like any inline
+     * spec (nothing auto-registers): the model reads a ref's content by id,
+     * session-scoped, text inline and binary as a structured refusal.
+     */
+    static attachments: {
+        create: typeof createAttachment;
+        readTool: import("./tools").InlineTool;
+    };
+    /**
+     * The roster surface (participants spec §4.1) — STATIC like
+     * `Agent.attachments`, because membership belongs to sessions, not to one
+     * agent instance, and SERVER-ONLY by design: joins are app-code decisions
+     * (an invite flow, compose's policy-gated recipient), never a DDP cap. The
+     * app that wants a UI for it writes its own owner-gated method over these.
+     *
+     *   await Agent.participants.add(sessionId, {
+     *     id: 'h:'+inviteeId, kind: 'human', role: 'member',
+     *     userId: inviteeId, displayName: 'Dana',
+     *   }, { by: 'h:'+ownerId });
+     *   await Agent.participants.add(sessionId, {
+     *     id: 'm:analyst', kind: 'model', role: 'member', agent: 'analyst',
+     *   });
+     *
+     * `add` seeds the roster (owner + primary model) on first join, adopts an
+     * existing id, and refuses past the 16-participant cap. `remove` refuses
+     * the owner (ownership transfer is a named open question) and is what makes
+     * ingress stop admitting the identity — admission reads the roster.
+     */
+    static participants: {
+        add: typeof addParticipant;
+        remove: typeof removeParticipant;
+        list: typeof listParticipants;
+    };
+    /**
+     * The app's own way into the memory store (memory spec §5).
+     *
+     * UNRESTRICTED where the DDP methods are not: this is server code, not a
+     * client, so it may write shared work memory directly — seeding an app's
+     * institutional knowledge at startup is exactly the case the approval flow
+     * exists to govern for MODELS, not for the operator who owns the deployment.
+     *
+     * `Agent.memory.save(null, …)` (or `scope: 'app'`) writes the shared pool;
+     * `Agent.memory.list(null)` reads it.
+     */
+    static memory: {
+        save(userId: string | null, args: SaveArgs & {
+            by?: string;
+        }, opts?: {
+            agent?: string;
+        }): Promise<import("./memory").SaveResult>;
+        list(userId: string | null, opts?: {
+            agent?: string;
+        }): Promise<import(".").AgentMemory[]>;
+        forget(userId: string | null, id: string, opts?: {
+            agent?: string;
+        }): Promise<import("./memory").ForgetResult>;
+    };
+    /**
+     * Register a provider implementation under a NAME, so a config can say
+     * `provider: 'name'` instead of holding the implementation.
+     *
+     *   Agent.provider('mock', mockProvider(() => ({ text: 'hi' })));
+     *   Support.define({ model: 'mock', instructions: '…', provider: 'mock' });
+     *
+     * STATIC and GLOBAL, like `Agent.method`, `Agent.mcpServer` and `Agent.hook`:
+     * a provider belongs to the process, and any number of agents may name one.
+     *
+     * Two things it buys. An agent config can live in an ISOMORPHIC file — the
+     * string names a server-only implementation without importing it into the
+     * client bundle. And a deployment swaps its backend behind one registration
+     * rather than editing every agent: a custom provider is also the third way to
+     * avoid pi-ai entirely (the other two being `mockProvider` and passing an
+     * implementation inline), which is what makes the npm peer genuinely
+     * optional.
+     *
+     * Resolution happens on the first TURN, not at `define()`: agents and
+     * providers register in whatever order their server files load, so an unknown
+     * name throws when a turn needs it, naming what was asked for and what is
+     * registered. Re-registering a name overwrites it with one warning — that is
+     * a dev hot reload, and refusing it would turn an ordinary edit into a
+     * startup failure.
+     */
+    static provider(name: string, impl: Provider): void;
+    /**
+     * Register an MCP server as a tool source. STATIC for the same reason
+     * `Agent.method` is: a server belongs to the app, and any number of agents
+     * may list tools from it.
+     *
+     *   Agent.mcpServer('docs', { command: 'npx', args: ['-y', 'mcp-server-docs'] });
+     *   Support.define({ ..., tools: [
+     *     { mcp: { server: 'docs', tool: 'search' } },  // one tool
+     *     { mcp: { server: 'docs' } },                  // all of them
+     *   ] });
+     *
+     * Nothing is spawned here. The definition is validated (a bad command is a
+     * startup error) and the server is connected lazily, at most once per
+     * process, by the first turn that needs it.
+     */
+    static mcpServer(name: string, def: McpServerDef): void;
+    /**
+     * Register a hook — the package's extension surface, and the replacement for
+     * Pi's extension API (see server/hooks.ts for the whole contract).
+     *
+     *   Agent.hook('beforeProviderRequest', (req, ctx) => ({
+     *     ...req, system: `${req.system}\n\nToday is ${new Date().toDateString()}.`,
+     *   }));
+     *   Agent.hook('afterToolResult', (result) => redact(result));
+     *
+     * STATIC and GLOBAL, like `Agent.method` and `Agent.mcpServer`: a hook is
+     * installed into the process, not into one agent. For one agent's own hooks
+     * use the INSTANCE form, `agentInstance.hook(name, fn)` — every global hook
+     * runs first, then that agent's.
+     *
+     * Hooks run in registration order, each seeing the previous one's output.
+     * Returning nothing keeps the value; returning a replacement swaps it. A hook
+     * that throws is skipped with one warning — a broken extension must not kill
+     * turns. An unknown hook name throws HERE, at registration, rather than
+     * silently never running.
+     */
+    static hook<N extends HookName>(name: N, fn: HookMap[N]): void;
+    /**
+     * Remove every registered hook — GLOBAL AND PER-AGENT. A TEST SEAM: hooks are
+     * registered once at startup in an app, so the only caller with a reason to
+     * clear them is a test that must not leak one into the next test's turn (call
+     * it in a `finally`). It clears both scopes so that "no hook survives this
+     * call" keeps meaning exactly that; `agentInstance.clearHooks()` is the narrow
+     * form that clears one agent's.
+     */
+    static clearHooks(): void;
+}
+export type { AgentConfig };
+//# sourceMappingURL=agent.d.ts.map

@@ -3,6 +3,7 @@ import { check, Match } from 'meteor/check';
 import { DDP } from 'meteor/ddp';
 import { DDPCommon } from 'meteor/ddp-common';
 import type { ToolSchema } from './providers/types';
+import type { FromSchema } from '../common/schema';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
 import {
   callMcpTool, discoverMcpTools, sanitizeMcpReason, warnMcp, type McpToolInfo,
@@ -74,6 +75,10 @@ export interface ToolContext {
    *  a host driving one tool) has no call to name. A subagent needs it: it is
    *  half of the child's `parent` lineage. */
   toolCallId?: string;
+  // Which agent is running this call. Same value as hook context and park
+  // records. Optional because a direct `runTool` caller has no turn behind it;
+  // both loop dispatch paths set it.
+  agent?: string;
   /** The SESSION's owner, present only when `runAs` replaced `userId` for this
    *  call. It is what a `runAs` tool checks to decide what it will do on whose
    *  behalf: the escalation gives the tool an identity, and this is the only
@@ -214,6 +219,57 @@ export type McpTool = {
 };
 
 export type ToolSpec = InlineTool | AdoptedTool | SubagentTool | McpTool | string;
+
+/* ---------------------------------------------------------------------------
+ * TYPED ARGUMENTS — `tool()` and `methodTool()`.
+ *
+ * Opt-in wrappers that infer `run`/`describe` argument types from the JSON
+ * Schema in `args`. The spec types above (`InlineTool`, `AdoptedTool`) are
+ * unchanged — `args: unknown`, `run: (args: any, …)` — so every existing
+ * tool compiles as before. Both forms sit in the same array.
+ *
+ * A wrapper is needed because TS only infers a type parameter from a function
+ * call, not from a bare literal. And the return type is erased to `InlineTool`
+ * because a generic `InlineTool<S>` is not assignable to `InlineTool<unknown>`
+ * (`S` is in a contravariant position).
+ * ------------------------------------------------------------------------ */
+
+// `InlineTool` with `args` preserved so `run` and `describe` get typed arguments.
+export type TypedInlineTool<S> = {
+  name: string;
+  description: string;
+  args: S;
+  run: (args: FromSchema<S>, ctx: ToolContext) => Promise<unknown>;
+  gate?: Gate;
+  // See `runAs` note above.
+  runAs?: string | null;
+  describe?: (args: FromSchema<S>, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
+};
+
+// Same for `AdoptedTool`.
+export type TypedAdoptedTool<S> = {
+  method: string;
+  description: string;
+  args: S;
+  name?: string;
+  gate?: Gate;
+  runAs?: string | null;
+  describe?: (args: FromSchema<S>, ctx: Pick<ToolContext, 'userId' | 'sessionId'>) =>
+    string | Promise<string>;
+};
+
+// Wrap a tool spec so `run` and `describe` get typed arguments from the schema.
+// Returns the spec unchanged at run time — the `const` type parameter preserves
+// literal types so inference works.
+export function tool<const S>(spec: TypedInlineTool<S>): InlineTool {
+  return spec as unknown as InlineTool;
+}
+
+// `tool()` for an adopted Meteor method.
+export function methodTool<const S>(spec: TypedAdoptedTool<S>): AdoptedTool {
+  return spec as unknown as AdoptedTool;
+}
 
 export interface ResolvedTool {
   name: string;

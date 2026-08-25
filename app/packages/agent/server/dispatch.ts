@@ -407,7 +407,7 @@ export async function dispatchCalls(
     const resultRefs: import('../common/types').AttachmentRef[] = [];
     const dispatched = tool
       ? await dispatchTool(tool, call.args, {
-        userId: turn.userId, sessionId, toolCallId: call.id,
+        userId: turn.userId, sessionId, toolCallId: call.id, agent: turn.agent,
         ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
         attachToResult: (ref) => { resultRefs.push(ref); },
       }, runTurn)
@@ -616,7 +616,7 @@ export async function resumeParkedTurn(
       // goes back through `dispatchCalls` below, where nobody has approved
       // anything.
       ({ result, childSessionId } = await dispatchTool(tool, call.args, {
-        userId, sessionId, toolCallId: call.id,
+        userId, sessionId, toolCallId: call.id, agent,
         ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
         attachToResult: (ref) => { resultRefs.push(ref); },
       }, runTurn));
