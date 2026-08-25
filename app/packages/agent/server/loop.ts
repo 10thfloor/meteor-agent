@@ -8,7 +8,7 @@ import {
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
 import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
-import { consumeSystemIntent } from './system-turn';
+import { consumeSystemIntent, systemRowId } from './system-turn';
 import type { Provider } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease,
@@ -292,10 +292,25 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // A standing SYSTEM INTENT is the wake this turn IS, on the same terms
       // and for the same reason (system-turn spec decision 14): cleared by the
       // first commit below, not here, so the pre-commit stretch stays
-      // recoverable. No token comparison is needed — decision 9 refuses a
-      // second park while one stands, so the intent visible at entry is
-      // necessarily the one that started this turn.
-      const consumingSystem = !!entry.pendingSystem;
+      // recoverable.
+      //
+      // The latch is the intent's ROW, not the marker's presence. The spec's
+      // first draft latched on presence, reasoning that decision 9 keeps the
+      // standing intent unique — but uniqueness is not evidence that THIS turn
+      // was dispatched to consume it, and the difference is not academic: a
+      // turn resuming an approval, or answering a plain send, starts while an
+      // intent stands and would clear the marker and bill the counter for a
+      // prompt no model ever saw. That destroyed the scheduled turn on exactly
+      // the parked-approval case this feature exists for.
+      //
+      // `consumeSystemIntent` writes the row BEFORE it dispatches, so the row
+      // existing is proof the intent was materialized into this transcript —
+      // which is precisely the condition under which a commit here is
+      // answering it. One primary-key read, and only when a marker stands.
+      const consumingSystem = entry.pendingSystem !== undefined
+        && (await AgentMessages.findOneAsync(
+          systemRowId(sessionId, entry.pendingSystem.key ?? entry.pendingSystem.token),
+        )) !== undefined;
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit

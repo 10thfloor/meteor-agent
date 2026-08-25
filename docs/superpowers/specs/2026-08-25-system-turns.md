@@ -47,7 +47,7 @@ call it. See §12.
 | 6 | **A budget refusal is a refusal, not a stop** | *(Rewritten from the draft, which reached for `commitBudgetNote`.)* `commitBudgetNote` sets `phase: 'stopped'` (`turn-state.ts:144-155`), which wedges the session until a human sends. Wedging a conversation because a *machine's* purse ran out is backwards. This follows `turns` instead (`methods.ts:504-511`): the bound is folded into the park selector, a miss writes nothing at all, and the caller gets a structured reason. |
 | 7 | **A system turn does not reset `relay`, and does not clear `pendingRelay`** | This amends **participants decision 7**, whose rule is "a human message outranks a pending relay, at any seq". The rule is about *humans*: a person interjecting is a new instruction that supersedes a colleague hand-off. A machine's scheduled prompt is not an interjection and has no standing to cancel work the team is mid-way through. Mechanically a pure omission — the clauses at `methods.ts:498` and `:500` are not copied. |
 | 8 | **Busy sessions park a durable standing intent; they do not drop the request** | The failure this closes is the sharpest one in practice: a session parked on an approval is not `idle`, so under the app-level workaround the *next* firing is skipped and its schedule slot advanced — dropped, not deferred. `pendingSystem` is a top-level optional on `AgentSession`, sibling to `pendingRelay` (`types.ts:319`). |
-| 9 | **One standing intent per session. A second is refused — not queued, not overwritten** | Overwriting silently destroys scheduled work; queueing N is a job queue, a different feature (§8). One slot matches `pendingRelay`'s shape, and a refused caller is a scheduler that comes back on its next tick. **This refusal is load-bearing for §4.7**: because no second intent can be parked while one stands, the intent a turn's first commit clears is necessarily the intent that started it, and no token comparison is needed there. |
+| 9 | **One standing intent per session. A second is refused — not queued, not overwritten** | Overwriting silently destroys scheduled work; queueing N is a job queue, a different feature (§8). One slot matches `pendingRelay`'s shape, and a refused caller is a scheduler that comes back on its next tick. *(The draft also leaned on this decision to justify §4.7's latch. It does not carry that weight — see the note there.)* |
 | 10 | **A human send does NOT cancel a standing intent** | The deliberate asymmetry with decision 7. A relay is cancelled by a human because the human is answering the same conversation the relay was about. A standing system intent is unrelated work that happens to share a session; dropping it because somebody typed would make scheduled work vanish at random. The human's turn runs first because it is live; the intent fires at the next idle. |
 | 11 | **A park is refused on a halted session, and a stale intent may be replaced** | *(Added by review — two lenses found the same hole independently.)* `WAKE_EXCLUDED` keeps the sweep off `stopped`/`error` sessions, so an intent parked into one would stand forever and, by decision 9, refuse every later firing — a permanent block from a transient failure. So: parking is refused outright with `session-halted` when the phase is `stopped` or `error` (the scheduler learns on its next tick instead of discovering months later that nothing ran), and a park may **replace** an intent older than `intentTtlMs` (default 24h). `awaiting` still parks — that is the case this feature exists for. |
 | 12 | **Idempotency is a `$ne` on the park selector, backed by a key-derived `_id`** | Not a unique index: `ensureIndexes` is non-fatal by design (`indexes.ts:236-244`), so an index-backed guarantee silently disappears when the build fails — the trap that already bit memory. `lastSystemKey` in the selector is single-winner and needs no index; the system row's `_id`, derived from **the idempotency key** (not the token — a fresh token per call would make the backstop protect nothing), is the permanent guard against a repeated key ever writing a second row. |
@@ -351,12 +351,27 @@ And the index (decision 15), beside the existing phase index in `indexes.ts`:
 At turn entry, beside `consumingRelay` (`loop.ts:287`):
 
 ```ts
-const consumingSystem = !!entry.pendingSystem;
+const consumingSystem = entry.pendingSystem !== undefined
+  && (await AgentMessages.findOneAsync(
+    systemRowId(sessionId, entry.pendingSystem.key ?? entry.pendingSystem.token),
+  )) !== undefined;
 ```
 
-No token comparison is needed, and that is a consequence of decision 9: because
-no second intent can be parked while one stands, the intent visible at entry is
-necessarily the one that started this turn.
+*(Rewritten during the build — the draft latched on `!!entry.pendingSystem` and
+argued that "decision 9 refuses a second park while one stands, so the intent
+visible at entry is necessarily the one that started this turn". That is a
+non-sequitur, and the test that drove it end to end caught it: decision 9 makes
+the standing intent **unique**, which is not evidence that this turn was
+dispatched to consume it. Any turn starting while an intent stands — an approval
+resume, a plain send answering a stranded marker — would clear it and bill the
+counter for a prompt no model ever saw. It destroyed the scheduled turn on
+exactly the parked-approval case in decision 8, and it contradicted decision 10
+outright.)*
+
+The honest latch is the intent's **row**. `consumeSystemIntent` writes it before
+it dispatches, so the row's existence is proof the intent was materialized into
+this transcript — which is the condition under which a commit here is answering
+it. One primary-key read, and only when a marker stands.
 
 `allocateSeq`'s `unset` parameter (`turn-state.ts:99`) widens from
 `{ pendingRelay?: 1 }` to `{ pendingRelay?: 1; pendingSystem?: 1 }`, and the
