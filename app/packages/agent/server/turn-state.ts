@@ -96,7 +96,13 @@ export async function allocateSeq(
   // anywhere before that commit leaves the wake standing and recovery
   // resumes the RIGHT model (a reviewer-confirmed window: consuming at turn
   // entry re-routed a crashed relay to the primary).
-  unset?: { pendingRelay?: 1 },
+  // A standing SYSTEM INTENT is consumed the same way and for the same reason
+  // (system-turn spec decision 14): the turn's first commit clears it, never
+  // whoever dispatched the turn. `deferTurn` is fire-and-forget and `runTurn`
+  // returns silently on a lost lease or an in-process duplicate, so clearing
+  // the marker outside a turn would strand the row it wrote with nothing left
+  // for the sweep to find.
+  unset?: { pendingRelay?: 1; pendingSystem?: 1 },
 ): Promise<number | null> {
   // The driver's declared return is `ModifyResult<AgentSession>`, but with the
   // v5+ default (`includeResultMetadata: false`) `findOneAndUpdate` resolves to

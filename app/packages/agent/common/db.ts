@@ -81,6 +81,7 @@ export type SessionQuery =
   & { [k: `channel.${string}`]:unknown }
   & { [k: `participants.${string}`]:unknown }
   & { [k: `pendingRelay.${string}`]:unknown }
+  & { [k: `pendingSystem.${string}`]:unknown }
   & {
     $or?: SessionQuery[];
     $and?: SessionQuery[];

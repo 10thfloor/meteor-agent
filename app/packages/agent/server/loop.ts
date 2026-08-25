@@ -83,7 +83,10 @@ export interface RunConfig {
    *  already happened. `relay` caps model-to-model hops (participants spec
    *  decision 7; default 4). On an ADDRESSED turn this whole bundle is the
    *  PRIMARY agent's, whatever config the rest of the run came from. */
-  budget?: { turns?: number; toolCalls?: number; spend?: number; relay?: number };
+  budget?: {
+    turns?: number; systemTurns?: number; toolCalls?: number;
+    spend?: number; relay?: number;
+  };
   /** $ per million tokens. The FALLBACK for a provider that reports no cost of
    *  its own; see `accruedCost`. */
   pricing?: { input: number; output: number };
@@ -285,6 +288,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       // `$unset` rides the same atomic write), so the whole pre-commit
       // stretch stays recoverable as the right model.
       const consumingRelay = entry.pendingRelay?.agent === selfAgent;
+      // A standing SYSTEM INTENT is the wake this turn IS, on the same terms
+      // and for the same reason (system-turn spec decision 14): cleared by the
+      // first commit below, not here, so the pre-commit stretch stays
+      // recoverable. No token comparison is needed — decision 9 refuses a
+      // second park while one stands, so the intent visible at entry is
+      // necessarily the one that started this turn.
+      const consumingSystem = !!entry.pendingSystem;
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit
@@ -706,6 +716,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           'usage.input': usage.input,
           'usage.output': usage.output,
           'usage.cost': accruedCost(usage, config.pricing),
+          // The system-turn budget is spent HERE rather than at the park
+          // (system-turn spec decision 14), so a turn that was dispatched but
+          // never ran is never billed. The park only checks the bound.
+          ...(consumingSystem ? { 'budgetSpent.systemTurns': 1 } : {}),
         }, relaying ? {
           pendingRelay: { agent: relayHit!.agent, token: Random.id() },
           relay: relayCount + 1,
@@ -713,8 +727,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // The relay's CONSUMPTION (decision 7): the addressee's first commit
         // clears the marker it answers — never turn entry, so a crash before
         // any commit leaves the wake standing for recovery. A commit that
-        // itself relays onward OVERWRITES instead (the $set above).
-        !relaying && consumingRelay ? { pendingRelay: 1 } : undefined);
+        // itself relays onward OVERWRITES instead (the $set above). A standing
+        // system intent is cleared on the same terms.
+        {
+          ...(!relaying && consumingRelay ? { pendingRelay: 1 as const } : {}),
+          ...(consumingSystem ? { pendingSystem: 1 as const } : {}),
+        });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
 
         // The TURN-FINAL row (no toolCalls) claims the session's staged

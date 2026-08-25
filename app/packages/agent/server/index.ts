@@ -143,6 +143,15 @@ export {
   type AttachmentDownloadToken,
 } from './downloads';
 export type { ViaIdentity } from './methods';
+// System turns: a turn nobody typed (system-turn spec). `Agent#systemTurn` is
+// the blessed door; the free function is here for a host that schedules
+// without an Agent handle. `consumeSystemIntent` is exported for the watcher's
+// sweep and for tests — an app has no reason to call it.
+export {
+  startSystemTurn, consumeSystemIntent, systemRowId, systemBudgetClause,
+  SYSTEM_INTENT_TTL_MS, type SystemTurnResult,
+} from './methods';
+export { systemParticipantId, systemFrom } from '../common/participants';
 export type { TranscriptView } from './transcript';
 
 /**

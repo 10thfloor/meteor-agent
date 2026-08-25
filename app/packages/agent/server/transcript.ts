@@ -86,6 +86,31 @@ export function toProviderMessages(
   for (const m of msgs) {
     if (m.role === 'note') continue;
 
+    // A SYSTEM row — a turn the clock or a job runner started (system-turn
+    // spec §4.9). No provider has a mid-conversation system message: that
+    // channel is `ProviderRequest.system`, which the loop rebuilds from the
+    // config on every iteration, so routing a one-shot prompt there would make
+    // it standing and strip its place in history. It projects as a MARKED user
+    // row instead — the shape a compaction note and a colleague's reply already
+    // use.
+    //
+    // This arm must push and `continue`. The generic build below casts
+    // `m.role as ProviderMessage['role']`, which compiles happily with a
+    // literal 'system' and reaches an adapter that silently re-labels it
+    // `role: 'user'` — telling the model a PERSON said it, the exact confusion
+    // the role exists to prevent. The marker is unconditional, never gated on
+    // `prefixing`: gating it would leave machine input unlabelled in every 1:1
+    // session, and a session with no system rows projects identically either
+    // way.
+    if (m.role === 'system') {
+      const body = (m.content ?? '').trim();
+      // An empty user row is a 400 on some providers; a marker with nothing
+      // after it is worse than no row at all.
+      if (body === '') continue;
+      out.push({ role: 'user', content: `[${m.from?.name ?? 'system'}] ${body}` });
+      continue;
+    }
+
     if (view && (m.role === 'assistant' || m.role === 'tool')) {
       const author = m.from?.participant ?? view.primary;
       const foreign = view.self !== undefined && author !== view.self;
