@@ -1,10 +1,18 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { DECIDED_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import {
+  DECIDED_PHASES, type AgentSession, type Phase, type SessionInc,
+} from '../common/types';
 import { systemFrom } from '../common/participants';
 import { getAgent, resolveBudget, memoryOpt, type AgentConfig } from './registry';
 import { SERVER_ID } from './lease';
 import { isRunning } from './turn-state';
+import { isDuplicateKey } from './channels/collections';
+
+/** The decided phases a person must clear before scheduled work may park —
+ *  `DECIDED_PHASES` minus `awaiting`, which is exactly the case this exists
+ *  for. Named once so the three sites that test it cannot drift. */
+const HALTED_PHASES: Phase[] = ['stopped', 'error'];
 
 /**
  * System turns — a turn nobody typed.
@@ -90,6 +98,7 @@ function consumableByUs(now: Date): object {
   return {
     $or: [
       { lease: { $exists: false } },
+      { lease: null },
       { 'lease.until': { $lt: now } },
       { 'lease.serverId': SERVER_ID },
     ],
@@ -159,12 +168,12 @@ export async function consumeSystemIntent(
         from: systemFrom(intent.source),
         createdAt: now,
       });
-    } catch (e: any) {
+    } catch (e) {
       // A duplicate `_id`: another consumer materialized this same intent
       // between our read and our insert, and its turn is already on its way.
       // The seq we allocated becomes a gap, which the transcript tolerates
       // (a discarded turn leaves one too).
-      if (e?.code !== 11000) throw e;
+      if (!isDuplicateKey(e)) throw e;
       return false;
     }
   }
@@ -205,21 +214,23 @@ export async function startSystemTurnWith(
   const session = await AgentSessions.findOneAsync(sessionId);
   if (!session) return { ok: false, reason: 'no-session' };
 
-  // An intent naming an unregistered agent is a config bug in the caller, so
-  // this is a hard refusal — NOT the visible primary fallback the recovery
-  // paths use for a renamed colleague. Answering as somebody else would hide
-  // it, and a schedule pointing at a teammate that no longer exists is exactly
-  // the thing an operator needs told.
-  const target = getAgent(opts?.agent ?? session.agent);
-  if (!target) return { ok: false, reason: 'no-agent' };
   // The purse is the PRIMARY's, as every other budget in a session is.
   const primary = getAgent(session.agent);
+  // The teammate that answers: the named one, else the primary. Naming an
+  // unregistered agent is a config bug in the caller, so it is a hard refusal —
+  // NOT the visible primary fallback the recovery paths use for a renamed
+  // colleague. Answering as somebody else would hide a schedule pointing at a
+  // teammate that no longer exists, which is exactly what an operator needs
+  // told. (An absent `opts.agent` reuses `primary` rather than looking it up
+  // twice.)
+  const target = opts?.agent ? getAgent(opts.agent) : primary;
+  if (!target) return { ok: false, reason: 'no-agent' };
 
   // `stopped` and `error` are states a person is meant to see and clear.
   // Parking into one would stand forever — the sweep excludes those phases —
   // and then refuse every later firing, turning a transient failure into a
   // permanent block. Refusing now means the scheduler learns on its next tick.
-  if (session.phase === 'stopped' || session.phase === 'error') {
+  if (HALTED_PHASES.includes(session.phase)) {
     return { ok: false, reason: 'session-halted' };
   }
 
@@ -228,7 +239,7 @@ export async function startSystemTurnWith(
   const claimed = await AgentSessions.rawCollection().findOneAndUpdate(
     {
       _id: sessionId,
-      phase: { $nin: ['stopped', 'error'] },
+      phase: { $nin: HALTED_PHASES },
       // `Agent.ask`'s throwaway sessions are deleted when the call returns, so
       // an intent parked on one is unreachable by construction.
       ephemeral: { $ne: true },
@@ -273,7 +284,7 @@ export async function startSystemTurnWith(
     if (opts?.key && after.lastSystemKey === opts.key) {
       return { ok: false, reason: 'duplicate-key' };
     }
-    if (after.phase === 'stopped' || after.phase === 'error') {
+    if (HALTED_PHASES.includes(after.phase)) {
       return { ok: false, reason: 'session-halted' };
     }
     if (after.pendingSystem) return { ok: false, reason: 'intent-standing' };

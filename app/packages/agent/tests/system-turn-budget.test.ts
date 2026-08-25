@@ -490,6 +490,46 @@ describe('system turns — idempotency, the strand, and the budget', () => {
     assert.equal(doc.budgetSpent.toolCalls, 0);
   });
 
+  it('D1b: a TOOL-using system turn is billed once, not once per iteration', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { startSystemTurn } = await import('../server/methods');
+
+    // Every OTHER system-turn test drives a single-iteration provider
+    // (tools: []), so the commit runs once and the bill is coincidentally
+    // right. A real scheduled turn does tool work: the model asks for a tool,
+    // the tool runs, the model answers — two commits, two trips through the
+    // block that spends `budgetSpent.systemTurns`. This pins that the charge
+    // is once PER TURN, the thing the per-iteration bug got wrong.
+    const calls = { n: 0 };
+    const provider = mockProvider(() => {
+      calls.n += 1;
+      return calls.n === 1
+        ? { toolCalls: [{ id: 't1', name: 'peek', args: {} }] }
+        : { text: 'done looking' };
+    });
+    new Agent('stb-d1b', {
+      model: 'mock',
+      instructions: '',
+      tools: [{
+        name: 'peek', description: 'x', args: { type: 'object', properties: {} },
+        run: async () => ({ ok: true }),
+      }],
+      provider,
+    } as any);
+    await seedSolo('sbb-d1b', 'stb-d1b');
+
+    ok(await startSystemTurn('sbb-d1b', 'look into it'), 'firing');
+    // Two assistant rows: the tool-call round, then the answer.
+    await waitFor(() => finished('sbb-d1b', 2), 'the tool-using system turn to finish');
+
+    const doc = (await AgentSessions.findOneAsync('sbb-d1b'))!;
+    assert.equal(doc.budgetSpent.systemTurns, 1, 'billed once for the whole turn, not per commit');
+    assert.equal(doc.budgetSpent.toolCalls, 1, 'and the one tool call it made');
+  });
+
   it('D2: a human send still increments only turns', async function () {
     this.timeout(30000);
     const { AgentSessions } = await import('../common/collections');

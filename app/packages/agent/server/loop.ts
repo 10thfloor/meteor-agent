@@ -311,6 +311,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         && (await AgentMessages.findOneAsync(
           systemRowId(sessionId, entry.pendingSystem.key ?? entry.pendingSystem.token),
         )) !== undefined;
+      // The budget is billed ONCE, on the first commit — not once per commit.
+      // `consumingSystem` is a turn-constant, but the commit below runs once per
+      // provider ITERATION, so a system turn that makes K tool rounds would
+      // $inc `budgetSpent.systemTurns` K+1 times and trip its own bound far too
+      // early. This latch bills on the first successful commit and no more;
+      // the marker clear stays per-commit (idempotent, mirroring the relay).
+      let systemUnbilled = consumingSystem;
       if (entry.pending) {
         if (!entry.pending.verdict) {
           // Still parked, and re-entry here is the recovering-server case: exit
@@ -734,8 +741,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           'usage.cost': accruedCost(usage, config.pricing),
           // The system-turn budget is spent HERE rather than at the park
           // (system-turn spec decision 14), so a turn that was dispatched but
-          // never ran is never billed. The park only checks the bound.
-          ...(consumingSystem ? { 'budgetSpent.systemTurns': 1 } : {}),
+          // never ran is never billed. The park only checks the bound. Once
+          // per turn, not once per iteration — see `systemUnbilled`.
+          ...(systemUnbilled ? { 'budgetSpent.systemTurns': 1 } : {}),
         }, relaying ? {
           pendingRelay: { agent: relayHit!.agent, token: Random.id() },
           relay: relayCount + 1,
@@ -750,6 +758,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           ...(consumingSystem ? { pendingSystem: 1 as const } : {}),
         });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
+        // A real commit landed and carried the charge; every later commit this
+        // turn makes must not repeat it. (A null return meant a lost lease and
+        // no write, so the latch stays true for a clean single bill on recovery.)
+        systemUnbilled = false;
 
         // The TURN-FINAL row (no toolCalls) claims the session's staged
         // attachment refs and embeds them — the reply becomes a file-bearing
