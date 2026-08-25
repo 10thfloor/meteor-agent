@@ -1025,6 +1025,64 @@ session rather than re-running it. And forking is rate-limited by the
 entry of its own: a fork creates a session exactly as a start does, and copies a
 whole transcript on top of it.
 
+## System turns — work that starts without a person
+
+Every other way into a turn is a human action, and a `send` writes a `role:
+'user'` row attributed to the session's owner. Scheduled work has no such
+person. `systemTurn` is the entry point that does not borrow one:
+
+```ts
+const r = await Conditions.systemTurn(sessionId, 'Review the week against the bulletin.', {
+  key: 'morning-review@2026-08-25T06:30',   // the same key twice runs once
+  source: 'routine',                        // attribution: `s:routine`
+});
+```
+
+It is server-only, like `ask` — there is no caller to authorize, and a
+client-reachable version would start turns that bypass both the turn budget and
+the rate limiter.
+
+Four things differ from a `send`, and each is the point:
+
+**The transcript says a machine did it.** The row is `role: 'system'`,
+attributed to an `s:<source>` participant that is not in the roster and is not a
+person. The model still sees it — projected as a marked message, since no
+provider has a mid-conversation system role — but your audit record no longer
+claims somebody typed it.
+
+**It waits behind live work instead of being dropped.** A busy session — most
+importantly one sitting in `awaiting` on an approval — parks a durable intent
+and runs it when the session next goes idle. The intent survives a deploy, and
+the watcher recovers one whose process died.
+
+**It spends its own purse.** `budget.systemTurns` is separate from `turns`, and
+is spent when the turn commits, not when it is requested — so a turn that never
+ran is never billed.
+
+**It does not outrank the team.** A human message clears a pending relay and
+resets the hop count; a system turn does neither. Scheduled work is not an
+interjection, and it has no standing to cancel a hand-off the team is mid-way
+through.
+
+The result says what happened:
+
+```ts
+{ ok: true, ran: true }                  // ran immediately
+{ ok: true, ran: false, parked: true }   // standing; fires at the next idle
+{ ok: false, reason: 'duplicate-key' | 'intent-standing' | 'session-halted'
+                   | 'budget-exhausted' | 'no-session' | 'no-agent' }
+```
+
+`session-halted` is worth handling: `stopped` and `error` are states a person is
+meant to clear, so a park into one is refused rather than left standing forever.
+
+**There is no scheduler here, deliberately.** Cron semantics — local time, DST,
+catch-up after downtime, which instance ticks — are business facts, and the app
+that has them should keep them. Every instance may tick; derive the same `key`
+and exactly one wins.
+
+Full design: `docs/superpowers/specs/2026-08-25-system-turns.md`
+
 ## Headless one-shots
 
 `ask` is the whole conversation in one call — no session to start, subscribe to
