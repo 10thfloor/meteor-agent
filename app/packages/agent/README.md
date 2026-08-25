@@ -515,8 +515,8 @@ architecture, and both export a class called `Agent` with different surfaces.
 TypeScript cannot model that, so the default `Agent` is the SERVER one — that is
 where configs, tools, gates and hooks live. Client code imports `ClientAgent`
 for the browser surface (`subscribe`, `messages`, `status`, `pending`). The
-residue is real and worth knowing: a client file importing a server-only export
-type-checks and fails at run time.
+residue: a client file importing a server-only export type-checks and fails at
+run time.
 
 ### Typed tool arguments
 
@@ -558,7 +558,7 @@ widens to `unknown` rather than guessing.
 before and sits in the same array. Wrapping is how you opt in, one tool at a
 time.
 
-Two things worth knowing before you convert a file:
+Two things to know before you convert a file:
 
 - A helper is unavoidable. TypeScript infers a type argument from a CALL, never
   from a bare object literal checked against a type, so `args` in an unwrapped
