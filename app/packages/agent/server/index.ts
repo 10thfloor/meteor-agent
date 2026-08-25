@@ -49,10 +49,11 @@ export {
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
   type ArgsValidator, type TypeboxValue, type TypeboxCompile,
   type TypeboxValidator, type Skill, type ToolResult,
-  // The gate surface. `Gate` is what a spec's `gate` accepts; `GateContext` is
-  // what an app's predicate is handed, and is the one type it has to name.
   type Gate, type GateContext, type GatePredicate,
+  // Typed arguments (opt-in via `tool()` / `methodTool()`).
+  tool, methodTool, type TypedInlineTool, type TypedAdoptedTool,
 } from './tools';
+export type { FromSchema } from '../common/schema';
 export type {
   HookName, HookMap, HookPurpose, HookToolCall,
   BeforeProviderRequestHook, AfterToolResultHook,

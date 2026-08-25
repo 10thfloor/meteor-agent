@@ -486,6 +486,91 @@ through the same `runTool` an inline tool is, so `gate: 'ask'` parks it, a
 `canUse` refusal never reaches the server, arguments are checked against the
 discovered schema before the call, and each call costs one `budget.toolCalls`.
 
+## Types
+
+The package is TypeScript, and ships generated declarations. Point your app's
+`tsconfig.json` at the entry:
+
+```jsonc
+{
+  "compilerOptions": {
+    "paths": {
+      "meteor/10thfloor:agent": ["./packages/agent/index.d.ts"]
+    }
+  }
+}
+```
+
+That is the whole setup. `npm run types` regenerates `packages/agent/types/`
+from source with `tsc --emitDeclarationOnly`, so declarations cannot drift from
+the implementation, and `npm run types:check` fails if the working tree changes
+as a result — wire it into CI beside `tsc --noEmit`.
+
+A `.js` app gets hover and completion from this immediately; no `checkJs`, no
+conversion. `declarationMap` is on, so cmd-click lands in the real source rather
+than in a `.d.ts`.
+
+**One id, one shape.** `api.mainModule` names a different entry per
+architecture, and both export a class called `Agent` with different surfaces.
+TypeScript cannot model that, so the default `Agent` is the SERVER one — that is
+where configs, tools, gates and hooks live. Client code imports `ClientAgent`
+for the browser surface (`subscribe`, `messages`, `status`, `pending`). The
+residue: a client file importing a server-only export type-checks and fails at
+run time.
+
+### Typed tool arguments
+
+`tool()` makes a tool's `run` and `describe` read their own schema:
+
+```ts
+import { tool } from 'meteor/10thfloor:agent';
+
+tools: [
+  tool({
+    name: 'lookup_offering',
+    description: 'Look one up by slug.',
+    args: {
+      type: 'object',
+      properties: {
+        slug: { type: 'string' },
+        limit: { type: 'integer' },
+        verdict: { type: 'string', enum: ['ready', 'stretch', 'gap'] },
+      },
+      required: ['slug'],
+    },
+    run: async ({ slug, limit, verdict }) => {
+      //      slug: string
+      //      limit: number | undefined        (not in `required`)
+      //      verdict: 'ready' | 'stretch' | 'gap' | undefined
+    },
+  }),
+]
+```
+
+No second schema, no TypeBox, no `as const` — the JSON Schema you already write
+is the one the runtime validator compiles AND the one the types come from.
+Nullable via a type array (`{ type: ['integer', 'null'] }`) becomes
+`number | null`. `enum` becomes a union. Anything the mapper does not recognise
+widens to `unknown` rather than guessing.
+
+**Additive, not a migration.** The spec types are unchanged — `args: unknown`,
+`run: (args: any, …)`. A tool written without `tool()` compiles exactly as
+before and sits in the same array. Wrapping is how you opt in, one tool at a
+time.
+
+Two things to know before you convert a file:
+
+- A helper is unavoidable. TypeScript infers a type argument from a CALL, never
+  from a bare object literal checked against a type, so `args` in an unwrapped
+  spec is `unknown` and always will be.
+- `run: async (args = {}) => …` does not compile. The default is checked against
+  the argument type before the schema has been inferred. Dispatch always passes
+  an object, so use per-property defaults: `async ({ limit = 10 }) => …`.
+
+`methodTool()` is the same thing for an adopted Meteor method. Both return the
+erased spec type, which is why a generic tool drops into any existing
+`ToolSpec[]` without a variance error.
+
 ## Skills
 
 A skill is a block of instructions the model loads **only when it needs it**.

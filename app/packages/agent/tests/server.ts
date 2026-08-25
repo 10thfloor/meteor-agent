@@ -4,6 +4,7 @@ import './loader.test';
 import './piai.test';
 import './capped.test';
 import './tools.test';
+import './schema.test';
 import './lease.test';
 import './loop.test';
 import './ask.test';

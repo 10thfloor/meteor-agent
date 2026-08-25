@@ -1,0 +1,28 @@
+{
+  // Emits declarations into packages/agent/types/. Separate from tsconfig.json
+  // (which is noEmit) so a type error doesn't look like a build failure.
+  // `npm run types` regenerates; `npm run types:check` fails if anything changed.
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    // Cmd-click goes to real source instead of .d.ts files.
+    "declarationMap": true,
+    "outDir": "./packages/agent/types",
+    "rootDir": "./packages/agent",
+    "stripInternal": true
+  },
+  "include": [
+    "packages/agent/common/**/*.ts",
+    "packages/agent/server/**/*.ts",
+    "packages/agent/client/**/*.ts",
+    "types/**/*.d.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    ".meteor",
+    "packages/agent/tests/**",
+    "packages/agent/types/**"
+  ]
+}

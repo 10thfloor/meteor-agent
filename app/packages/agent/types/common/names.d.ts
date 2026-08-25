@@ -1,0 +1,31 @@
+export declare const NAMES: {
+    readonly sessions: 'agent_sessions';
+    readonly messages: 'agent_messages';
+    readonly deltas: 'agent_deltas';
+    readonly channelIdentities: 'agent_channel_identities';
+    readonly channelBindings: 'agent_channel_bindings';
+    readonly deliveryReceipts: 'agent_delivery_receipts';
+    readonly inboundSubmissions: 'agent_inbound_submissions';
+    readonly channelLinkTokens: 'agent_channel_link_tokens';
+    readonly channelVerdictTokens: 'agent_channel_verdict_tokens';
+    readonly attachments: 'agent_attachments';
+    readonly attachmentTokens: 'agent_attachment_tokens';
+    readonly memories: 'agent_memories';
+    readonly pubSession: 'agent.session';
+    readonly pubSessions: 'agent.sessions';
+    readonly mStart: 'agent.start';
+    readonly mSend: 'agent.send';
+    readonly mInterrupt: 'agent.interrupt';
+    readonly mFork: 'agent.fork';
+    readonly mApprove: 'agent.approve';
+    readonly mDeny: 'agent.deny';
+    readonly mCompact: 'agent.compact';
+    readonly mAttachmentToken: 'agent.attachmentToken';
+    readonly pubMemories: 'agent.memories';
+    readonly mMemorySave: 'agent.memorySave';
+    readonly mMemorySearch: 'agent.memorySearch';
+    readonly mMemoryForget: 'agent.memoryForget';
+};
+/** Capped collection size in bytes. Sized for ~200 concurrent streaming turns. */
+export declare const DELTA_CAP_BYTES: number;
+//# sourceMappingURL=names.d.ts.map
