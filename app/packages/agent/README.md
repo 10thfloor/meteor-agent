@@ -855,10 +855,32 @@ chat.mentionables = [
 
 | Field | Meaning |
 | --- | --- |
-| `handle` | **Required.** What follows the `@`. No whitespace. |
+| `handle` | **Required.** What follows the symbol. No whitespace. |
 | `label` | What the chip and the typeahead show. Defaults to `handle`. |
 | `kind` | Free-form, becomes a `part` token: `::part(mention guest)`. Model participants get `agent`; anything else defaults to `subject`. |
 | `detail` | A second line in the typeahead, and the chip's tooltip. |
+| `prefix` | The symbol that summons it. Defaults to `@`. |
+
+### A second symbol
+
+`prefix` gives you another namespace in the same composer:
+
+```js
+chat.mentionables = [
+  { handle: 'priya-natarajan', label: 'Priya Natarajan', kind: 'guest' },
+  { handle: 'ast-1-course', label: 'AST 1', kind: 'offering', prefix: '#' },
+];
+```
+
+Each symbol offers only what it names — typing `#` will not suggest a person —
+and the two namespaces are independent, so `@ast-1` and `#ast-1` are different
+subjects rather than one overwriting the other.
+
+Reach for a second symbol when the things being named are of a different
+**order**, not merely a different type: `@` reaches people, and for a model
+participant it actually routes the turn, while `#` might point at a catalogue
+item that could never take one. Only `@` is ever parsed as an addressee, so
+anything under another symbol is inert by construction.
 
 App-supplied subjects are **inert on purpose**: they render and they complete,
 but naming one schedules nothing. Only a model participant can take a turn, and

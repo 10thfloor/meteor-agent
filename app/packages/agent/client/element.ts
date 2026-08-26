@@ -52,14 +52,37 @@ export interface Mentionable {
   kind?: string;
   /** A second line in the typeahead — an email, a role, a last-seen date. */
   detail?: string;
+  /**
+   * The symbol that summons it. Defaults to `@`.
+   *
+   * A second symbol is worth having when the things being named are of a
+   * different ORDER, not merely a different type: `@` reaches people (and, for
+   * model participants, actually routes the turn), while something like `#`
+   * points at an item in a catalogue that could never take a turn. One symbol
+   * for both makes the composer offer a product where a person belongs.
+   *
+   * Only `@` is ever parsed as an addressee — see `resolveAddressee` — so a
+   * mentionable under any other symbol is inert by construction, whatever kind
+   * it claims.
+   */
+  prefix?: string;
 }
 
+const DEFAULT_PREFIX = '@';
 /** Same character class as `LEADING_MENTION` in common/participants.ts. The two
- *  must agree: a token this renders as a chip but the parser will not accept as
- *  an addressee is a chip that promises routing it cannot deliver. */
-const MENTION_TOKEN = /@([\w.-]{1,64})/g;
-/** The partial token under the caret, for the typeahead. */
-const MENTION_PREFIX = /@([\w.-]{0,64})$/;
+ *  must agree for `@`: a token this renders as a chip but the parser will not
+ *  accept as an addressee is a chip that promises routing it cannot deliver. */
+const HANDLE_CLASS = '[\\w.-]';
+/** Prefixes are author-supplied strings that go straight into a character
+ *  class, so a `-` or a `]` would otherwise change what the pattern matches. */
+const escapeForClass = (s: string) => s.replace(/[\\\]^-]/g, '\\$&');
+
+function tokenPattern(prefixes: string[], trailing: boolean): RegExp {
+  const set = `[${prefixes.map(escapeForClass).join('')}]`;
+  return trailing
+    ? new RegExp(`(${set})(${HANDLE_CLASS}{0,64})$`)
+    : new RegExp(`(${set})(${HANDLE_CLASS}{1,64})`, 'g');
+}
 /** The reason the built-in Deny button sends. It reaches the MODEL as the
  *  denied tool result, so it says who refused rather than just "denied". A host
  *  that wants to ask the human why calls `el.agentInstance.deny(el.sessionId,
@@ -402,31 +425,34 @@ function renderRow(
 function renderText(text: string, mentions: Map<string, Mentionable>): Node[] {
   if (!text) return [];
   if (mentions.size === 0) return [document.createTextNode(text)];
+  const prefixes = [...new Set([...mentions.values()].map((m) => m.prefix ?? DEFAULT_PREFIX))];
   const nodes: Node[] = [];
   let cursor = 0;
-  // A fresh regex per call: /g carries `lastIndex` between uses, and a module
-  // -level literal shared across rows would skip matches on every other row.
-  const scan = new RegExp(MENTION_TOKEN.source, 'g');
+  // A fresh regex per call: /g carries `lastIndex` between uses, and one shared
+  // across rows would skip matches on every other row.
+  const scan = tokenPattern(prefixes, false);
   let hit: RegExpExecArray | null = scan.exec(text);
   while (hit !== null) {
     // "@risk." — the class admits '.' and '-', so sentence punctuation rides
     // into the capture. Same two-step as `resolveAddressee`: try the token, then
     // retry with trailing punctuation trimmed. A real handle cannot END in it,
     // so the trim can only recover a match, never invent one.
-    const raw = hit[1];
+    const prefix = hit[1];
+    const raw = hit[2];
     const trimmed = raw.replace(/[.-]+$/, '');
-    const found = mentions.get(raw) ?? (trimmed !== raw ? mentions.get(trimmed) : undefined);
+    const found = mentions.get(prefix + raw)
+      ?? (trimmed !== raw ? mentions.get(prefix + trimmed) : undefined);
     if (found) {
-      const handle = mentions.get(raw) ? raw : trimmed;
+      const handle = mentions.get(prefix + raw) ? raw : trimmed;
       if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
       const chip = document.createElement('span');
       const kind = found.kind ?? 'subject';
       chip.className = `mention ${kind}`;
       chip.setAttribute('part', `mention ${kind}`);
-      chip.textContent = `@${found.label ?? handle}`;
+      chip.textContent = `${prefix}${found.label ?? handle}`;
       if (found.detail) chip.title = found.detail;
       nodes.push(chip);
-      cursor = hit.index + 1 + handle.length;
+      cursor = hit.index + prefix.length + handle.length;
     }
     hit = scan.exec(text);
   }
@@ -571,22 +597,29 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     }
 
     /**
-     * Handle → subject, for both the transcript and the typeahead.
+     * `prefix + handle` → subject, for both the transcript and the typeahead.
+     *
+     * Keyed WITH the prefix so `@ast-1` and `#ast-1` are different subjects
+     * rather than one overwriting the other — which is the whole point of a
+     * second symbol.
      *
      * The session's MODEL participants come first and the app's list is layered
      * over them, so an app can relabel `@risk` but cannot accidentally shadow a
-     * real addressee with an inert subject of the same name — the kind stays
-     * `agent` unless the app deliberately overrides the whole entry.
+     * real addressee with an inert subject of the same name.
      */
     private mentionMap(): Map<string, Mentionable> {
       const out = new Map<string, Mentionable>();
       const session = this.client && this.sid ? this.client.session(this.sid) : null;
       for (const p of session?.participants ?? []) {
         if (p.kind !== 'model' || !p.agent) continue;
-        out.set(p.agent, { handle: p.agent, label: p.agent, kind: 'agent', detail: p.displayName });
+        out.set(DEFAULT_PREFIX + p.agent, {
+          handle: p.agent, label: p.agent, kind: 'agent',
+          detail: p.displayName, prefix: DEFAULT_PREFIX,
+        });
       }
       for (const m of this.appMentions) {
-        out.set(m.handle, { kind: 'subject', ...m });
+        const prefix = m.prefix ?? DEFAULT_PREFIX;
+        out.set(prefix + m.handle, { kind: 'subject', ...m, prefix });
       }
       return out;
     }
@@ -780,17 +813,22 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      * finished mentions, and completing the one under the cursor is the only
      * behaviour that does not rewrite text the user has moved on from.
      */
-    private tokenAtCaret(): { start: number; query: string } | null {
+    private tokenAtCaret(): { start: number; query: string; prefix: string } | null {
       const { input } = this.ui;
       // A range selection has no single insertion point to complete at.
       if (input.selectionStart === null || input.selectionStart !== input.selectionEnd) return null;
       const caret = input.selectionStart;
-      const hit = MENTION_PREFIX.exec(input.value.slice(0, caret));
+      const prefixes = [...new Set(
+        [...this.mentionMap().values()].map((m) => m.prefix ?? DEFAULT_PREFIX),
+      )];
+      if (prefixes.length === 0) return null;
+      const hit = tokenPattern(prefixes, true).exec(input.value.slice(0, caret));
       if (!hit) return null;
-      // `@` must open a word — mid-token (an email address) it is not a mention.
+      // The symbol must open a word — mid-token (an email address) it is not a
+      // mention.
       const before = hit.index === 0 ? '' : input.value[hit.index - 1];
       if (before !== '' && !/\s/.test(before)) return null;
-      return { start: hit.index, query: hit[1] };
+      return { start: hit.index, prefix: hit[1], query: hit[2] };
     }
 
     private refreshSuggestions() {
@@ -798,7 +836,10 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       if (!token) { this.closeSuggestions(); return; }
       const q = token.query.toLowerCase();
       const all = [...this.mentionMap().values()];
-      const matches = all.filter((m) => `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(q));
+      const matches = all
+        // Only what THIS symbol names: typing `#` must not offer a person.
+        .filter((m) => (m.prefix ?? DEFAULT_PREFIX) === token.prefix)
+        .filter((m) => `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(q));
       if (matches.length === 0) { this.closeSuggestions(); return; }
       // Agents before subjects: in a chat the addressable thing is the more
       // likely intent, and a roster is short enough that it never buries the
@@ -821,7 +862,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         const handle = document.createElement('span');
         handle.className = 'suggestion-handle';
         handle.setAttribute('part', 'suggestion-handle');
-        handle.textContent = `@${m.label ?? m.handle}`;
+        handle.textContent = `${m.prefix ?? DEFAULT_PREFIX}${m.label ?? m.handle}`;
         row.append(handle);
         if (m.detail) {
           const detail = document.createElement('span');
@@ -876,7 +917,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const caret = input.selectionStart ?? input.value.length;
       // The trailing space is what ends the token: without it the next
       // keystroke re-opens the list against a handle that is already complete.
-      const insert = `@${chosen.handle} `;
+      const insert = `${chosen.prefix ?? DEFAULT_PREFIX}${chosen.handle} `;
       input.value = input.value.slice(0, token.start) + insert + input.value.slice(caret);
       const at = token.start + insert.length;
       input.setSelectionRange(at, at);
