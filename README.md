@@ -1,9 +1,28 @@
 # meteor-agent
 
-**An AI agent harness that works the Meteor way.** The transcript is a Mongo
-collection. Streaming tokens are a capped collection. Tools are Meteor
-methods. Authorization is `this.userId`. If you know Meteor, you already know
-most of this package — the part you don't know is the part it does for you.
+**A Meteor-native agent harness, powered by
+[pi-ai](https://github.com/earendil-works/pi).** Durable conversations,
+streaming, tools, authorization, and recovery are built from the primitives
+your Meteor app already uses—without a second realtime stack.
+
+[v0.1.0](https://github.com/10thfloor/meteor-agent/tree/v0.1.0) ·
+[CI](https://github.com/10thfloor/meteor-agent/actions/workflows/ci.yml) ·
+Meteor 3.5+ · [MIT](LICENSE)
+
+[Quick start](#quick-start) · [Why Meteor?](#why-this-exists) ·
+[Tools](#tools--five-kinds) · [Durability](#durability) ·
+[Channels](#channels) · [API reference](app/packages/agent/README.md)
+
+| Agent concern | Meteor primitive |
+| --- | --- |
+| Durable transcript | Mongo collection |
+| Token streaming | Capped collection + publication |
+| Tools | Meteor methods or server functions |
+| Identity and authorization | `this.userId` + publications |
+| Crash recovery | Leases + observers on every app server |
+
+If you know Meteor, most of the system is already familiar. `meteor-agent`
+supplies the durable model loop and keeps the rest native.
 
 ```ts
 // server
@@ -36,32 +55,48 @@ Support.messages(sessionId).fetch();  // minimongo cursor — streaming tokens
 Support.status(sessionId);            // 'idle' | 'streaming' | 'awaiting' | …
 ```
 
-That cursor updates token by token, works in Blaze, React, and Svelte, and
-needs no client-side AI library at all.
+That cursor updates token by token, works in Blaze, React, Svelte, or plain
+JavaScript, and needs no client-side AI library.
 
 ## Quick start
 
-```bash
-meteor add 10thfloor:agent            # (not yet on Atmosphere — see Status)
-meteor npm install --save @earendil-works/pi-ai typebox
-meteor remove insecure autopublish
-export ANTHROPIC_API_KEY=sk-...       # or OPENAI_API_KEY, etc.
-```
-
-Define an agent on the server, drop `<agent-chat>` on a page (after calling
-`defineAgentChat()`), and you have a streaming, tool-using, human-gated agent.
-
-### Try the demo
+### Run the demo
 
 ```bash
-git clone https://github.com/10thfloor/meteor-agent && cd meteor-agent/app
+git clone --branch v0.1.0 --depth 1 https://github.com/10thfloor/meteor-agent
+cd meteor-agent/app
 meteor npm ci
 meteor run --port 3400
 ```
 
-No API key needed — a scripted provider streams canned responses and
-exercises the tool and approval paths (`"what time is it?"`, `"refund my
-order"`). Set `ANTHROPIC_API_KEY` and restart to talk to a real model.
+No API key is needed: the demo provider streams scripted responses through
+the real transcript, tool, and approval paths. Try `what time is it?` or
+`refund my order`. Set `ANTHROPIC_API_KEY` and restart to use a real model.
+
+### Install in an app
+
+The packages are not yet on Atmosphere. From your Meteor app's root, vendor the
+tagged core package at `packages/agent`, then install it normally:
+
+```bash
+git clone --branch v0.1.0 --depth 1 \
+  https://github.com/10thfloor/meteor-agent ../meteor-agent-v0.1.0
+mkdir -p packages
+cp -R ../meteor-agent-v0.1.0/app/packages/agent packages/agent
+
+meteor add 10thfloor:agent
+meteor npm install --save @earendil-works/pi-ai typebox
+meteor remove insecure autopublish
+export ANTHROPIC_API_KEY=sk-...       # or OPENAI_API_KEY, GOOGLE_API_KEY, etc.
+```
+
+Need Slack, Telegram, WhatsApp, SMS, or email too? Vendor the matching
+`app/packages/agent-channel-*` directory beside the core package. The
+[package README](app/packages/agent/README.md#install) covers submodules,
+`METEOR_PACKAGE_DIRS`, dependencies, and production requirements.
+
+Define the server agent shown above, call `defineAgentChat()` on the client,
+and place `<agent-chat agent="support"></agent-chat>` on a page.
 
 ### Test without spending a cent
 
@@ -528,10 +563,11 @@ side.
 
 ## Channels
 
-The same agent, reachable from Slack, SMS, or email. A channel is two adapters
-over the machinery above — a verified webhook in, a delivery worker out — plus
-a **lens**: one object that renders outbound items into the surface's native
-form and interprets inbound events back into a fixed set of meanings.
+The same agent can meet users in Slack, Telegram, WhatsApp, SMS, email, and the
+web app at once. A channel is two adapters over the machinery above—a verified
+webhook in and a delivery worker out—plus a **lens**: one object that renders
+outbound items into the surface's native form and interprets inbound events
+back into a fixed set of meanings.
 
 ```ts
 // server
@@ -651,11 +687,12 @@ Development workflow, the test command, and the npm-dependency policy are in
 
 ## Status
 
-The package metadata targets the first public release, `0.1.0`. Until the
+The first public source release is
+[`v0.1.0`](https://github.com/10thfloor/meteor-agent/tree/v0.1.0). Until the
 Atmosphere packages are published, vendor the package directories from this
-repository as described in the package README. CI type-checks source and
-published declarations, runs the core and all five channel suites, and verifies
-a production Meteor bundle.
+repository as described above. CI type-checks source and published
+declarations, runs the core and all five channel suites, audits production
+dependencies, and verifies a production Meteor bundle.
 
 The default suite uses mock providers. Separate opt-in live smokes cover a real
 provider and MCP process. Channel providers differ in their guarantees around a
