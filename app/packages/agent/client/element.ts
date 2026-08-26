@@ -3,47 +3,16 @@ import { Agent } from './agent';
 import type { Phase, ViewMessage } from '../common/types';
 import { prettySize } from '../common/format';
 
-/**
- * `<agent-chat>` — the packaged UI.
- *
- * One custom element that renders a whole session: transcript (user/assistant
- * bubbles with a streaming cursor, tool rows, notes), phase badge, approval
- * bar, and a composer with Send/Stop. It is the demo app's vanilla renderer
- * with nothing added but packaging, which is the point: the data layer is a
- * reactive minimongo cursor, so the renderer underneath is plain DOM in a
- * `Tracker.autorun`. Drop the tag into Blaze, React, Svelte or an HTML file —
- * a custom element is the same element in all four.
- *
- * NEVER auto-registered. A package that called `customElements.define` at
- * import time would squat the name `agent-chat` in every app that depends on
- * it, and a second definition of the same name is a hard `DOMException`. So
- * registration is the app's call, by name:
- *
- * ```ts
- * import { defineAgentChat } from 'meteor/10thfloor:agent';
- * defineAgentChat();                 // <agent-chat>
- * defineAgentChat('support-chat');   // …or under your own name
- * ```
- */
+/** `<agent-chat>` — a custom element rendering a whole session. Never
+ *  auto-registered (a second `customElements.define` is a DOMException);
+ *  the app calls `defineAgentChat()` or `defineAgentChat('my-tag')`. */
 
 const DEFAULT_TAG = 'agent-chat';
 const DEFAULT_PLACEHOLDER = 'Message the agent…';
 
-/**
- * Something a message can name with `@`.
- *
- * The package resolves the session's own MODEL participants into this shape for
- * free, because those are the handles that actually address a turn
- * (`resolveAddressee` in common/participants.ts parses exactly one leading
- * `@name` against them). An app adds its OWN subjects — a customer, a ticket, an
- * account — through the `mentionables` property, and those are deliberately
- * inert: they render and they autocomplete, but naming one schedules nothing,
- * because the package will not invent a routing rule for a noun it cannot see.
- *
- * `handle` is what follows the `@`, and it may not contain whitespace. Anything
- * that does not match a known handle stays plain text, which is the same rule
- * the addressee parse uses: an unmatched `@name` is speech, not markup.
- */
+/** Something a message can name with `@`. Model participants are resolved
+ *  automatically; app-specific subjects (via `mentionables`) autocomplete
+ *  and render but schedule nothing. */
 export interface Mentionable {
   handle: string;
   /** Shown in the chip and the typeahead. Defaults to `handle`. */
@@ -54,14 +23,10 @@ export interface Mentionable {
   detail?: string;
 }
 
-/** A field name on the record, or a function derived from it. A function is
- *  what a stored column cannot express: a handle slugged from a display name,
- *  a label joined from two columns. */
+/** A field name or a function derived from the record. */
 type Field<T> = string | ((record: never) => T | undefined);
 
-/** The shape this element needs from a live collection: a reactive `find` it
- *  can `fetch`. Structural on purpose — the package neither imports Mongo nor
- *  requires that the thing on the other side IS Mongo. */
+/** Structural — any object with a reactive `find().fetch()`. */
 export interface MentionCollection {
   find(selector: unknown, options: unknown): { fetch(): unknown[] };
 }
@@ -81,17 +46,8 @@ interface MentionShape {
   max?: number;
 }
 
-/**
- * Where the things one symbol names come from.
- *
- * Three forms, because the shapes an app actually has are not all the same:
- * a live collection whose contents change under the user, a plain list that is
- * computed or static, or — when neither fits — the two functions the element
- * really needs. The first two are conveniences over the third.
- *
- * A collection is read inside the element's own `Tracker.autorun`, so chips
- * repaint when the underlying data changes with nothing to wire up.
- */
+/** Three forms: a reactive collection, a plain list, or raw search/resolve
+ *  functions. Collection reads run inside the element's Tracker.autorun. */
 export type MentionSource =
   | (MentionShape & { collection: MentionCollection; list?: never })
   | (MentionShape & { list: unknown[] | (() => unknown[]); collection?: never })
@@ -125,15 +81,8 @@ function matches(m: Mentionable, needle: string): boolean {
   return `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(needle);
 }
 
-/**
- * One source, whatever form it arrived in, as `search` + `lookup`.
- *
- * The collection and list forms MATERIALISE ONCE per resolver and cache, so a
- * paint that renders forty rows reads the collection once rather than forty
- * times. The cache is safe because a resolver is built fresh per paint and per
- * keystroke — it never outlives the read it was made for, so it cannot go
- * stale against the data it came from.
- */
+/** Normalize any source form into search + lookup. Collection/list forms
+ *  materialize once per resolver and cache (resolver is per-paint/keystroke). */
 function normalizeSource(src: MentionSource): ResolvedSource {
   if ('search' in src && typeof src.search === 'function') {
     const ok = (list: Mentionable[] | undefined) => (list ?? []).filter((m) => m && m.handle);
@@ -182,34 +131,15 @@ function tokenPattern(prefixes: string[], trailing: boolean): RegExp {
     ? new RegExp(`(${set})(${HANDLE_CLASS}{0,64})$`)
     : new RegExp(`(${set})(${HANDLE_CLASS}{1,64})`, 'g');
 }
-/** The reason the built-in Deny button sends. It reaches the MODEL as the
- *  denied tool result, so it says who refused rather than just "denied". A host
- *  that wants to ask the human why calls `el.agentInstance.deny(el.sessionId,
- *  reason)` itself and leaves this button out of the flow. */
+/** Default deny reason — reaches the model as the tool result text. */
 const DENY_REASON = 'denied by the user';
 
-/**
- * Static, author-written markup — no interpolation of any kind reaches it.
- * Every piece of TRANSCRIPT content below goes in through `textContent`
- * instead (see `renderRow`): message bodies, tool output and tool arguments
- * are model- and API-shaped strings that no one in this stack has escaped, so
- * `innerHTML` on any of them would be an XSS sink wearing a chat bubble.
- *
- * Theming is `part` attributes plus CSS custom properties, so an app restyles
- * this without piercing the shadow root:
- *
- * ```css
- * agent-chat { --agent-chat-accent: rebeccapurple; }
- * agent-chat::part(message user) { border-radius: 0; }
- * ```
- */
+/** Static markup only — transcript content uses `textContent` to avoid XSS.
+ *  Themed via `part` attributes and CSS custom properties. */
 const FRAME = `
 <style>
   :host {
-    /* Public knobs, resolved once into private aliases so the rest of the
-       sheet reads plainly. The defaults are the system color keywords, which
-       (with color-scheme below) track the OS light/dark preference — an app
-       that sets nothing still looks native in both. */
+    /* Public knobs → private aliases; defaults are system color keywords. */
     --_accent: var(--agent-chat-accent, #2b7de9);
     --_bg: var(--agent-chat-bg, Canvas);
     --_fg: var(--agent-chat-fg, CanvasText);
@@ -224,10 +154,7 @@ const FRAME = `
     color: var(--_fg);
     font-family: var(--agent-chat-font, system-ui, sans-serif);
   }
-  /* Same lesson as the .approval[hidden] rule below, one level up: the
-     display:flex on :host beats the UA's [hidden] { display: none }, so
-     <agent-chat hidden> would render without this.
-     (No backticks anywhere in this sheet — it is a template literal.) */
+  /* display:flex on :host beats the UA [hidden] rule. */
   :host([hidden]) { display: none; }
 
   .root { display: flex; flex-direction: column; flex: 1; min-height: 0; }
@@ -281,18 +208,12 @@ const FRAME = `
     background: color-mix(in srgb, #fff 15%, transparent);
   }
 
-  /* A resolved handle. Inline so it wraps with the sentence it is part of —
-     a chip that cannot break mid-line turns one long mention into a scrollbar.
-     The QUIET treatment is the default, because merely naming something is the
-     common case and it schedules nothing. */
+  /* Inline so a mention wraps with its sentence. */
   .mention {
     border-radius: 0.35rem; padding: 0 0.2rem; font-weight: 500;
     background: color-mix(in srgb, var(--_fg) 13%, transparent);
   }
-  /* ADDRESSED: a leading at-sign naming a model participant, which is the only
-     mention that actually schedules a turn. It gets the accent and the arrow,
-     because it is the one that DID something. (No backticks in this sheet —
-     it is a template literal.) */
+  /* ADDRESSED: a leading @-mention that schedules a turn. */
   .mention.addressed {
     background: color-mix(in srgb, var(--_accent) 22%, transparent);
     font-weight: 600;
@@ -410,23 +331,8 @@ function noteText(m: ViewMessage): string {
   return m.error?.reason ?? m.kind ?? '';
 }
 
-/**
- * One transcript row, or `null` for a row this verbosity does not show.
- *
- * `quiet` is the reading an OPERATOR wants: the conversation, and the decisions
- * they have to make. A tool's raw result and the `→ name({…})` trace under an
- * assistant bubble are the machine's working, and in a business UI they bury
- * the answer under JSON.
- *
- * Dropping them is not enough on its own: an assistant row that only called
- * tools has NO text of its own, so hiding the trace alone would leave an empty
- * bubble per tool round. Quiet therefore drops the whole row when nothing human
- * -readable is left — which is why this is a filter here and not a `::part`
- * rule in the host page, where the empty row is unaddressable.
- *
- * Errors, budget stops and approval notes are never quiet: they are the reasons
- * a person is needed.
- */
+/** One transcript row, or null if `quiet` hides it. Quiet drops tool results,
+ *  tool-only assistant rows, and compaction notes — errors/approvals always show. */
 function renderRow(
   m: ViewMessage, names: Map<string, string>,
   download?: (attachmentId: string) => void,
@@ -472,13 +378,8 @@ function renderRow(
     return row;
   }
 
-  // Attribution (participants spec §4.1): rows in a rostered session carry
-  // `from`, and a group transcript that does not say who is speaking is
-  // unreadable. A small name line above the text; 1:1 sessions carry no
-  // `from` worth showing (the roles already say who spoke) — the stamp is
-  // rendered only when the roster made names meaningful, which the server
-  // signals by stamping deltas/rows in rostered sessions with display names
-  // resolved from the roster.
+  // Speaker attribution — only shown in rostered sessions where names
+  // disambiguate (1:1 carries no `from`).
   if (m.from && (m.role === 'user' || m.role === 'assistant')) {
     const speaker = document.createElement('span');
     speaker.className = 'speaker';
@@ -500,10 +401,7 @@ function renderRow(
       .join('');
     row.append(calls);
   }
-  // Attachment chips (participants spec §7.3): the refs already ride the
-  // published row; the click MINTS a single-use download URL and navigates —
-  // the server's attachment-disposition means the page never leaves. All
-  // text through textContent, like every other row part.
+  // Attachment chips — click mints a one-time download URL.
   if (m.attachments?.length && download) {
     const wrap = document.createElement('span');
     wrap.className = 'attachments';
@@ -522,19 +420,8 @@ function renderRow(
   return row;
 }
 
-/**
- * Message text, with every RESOLVED `@handle` lifted into a chip.
- *
- * Returns nodes rather than markup on purpose. Message bodies are model- and
- * API-shaped strings that nothing in this stack has escaped, so the rule the
- * FRAME docblock sets — every piece of transcript content goes in through
- * `textContent` — holds here too: the gaps between mentions become text nodes
- * and the chips get their label the same way. No `innerHTML` path exists.
- *
- * An unresolved token stays in its text node, which keeps the rendering honest
- * against `resolveAddressee`: if the roster does not know the name, the message
- * did not address anyone, and it should not look as though it did.
- */
+/** Lift resolved `@handle` tokens into chips; unresolved tokens stay as text.
+ *  All content via `textContent` — no innerHTML path. */
 function renderText(text: string, mentions: Map<string, ResolvedSource>): Node[] {
   if (!text) return [];
   if (mentions.size === 0) return [document.createTextNode(text)];
@@ -546,10 +433,7 @@ function renderText(text: string, mentions: Map<string, ResolvedSource>): Node[]
   const scan = tokenPattern(prefixes, false);
   let hit: RegExpExecArray | null = scan.exec(text);
   while (hit !== null) {
-    // "@risk." — the class admits '.' and '-', so sentence punctuation rides
-    // into the capture. Same two-step as `resolveAddressee`: try the token, then
-    // retry with trailing punctuation trimmed. A real handle cannot END in it,
-    // so the trim can only recover a match, never invent one.
+    // Retry with trailing punctuation trimmed — same two-step as resolveAddressee.
     const prefix = hit[1];
     const raw = hit[2];
     const trimmed = raw.replace(/[.-]+$/, '');
@@ -561,12 +445,8 @@ function renderText(text: string, mentions: Map<string, ResolvedSource>): Node[]
       if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
       const chip = document.createElement('span');
       const kind = found.kind ?? 'subject';
-      // ADDRESSED vs merely NAMED. `resolveAddressee` reads one position — the
-      // leading token — so `@risk` at the front of a message schedules Risk's
-      // turn and `@risk` in the second paragraph schedules nothing. Rendering
-      // both identically is a chip that promises routing it cannot deliver:
-      // the transcript then shows a confident mention beside a roster that
-      // never woke, and the reader has no way to tell which happened.
+      // Only a leading @-mention is ADDRESSED; mid-text is merely named.
+      // Different styling prevents a chip that promises routing it cannot deliver.
       const addressed = kind === 'agent'
         && prefix === DEFAULT_PREFIX
         && /^\s*$/.test(text.slice(0, hit.index));
@@ -600,18 +480,8 @@ function messageOf(e: unknown): string {
   return err?.reason || err?.message || String(e);
 }
 
-/**
- * Register `<agent-chat>` (or any tag name you prefer) and return its
- * constructor.
- *
- * Idempotent PER TAG: calling it twice with the same name is a no-op that
- * returns whatever is already registered — including, if the app registered
- * something else under that name first, that other element; the platform gives
- * no way to check provenance, and throwing would be worse than yielding.
- * Calling it with a DIFFERENT name registers again, from a fresh class:
- * `customElements.define` refuses to reuse one constructor for two names, so
- * the class is built per call rather than hoisted to module scope.
- */
+/** Register `<agent-chat>` (or a custom tag) and return its constructor.
+ *  Idempotent per tag; a different name registers a fresh class. */
 export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementConstructor {
   const existing = customElements.get(tagName);
   if (existing) return existing;
@@ -642,15 +512,9 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     private client: Agent | null = null;
     private sid: string | null = null;
     private computation: Tracker.Computation | null = null;
-    /** Bumped by every attach/detach. An in-flight `start()` compares against
-     *  it before touching the DOM, so an element removed (or re-pointed at
-     *  another session) while the method call was on the wire cannot resurrect
-     *  itself when the call resolves. */
+    /** Bumped on attach/detach; in-flight calls check it before touching the DOM. */
     private generation = 0;
-    /** True between connected and disconnected. `attributeChangedCallback`
-     *  fires BEFORE `connectedCallback` during an upgrade — once per observed
-     *  attribute — so without this flag a `<agent-chat agent="x">` already in
-     *  the markup would attach three times over. */
+    /** Guards against pre-connect attribute callbacks firing during upgrade. */
     private live = false;
     /** A re-attach is already queued for the end of this microtask — see
      *  `queueReattach`. */
@@ -707,32 +571,8 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  detached. */
     get agentInstance(): Agent | null { return this.client; }
 
-    /**
-     * What each symbol names, keyed BY the symbol.
-     *
-     * ```js
-     * chat.mentionSources = {
-     *   '@': { collection: Customers, handle: (c) => slug(c.name), label: 'name', kind: 'customer' },
-     *   '#': { list: () => tickets.open(), handle: 'id', label: 'title', kind: 'ticket' },
-     * };
-     * ```
-     *
-     * The element owns the UI — matching, the typeahead, the keyboard, chips in
-     * the transcript — and the app owns only WHERE the records come from. It
-     * never inspects a record beyond the fields named here, so nothing about
-     * the app's domain reaches the package.
-     *
-     * `@` always carries the session's own MODEL participants, layered UNDER
-     * anything set here: an app can add subjects to `@` but cannot shadow a
-     * real addressee with an inert one of the same name. Every other symbol is
-     * inert by construction, because `resolveAddressee` parses one leading `@`
-     * and nothing else.
-     *
-     * A second symbol earns its place when the things named are of a different
-     * ORDER, not merely a different type: `@` reaches someone who could answer;
-     * `#` might name a row in a price list that could never take a turn. One
-     * symbol for both makes the composer offer a product where a person belongs.
-     */
+    /** Mention sources keyed by symbol. `@` always includes model participants
+     *  underneath; other symbols are inert (no routing). */
     get mentionSources(): Record<string, MentionSource> { return { ...this.sources }; }
 
     set mentionSources(next: Record<string, MentionSource>) {
@@ -740,14 +580,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       this.paint();
     }
 
-    /**
-     * Symbol → resolved source, for both the transcript and the typeahead.
-     *
-     * Built FRESH on every read, which is what makes the collection form
-     * reactive: `find().fetch()` runs inside the caller's `Tracker.autorun`, so
-     * a paint re-registers its dependency each time and re-runs when the data
-     * changes. It is also what makes each source's internal cache safe.
-     */
+    /** Symbol to resolved source. Built fresh per read for Tracker reactivity. */
     private mentionMap(): Map<string, ResolvedSource> {
       const out = new Map<string, ResolvedSource>();
       for (const [prefix, src] of Object.entries(this.sources)) {
@@ -801,40 +634,13 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       this.queueReattach();
     }
 
-    /**
-     * Tear down now, re-attach once, at the end of the microtask.
-     *
-     * Attributes are set one at a time and re-pointing an element routinely
-     * takes two of them (`el.removeAttribute('session-id')` then
-     * `el.setAttribute('agent', …)`, or a framework patching both in one
-     * render). Attaching on each callback made the INTERMEDIATE combination
-     * real: the element with the session-id removed and the old agent still in
-     * place has no session, so `attach()` called `start()` — and a moment later
-     * the second attribute landed, detached, and started again. The generation
-     * guard stopped the first session from ever being rendered, which is
-     * precisely the problem: it was created on the server, owned by nobody, and
-     * left in the user's session list. One orphan per re-point.
-     *
-     * The DETACH still happens synchronously, on every callback. It is what
-     * stops the old subscription and bumps the generation, and an in-flight
-     * `start()` must be orphaned the instant the attributes stop describing it,
-     * not a microtask later.
-     *
-     * The re-attach is deferred to a microtask and deduped, so a run of
-     * synchronous attribute writes produces exactly ONE attach, against the
-     * attribute values as they finally stand. The generation captured after the
-     * detach is the guard: any connect, disconnect or further churn in between
-     * bumps it, and the queued attach — now describing a state that no longer
-     * exists — does nothing.
-     */
+    /** Detach now, re-attach once at end of microtask. Coalesces rapid attribute
+     *  writes so intermediate combos never create orphan sessions. */
     private queueReattach() {
       this.detach();
       this.failure = null;
-      // The LATEST detach's generation, on a field rather than in the closure:
-      // the second write of a churn re-detaches (bumping the generation again)
-      // but does not queue a second microtask, so a captured local would leave
-      // the one queued callback comparing against a stale number and skipping
-      // the attach entirely.
+      // On a field (not a closure local) so a second detach updates the guard
+      // the already-queued microtask will check.
       this.reattachGeneration = this.generation;
       if (this.reattachQueued) return;
       this.reattachQueued = true;
@@ -879,12 +685,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       this.sid = sessionId;
       this.client!.subscribe(sessionId);
       if (this.computation) this.computation.stop();
-      // ONE autorun for the whole element, repainting from `replaceChildren`.
-      // The tradeoff is deliberate: every delta rebuilds every row, which is
-      // free at chat scale (tens of rows, a few repaints a second) and buys
-      // zero diffing code and zero stale-node bugs. A transcript in the
-      // thousands of rows wants a keyed patch instead — at which point you are
-      // writing a framework, so reach for yours and use `Agent` directly.
+      // Full repaint per delta — cheap at chat scale, zero diffing code.
       this.computation = Tracker.autorun(() => this.paint());
     }
 
@@ -916,10 +717,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
             .catch((e) => { console.warn('[agent-chat] download refused:', e); });
         }
         : undefined;
-      // `verbosity="quiet"` drops the machine's working (tool results, the
-      // `→ name({…})` traces, and the tool-only assistant rows those leave
-      // behind). Anything else — including an absent attribute — is `full`,
-      // so the default is unchanged for every existing consumer.
+      // `verbosity="quiet"` drops tool results and traces; default is `full`.
       const quiet = this.getAttribute('verbosity') === 'quiet';
       const mentions = this.mentionMap();
       const nodes: HTMLElement[] = rows
@@ -938,21 +736,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const parked = !!ask && !ask.verdict;
       (this.ui.approval as HTMLElement).hidden = !parked;
       if (parked) {
-        // `runAs` is announced whenever the parked tool has one, because the
-        // person clicking Approve is authorizing an IDENTITY as well as an
-        // action: a tool that runs as `service-account` is not the same request
-        // as one that runs as them. Presence, not truthiness — `null` is the
-        // anonymous service context and says so in words, while an absent field
-        // means the ordinary case (the tool runs as the session's owner) and
-        // adds nothing to the sentence.
+        // Show `runAs` when present — the approver is authorizing an identity,
+        // not just an action. `null` = anonymous; absent = session owner.
         const runsAs = ask.runAs === undefined
           ? '' : ` — runs as ${ask.runAs ?? 'anonymous'}`;
-        // The tool's own park-time account (participants spec §8) LEADS, and
-        // the exact arguments follow it — the shape every channel lens
-        // already uses. Rendering the summary INSTEAD of the args left the
-        // approver with no access to the record they are authorizing, which
-        // matters most for the tools that summarize hardest: a memory
-        // promotion shows 300 marked characters of a fact that may be 2000.
+        // Summary leads, full args follow — approver needs the actual record.
         const argsJson = JSON.stringify(ask.args, null, 2) ?? '';
         const clamped = argsJson.length > 2000 ? `${argsJson.slice(0, 2000)}…` : argsJson;
         this.ui.approvalText.textContent = ask.display
@@ -961,13 +749,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       }
     }
 
-    /**
-     * The token being typed, or null.
-     *
-     * Anchored to the CARET, not the whole value: a message may already contain
-     * finished mentions, and completing the one under the cursor is the only
-     * behaviour that does not rewrite text the user has moved on from.
-     */
+    /** The mention token at the caret, or null. Only completes at the cursor. */
     private tokenAtCaret(): { start: number; query: string; prefix: string } | null {
       const { input } = this.ui;
       // A range selection has no single insertion point to complete at.

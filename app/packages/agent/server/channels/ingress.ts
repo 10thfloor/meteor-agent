@@ -20,35 +20,16 @@ import { deliverOnce } from './egress';
 import { issueLinkToken, resolveIdentity } from './linking';
 import { getChannel, listChannels, type ChannelDef, type RawInbound } from './registry';
 
-/**
- * Ingress (channels spec §9): one provider-free pipeline every channel shares.
- *
- *   verify signature → lens.in(event) → throttle → claim eventId → route
- *
- * Everything provider-specific happens inside `def.verify`/`def.parse` and the
- * lens; everything after the reading is generic. The core is `handleInbound` —
- * a plain function over `{ headers, rawBody }` returning a status — so the
- * whole pipeline is testable without an HTTP server; `mountChannelRoutes` is
- * the thin express glue that feeds it.
- */
+/* Ingress (§9): verify → lens.in → throttle → claim → route.
+ * Provider-specific logic lives in def.verify/def.parse and the lens;
+ * everything after the reading is generic. */
 
 interface InboundResponse { status: number; body?: string }
 
 // ---- The per-sender throttle (§9 step 3) -----------------------------------
 
-/** In-memory sliding windows, per process: the brake on a flood, deliberately
- *  BEFORE the admission claim — the throttle is a counter, the claim is a
- *  database write, and validly-signed junk must not buy an insert each. A
- *  throttled event is settled with a 200 and forgotten — it buys neither a
- *  write nor a provider retry (see the handler: a 429 would be a failure the
- *  provider retries and holds against the integration).
- *
- *  Bounded by CONCURRENT senders, not history: every `PRUNE_EVERY` calls the
- *  map is swept and any key whose newest hit has aged out of its own window
- *  is dropped, so a phone number that texted once last month does not hold
- *  an entry forever. (Only signature-verified senders ever create a key —
- *  the throttle runs after `verify` — so an anonymous flood cannot grow it;
- *  the sweep is about long-lived processes, not attackers.) */
+/** Per-sender sliding windows, before the admission claim — flood costs
+ *  counters, not DB writes. Settles 200 (429 would invite retries). */
 const windows = new Map<string, { hits: number[]; intervalMs: number }>();
 const PRUNE_EVERY = 512;
 let callsSincePrune = 0;
@@ -89,16 +70,8 @@ export function _throttleStats(now = Date.now()): { tracked: number } {
 
 // ---- Binding first, session second (§6.2 / §9) -----------------------------
 
-/**
- * Find or create the binding for one external conversation. The ORDER is the
- * point: insert the binding FIRST with a pre-generated sessionId, create the
- * session only after winning that insert. The loser of a two-server race
- * catches the duplicate key having created NOTHING, and adopts the winner's
- * binding — whereas session-first would orphan a session on every lost race.
- *
- * `findOrCreateBinding` wins or adopts the binding; `ensureSession` then
- * repairs the session it names.
- */
+/** Binding first, session second: the loser of a two-server race catches
+ *  a duplicate key having created nothing. Session-first would orphan. */
 async function bindConversation(
   kind: string, def: ChannelDef, conversationRef: string, reading: InboundReading,
   identity: { userId: string; assurance: 'link' | 'oidc' } | null,
@@ -145,25 +118,15 @@ async function findOrCreateBinding(
     binding = await ChannelBindings.findOneAsync(bindingId);
     if (!binding) return null;
   } else {
-    // Activity bump: the egress sweep only walks RECENTLY active bindings
-    // (its lookback is what keeps a process's sweep cost proportional to live
-    // conversations, not history), so every inbound event marks its binding.
-    // Destination ADOPTION deliberately does NOT happen here: this runs
-    // before admission, and a refused stranger must not get to set a
-    // conversation's threading root (see `route`).
+    // Activity bump for the egress sweep's lookback window. Destination
+    // adoption deliberately happens AFTER admission in `route`.
     await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
   }
   return binding;
 }
 
-/**
- * Repair-on-entry: create the session the binding names if it does not
- * exist yet — first contact, or the winner crashed between its two writes and
- * this pass repairs it on the next message (the loop's own repair-on-entry
- * ethos). The EXACT document `agent.start` builds, field for field, plus the
- * additive channel descriptor (§5.2) — the loop, the lease and the watcher
- * all read this shape.
- */
+/** Repair-on-entry: create the session the binding names if it doesn't
+ *  exist yet (first contact, or the winner crashed between its two writes). */
 async function ensureSession(kind: string, binding: ChannelBinding): Promise<boolean> {
   const config = getAgent(binding.agent);
   if (!config) {
@@ -196,15 +159,9 @@ async function ensureSession(kind: string, binding: ChannelBinding): Promise<boo
 
 // ---- Free text against an outstanding prompt (§8.3) ------------------------
 
-/**
- * "YES" from a phone number is a verdict ONLY IF an approval prompt is
- * outstanding on that binding — otherwise it is a message. The receipt is the
- * memory of what was offered, looked up by the CURRENTLY parked toolCallId —
- * that lookup is the staleness guard: last week's prompt receipt is never
- * consulted. The `toolCallId` check on the match is a belt-and-braces
- * invariant (exported `deliverOnce` callers build their own `expects`); and
- * beneath both, the single-winner verdict write remains the final authority.
- */
+/** Free text matches a verdict grammar only when an approval prompt is
+ *  currently parked on this binding. Receipt lookup by toolCallId is the
+ *  staleness guard; the single-winner verdict write is the final authority. */
 async function verdictFromExpects(
   binding: ChannelBinding, text: string,
 ): Promise<'approved' | 'denied' | null> {
@@ -223,12 +180,8 @@ async function verdictFromExpects(
 
 // ---- The pipeline ----------------------------------------------------------
 
-/**
- * The whole webhook, as a function — §9's five steps in order. Returns the
- * HTTP answer; throws only on a genuinely unexpected failure — the claim is
- * RELEASED on the way out (the catch below) so the provider's retry can try
- * again, and the mount answers 500.
- */
+/** The whole webhook as a function — §9's five steps. Throws only on
+ *  unexpected failures; the claim is released so the provider's retry works. */
 export async function handleInbound(kind: string, raw: RawInbound): Promise<InboundResponse> {
   const def = getChannel(kind);
   if (!def) return { status: 404 };
@@ -237,12 +190,7 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   // event came from the provider; nothing before it has spent anything.
   if (!(await def.verify(raw))) return { status: 401 };
 
-  // 2. INTERPRET — pure: raw → provider event → reading. No side effects yet.
-  // A VERIFIED event the lens cannot interpret (a user-craftable callback
-  // payload of literal `null`, a shape the provider added last week) must
-  // SETTLE, not 500: a 500 invites the provider's retry loop, and a lens bug
-  // must never become a channel-wide outage. Logged once per event, answered
-  // 200, forgotten.
+  // 2. INTERPRET — a lens failure settles 200, not 500 (a 500 invites retries).
   let reading: InboundReading;
   try {
     reading = def.lens.in(def.parse(raw));
@@ -255,11 +203,7 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   // (Slack's URL-verification challenge rides `reading.respond`).
   if (reading.intent.kind === 'noop') return { status: 200, body: reading.respond };
 
-  // 3. THROTTLE — per sender, before the claim buys a write. Throttled events
-  // are DROPPED with a 200, not refused with a 429: providers retry non-2xx
-  // (Slack up to three times, Twilio likewise) and count failures toward
-  // disabling the integration, so a 429 would let one abusive sender degrade
-  // the whole channel. Settled and forgotten is the safe answer.
+  // 3. THROTTLE — dropped with a 200, not 429 (providers retry non-2xx).
   const t = def.throttle ?? { limit: 30, intervalMs: 60_000 };
   const sender = reading.externalUserId ?? reading.conversationRef ?? 'unknown';
   if (throttled(`${kind}:${sender}`, t.limit, t.intervalMs)) return { status: 200 };
@@ -271,9 +215,7 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
     return { status: 200 };   // already admitted
   }
 
-  // 5. ROUTE by intent. Failures past the claim would strand the event as
-  // "admitted but never acted on", so the claim is RELEASED on the way out of
-  // a crash and the provider's retry gets a clean run.
+  // 5. ROUTE — release the claim on crash so the provider's retry works.
   try {
     return await route(kind, def, reading);
   } catch (e) {
@@ -289,33 +231,8 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
  *  in the roster rather than an account. */
 type Admission = { userId: string | null; via?: ViaIdentity } | 'refused';
 
-/**
- * The admission precedence (participants spec decision 11), one order:
- *
- *   1. An ANONYMOUS conversation admits only its recorded opener — v1's
- *      guard, verbatim, before anything else and regardless of `admits`.
- *      It fires regardless of `audience`: email's conversationRef is a THREAD
- *      key, so a Cc'd or reply-all party lands on the opener's binding with a
- *      different `From`, and admitting them would be impersonation by
- *      proximity (approving someone else's parked ask). The rare legitimate
- *      case — the opener replying from a second address before linking — is
- *      refused too: the safe direction, resolved the moment they link.
- *   2. The OWNER — a resolved account equal to the binding's — passes as
- *      today.
- *   3. A NON-OWNER passes only through a `members`/`linked` binding, and only
- *      through the roster: an account member by their userId, a
- *      channel-identified member through the trusted `via` principal —
- *      REGARDLESS of `senderVerified`, deliberately (participants spec §5):
- *      most legitimate mail lacks author-aligned DKIM, and requiring it would
- *      silently strand the composed loop. What the tradeoff costs is one
- *      attributed, powerless message from a From-spoofer who also knows the
- *      reply key; what verification still gates is ACCOUNT resolution, above.
- *   4. `admits: 'linked'` grows the roster: a sender with a LINKED identity
- *      auto-joins as a member on first message (the group-thread acquisition
- *      path), capped by the roster like any join.
- *   5. Everyone else settles — including, under the default `'opener'`, a
- *      roster member: the binding gates ingress, the roster gates DDP.
- */
+/** Admission precedence: anonymous opener → owner → roster → auto-join
+ *  (if admits:'linked') → refused. */
 async function admitSender(
   kind: string, binding: ChannelBinding, reading: InboundReading,
   identity: { userId: string; assurance: 'link' | 'oidc' } | null,
@@ -325,14 +242,8 @@ async function admitSender(
   if (binding.userId === null) {
     const opener = binding.externalUserId;
     if (opener !== undefined && sender !== opener) return 'refused';
-    // On a MEMBER binding (or one that admits beyond its opener) the opener
-    // is by construction NOT the session's owner — compose's pre-bound
-    // recipient on an anonymous composing session lands exactly here — and
-    // returning a bare null would make `sendToSession` fall through to the
-    // OWNER's roster row when stamping `from` (a reviewer-confirmed
-    // mis-attribution). Hand the roster match its `via` principal so the
-    // speech is stamped as theirs. Ordinary anonymous conversations (no
-    // member flag, opener-only) skip the session read entirely.
+    // On a member binding the opener isn't the session owner — return a `via`
+    // principal so the message is attributed correctly.
     if (sender !== undefined
       && (binding.member || (binding.admits !== undefined && binding.admits !== 'opener'))) {
       const session = await AgentSessions.findOneAsync(binding.sessionId);
@@ -385,39 +296,21 @@ async function route(
     return { status: 200 };
   }
 
-  // Identity resolution is gated on the channel VOUCHING for the sender's
-  // claimed id (§12). Provider-authenticated surfaces (SMS/WhatsApp/Slack/
-  // Telegram) leave `senderVerified` undefined — the provider already proved
-  // the number or account, so the external id is trustworthy to map to a
-  // linked account. Email is forgeable: its lens sets `senderVerified: false`
-  // unless the inbound mail passed author-aligned DKIM, and an UNVERIFIED
-  // sender must never resolve to a linked identity — else a spoofed `From:`
-  // inherits the victim's account (send AND approve, as the owner). An
-  // unverified sender still drives its OWN anonymous conversation (below);
-  // it just cannot become someone who linked.
+  // Resolve identity only for verified senders — spoofed From must not inherit a linked account.
   const identity = reading.externalUserId !== undefined && reading.senderVerified !== false
     ? await resolveIdentity(kind, reading.externalUserId)
     : null;
   const binding = await bindConversation(kind, def, reading.conversationRef, reading, identity);
   if (!binding) return { status: 200 };
 
-  // ADMISSION (participants spec decision 11): one precedence order decides
-  // who this event acts as — or that it acts as nobody and settles. `via` is
-  // the trusted ingress principal for a channel-identified member; `userId`
-  // is everything requireSession's equality (and membership branch) needs for
-  // the rest. 'refused' settles silently: a refusal posted into the thread is
-  // itself a spam channel.
+  // ADMISSION — 'refused' settles silently (a refusal posted into the
+  // thread is itself a spam channel).
   const admission = await admitSender(kind, binding, reading, identity);
   if (admission === 'refused') return { status: 200 };
   const { userId, via } = admission;
 
-  // DESTINATION ADOPTION (participants spec §5) — AFTER admission, a
-  // reviewer-confirmed ordering: a binding whose stored destination predates
-  // knowledge this event carries (the compose pre-bind's missing
-  // rootMessageId) learns it through the channel's own pure merge — but only
-  // from a sender the conversation actually admits. Adopting before the
-  // guard let any stranger holding the reply key permanently set the
-  // thread's root and subject with a message that was then refused.
+  // DESTINATION ADOPTION — AFTER admission so a refused stranger can't set
+  // the thread's root.
   if (def.adoptDestination) {
     const merged = def.adoptDestination(binding.destination, reading.destination);
     if (merged !== undefined) {
@@ -441,22 +334,9 @@ async function route(
         return { status: 200 };
       }
 
-      // Files the event carried (email v2 spec §6): admission is CORE policy —
-      // apply the channel's caps, store what passes, and append one bracket
-      // note per rejected file so the model and the web transcript both see
-      // exactly what the agent actually has. `attachments: false` restores
-      // v1's ignore-them behavior. An attachment-only event (empty text, kept
-      // files — or dropped files whose notes are the whole story) is a
-      // MESSAGE now; only an event with no text, no files kept and nothing to
-      // report settles without a send.
-      //
-      // REMOTE references resolve first (participants spec §6): the chat
-      // surfaces deliver URLs and ids, not bytes, and the size-gated fetch
-      // under the def's `media` recipe happens here — AFTER the admission
-      // claim (a provider retry during a slow fetch collides there and
-      // settles) and inside route's own note-not-throw discipline. Total
-      // fetch time may exceed a chat provider's ack deadline; the claim
-      // absorbs the duplicate retries.
+      // Attachments (§6): resolve remote refs, apply caps, store what passes,
+      // bracket-note each rejection. Runs AFTER the admission claim so
+      // provider retries during a slow fetch collide harmlessly.
       let text = intent.text;
       let refs: AttachmentRef[] | undefined;
       if (def.attachments !== false && reading.attachments?.length) {
@@ -478,10 +358,7 @@ async function route(
         binding.agent, binding.sessionId, text, userId,
         (refs || via) ? {
           ...(refs ? { attachments: refs } : {}),
-          // The trusted principal (participants spec decision 12): a
-          // channel-identified member's standing, vouched for by this
-          // admission, for exactly this send. Verdict branches never carry
-          // it — channel-identified members cannot answer approvals.
+          // Trusted principal for channel-identified members (decision 12).
           ...(via ? { via } : {}),
         } : undefined,
       );
@@ -501,13 +378,8 @@ async function route(
       return { status: 200 };
     }
 
-    // link-request. The linking URL is a CREDENTIAL: whoever opens it while
-    // signed in becomes this external identity's account and inherits the
-    // anonymous history it created. So, exactly like the overflow URL (§8.5),
-    // it only ever travels to a `direct` destination — posted into a group it
-    // would let any member hijack the requester. On a group surface the
-    // answer is a hint, not a token. Without a `linkUrl` there is nothing to
-    // offer at all.
+    // link-request. The URL is a credential — only travels to a `direct`
+    // destination; groups get a hint instead.
     if (!def.linkUrl || reading.externalUserId === undefined) return { status: 200 };
     if (binding.audience !== 'direct') {
       const outcome = await deliverOnce(binding, {
@@ -525,21 +397,15 @@ async function route(
       text: `To link this conversation to your account, open: ${def.linkUrl(token)}`,
     }, `link:${reading.eventId ?? token}`);
     if (outcome !== 'delivered') {
-      // Link replies are not seq rows, so no sweep retries them: say so, and
-      // the user can send "link" again (a fresh eventId, a fresh receipt).
+      // Not a seq row — no sweep retries it; the user can send "link" again.
       console.warn(`[10thfloor:agent] channel "${kind}": link reply for session ${binding.sessionId} not delivered (${outcome}); nothing retries it`);
     }
     return { status: 200 };
   } catch (e) {
-    // The agent-facing calls refuse with Meteor.Errors that are SETTLED facts
-    // about this event — not-yours (`no-session`), out of budget, nothing
-    // pending. A provider retry would meet the identical refusal forever, so
-    // answer 200 and log; only unexpected failures propagate to the 500/
-    // release path in `handleInbound`.
+    // Meteor.Errors are settled refusals (no-session, over budget, nothing
+    // pending) — answer 200. Only unexpected failures propagate to 500.
     if (e instanceof Meteor.Error) {
-      // The session id, never the binding id: binding ids embed the
-      // conversation key, which for SMS/WhatsApp is a phone number — PII that
-      // has no business in a log line.
+      // Session id, never binding id (binding ids embed phone numbers).
       console.warn(
         `[10thfloor:agent] channel "${kind}": ${intent.kind} for session ${binding.sessionId} `
         + `refused (${String(e.error)}); the event is settled`,
@@ -552,28 +418,19 @@ async function route(
 
 // ---- The mount -------------------------------------------------------------
 
-/**
- * The most a webhook body may be. Every provider's payload is small (a Slack
- * event envelope is a few KB; Twilio's form a few hundred bytes), and this
- * read happens BEFORE signature verification — so without a cap an
- * unauthenticated sender could stream gigabytes into process memory. Over
- * the cap the socket is closed and the request answered 413, having spent
- * nothing but the bytes already buffered.
- */
+/** Cap on webhook bodies — read BEFORE signature verification, so without
+ *  it an unauthenticated sender could stream GB into process memory. */
 export const MAX_INBOUND_BYTES = 1024 * 1024;
 
 class BodyTooLarge extends Error {
   constructor() { super('request body over MAX_INBOUND_BYTES'); }
 }
 
-/** Read the whole request body UNPARSED: signature schemes sign raw bytes, and
- *  a re-serialized body never verifies. Capped — `MAX_INBOUND_BYTES` unless
- *  the channel declared its own ceiling (`maxInboundBytes` — email's webhook
- *  legitimately carries tens of MB of base64'd attachments). */
+/** Read the body UNPARSED (signature schemes sign raw bytes). Capped by
+ *  `maxInboundBytes` or `MAX_INBOUND_BYTES`. */
 function readRawBody(req: any, maxBytes: number): Promise<string> {
   return new Promise((resolve, reject) => {
-    // Honor a declared length first: a truthful oversize client is refused
-    // before a single chunk is buffered.
+    // Refuse a truthful oversize length before buffering anything.
     const declared = Number(req.headers?.['content-length']);
     if (Number.isFinite(declared) && declared > maxBytes) {
       reject(new BodyTooLarge());
@@ -585,8 +442,7 @@ function readRawBody(req: any, maxBytes: number): Promise<string> {
     req.on('data', (chunk: string) => {
       size += Buffer.byteLength(chunk, 'utf8');
       if (size > maxBytes) {
-        // Stop reading and close the socket — do not keep buffering while a
-        // lying client streams past its declared length.
+        // Close the socket immediately.
         req.destroy();
         reject(new BodyTooLarge());
         return;
@@ -598,12 +454,8 @@ function readRawBody(req: any, maxBytes: number): Promise<string> {
   });
 }
 
-/**
- * Mount every registered channel at `/agent/channels/<kind>` on Meteor's
- * connect/express handler stack. Called from the package's `Meteor.startup`
- * (server/index.ts), by which point every app-file `Agent.channel(...)` has
- * run — startup callbacks fire after all code loads.
- */
+/** Mount every registered channel on Meteor's connect handler. Called from
+ *  `Meteor.startup`, after all `Agent.channel(...)` registrations. */
 export function mountChannelRoutes(webAppHandlers: {
   use(path: string, fn: (req: any, res: any, next: () => void) => void): void;
 }): void {
@@ -613,11 +465,8 @@ export function mountChannelRoutes(webAppHandlers: {
       void (async () => {
         try {
           const rawBody = await readRawBody(req, maxBytes);
-          // `originalUrl`, not `url`: under `handlers.use('/agent/channels/<kind>', fn)`
-          // express strips the mount prefix from `req.url`, and `RawInbound.url`
-          // promises the path+query as Node saw it (a signature that covers the
-          // full webhook URL needs the real path). The fallback is for a bare
-          // Node request with no express in front.
+          // `originalUrl`: express strips the mount prefix from `req.url`,
+          // but signatures need the full path.
           const url = req.originalUrl ?? req.url;
           const out = await handleInbound(kind, {
             headers: req.headers ?? {}, rawBody,
@@ -627,9 +476,7 @@ export function mountChannelRoutes(webAppHandlers: {
           res.end(out.body ?? '');
         } catch (e) {
           if (e instanceof BodyTooLarge) {
-            // Not an error worth a stack trace — and not a 500 a provider
-            // would retry. The socket may already be destroyed; writing is
-            // best-effort.
+            // Socket may already be destroyed; writing is best-effort.
             try { res.writeHead(413); res.end(); } catch { /* socket gone */ }
             return;
           }

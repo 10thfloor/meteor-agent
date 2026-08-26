@@ -14,50 +14,20 @@ import { issueVerdictToken } from './linking';
 import { getChannel, uncertainDeliveryMode, type ChannelDef } from './registry';
 import { VERDICT_FOR, type DeliveryItem } from '../../common/channel-contract';
 
-/**
- * The egress worker (channels spec §6.4/§11) — `startWatcher` with the
- * collection swapped, deliberately: one worker per channel kind per process,
- * an observer for latency plus a timed sweep for everything no write signals,
- * `{ stop() }` returned, all state in closure vars.
- *
- * ONE worker, query-sliced — never an observer per conversation. A browser
- * tab's subscription dies with the tab; a Slack thread never disconnects, so
- * per-conversation observers accumulate forever. The observer here watches
- * committed MESSAGES (insert-only, so `added` is the whole story and the
- * session document's `nextSeq`/`usage` churn never wakes it) and the sweep
- * walks the kind's bindings.
- *
- * Every multi-server race resolves through an atomic conditional write — the
- * claim (all four `claimLease` branches, INCLUDING "already ours", because a
- * delivering worker is a renewing owner, not the watcher's discoverer), the
- * cursor advance (guarded on claim AND expected value), and the receipt's
- * derived `_id`. No Redis, no leader election.
- */
+/** Egress worker: one per channel kind, observer + timed sweep.
+ *  All multi-server races resolve through atomic conditional writes. */
 
 export interface EgressOptions {
   /** How often the sweep runs. Default 15s; tests lower it. */
   sweepMs?: number;
   /** How long a delivery claim lasts. Renewed per row; default 30s. */
   claimMs?: number;
-  /**
-   * How far back the sweep looks: only bindings active (any inbound event,
-   * any delivery) within this window are walked. Default 24h. This is what
-   * keeps a process's per-sweep cost proportional to LIVE conversations
-   * rather than to every conversation ever bound — without it a single
-   * workspace member could mint thousands of thread bindings that every
-   * instance would then re-read every 15 seconds, forever. Fresh rows on an
-   * older binding still deliver promptly: the observer fires per committed
-   * message regardless of age, and its delivery bumps the binding back into
-   * the window.
-   */
+  /** How far back the sweep looks (default 24h). Bounds sweep cost to live
+   *  conversations. The observer handles fresh rows on older bindings. */
   sweepLookbackMs?: number;
 }
 
-/** Retry policy for a receipt found mid-`sending` (§11 `retry` tier): doubling
- *  from one sweep interval, capped at an hour, and given up after
- *  `MAX_DELIVERY_ATTEMPTS`. Without it a payload the provider rejects
- *  DETERMINISTICALLY (a cut surrogate pair, a closed WhatsApp window) would be
- *  re-posted every sweep forever and wedge the conversation behind it. */
+/** Retry backoff for mid-sending receipts. Caps prevent infinite re-posting. */
 export const BACKOFF_BASE_MS = 15_000;
 export const BACKOFF_MAX_MS = 60 * 60_000;
 export const MAX_DELIVERY_ATTEMPTS = 48;
@@ -93,10 +63,7 @@ export async function claimBinding(
   return n === 1;
 }
 
-/** The cursor advance — guarded on BOTH the claim and the expected `fromSeq`,
- *  the `writeVerdict` single-winner shape: a stale worker's late write matches
- *  nothing and no-ops. Advanced only after the row is HANDLED (posted and
- *  receipted, or planned as advance-past). */
+/** Cursor advance — guarded on claim + expected `fromSeq` (single-winner). */
 export async function advanceCursor(
   bindingId: string, fromSeq: number, toSeq: number, serverId = SERVER_ID,
 ): Promise<boolean> {
@@ -107,12 +74,8 @@ export async function advanceCursor(
   return n === 1;
 }
 
-/** §8.5's audience rule for the overflow/web link: an OWNED session's URL is
- *  login-gated and may go anywhere; an anonymous session's URL IS the
- *  credential (§12) and may only be sent to a single-recipient destination.
- *  A MEMBER binding gets no URL at all (participants spec decision 14): for
- *  an anonymous session the URL is owner-equivalent capability, and mailing
- *  it to a composed-to outsider would hand them send, interrupt and approve. */
+/** Audience rule for the overflow URL: members get none; anonymous sessions
+ *  only to direct destinations (the URL is a capability). */
 function overflowUrlFor(
   def: ChannelDef, binding: ChannelBinding, session: AgentSession,
 ): string | undefined {
@@ -133,37 +96,9 @@ async function settleReceipt(
   );
 }
 
-/**
- * The three-phase intent log (§11): reserve → post → confirm, keyed on a
- * DERIVED receipt id (`deliver:<bindingId>:<suffix>`), so "the surface shows
- * it once" holds across servers and across the observer's whole-backlog replay
- * on every boot.
- *
- * Returns `'delivered'` when the item is durably `sent` (whether by this call
- * or a previous one), `'abandoned'` when the channel's declared recovery or
- * the attempt cap gave it up, and `'deferred'` when a prior `sending` receipt
- * is still inside its backoff window — nothing was posted; a cursor-driven
- * caller stops and the next sweep retries, a one-shot caller (ingress, a tool
- * body) should treat it as not sent. Throws when the transport fails — the
- * caller stops and the next sweep retries under the same receipt.
- *
- * `item` may be a thunk; it runs only when a post actually happens. The
- * channel is the binding's own `kind` — a binding can only ever be delivered
- * through the surface that created it, so the caller names nothing twice.
- *
- * EXPORTED for tool bodies (§7's `channel.notify` shape): tool dispatch
- * re-runs on crash recovery — the package's own dispatch comment calls that
- * window "irreducible without idempotency keys carried through to the tools
- * themselves" — and this, keyed on the tool call's id, is that idempotency
- * key carried through.
- *
- * The binding parameter is a PICK on purpose (email v2 spec §9): exactly the
- * three fields the log reads — `_id` (the receipt key), `kind` (the def
- * lookup), `destination`. A proactive tool (compose) passes a SYNTHETIC
- * binding — `{ _id: 'compose:email:<toolCallId>', kind, destination }` — and
- * gets the full three-phase log with no new machinery; `opts.def` supplies
- * the transport/lens directly so the tool works with no channel registered.
- */
+/** Three-phase delivery: reserve → post → confirm. Receipt-keyed for
+ *  idempotency. Returns delivered/abandoned/deferred. Throws on transport
+ *  failure (the next sweep retries). Exported for tool-body idempotency. */
 
 /** What `deliverOnce` reads from a binding — a real row satisfies it; a
  *  synthetic one is these three fields and nothing more. */
@@ -197,11 +132,7 @@ export async function deliverOnce(
     const existing = await DeliveryReceipts.findOneAsync(receiptId);
     if (!existing || existing.state === 'sent') return 'delivered';
     if (existing.state === 'abandoned') return 'abandoned';
-    // Mid-`sending`: a crash between post and confirm, or a concurrent worker
-    // still in flight. Under `deliverBinding` the claim serializes workers per
-    // binding, so "concurrent" is over and this is the crash case; a one-shot
-    // caller is serialized by its own guard (the inbound event claim, the loop
-    // lease). Either way: apply the declared recovery.
+    // Mid-`sending`: crash between post and confirm — apply declared recovery.
     const mode = uncertainDeliveryMode(def);
     if (mode === 'abandon') {
       await settleReceipt(receiptId, 'abandoned');
@@ -214,14 +145,8 @@ export async function deliverOnce(
         return 'delivered';
       }
     }
-    // 'retry' (tier A: the provider collapses the repeated key; tier C: the
-    // channel DECLARED it accepts possible duplicates) — but on a SCHEDULE.
-    // A receipt that keeps failing is given up after MAX_DELIVERY_ATTEMPTS
-    // (abandoned; the cursor moves on), and between attempts it waits a
-    // doubling backoff measured from its last attempt — so a deterministic
-    // rejection neither hammers the provider every sweep nor wedges the
-    // conversation forever. `deferred` tells the caller to stop here and
-    // leave the cursor where it is.
+    // Retry on a doubling backoff schedule; give up after MAX_DELIVERY_ATTEMPTS.
+    // `deferred` means the backoff window has not elapsed yet.
     if (existing.attempts >= MAX_DELIVERY_ATTEMPTS) {
       await settleReceipt(receiptId, 'abandoned');
       return 'abandoned';
@@ -231,13 +156,8 @@ export async function deliverOnce(
     await DeliveryReceipts.updateAsync(receiptId, { $inc: { attempts: 1 }, $set: { at: new Date() } });
   }
 
-  // POST. A lens may return several payloads (a segmented SMS); each gets its
-  // own provider-side key — one shared key would make a tier-A provider
-  // collapse the segments into one.
-  //
-  // A thunk is resolved only here, on the POST path — side effects a
-  // rendering needs (a `link` channel's per-choice verdict tokens) must not
-  // run on a re-sweep that finds the receipt already settled or backed off.
+  // POST. Thunk resolved only here so side effects (verdict tokens) never run
+  // on a re-sweep that finds the receipt already settled.
   const resolved = typeof item === 'function' ? await item() : item;
   const rendered = def.lens.out(resolved, binding.destination);
   const payloads = Array.isArray(rendered) ? rendered : [rendered];
@@ -261,15 +181,8 @@ export async function deliverOnce(
   return 'delivered';
 }
 
-/**
- * A planned row's deliverable: the item itself, or — when its message carries
- * attachment refs — a THUNK that hydrates them (email v2 spec §8). Bytes load
- * only on `deliverOnce`'s POST path: a settled receipt or a backoff window
- * loads nothing, exactly like verdict-token minting. A ref that no longer
- * hydrates (pruned by the retention TTL) is dropped from the payload and the
- * text gains one bracket line — the courier never claims to have delivered a
- * file it didn't, and never wedges the conversation over one.
- */
+/** Hydrate attachments lazily (only on the POST path). Expired refs become
+ *  bracket notes rather than stalling delivery. */
 function deliverable(
   binding: ChannelBinding, row: PlannedRow,
 ): DeliveryItem | (() => Promise<DeliveryItem>) {
@@ -288,13 +201,8 @@ function deliverable(
   };
 }
 
-/**
- * Deliver one binding's backlog: claim it, walk the transcript past the
- * cursor, post what the planner says to post, advance past the rest, then
- * offer the parked prompt (receipt-guarded — a prompt is session state, not a
- * seq row, so it advances no cursor and re-delivers only when a NEW ask
- * parks).
- */
+/** Deliver one binding's backlog: claim, plan, post, advance cursor,
+ *  then offer any parked prompt. */
 export async function deliverBinding(
   kind: string, bindingId: string, opts: EgressOptions = {},
 ): Promise<void> {
@@ -344,21 +252,11 @@ export async function deliverBinding(
     cursor = row.message.seq;
   }
 
-  // The parked ask, once per ask: the receipt suffix carries the toolCallId,
-  // so a re-park of a DIFFERENT call is a new receipt and a re-sweep of the
-  // same one is a settled no-op.
-  //
-  // NEVER to a member binding (participants spec decision 14): on a
-  // link-interact channel the prompt carries live single-use Approve/Deny
-  // URLs whose redemption records the verdict AS THE OWNER — mailing those
-  // to a composed-to outsider would hand an assurance-none correspondent
-  // approval authority over the session's gated tools.
+  // Parked ask, once per toolCallId. Never to a member binding — the prompt's
+  // verdict URLs would hand approval authority to an outsider.
   const prompt = binding.member ? null : promptItem(session, def.profile);
   if (prompt) {
-    // `link` channels mint the per-choice verdict URLs here — LAZILY, as a
-    // thunk deliverOnce runs only on its POST path. Each token is a live
-    // single-use capability; minting eagerly would issue two per sweep per
-    // parked ask, forever, while the receipt is already `sent`.
+    // Verdict URLs minted lazily — only on deliverOnce's POST path.
     const withUrls = async () => {
       if (def.profile.interact === 'link' && def.approvalUrl) {
         for (const choice of prompt.choices) {
@@ -413,14 +311,8 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
     });
   };
 
-  /**
-   * The sweep — the braces. It re-attempts every binding of this kind: the
-   * tail read per binding is one `{ sessionId, seq }` range scan, and a
-   * binding with nothing new advances nothing and posts nothing. It is also
-   * the only path that notices a PARKED prompt (a park writes the session
-   * document, which the message observer deliberately does not watch) and an
-   * expired claim another server left mid-delivery.
-   */
+  /** Re-attempt every active binding. Also the only path that notices a
+   *  parked prompt or an expired claim from another server. */
   const sweep = async (): Promise<void> => {
     // Only bindings active within the lookback — see `sweepLookbackMs`.
     const since = new Date(Date.now() - (opts.sweepLookbackMs ?? 24 * 60 * 60_000));
@@ -447,18 +339,9 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
   };
   const timer = setInterval(runSweep, sweepMs);
 
-  /**
-   * The observer — the belt: a committed row reaches its surfaces within
-   * milliseconds instead of within a sweep interval, and its initial `added`
-   * pass replays the whole backlog on boot — which is exactly how post-crash
-   * deliveries recover, and exactly why the receipts table exists (§11): the
-   * replayed rows find their receipts already `sent` and do nothing.
-   *
-   * `AgentMessages` is INSERT-ONLY, so `added` is the whole story — a
-   * `changed` handler would be dead code. Assistant rows and notes are the
-   * only kinds the planner can post, but the binding lookup is by sessionId,
-   * so the projection carries only that.
-   */
+  /** Live observer: committed rows reach surfaces within ms. `added` replays
+   *  the full backlog on boot (receipts prevent re-delivery). INSERT-ONLY
+   *  collection, so `changed` is unnecessary. */
   let handle: { stop(): void } | null = null;
   const observing = AgentMessages.find(
     { role: { $in: ['assistant', 'note'] } },

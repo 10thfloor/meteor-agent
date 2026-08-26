@@ -5,31 +5,8 @@ import {
 import { DEFAULT_ATTACHMENT_CAPS, prettySize, sanitizeAttachmentName } from '../attachments';
 import type { ChannelDef } from './registry';
 
-/**
- * The remote-media fetcher (participants spec §6): resolve a lens's
- * `RemoteAttachment` references into the bytes admission stores — under the
- * channel def's own recipe, because this is an SSRF surface and is treated as
- * one:
- *
- *   - https only, and every fetched URL — the first, the indirect hop, every
- *     redirect target — must exact-match the channel-authored `media.hosts`
- *     allowlist. The webhook can make us fetch only from hosts the channel
- *     already trusts.
- *   - redirects are followed MANUALLY (at most 3), re-checked per hop, and
- *     auth headers are STRIPPED on a cross-host redirect (Twilio's 302 to its
- *     CDN is the canonical case). The INDIRECT hop is different on purpose:
- *     it is a credentialed, allowlisted provider API call (WhatsApp's
- *     lookaside URL rejects unauthenticated GETs), so it keeps its headers —
- *     both targets are allowlisted, which is what makes the asymmetry safe.
- *   - the read is STREAMED and aborts past `maxFileBytes` — a lying
- *     `declaredSize` costs the provider the file, not us the memory — under a
- *     per-fetch timeout.
- *   - a failure is a NOTE, never a throw: expired WhatsApp URLs (~5 minutes)
- *     and deleted Slack files are routine, and a throw past the admission
- *     claim would release it and 500 into the provider's retry storm. The
- *     message still delivers; the note names the FILE, never the URL or the
- *     headers.
- */
+/* Remote-media fetcher. SSRF-guarded: https only, URL must match
+ * media.hosts (redirects included). Failures become notes, never throws. */
 
 /** Hop ceilings: redirects per fetch, and one indirect hop by contract. */
 const MAX_REDIRECTS = 3;
@@ -37,8 +14,7 @@ const DEFAULT_FETCH_TIMEOUT_MS = 20_000;
 
 let mediaFetch: typeof fetch = globalThis.fetch;
 
-/** TEST SEAM, the `_setBackoff` shape: the fetcher's I/O, injectable so the
- *  whole resolution path runs network-free. Pass null to restore. */
+/** Test seam: inject a fetch replacement. Pass null to restore. */
 export function _setMediaFetch(fn: typeof fetch | null): () => void {
   const previous = mediaFetch;
   mediaFetch = fn ?? globalThis.fetch;
@@ -54,9 +30,8 @@ function hostAllowed(url: string, hosts: string[]): boolean {
   }
 }
 
-/** One GET with manual redirects, host re-checks, cross-host auth stripping,
- *  a byte ceiling on the streamed read, and a shared timeout. Returns the
- *  bytes or a refusal token the caller turns into a note. */
+/** Single GET: manual redirects, host re-checks, cross-host auth strip,
+ *  byte ceiling. Returns bytes or a refusal token. */
 async function boundedGet(
   startUrl: string, headers: Record<string, string> | undefined,
   hosts: string[], maxBytes: number, signal: AbortSignal,
@@ -75,8 +50,7 @@ async function boundedGet(
       const location = res.headers.get('location');
       if (!location) return 'failed';
       const next = new URL(location, url).toString();
-      // Cross-host redirect: the credential was for the host we asked, not
-      // wherever it forwards us. Same-host keeps them (auth-gated hops).
+      // Cross-host redirect: strip auth headers.
       if (new URL(next).hostname !== new URL(url).hostname) sendHeaders = undefined;
       url = next;
       continue;
@@ -84,8 +58,7 @@ async function boundedGet(
     if (!res.ok) return 'failed';
     const reader = res.body?.getReader?.();
     if (!reader) {
-      // A fetch impl without streaming (tests): fall back to arrayBuffer,
-      // still bounded — the check just runs after the read.
+      // Non-streaming fetch (tests): bound check runs after the read.
       const buf = Buffer.from(await res.arrayBuffer());
       return buf.length > maxBytes ? 'too-large' : buf;
     }
@@ -129,10 +102,8 @@ async function fetchOne(
       request.url, request.headers, media.hosts, maxBytes, abort.signal,
     );
     if (att.indirect && Buffer.isBuffer(body)) {
-      // The indirect hop: the first response is JSON the def's resolver turns
-      // into the real target — fetched with the SAME headers (see the module
-      // note for why this differs from redirects), re-checked against the
-      // same allowlist inside boundedGet.
+      // Indirect hop: first response is JSON → resolve to real target URL,
+      // fetched with same headers (both targets are allowlisted).
       let target: string | null = null;
       try {
         target = media.resolveIndirect
@@ -162,7 +133,7 @@ async function fetchOne(
       content: body.toString('base64'),
     };
   } catch {
-    // Timeouts, network failures, aborts — all the same routine fact.
+    // Timeouts, network failures, aborts — routine.
     return `[file "${name}" could not be retrieved]`;
   } finally {
     clearTimeout(timer);
@@ -170,25 +141,12 @@ async function fetchOne(
 }
 
 export interface ResolvedInbound {
-  /** Inline files passed through plus remote files fetched — what admission
-   *  stores, in the event's order. */
   files: ChannelAttachment[];
-  /** One bracket line per file that could not be resolved — joined into the
-   *  message text beside admission's own notes. */
   notes: string[];
 }
 
-/**
- * Resolve an event's attachments — inline ones pass through untouched; remote
- * ones fetch under the def's recipe. Fetching stops once `maxFiles` files are
- * in hand (admission would drop the rest anyway — no reason to download what
- * cannot be kept); the un-fetched remainder gets admission's own over-count
- * note phrasing, so the transcript reads one way however the file was lost.
- *
- * A channel whose lens emits remote attachments but whose def carries no
- * `media` recipe notes every file as unretrievable — a miswiring made visible
- * in the transcript rather than a silent drop.
- */
+/** Resolve an event's attachments: inline pass through, remote fetch
+ *  under the def's recipe. Stops at maxFiles; no media recipe → noted. */
 export async function resolveInboundAttachments(
   incoming: InboundAttachment[],
   media: ChannelDef['media'],

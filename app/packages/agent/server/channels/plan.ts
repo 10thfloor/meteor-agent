@@ -1,49 +1,29 @@
 import type { AgentMessage, AgentSession } from '../../common/types';
 import { MENU_MATCHES, type ChannelProfile, type DeliveryItem } from '../../common/channel-contract';
 
-/**
- * The shared planner (channels spec §8.2): decide WHAT a surface receives.
- * Everything here is pure — same rows in, same items out — which is what makes
- * redelivery after a crash reproduce the same payload, and what makes the
- * planner testable with plain arrays.
- *
- * The line it draws (§7): the turn's ANSWER is an assistant row with no
- * `toolCalls` (a row WITH them is committed before dispatch and is
- * intermediate planning, not an answer). Notes are opt-in per channel via
- * `statuses`. Everything else — user rows, tool rows, planning rows,
- * un-opted notes — is advanced past silently: the cursor still moves, nothing
- * posts.
- */
+/* Shared planner (§8.2): pure function — same rows in, same items out.
+ * An ANSWER is an assistant row with no toolCalls; notes are opt-in via
+ * `statuses`; everything else advances past silently. */
 
 export interface PlanOptions {
-  /** Which note kinds this channel delivers as `status` items. The `approval`
-   *  note is the POST-VERDICT audit outcome — the ask itself is never a
-   *  status; it is always the `prompt` item (§8.2). */
+  /** Which note kinds to deliver as `status` items. */
   statuses?: ReadonlyArray<NonNullable<AgentMessage['kind']>>;
   profile: ChannelProfile;
-  /** The session's web view, when the audience rules allow linking to it
-   *  (§8.5): for an ANONYMOUS session the URL is the credential, so the caller
-   *  passes it only for a `direct` destination; an owned session's URL is
-   *  login-gated and may go anywhere. Absent = overflow carries no link. */
+  /** Session web URL for overflow links (§8.5). Absent = no link. */
   overflowUrl?: string;
 }
 
-/** One planned row: the message (for its `seq` and `_id` — the receipt key and
- *  the cursor advance) and what to send for it, `null` meaning "advance past,
- *  post nothing". */
+/** One planned row: the message and its delivery item, or null (advance past). */
 export interface PlannedRow {
   message: AgentMessage;
   item: DeliveryItem | null;
 }
 
-/** A reply over the profile's limit becomes a MECHANICAL head-slice — the
- *  worker never calls a model, so there is no summarization, only a slice with
- *  room reserved for the ellipsis and the link. */
+/** Head-slice a reply over the profile's limit — no summarization. */
 function overflow(text: string, limit: number, url?: string): DeliveryItem {
   const reserve = 2 + (url ? url.length + 1 : 0);
   let end = Math.max(1, limit - reserve);
-  // Never cut a surrogate pair: a lone high surrogate is a payload providers
-  // reject deterministically (see egress.ts MAX_DELIVERY_ATTEMPTS).
+  // Never cut a surrogate pair.
   const last = text.charCodeAt(end - 1);
   if (last >= 0xd800 && last <= 0xdbff) end -= 1;
   const head = `${text.slice(0, end)}…`;
@@ -52,18 +32,9 @@ function overflow(text: string, limit: number, url?: string): DeliveryItem {
 
 function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null {
   if (message.role === 'assistant') {
-    // Internal deliberation (participants spec decision 13): a reply whose
-    // `to` names a MODEL participant is working conversation between
-    // colleagues — the web transcript shows it; channels advance past it.
-    // Without this, two models conferring would mail a human one message per
-    // relay hop.
+    // Model-to-model deliberation: channels advance past it.
     if (message.to?.startsWith('m:')) return null;
-    // The turn-final signal: no toolCalls. Empty text is possible (a turn that
-    // ended on a refusal note) — nothing to say is nothing to post, UNLESS
-    // the row carries attachment refs: a file with no cover note is still a
-    // message (email v2 spec §8), and dropping it would vanish work product.
-    // The refs themselves are NOT attached here — the planner stays pure and
-    // byte-free; the egress worker hydrates them on the POST path.
+    // Turn-final = no toolCalls. Empty text + no attachments = nothing to post.
     if (message.toolCalls && message.toolCalls.length > 0) return null;
     const text = message.content ?? '';
     if (text === '' && !(message.attachments?.length)) return null;
@@ -86,26 +57,13 @@ function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null 
   return null;
 }
 
-/**
- * Plan the tail of a transcript for one surface. `messages` are the rows past
- * the binding's cursor, in seq order — the caller reads them with the same
- * `{ sessionId, seq }` range scan every transcript consumer uses.
- */
+/** Plan the tail of a transcript for one surface. */
 export function planItems(messages: AgentMessage[], opts: PlanOptions): PlannedRow[] {
   return messages.map((message) => ({ message, item: itemFor(message, opts) }));
 }
 
-/**
- * The parked approval as a `prompt` item — built from `session.pending`, never
- * from a note (§8.2), and only while the ask is still UNANSWERED. `toolCallId`
- * rides along so the receipt's `expects` can name the exact ask a reply
- * answers (§8.3's staleness rule).
- *
- * The profile decides the grammar the choices carry: `menu` choices get their
- * reply `match` words here — the single source the lens renders from and the
- * worker registers — and `link` choices get their single-use `url`s later, at
- * delivery time, because minting a token is I/O and the planner is pure.
- */
+/** Build the `prompt` item from a parked approval. Menu choices get
+ *  match words here; link choices get URLs at delivery time (I/O). */
 export function promptItem(
   session: AgentSession, profile: ChannelProfile,
 ): Extract<DeliveryItem, { item: 'prompt' }> | null {
@@ -116,11 +74,9 @@ export function promptItem(
     item: 'prompt',
     name: pending.name,
     args: pending.args,
-    // The park-time legibility line (participants spec §8), passed through
-    // untouched — the planner stays pure; hydration happened at the park.
+    // Park-time legibility line, passed through untouched.
     ...(pending.display !== undefined ? { display: pending.display } : {}),
-    // Presence, not truthiness: `runAs: null` is the anonymous service
-    // context, a fact an approver is entitled to see (see the session type).
+    // Presence, not truthiness: `runAs: null` is a real value.
     ...('runAs' in pending ? { runAs: pending.runAs } : {}),
     toolCallId: pending.toolCallId,
     choices: [

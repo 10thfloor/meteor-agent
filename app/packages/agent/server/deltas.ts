@@ -2,43 +2,21 @@ import { Random } from 'meteor/random';
 import { AgentDeltas } from '../common/collections';
 import type { DeltaKind } from '../common/types';
 
-/**
- * The default per-turn `tool_args` delta ceiling: 256 KiB.
- *
- * `AgentDeltas` is a 32 MiB CAPPED collection shared by every session on the
- * deployment, and eviction is global FIFO — so the pressure one session's
- * argument streaming puts on it is everybody's problem.
- *
- * MEASURED (M5 Task 4, `tests/perf.test.ts`): a turn with four parallel tool
- * calls streaming ~20 KB of arguments each, in 200-byte fragments, writes
- * **400 delta documents totalling 80,000 bytes** — 0.24% of the cap. Note the
- * document count: `tool_args` is the one kind coalescing cannot help, because
- * parallel calls arrive INTERLEAVED and `contentIndex` is part of the
- * coalescing key, so no two consecutive fragments ever merge. Its cost scales
- * with the provider's fragment size, not with the response.
- *
- * 256 KiB is therefore a bit over three such turns' worth of headroom per
- * turn: generous for anything real, and a hard stop for a model looping on a
- * JSON fragment.
- */
+/** Per-turn `tool_args` delta ceiling (256 KiB). AgentDeltas is a shared capped
+ *  collection with global FIFO eviction, so one session's argument streaming
+ *  is everybody's problem. `tool_args` can't coalesce (interleaved parallel calls). */
 export const DEFAULT_MAX_TOOL_ARG_BYTES = 256 * 1024;
 
-/** Buffers deltas and flushes on an interval so a long response is O(chunk)
- *  on the wire rather than O(n²). */
-/** Exported as a TEST SEAM. The loop is its only production caller; the
- *  attribution tests drive it directly because a committed turn deletes its
- *  own deltas, so nothing survives a full run to assert on. */
+/** Buffers deltas and flushes on an interval: O(chunk) on the wire, not O(n²).
+ *  Exported as a test seam (committed turns delete their deltas). */
 export class DeltaWriter {
   private buf: Array<{ kind: DeltaKind; chunk: string; seq: number; contentIndex?: number }> = [];
   private seq = 0;
   private timer: ReturnType<typeof setInterval> | null = null;
-  /** Non-reentrancy: the interval fires on a wall clock regardless of whether
-   *  the previous flush settled. Two overlapping flushes would interleave
-   *  their inserts and scramble the rendered text. */
+  /** Non-reentrancy guard: overlapping flushes would scramble insert order. */
   private flushing = false;
   private pending: Promise<void> | null = null;
-  /** Cumulative bytes of `tool_args` chunks ACCEPTED by this writer. Compared
-   *  against `maxToolArgBytes`; see `push`. */
+  /** Cumulative `tool_args` bytes accepted; compared against `maxToolArgBytes`. */
   private toolArgBytes = 0;
   /** One warn per turn, not one per dropped chunk. */
   private warnedClamp = false;
@@ -48,62 +26,29 @@ export class DeltaWriter {
     private messageId: string,
     private msgSeq: number,
     flushMs: number,
-    /**
-     * Per-TURN ceiling on `tool_args` delta bytes. Display-stream hygiene and
-     * nothing more: `AgentDeltas` is a capped collection shared by every
-     * session on the deployment, so one model emitting a megabyte of arguments
-     * JSON evicts every other session's in-flight tokens. Past the ceiling this
-     * writer stops writing `tool_args` deltas; `text` and `thinking` are
-     * untouched, and the COMMITTED assistant message's `toolCalls` — the actual
-     * dispatch data — never passed through here at all. `Infinity` disables it.
-     */
+    /** Per-turn ceiling on `tool_args` delta bytes. Past this, `tool_args`
+     *  deltas stop; `text`/`thinking` and committed `toolCalls` are unaffected. */
     private maxToolArgBytes: number = Infinity,
-    /** Streaming attribution (participants spec §4.1): the model participant
-     *  whose turn is streaming, stamped on each delta so the in-flight row
-     *  can be labelled before it commits. Absent for 1:1 sessions, whose
-     *  deltas stay byte-identical to before the field existed. */
+    /** Model participant whose turn is streaming; absent for 1:1 sessions. */
     private from?: { participant: string; name: string },
   ) {
-    // The `.catch` is not decoration. A bare `void this.flush()` turns an
-    // `insertAsync` rejection into an unhandled promise rejection, which is
-    // fatal by default on Node >= 15 — a delta write failure would kill the
-    // whole turn, and deltas are ephemeral by design (capped, and superseded
-    // by the committed message). Swallow it: the next tick flushes whatever is
-    // still buffered, and `stop()` flushes the tail.
+    // Unhandled rejection is fatal on Node >= 15; deltas are ephemeral, so
+    // swallow — the next tick retries whatever is still buffered.
     this.timer = setInterval(() => {
       void this.flush().catch(() => { /* ephemeral: the next tick retries */ });
     }, flushMs);
   }
 
-  /**
-   * `seq` is assigned HERE, in push order, never lazily inside `flush()`.
-   * Consecutive same-kind chunks coalesce into one run, so a run of tokens
-   * costs a single delta document (one Mongo round trip) instead of one per
-   * token — which is what this class's "O(chunk) on the wire" claim means.
-   * Coalescing at push time is also what keeps `seq` contiguous: one run, one
-   * seq, one document. `mergeView` walks back only while `seq` decrements by
-   * exactly 1, so any gap would silently truncate the rendered message.
-   *
-   * `contentIndex` (tool_args only) is part of the coalescing key, not just a
-   * field along for the ride: two PARALLEL tool calls stream interleaved, so
-   * merging their fragments because both are `tool_args` would concatenate one
-   * call's JSON into the other's and lose the boundary permanently — the
-   * delta document is the only place the attribution can still be recorded.
-   */
+  /** Consecutive same-kind chunks coalesce into one delta document. `seq` is
+   *  assigned at push time to stay contiguous (`mergeView` truncates on gaps).
+   *  `contentIndex` is part of the coalescing key to keep parallel tool calls apart. */
   push(kind: DeltaKind, chunk: string, contentIndex?: number) {
-    // `contentIndex` is meaningful for `tool_args` and nothing else — `mergeView`
-    // only accumulates per index there. A stray one (a third-party Provider
-    // stamping it on a text chunk) is DROPPED rather than thrown: deltas are
-    // ephemeral by design and a provider's mistake must not abandon a turn, but
-    // carried through it would split one text run into two coalescing buckets
-    // and reorder nothing visibly — the worst kind of bug to find later.
+    // Only `tool_args` uses `contentIndex`; a stray one on text would split
+    // coalescing buckets silently, so drop it rather than throw.
     const index = kind === 'tool_args' ? contentIndex : undefined;
 
-    // The clamp. Checked BEFORE coalescing, so a dropped chunk cannot sneak in
-    // by being appended to the run already buffered. The chunk that CROSSES the
-    // ceiling is written whole (a truncated JSON fragment renders no better
-    // than a missing one) and everything after it is dropped, so the decision
-    // is monotone and a client's partial-args view simply stops growing.
+    // Checked before coalescing so a dropped chunk can't sneak in via an
+    // existing run. The crossing chunk is written whole; everything after is dropped.
     if (kind === 'tool_args' && this.maxToolArgBytes !== Infinity) {
       if (this.toolArgBytes >= this.maxToolArgBytes) {
         if (!this.warnedClamp) {
@@ -137,8 +82,7 @@ export class DeltaWriter {
 
   private async drain(): Promise<void> {
     try {
-      // Loop rather than snapshot once: chunks pushed while an insert was in
-      // flight belong to this flush, not to a tick that may never come.
+      // Chunks pushed during an in-flight insert belong to this flush.
       while (this.buf.length > 0) {
         const batch = this.buf;
         this.buf = [];
@@ -158,17 +102,8 @@ export class DeltaWriter {
               at: new Date(),
             });
           } catch (e) {
-            // A throw here must not drop the UNWRITTEN remainder: `batch` was
-            // already detached from `this.buf` above, so items after `i` —
-            // never inserted — would otherwise vanish, opening a permanent
-            // gap in `seq` that mergeView's backward walk (which stops the
-            // instant `seq` fails to decrement by exactly 1) silently
-            // truncates the render at. Splice the remainder (order
-            // preserved, failed item included since it never landed) back
-            // onto the FRONT of `this.buf` — ahead of anything pushed since —
-            // so the next flush picks up exactly where this one broke off,
-            // then rethrow to the caller, which already swallows this
-            // rejection (the interval's `.catch`, or `stop()`'s).
+            // Splice unwritten remainder back onto the front so the next flush
+            // retries them — a seq gap would truncate mergeView's render.
             this.buf = [...batch.slice(i), ...this.buf];
             throw e;
           }
@@ -181,9 +116,7 @@ export class DeltaWriter {
 
   async stop(): Promise<void> {
     if (this.timer) { clearInterval(this.timer); this.timer = null; }
-    // Wait for an in-flight flush instead of skipping the tail: a bare
-    // `flush()` here would hit the non-reentrancy guard and return having
-    // written nothing.
+    // Wait for in-flight flush before final drain; bare `flush()` would no-op.
     const inFlight = this.pending;
     if (inFlight) await inFlight;
     await this.flush();

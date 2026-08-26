@@ -28,13 +28,7 @@ export const NAMES = {
   mCompact: 'agent.compact',
   mAttachmentToken: 'agent.attachmentToken',
   pubMemories: 'agent.memories',
-  // The UI caps (memory spec decision 7). Registered ONCE behind a latch at
-  // the first memory-declaring define(); dotted names are DDP-only — the
-  // model-facing tools use underscored, provider-safe names.
-  // Namespaced like every other method this package registers. Bare
-  // `memory.save` is a name a host app plausibly already owns — and
-  // `Meteor.methods` throws on a duplicate, so the collision would be a boot
-  // failure the moment an app added `memory: true`.
+  // Memory methods — namespaced to avoid collisions with host app methods.
   mMemorySave: 'agent.memorySave',
   mMemorySearch: 'agent.memorySearch',
   mMemoryForget: 'agent.memoryForget',

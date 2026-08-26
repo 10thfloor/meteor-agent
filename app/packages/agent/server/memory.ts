@@ -5,34 +5,15 @@ import {
   type AgentMemory, type MemoryScope, type ResolvedMemory,
 } from '../common/types';
 
-/**
- * The memory store's core: every rule about who may remember what, how much,
- * and how it is found. A LEAF module — collections and types only — so the
- * loop, the tools, the DDP methods and `Agent.memory` can all call in without
- * a cycle.
- *
- * BOTH surfaces funnel here (memory spec decision 7). The model reaches these
- * functions through per-agent inline tools that close over the resolved config
- * and the running model's participant id; the UI reaches them through three
- * global DDP methods whose bodies apply a NARROWER policy first (decision 7a:
- * gates only run on the loop's dispatch path, so the DDP surface must refuse
- * app-scope writes itself rather than trust a gate that will never fire).
- *
- * The split matters because an adopted Meteor method body receives only the
- * invocation and its args — no session, no agent name, no config — which is
- * why "co-registered method" could not carry memory and this core exists.
- */
+/** Core memory store — leaf module (no cycles). Both the tool and DDP
+ *  surfaces funnel here; DDP applies its own narrower policy first. */
 
 /* ---------------------------------------------------------------------------
  * Scoping
  * ------------------------------------------------------------------------ */
 
-/** The selector for one scope's rows.
- *
- *  `'app'` rows carry NO `userId` — the absence IS the sharing (spec §4), so
- *  the app clause must not mention the field at all: `{ userId: undefined }`
- *  would serialize to a match on missing-or-null and quietly pull anonymous
- *  rows if any ever existed. */
+/** Selector for one scope's rows. App rows carry no `userId` — the absence
+ *  is the sharing, so the clause must not mention the field at all. */
 function scopeClause(
   scope: MemoryScope, userId: string | null, agent: string,
 ): Record<string, unknown> | null {
@@ -78,17 +59,9 @@ export interface ListedMemories {
   workTotal: number;
 }
 
-/**
- * The standing block's read (spec §6): pinned first, then most-recent, split
- * into the person and work sections so neither can crowd the other out.
- *
- * A DIRECT `findAsync`, never the search ladder — that is what makes a fact
- * saved this turn visible in the next iteration's block and in a colleague's
- * next turn, without waiting on mongot's change stream to index it.
- *
- * Overflow pinned rows do NOT consume recent slots: the caps are per-section
- * and the totals below tell the model more exist.
- */
+/** Standing block read: pinned first, then most-recent, split into person
+ *  and work sections. Direct `findAsync` (not the search ladder) so saves
+ *  are visible immediately. Overflow pins do not consume recent slots. */
 export async function listForBlock(
   userId: string | null, agent: string, config: ResolvedMemory,
 ): Promise<ListedMemories> {
@@ -101,11 +74,8 @@ export async function listForBlock(
     const pins = await AgentMemories.find(
       { ...sel, pinned: true } as any, { sort: { at: -1 }, limit: pinned },
     ).fetchAsync();
-    // The recent section excludes EVERY pinned row, not just the `pinned` of
-    // them that made the cut. Excluding only the shown ones let overflow pins
-    // fall into the recent fetch and eat its slots — the precise behavior §6
-    // forbids, and with more pins than `recent` the unpinned rows vanished
-    // from the block entirely.
+    // Exclude ALL pinned rows, not just the shown ones — overflow pins must
+    // not fall into the recent fetch and eat its slots.
     const rest = await AgentMemories.find(
       { ...sel, pinned: { $ne: true } } as any, { sort: { at: -1 }, limit: recent },
     ).fetchAsync();
@@ -126,21 +96,8 @@ export type SearchRung = 'installed' | 'vector' | 'text' | 'regex';
 
 /** Which rung answered last — read by tests and by the one-time warning. */
 let activeRung: SearchRung | null = null;
-/**
- * Why the vector rung is or is not usable here. `null` = not yet probed;
- * cached in module state (the `SERVER_ID` idiom) because it is a property of
- * the DEPLOYMENT, not of a call.
- *
- * This is a PROBE, not error-message archaeology, and that distinction was
- * bought the hard way: smoked against a real MongoDB 8.2 + mongot, the three
- * failure modes we care about produce (a) `SearchNotEnabled` — "requires
- * additional configuration" — when there is no search node, (b) "while in
- * state FAILED" when the index exists but never built, and, worst,
- * (c) **no error at all** when the index simply does not exist: `$vectorSearch`
- * against an unknown index name returns an EMPTY RESULT SET. A ladder that
- * waits to be thrown at therefore never engages — it reports the vector rung
- * working and returns nothing, forever, silently.
- */
+/** `null` = unprobed. Must probe explicitly — a missing index returns empty,
+ *  not an error, so passive discovery silently returns nothing forever. */
 type VectorReadiness = 'ready' | 'no-search-node' | 'missing-index' | 'index-not-queryable';
 let vectorReadiness: VectorReadiness | null = null;
 let textAvailable: boolean | null = null;
@@ -148,14 +105,8 @@ let textAvailable: boolean | null = null;
 /** The index name the pipeline queries and the probe checks for. */
 const VECTOR_INDEX = 'agent_memories_vector';
 
-/**
- * Ask the deployment directly whether the vector rung can work, once.
- *
- * `$listSearchIndexes` answers all three questions in one call: it throws when
- * there is no search node at all, returns nothing when the index was never
- * created, and reports `queryable` when it exists — so no failure mode has to
- * be inferred from the wording of an error.
- */
+/** Probe whether the vector rung can work. `$listSearchIndexes` covers all
+ *  three failure modes in one call without error-message inference. */
 async function probeVector(): Promise<VectorReadiness> {
   try {
     const found = await (AgentMemories as any).rawCollection()
@@ -215,18 +166,13 @@ function isDuplicateKey(e: unknown): boolean {
   return String(err?.message ?? '').includes('E11000');
 }
 
-/** Regex metacharacters, escaped. The package has no such helper, and the
- *  hint path feeds it RAW human text: `order #8812 (dispute` compiles to a
- *  SyntaxError, which inside the per-iteration assembly would take the turn
- *  down — precisely what "the ladder never fails a turn" forbids. */
+/** Escape regex metacharacters — raw user text would otherwise SyntaxError. */
 function escapeRegExp(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-/** TEST SEAM, not public API: replaces the vector rung so a suite can drive
- *  the ladder without a mongot. Returns a restore fn, and resets the probe
- *  cache and the warn latch — `tests/server.ts` runs every suite in one
- *  process, so a latch armed by one test would silence the next. */
+/** TEST SEAM: replaces the vector rung. Returns a restore fn; resets probe
+ *  cache and warn latch so suites sharing one process stay independent. */
 export function _setMemorySearch(
   fn: ((sel: Record<string, unknown>, query: string, limit: number)
     => Promise<AgentMemory[]>) | null,
@@ -253,11 +199,8 @@ export function _setMemorySearch(
 /** The active rung, for tests and diagnostics. */
 export function _activeRung(): SearchRung | null { return activeRung; }
 
-/** TEST SEAM, not public API: force the FLOOR rung by declaring the two rungs
- *  above it unavailable. Without this a suite cannot reach `regexSearch` at
- *  all — the text index exists in the test database, so the text rung answers
- *  first and the escaping the hint path depends on goes unexercised. Returns
- *  a restore fn. */
+/** TEST SEAM: force the regex rung by disabling vector and text.
+ *  Returns a restore fn. */
 export function _forceRegexRung(): () => void {
   const prevReadiness = vectorReadiness;
   const prevText = textAvailable;
@@ -270,26 +213,15 @@ let vectorSearchImpl:
   | ((sel: Record<string, unknown>, query: string, limit: number) => Promise<AgentMemory[]>)
   | null = null;
 
-/**
- * `$vectorSearch` with automated embedding (mongot). The query STRING goes to
- * the pipeline — mongot embeds it at search time — so there is no embedding
- * call of our own to make, no key to hold, and nothing to keep in sync.
- *
- * A deployment without mongot errors on the unknown stage. That is a
- * capability answer, not a transient one: probe once, cache, and fall down the
- * ladder for the life of the process.
- */
+/** `$vectorSearch` via mongot's automated embedding — the query string goes
+ *  to the pipeline, no embedding call of our own. A deployment without mongot
+ *  errors once; the probe caches the answer and falls down the ladder. */
 async function vectorSearch(
   sel: Record<string, unknown>, query: string, limit: number,
 ): Promise<AgentMemory[]> {
   if (vectorSearchImpl) return vectorSearchImpl(sel, query, limit);
-  // `filter` runs INSIDE the vector stage, before its limit. Post-filtering a
-  // global top-N with `$match` was the original shape and it is wrong at any
-  // real scale: with thousands of rows across hundreds of accounts, the top
-  // `limit` nearest neighbours are mostly other people's, so a scoped search
-  // returned a handful of rows or none — recall silently emptying as the
-  // deployment grew. The `$match` stays as a BELT: `filter` depends on the
-  // index declaring those paths, and a misconfigured index must not leak.
+  // `filter` scopes inside the vector stage (pre-limit). The `$match` stays
+  // as a belt in case the index lacks the declared filter paths.
   const cursor = await (AgentMemories as any).rawCollection().aggregate([
     {
       $vectorSearch: {
@@ -339,14 +271,9 @@ async function regexSearch(
   ).fetchAsync();
 }
 
-/**
- * Recall, down the ladder: installed fn → `$vectorSearch` → `$text` → regex.
- *
- * Every rung failure DEGRADES rather than throws. A search that takes the turn
- * down is worse than a search that returns less: the model can route around a
- * thin answer, but a thrown error inside the hint path kills a conversation
- * over a database capability nobody chose.
- */
+/** Recall down the ladder: installed fn -> $vectorSearch -> $text -> regex.
+ *  Every rung failure degrades rather than throws — a thin answer beats
+ *  killing the turn over a database capability nobody chose. */
 export async function searchMemory(
   query: string,
   opts: {
@@ -365,11 +292,8 @@ export async function searchMemory(
       const rows = await opts.config.search(q, {
         userId: opts.userId, agent: opts.agent, scopes: opts.config.scopes, limit,
       });
-      // The app's rows are re-scoped here, not trusted. An installed fn is a
-      // retrieval strategy, not an authorization decision: the obvious first
-      // draft (`AgentMemories.find({ $text: … })`, since the collection is
-      // exported) has no scope clause at all, and without this belt it would
-      // serve one account's memories to another.
+      // Re-scope the app's rows — an installed fn is a retrieval strategy,
+      // not an authorization decision, so its results must be filtered.
       return Array.isArray(rows)
         ? rows.filter((r) => inScope(r, opts.config.scopes, opts.userId, opts.agent))
           .slice(0, limit)
@@ -396,11 +320,8 @@ export async function searchMemory(
       activeRung = 'vector';
       return rows;
     } catch (e) {
-      // The index was queryable at probe time, so a throw now is either a
-      // definition mismatch or a transient blip. The filter-path case is the
-      // one worth naming — verified against a live mongot, which phrases it
-      // "Path 'agent' needs to be indexed as filter" — and it is a definition
-      // problem the operator must fix rather than something that will pass.
+      // A filter-path error is a definition problem the operator must fix;
+      // anything else is transient — degrade this call, retry next time.
       if (isFilterPathError(e)) {
         warnMemory('the memory vector index does not declare the filter paths this '
           + 'package needs (scope, userId, agent), so every semantic search is being '
@@ -447,19 +368,9 @@ export type SaveResult =
   | { ok: true; id: string; updated: boolean }
   | { ok: false; error: string; reason: string };
 
-/**
- * Remember one fact.
- *
- * Structured refusals rather than throws for every rule the MODEL can trip
- * (too long, unknown scope, scope not enabled, no account, pool full): a
- * refusal the model can read is a refusal it can route around, where a throw
- * spends a turn on an error note.
- *
- * `key` is the deliberate-upsert identity: two saves with the same key over
- * the same scope resolve to ONE row. That is what makes a crash-recovery
- * re-run of the tool idempotent — the participants spec's thread-key lesson,
- * applied to a store the model writes.
- */
+/** Save one fact. Returns structured refusals (not throws) so the model can
+ *  route around rule violations. `key` is the upsert identity — same key +
+ *  scope = one row, making crash-recovery re-runs idempotent. */
 export async function saveMemory(
   args: SaveArgs,
   opts: {
@@ -489,12 +400,8 @@ export async function saveMemory(
     };
   }
   if (opts.userId === null) {
-    // The gate is NOT the guard here. `config.approve` is optional, and with
-    // none configured the approval check is skipped entirely — so an anonymous
-    // capability-URL holder could propose an app-scope save and then approve
-    // it themselves, writing the pool every session's system prompt reads.
-    // The core refuses instead, for both scopes and for the same reason:
-    // there is nobody to attribute the write to.
+    // The gate is not the guard — `config.approve` is optional, so the core
+    // refuses directly: there is nobody to attribute the write to.
     return {
       ok: false,
       error: 'no-account',
@@ -517,11 +424,8 @@ export async function saveMemory(
   if (args.key) {
     const existing = await AgentMemories.findOneAsync({ ...clause, key: args.key } as any);
     if (existing) {
-      // `pinned` is TRI-STATE on this path: absent leaves the flag alone,
-      // `true` sets it, `false` CLEARS it. Treating false as absent made the
-      // unpin button on a memory page a silent no-op that still answered
-      // `{ ok: true }` — the user unpins, the UI congratulates them, the row
-      // stays pinned forever.
+      // `pinned` is tri-state: absent = leave alone, true = set, false = clear.
+      // Treating false as absent made unpin a silent no-op.
       await AgentMemories.updateAsync(
         existing._id,
         {
@@ -563,10 +467,7 @@ export async function saveMemory(
   try {
     await AgentMemories.insertAsync(row);
   } catch (e) {
-    // The partial unique index on (scope, userId, agent, key) rejected us: a
-    // racer inserted the same key between our lookup and this write. Losing
-    // that race means the row now EXISTS, so do what the key asked for in the
-    // first place and update it. Adopt-on-collision, the insertOrLose idiom.
+    // Race: another insert won. The row exists, so upsert it instead.
     if (args.key && isDuplicateKey(e)) {
       const winner = await AgentMemories.findOneAsync({ ...clause, key: args.key } as any);
       if (winner) {
@@ -589,14 +490,8 @@ export type ForgetResult =
   | { ok: true; forgotten: boolean }
   | { ok: false; error: string; reason: string };
 
-/**
- * Forget one fact, by id.
- *
- * `allowApp` is the decision-7a knob: the DDP surface passes `false`, because
- * shared work knowledge arrived through an approval and must not be deletable
- * by any signed-in client. The model's tool passes `true` — its call went
- * through the same gate its save did.
- */
+/** Forget one fact by id. `allowApp` gates shared-pool deletion: DDP passes
+ *  false (approval-guarded knowledge), the model's tool passes true. */
 export async function forgetMemory(
   id: string,
   opts: { userId: string | null; agent: string; allowApp: boolean },
@@ -605,11 +500,7 @@ export async function forgetMemory(
   if (!row) return { ok: true, forgotten: false };
 
   if (row.scope === 'app') {
-    // The unfinished half of the write-side guard. Writes to the shared pool
-    // are accountable to a signed-in account; deletions from it must be too,
-    // or the same self-propose-then-self-approve chain that was closed on the
-    // write side stays open on the destructive one — and destroying approved
-    // knowledge needs no injection payload at all.
+    // Deletions from the shared pool require a signed-in account, same as writes.
     if (opts.userId === null) {
       return {
         ok: false,
@@ -648,15 +539,9 @@ function title(text: string): string {
   return oneLine.length > 120 ? `${oneLine.slice(0, 117)}…` : oneLine;
 }
 
-/**
- * The hint's search (spec §10): mechanical, harness-run, never a model call.
- *
- * Returns TITLES ONLY. Content never enters context this way — the model must
- * still call `memory_search` — so a bad match costs one line, not a poisoned
- * turn. Threshold-gated by `minScore` where the rung reports one; the regex
- * and text rungs have no comparable score, so they contribute their top hits
- * and the cap does the limiting.
- */
+/** Harness-run hint search — returns titles only so a bad match costs one
+ *  line, not a poisoned turn. Threshold-gated by `minScore` where the rung
+ *  reports one; text/regex rungs contribute top hits ungated. */
 export async function memoryHint(
   query: string,
   opts: { userId: string | null; agent: string; config: ResolvedMemory },
@@ -665,33 +550,20 @@ export async function memoryHint(
   const { minScore } = opts.config.hints;
   try {
     const rows = await searchMemory(query, { ...opts, limit: 3 });
-    // THRESHOLD-GATED, which is the difference between a hint and noise. The
-    // rungs that report a relevance score (mongot's `$vectorSearch`, surfaced
-    // as `score`) are held to `minScore`; the text and regex rungs have no
-    // comparable number, so for them a match IS the signal and the limit does
-    // the bounding. Without this the block appended three arbitrary titles to
-    // every message, including "thanks, that's all" — the exact noise
-    // `minScore` was configured to prevent.
+    // Threshold-gate: vector scores below `minScore` are noise. Text/regex
+    // have no comparable score, so any match passes and the limit bounds.
     const scored = rows.filter((r) => {
       const score = (r as { score?: unknown }).score;
       return typeof score === 'number' ? score >= minScore : true;
     });
     return scored.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`);
   } catch {
-    // The hint is an optimization. A failure here must never reach the turn:
-    // the block still renders, the tool still works, the model just is not
-    // nudged. "Never fails a turn" is the ladder's promise and this is its
-    // last line of defense.
+    // Hints are best-effort — a failure here must never reach the turn.
     return [];
   }
 }
 
-/**
- * Render the memory block appended to the system prompt.
- *
- * Returns `''` when there is nothing to say — an empty block is a section
- * header the model must read on every call that can only ever mean "no".
- */
+/** Render the memory block for the system prompt. Returns `''` when empty. */
 export async function memoryBlock(opts: {
   userId: string | null;
   agent: string;
@@ -699,11 +571,8 @@ export async function memoryBlock(opts: {
   /** Titles from the turn's cached hint, already computed. */
   hint?: string[];
 }): Promise<string> {
-  // Guarded like the hint, and for the same reason: this runs inside the
-  // attempt's try/catch, so an unguarded rejection (a replica-set step-down
-  // mid-count) would be classified as a PROVIDER failure and retried with
-  // backoff — a database blip mis-reported as the model being down. A turn
-  // without its memory listing is a turn; a turn that dies is not.
+  // Guarded: an unguarded rejection here would be mis-classified as a
+  // provider failure and retried with backoff.
   let listed: ListedMemories;
   try {
     listed = await listForBlock(opts.userId, opts.agent, opts.config);

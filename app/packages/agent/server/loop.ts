@@ -56,14 +56,7 @@ export interface RunConfig {
   system: string;
   tools: ToolSpec[];
   provider: Provider;
-  /**
-   * WHICH AGENT this turn runs as (participants spec §4.3) — set by
-   * `buildRunConfig` when a turn is addressed to a non-primary model
-   * participant. Absent = the session's own agent, today's behavior. The loop
-   * and dispatch read it for `from` stamps, `pending.agent`, and hook
-   * context; the BUDGET is composed separately (always the primary's — one
-   * purse per conversation).
-   */
+  /** Which agent this turn runs as (§4.3). Absent = session's own agent. */
   agentName?: string;
   maxIterations?: number;
   flushMs?: number;
@@ -71,20 +64,13 @@ export interface RunConfig {
    *  (`phase: 'stopped'`). Tests lower it; the default keeps the cost to a few
    *  indexed reads per response. */
   interruptCheckMs?: number;
-  /** §10: bounded retry with full-jitter exponential backoff for a provider
-   *  stream that throws mid-iteration. `attempts` counts the initial try
-   *  (default 3); the delay is uniform in
-   *  `[0, min(maxDelayMs, baseMs * 2^attemptIndex)]` (defaults 500 / 10_000). */
+  /** §10: bounded retry with full-jitter backoff. `attempts` includes the
+   *  initial try (default 3). */
   retry?: { attempts?: number; baseMs?: number; maxDelayMs?: number };
   /** §9 compaction thresholds (defaults 200_000 / 0.8 / 6); absent =
    *  compaction disabled. */
   context?: { window?: number; compactAt?: number; keep?: number };
-  /** §9, threaded from the registry by `deferTurn`. `spend` is already parsed
-   *  to dollars (`parseSpend` runs at define() time). `turns` is enforced in
-   *  `mSend`, not here — by the time a turn runs, the send it would refuse has
-   *  already happened. `relay` caps model-to-model hops (participants spec
-   *  decision 7; default 4). On an ADDRESSED turn this whole bundle is the
-   *  PRIMARY agent's, whatever config the rest of the run came from. */
+  /** §9 budget. Always the PRIMARY agent's, even on addressed turns. */
   budget?: {
     turns?: number; systemTurns?: number; toolCalls?: number;
     spend?: number; relay?: number;
@@ -92,10 +78,7 @@ export interface RunConfig {
   /** $ per million tokens. The FALLBACK for a provider that reports no cost of
    *  its own; see `accruedCost`. */
   pricing?: { input: number; output: number };
-  /** §5.2. A tool result enters the transcript AND every later provider
-   *  request; one oversized result inside compaction's kept tail can exceed
-   *  the context window with nothing compaction can do about it. Truncation
-   *  is explicit in the content so the model knows it saw a prefix.
+  /** §5.2. Oversized results are truncated to avoid wedging compaction.
    *  Default 8000. */
   maxResultChars?: number;
   /** Per-TURN ceiling on the bytes of `tool_args` deltas this turn may publish.
@@ -107,16 +90,10 @@ export interface RunConfig {
    *  routes around — never a park, never a throw. */
   canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
     => boolean | Promise<boolean>;
-  /** The agent's skills. Their descriptions are already in `system` (see
-   *  `buildSystemPrompt`); the loop reads this only to decide whether to add
-   *  the built-in `skill` tool and what it can load. Absent or empty = no
-   *  loader tool at all. */
+  /** Skills available to the `skill` loader tool. Absent = no loader. */
   skills?: Skill[];
-  /** Durable recall (memory spec), resolved at define() time and threaded
-   *  here from the PRIMARY's config — beside `budget`, on purpose: an
-   *  addressed turn to a colleague that declared no memory of its own must
-   *  still see the conversation's memory, or recall would differ by whoever
-   *  was @-mentioned. Absent = no tools, no block, no writes. */
+  /** Durable recall (memory spec). Always the PRIMARY's config so every
+   *  participant sees the same memory. Absent = disabled. */
   memory?: ResolvedMemory;
 }
 
@@ -124,39 +101,22 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => { setTimeout(resolve, ms); });
 }
 
-/** Full jitter: uniform in [0, min(maxDelayMs, baseMs * 2^attemptIndex)].
- *  A deterministic exponential resynchronizes every session that failed
- *  together — a provider-wide 529 would have the whole fleet retrying in
- *  lockstep, which is how outages prolong themselves. */
+/** Full jitter to prevent lockstep retries after a provider-wide failure. */
 export function backoffDelay(attemptIndex: number, baseMs: number, maxDelayMs: number): number {
   return Math.random() * Math.min(maxDelayMs, baseMs * 2 ** attemptIndex);
 }
 
 let backoff: typeof backoffDelay = backoffDelay;
 
-/**
- * TEST SEAM, not public API — the same shape as lease.ts's `_setLeaseTimings`.
- * Full jitter draws a delay that can legitimately be ~0ms, which makes the
- * between-attempts `retrying` phase unobservable by any sampler (and the
- * test-environment Mongo observer runs on the polling driver, which coalesces
- * transient states away entirely). A test that must SEE the phase pins the
- * delay deterministic here and restores in `finally`. Pass null to restore
- * the jittered default. Not re-exported from server/index.ts.
- */
+/** TEST SEAM: pin a deterministic delay so `retrying` phase is observable.
+ *  Pass null to restore the jittered default. */
 export function _setBackoff(fn: typeof backoffDelay | null): () => void {
   const previous = backoff;
   backoff = fn ?? backoffDelay;
   return () => { backoff = previous; };
 }
 
-/**
- * Run one turn to completion. Assistant messages commit only at boundaries and
- * every abandonment path erases what it had already written, so the transcript
- * a turn leaves behind always ends in `user` or `tool` — the two states a turn
- * can legally start from. A recovering server additionally repairs on entry,
- * because cleanup by the abandoning process is not guaranteed to run at all.
- * Recovery is therefore just calling this again.
- */
+/** Run one turn to completion. Idempotent: recovery is just calling again. */
 export async function runTurn(sessionId: string, config: RunConfig): Promise<void> {
   const maxIterations = config.maxIterations ?? 10;
   const flushMs = config.flushMs ?? 60;
@@ -165,10 +125,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   // a turn that reaches this is pathological, not merely busy.
   const maxToolArgBytes = config.maxToolArgBytes ?? DEFAULT_MAX_TOOL_ARG_BYTES;
   const interruptCheckMs = config.interruptCheckMs ?? 250;
-  // `attempts` counts the INITIAL try, so 1 means "no retry" and 0 means
-  // nothing coherent at all: `attemptIndex + 1 < 0` is false on the first
-  // pass, so 0 silently behaved as 1 — a config that reads like "never call
-  // the provider" quietly calling it once. Floor it instead of trusting it.
+  // `attempts` counts the initial try; 0 would silently behave as 1, so floor it.
   const retryAttempts = Math.max(1, config.retry?.attempts ?? 3);
   const retryBaseMs = config.retry?.baseMs ?? 500;
   const retryMaxDelayMs = config.retry?.maxDelayMs ?? 10_000;
@@ -179,11 +136,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   // Both feed the durable-wake check in the outer `finally` — see there.
   let owned = false;
   let resumed = false;
-  // The strip-and-degrade latch (participants spec §9): a provider can refuse
-  // an image the byte gate passed (pixel caps are invisible to a byte check),
-  // and the ref sits on a COMMITTED row — without this, one bad image would
-  // re-hydrate into every future request and 400 the session forever. One
-  // extra attempt, images stripped, text results intact.
+  // Strip-and-degrade latch (§9): one retry with images stripped if a
+  // provider refuses an image the byte gate passed.
   let imagesStripped = false;
 
   if (running.has(sessionId)) return;   // already running in THIS process
@@ -199,40 +153,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
     }, HEARTBEAT_MS);
 
     try {
-      // The ONE async step in tool assembly, and the only concession the loop
-      // makes to MCP: a `{ mcp: … }` spec carries a server name, and its
-      // description, its schema and (for a whole-server spec) its very
-      // existence come from that server's `tools/list`. Resolution stays
-      // synchronous; discovery is awaited here, once per turn, before anything
-      // is shown to the model. Connections and catalogs are cached per process,
-      // so this is a Map lookup from the second turn on, and a no-op array
-      // pass-through for an agent with no MCP tools. A server that is down
-      // costs one failed connect and never fails the turn — see
-      // `expandMcpTools`.
-      //
-      // AFTER `claimLease`, and after the heartbeat is running, deliberately.
-      // Discovery spawns subprocesses and can burn a full
-      // `MCP_DISCOVERY_TIMEOUT_MS` per server; doing it before the lease meant
-      // a run that another server already owns paid the whole bill before
-      // finding out it had nothing to do — every duplicate wake-up spawning its
-      // own copy of every MCP server. Under the heartbeat, a slow discovery
-      // cannot cost us the lease either. Nothing above reads `tools` or
-      // `schemas`, so there is nothing to reorder around.
-      //
-      // The built-in `skill` loader joins the list AFTER expansion, for a
-      // reason that only shows up with MCP in the tree: a whole-server spec's
-      // tool names are not known until discovery has run, so appending earlier
-      // could put two tools named `skill` in front of a provider that rejects
-      // duplicates outright. Appending here makes the collision visible, and
-      // `withSkillTool` resolves it in the app's favor with one warning.
+      // MCP discovery runs AFTER claimLease: discovery can burn a full timeout
+      // per server, and doing it before the lease spawned duplicate copies.
       const baseTools = withSkillTool(
         await expandMcpTools(resolveTools(config.tools)), config.skills,
       );
 
-      // The turn's vision capability (participants spec §9), answered ONCE:
-      // absent surface, absent answer, and any failure all read as NO — the
-      // gate fails closed (see Provider.capabilities). Threaded to every
-      // tool's ctx through the limits bundle.
+      // Vision capability (§9): fails closed on absent surface or error.
       try {
         const answer = config.provider.capabilities?.imageInput?.(config.model);
         limits.imageInput = (await answer) === true;
@@ -242,24 +169,14 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
       if (!(await repairUnansweredToolUse(sessionId))) return;
 
-      // An approval gate is resolved BEFORE the think loop, because the
-      // transcript currently ends in an unanswered `tool_use`: streaming from
-      // here would 400 on every provider. Once the batch is answered the
-      // history ends in a `tool` row — the ordinary shape an iteration expects.
+      // Resolve any standing approval gate before the think loop — an
+      // unanswered tool_use would 400 every provider call.
       const entry = await AgentSessions.findOneAsync(sessionId);
       if (!entry) return;
-      // WHICH MODEL PARTICIPANT this turn runs as (participants spec §4.3):
-      // the addressed composition's name, else the session's own agent. Every
-      // stamp (`from`, `pending.agent`), the hook context, and the relay
-      // parse read this one value.
+      // Which model participant this turn runs as (§4.3).
       const selfAgent = config.agentName ?? entry.agent;
-      // Memory tools are appended HERE rather than beside `withSkillTool`
-      // because they need `selfAgent`: each closes over the running model's
-      // participant id, which is the `by` stamp on everything it remembers.
-      // Suppressed for subagent children and `Agent.ask` throwaways by
-      // SESSION rather than config (spec decision 20) — a child's transcript
-      // folds back into the parent, which is the memory-bearing conversation,
-      // and a throwaway is deleted.
+      // Memory tools need `selfAgent` for the `by` stamp. Suppressed for
+      // subagent children and throwaways (decision 20).
       const memoryOn = config.memory && !entry.parent && !entry.ephemeral
         ? config.memory : undefined;
       const tools = withMemoryTools(
@@ -274,77 +191,31 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           : undefined,
       );
       const schemas = toolSchemas(tools);
-      // The turn's hint, cached by the seq of the user row it answers (spec
-      // §6): system assembly runs per retry ATTEMPT inside the per-iteration
-      // loop, so an uncached hint would re-run its aggregation on every
-      // attempt of every iteration. Recomputed only when an interjection or a
-      // compaction re-read changes which user row is newest.
+      // Hint cached by user-row seq (§6) — recomputed only on interjection
+      // or compaction, not per attempt.
       let hintSeq = -1;
       let hintTitles: string[] = [];
-      // A relay addressed to us is the wake this turn IS — but it is NOT
-      // consumed here (a reviewer-confirmed window): consumption at entry
-      // meant a crash anywhere in this turn's first provider call dropped
-      // the marker, and recovery — finding no durable addressee — resumed
-      // the PRIMARY against a history ending in a colleague's question. The
-      // marker is cleared by this turn's FIRST COMMIT (`allocateSeq`'s
-      // `$unset` rides the same atomic write), so the whole pre-commit
-      // stretch stays recoverable as the right model.
+      // Relay marker consumed on first COMMIT, not at entry — a crash
+      // before any commit must leave the wake standing for recovery.
       const consumingRelay = entry.pendingRelay?.agent === selfAgent;
-      // A standing SYSTEM INTENT is the wake this turn IS, on the same terms
-      // and for the same reason (system-turn spec decision 14): cleared by the
-      // first commit below, not here, so the pre-commit stretch stays
-      // recoverable.
-      //
-      // The latch is the intent's ROW, not the marker's presence. The spec's
-      // first draft latched on presence, reasoning that decision 9 keeps the
-      // standing intent unique — but uniqueness is not evidence that THIS turn
-      // was dispatched to consume it, and the difference is not academic: a
-      // turn resuming an approval, or answering a plain send, starts while an
-      // intent stands and would clear the marker and bill the counter for a
-      // prompt no model ever saw. That destroyed the scheduled turn on exactly
-      // the parked-approval case this feature exists for.
-      //
-      // `consumeSystemIntent` writes the row BEFORE it dispatches, so the row
-      // existing is proof the intent was materialized into this transcript —
-      // which is precisely the condition under which a commit here is
-      // answering it. One primary-key read, and only when a marker stands.
+      // Latch on the intent's ROW, not the marker — a concurrent send can
+      // start while an intent stands.
       const consumingSystem = entry.pendingSystem !== undefined
         && (await AgentMessages.findOneAsync(
           systemRowId(sessionId, entry.pendingSystem.key ?? entry.pendingSystem.token),
         )) !== undefined;
-      // The budget is billed ONCE, on the first commit — not once per commit.
-      // `consumingSystem` is a turn-constant, but the commit below runs once per
-      // provider ITERATION, so a system turn that makes K tool rounds would
-      // $inc `budgetSpent.systemTurns` K+1 times and trip its own bound far too
-      // early. This latch bills on the first successful commit and no more;
-      // the marker clear stays per-commit (idempotent, mirroring the relay).
+      // Bill system-turn budget once, not per iteration — without the latch
+      // a multi-iteration system turn would over-count.
       let systemUnbilled = consumingSystem;
       if (entry.pending) {
         if (!entry.pending.verdict) {
-          // Still parked, and re-entry here is the recovering-server case: exit
-          // exactly as the parking run did, leaving the marker standing.
-          //
-          // 'awaiting' is a live request waiting on a human, and ONLY
-          // approve/deny resolves it. A send that arrives while awaiting does
-          // not cancel the approval and does not wake anything: `agent.send`
-          // clears 'stopped'/'error' and nothing else, so the message is
-          // QUEUED — it sits in the transcript until a verdict resumes the
-          // batch, at which point the think loop reads the whole history and
-          // answers it along with the tool results. (To cancel instead, the
-          // caller interrupts first: that is what 'stopped' below is.)
-          //
-          // 'stopped' is that same request with an interrupt over it. There a
-          // later send DOES clear the phase, and the overtaken branch below
-          // discards the dead request rather than leaving its `tool_use`
-          // unanswered.
+          // Re-entry while parked (recovering-server case): exit as the
+          // parking run did. 'awaiting' = live request, only approve/deny
+          // resolves it; 'stopped' = interrupted, a later send clears it.
           if (entry.phase === 'awaiting' || entry.phase === 'stopped') return;
 
-          // Any other phase means the park was OVERTAKEN: `agent.interrupt`
-          // stopped it and a later `agent.send` cleared the stop to 'idle'.
-          // approve/deny require 'awaiting', so nothing can ever answer this
-          // call now — and an unanswered `tool_use` 400s every provider call
-          // from here on. Discard the dead turn exactly as an interrupt during
-          // dispatch already does, then answer the message the user just sent.
+          // Park was overtaken (interrupted then sent again) — the call can
+          // never be answered now, so discard the dead turn.
           const msgs = await AgentMessages
             .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
           const batch = locateBatch(msgs, entry.pending.toolCallId);
@@ -356,15 +227,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           }
           if (!(await guardedUpdate(sessionId, SERVER_ID, { $unset: { pending: 1 } }))) return;
         } else {
-          // WHOSE park is this (decision 6)? A queued ADDRESSED send's
-          // deferred turn runs as its addressee and can reach a
-          // verdict-carrying park first — and resuming a COLLEAGUE's batch
-          // under this turn's toolset answers a human-approved call with
-          // `unknown-tool`. Only the parking model's turn consumes the
-          // verdict; anyone else's wake leaves it standing for the resume
-          // that `recordVerdict` already scheduled via `pending.agent` (and
-          // this turn's own wind-down self-check re-fires it if that resume
-          // was the one that got dropped).
+          // Only the parking model's turn consumes the verdict (decision 6);
+          // anyone else's wake leaves it standing.
           if ((entry.pending.agent ?? entry.agent) !== selfAgent) return;
           resumed = true;
           const outcome = await resumeParkedTurn(
@@ -382,24 +246,13 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       for (let iteration = 0; iteration < maxIterations; iteration += 1) {
         const session = await AgentSessions.findOneAsync(sessionId);
         if (!session) return;
-        // An interrupt is durable until the next send clears it (`agent.send`
-        // flips stopped→idle). Without this check the unconditional
-        // 'streaming' write below would silently erase a stop that landed
-        // between iterations — or between Meteor.defer and the first one.
+        // A stop that landed between iterations must not be overwritten
+        // by the 'streaming' write below.
         if (session.phase === 'stopped') return;
 
-        // §9: BEFORE the provider call, not after it — the point of a spend cap
-        // is to prevent the next charge, and a check after the fact only
-        // reports one. Reading it per ITERATION rather than once per turn is
-        // what makes a tool-using run stop at the boundary instead of running
-        // its whole batch out: each iteration is another model call.
-        //
-        // `>=` against the accrued total, so the turn that CROSSES the cap
-        // still completes (its cost was already committed to when it started)
-        // and the next one is refused. Combined with the note's
-        // `phase: 'stopped'`, a session that has overspent needs an operator to
-        // raise the budget: the next send clears the stop, and the very first
-        // iteration trips again right here, before spending anything.
+        // §9: checked per iteration BEFORE the provider call so a tool-using
+        // run stops at the boundary. The turn that crosses the cap still
+        // completes; the next one is refused.
         if (config.budget?.spend !== undefined
           && session.usage.cost >= config.budget.spend) {
           await commitBudgetNote(sessionId, 'spend');
@@ -409,15 +262,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         let history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
 
-        // QUEUED ADDRESSED MESSAGES re-resolve at the iteration top
-        // (participants spec §4.3, a reviewer-confirmed miss): a message
-        // addressed to a colleague can enter this turn's history without
-        // passing the interjection branch — queued while the session was
-        // awaiting an approval, or landed between tool-batch iterations —
-        // and answering it under THIS config would be the wrong model
-        // speaking. The handoff is durable (`pendingRelay`, the same marker
-        // a model relay writes) so the wind-down self-check and the
-        // watcher's sweep both know who is owed the turn.
+        // Re-resolve addressed messages at the iteration top (§4.3) — a
+        // colleague-addressed message can enter history without passing the
+        // interjection branch, and answering it here would be the wrong model.
         if (session.participants?.length) {
           const tail = [...history].reverse().find((m) => m.role === 'user');
           if (tail) {
@@ -433,10 +280,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           }
         }
 
-        // §9: compact BEFORE this iteration's provider call, so the call that
-        // would have overflowed is the one that benefits. A committed note
-        // changes the assembled view; re-read so this iteration streams
-        // against it (the note also occupies a seq).
+        // §9: compact before the provider call; re-read if a note was committed.
         if (await maybeCompact(
           sessionId, session.agent, config, history, schemas, interruptCheckMs,
         )) {
@@ -447,14 +291,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         const historyMaxSeq = history.length ? history[history.length - 1].seq : -1;
 
         let messageId = Random.id();
-        // Deltas sort the in-flight row at the seq the message is EXPECTED to
-        // commit at. If a user message interjects mid-stream, the committed
-        // assistant lands one seq later (allocated atomically below) and the
-        // committed row simply supersedes the in-flight one at its new, still
-        // correct position — after the interjection, which is what a reader
-        // expects. Retries reuse this SAME msgSeq (only messageId changes per
-        // attempt): a retry is still logically the one reply this iteration
-        // owes the transcript.
+        // Deltas sort at the expected commit seq; an interjection bumps the
+        // committed seq but the row still supersedes the in-flight one.
+        // Retries reuse msgSeq (only messageId changes per attempt).
         const msgSeq = session.nextSeq;
 
         let text = '';
@@ -463,24 +302,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         let usage: { input: number; output: number; cost?: number } = { input: 0, output: 0 };
         let interrupted = false;
 
-        // §10: pi-ai's adapter (and any other Provider) turns a terminal
-        // provider failure into a THROW mid-iteration, not a rejected
-        // promise. One pass of this loop is one attempt: a fresh DeltaWriter
-        // over a fresh messageId, because a failed attempt's deltas are
-        // removed below and a retry must never stream under an id a
-        // straggler flush from the dead attempt could still land under.
+        // §10: each pass is one attempt with a fresh DeltaWriter/messageId
+        // so straggler flushes from a dead attempt cannot collide.
         for (let attemptIndex = 0; ; attemptIndex += 1) {
-          // Per ATTEMPT, not once per iteration: a retry that left the phase
-          // on 'retrying' for the whole of its own stream tells the client a
-          // retry is still pending while tokens are already arriving.
-          // 'retrying' must be visible only BETWEEN attempts.
-          //
-          // Phase-conditional as well as lease-guarded: compaction sits
-          // between the iteration head's stopped-check and this write, a full
-          // provider round trip in which an interrupt can land. A lease-only
-          // write here would erase it — the M2 retry-branch hole, reopened.
-          // Zero matched (stop OR lost lease) → return; the finally preserves
-          // a stop.
+          // Per ATTEMPT: phase-conditional so a stop that landed during
+          // compaction is not overwritten. Zero matched = return.
           const streaming = await AgentSessions.updateAsync(
             { _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' } },
             { $set: { phase: 'streaming', updatedAt: new Date() } },
@@ -509,31 +335,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           const abort = new AbortController();
 
           try {
-            // The `beforeProviderRequest` seam for the turn's own call. Run per
-            // ATTEMPT rather than once per iteration, so a retry re-runs the
-            // chain instead of resending a request a hook built before the
-            // backoff (a hook stamping the current time is the obvious case).
-            //
-            // `signal` is attached AFTER the hooks and never handed to them to
-            // preserve: a hook that rebuilds the request wholesale must not be
-            // able to silently disable the interrupt — cancellation is the
-            // harness's contract with the user, not the extension's.
-            // The COMPACTED view when a compaction note stands; the raw
-            // (note-filtered) transcript otherwise — projected for THIS
-            // model participant when a roster stands (§4.4): its own rows
-            // keep their roles, colleagues' turn-final rows arrive as
-            // attributed user rows, colleagues' working drops.
+            // Hooks run per ATTEMPT so a retry re-runs the chain. `signal` is
+            // attached AFTER hooks — a hook must not disable the interrupt.
             const assembled = assembleContext(history, session.participants?.length ? {
               self: modelParticipantId(selfAgent),
               primary: modelParticipantId(session.agent),
               participants: session.participants,
             } : undefined);
-            // The memory block (spec §6). The LISTING is a direct findAsync,
-            // rebuilt here so a fact this turn just saved — or one a colleague
-            // saved a moment ago — is visible immediately, without waiting on
-            // mongot to index it. The HINT is the expensive half and is cached
-            // by the seq of the user row it answers, so it costs one
-            // aggregation per turn rather than one per retry attempt.
+            // Memory block (§6). Listing rebuilt per attempt so freshly saved
+            // facts are immediately visible; hint is cached (see above).
             let memoryText = '';
             if (memoryOn) {
               if (memoryOn.hints) {
@@ -552,21 +362,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 ...(hintTitles.length ? { hint: hintTitles } : {}),
               });
             }
-            // Image hydration (participants spec §9) — the separate async
-            // step, HERE and only here: after maybeCompact's estimate (base64
-            // in the estimator reads as megatokens and wedges compaction),
-            // never on the summarizer path, and skipped entirely once the
-            // strip-and-degrade latch fired or the model has no vision.
+            // Image hydration (§9) — after compaction estimate, never on the
+            // summarizer path, skipped once strip-and-degrade fired.
             let requestHasImages = false;
             if (limits.imageInput === true && !imagesStripped) {
               requestHasImages = await hydrateImageRefs(sessionId, history, assembled);
             }
             const request = await runBeforeProviderRequest({
               model: config.model,
-              // The participants block is appended PER ITERATION from the
-              // session just re-read — never baked into `config.system` — so
-              // a roster that changed mid-conversation (compose joining its
-              // recipient) is visible at the next boundary (§4.3).
+              // Participants block appended per iteration so roster changes
+              // mid-conversation are visible at the next boundary.
               system: (session.participants?.length
                 ? config.system + participantsBlock(session, selfAgent)
                 : config.system) + memoryText,
@@ -582,22 +387,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 else if (chunk.kind === 'thinking') {
                   thinking += chunk.chunk; writer.push('thinking', chunk.chunk);
                 } else if (chunk.kind === 'tool_args') {
-                  // Streamed for FIDELITY, not for dispatch: the tool calls the
-                  // loop actually runs come off the terminal `done` chunk,
-                  // already parsed. These deltas exist so a client can show a
-                  // tool call forming, and they carry `contentIndex` so two
-                  // calls forming at once stay apart. Nothing accumulates them
-                  // in memory here — a partial-JSON buffer the commit never
-                  // reads would be dead weight on every turn.
+                  // Streamed for display only — dispatch reads the parsed calls
+                  // off the `done` chunk, not these deltas.
                   writer.push('tool_args', chunk.chunk, chunk.contentIndex);
                 } else if (chunk.kind === 'done') {
                   toolCalls = chunk.toolCalls;
                   usage = chunk.usage ?? usage;
                 }
-                // Honor an interrupt WHILE streaming, not after. `agent.interrupt`
-                // sets `phase: 'stopped'`; without this check the stream runs to
-                // completion, commits, and dispatches its tools anyway — a stop
-                // button that only relabels the phase after the fact.
+                // Honor an interrupt WHILE streaming — without this the stream
+                // runs to completion and dispatches its tools anyway.
                 if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
                   lastPhaseCheck = Date.now();
                   const s = await AgentSessions.findOneAsync(sessionId);
@@ -612,13 +410,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 }
               }
             } finally {
-              // A tail-flush rejection is NOT a provider failure. `stop()`
-              // propagates an `insertAsync` rejection, so a Mongo blip after a
-              // fully successful stream would land in `providerError`,
-              // classify retryable (no status), and re-stream the entire
-              // response — a second provider charge for a database hiccup.
-              // The commit is built from the in-memory `text`, not from
-              // deltas, so a lost tail flush costs nothing durable.
+              // Tail-flush rejection is NOT a provider failure — a Mongo blip
+              // here must not re-stream the entire response.
               await writer.stop().catch(() => {
                 /* deltas are ephemeral; the commit supersedes them */
               });
@@ -632,32 +425,16 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             // its deltas must not linger as a streaming ghost row either.
             await AgentDeltas.removeAsync({ messageId });
 
-            // A stop outranks BOTH the retry and the error note. Re-read the
-            // session once here because this branch is otherwise blind to an
-            // interrupt: an attempt that throws before yielding a single chunk
-            // (the ordinary 429/503 shape) never runs the in-stream check at
-            // all, and every write below is guarded on the LEASE only — so a
-            // `stopped` written by `agent.interrupt` while the attempt was
-            // failing would be overwritten with 'retrying', the after-sleep
-            // re-check would read back the value this branch itself wrote, and
-            // a later attempt would commit a message the user cancelled. The
-            // same hole let the fatal path stamp an error note over a stop.
-            // The `finally` preserves `stopped`, so returning is enough.
+            // A stop outranks retry and error-note paths. Re-read because an
+            // attempt that throws before yielding any chunk never runs the
+            // in-stream interrupt check.
             const live = await AgentSessions.findOneAsync(sessionId);
             if (interrupted || !live || live.phase === 'stopped') return;
 
             const classification = classifyProviderError(providerError);
-            // An abandoned request is the interrupt path with a different
-            // trigger: deltas are already cleaned above, no note is owed to
-            // the user (nothing failed AT them), and the finally preserves a
-            // stop if one stands. Returning here is the whole handling.
+            // Abandoned request — nothing failed at the user, just exit.
             if (classification === 'abandon') return;
-            // STRIP-AND-DEGRADE (participants spec §9): a fatal answer to a
-            // request carrying hydrated images gets ONE retry with the images
-            // stripped (text results intact) — pixel caps are invisible to
-            // the byte gate, the offending ref sits on a committed row, and
-            // without this every future request would re-hydrate it and fail
-            // identically. Latched, so a genuinely fatal request cannot loop.
+            // Strip-and-degrade retry (see the latch doc above).
             if (classification === 'fatal' && attemptHadImages && !imagesStripped) {
               imagesStripped = true;
               messageId = Random.id();   // fresh id: the old deltas are gone
@@ -667,21 +444,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             if (classification === 'retryable' && hasMoreAttempts) {
               if (!(await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'retrying' } }))) return;
               await sleep(backoff(attemptIndex, retryBaseMs, retryMaxDelayMs));
-              // The interrupt check above only fires WHILE a stream is
-              // running; re-check here so an interrupt landing during the
-              // backoff sleep itself still stops the turn, instead of being
-              // silently overwritten by the next attempt's 'streaming' phase.
+              // Re-check for interrupt after the backoff sleep.
               const afterSleep = await AgentSessions.findOneAsync(sessionId);
               if (!afterSleep || afterSleep.phase === 'stopped') return;
               messageId = Random.id(); // fresh id: the old deltas are gone
               continue;
             }
 
-            // Fatal, or every attempt exhausted: commit a sanitized note
-            // through the normal atomic path and end the turn in a
-            // terminal, visible phase. NEVER the raw provider message — it
-            // can carry request headers, key fragments, or other upstream
-            // detail that must not reach the transcript.
+            // Fatal or exhausted: commit a sanitized note. NEVER the raw
+            // provider message — it can carry key fragments.
             const noteSeq = await allocateSeq(sessionId);
             if (noteSeq !== null) {
               await AgentMessages.insertAsync({
@@ -691,10 +462,7 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               });
               await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'error' } });
             } else {
-              // The only silent exit in this structure: the lease went to
-              // another server between the failure and the note, so neither
-              // the note nor the terminal phase can be written and the
-              // session is left showing whatever phase it last had.
+              // Lost lease between failure and note — session may show stale phase.
               console.warn(
                 `[10thfloor:agent] lost lease before error note; session ${sessionId} `
                 + 'may display a stale phase',
@@ -713,21 +481,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           return;
         }
 
-        // Commit is conditional on still owning the lease, and the seq is
-        // allocated ATOMICALLY in the same write — see allocateSeq. Losing the
-        // lease means another server is redoing this turn; abandon without
-        // writing, taking the deltas streamed under this messageId with us.
-        // Cost rides the SAME atomic write that allocates the seq and accrues
-        // the tokens — no second write, and no window in which a committed
-        // message exists whose cost the spend budget has not yet seen.
-        // A RELAY (participants spec decision 7): a rostered turn-final reply
-        // whose leading `@` names another model participant schedules that
-        // model's turn. Parsed BEFORE the seq allocation so the durable wake
-        // (`pendingRelay`) rides the SAME atomic write — a bare defer from
-        // inside a committing turn lands in exactly the non-durable-wake race
-        // the verdict machinery documents. Over the cap, the reply still
-        // commits and delivers; it just schedules nothing, and the note below
-        // says why.
+        // Commit + cost ride ONE atomic write (allocateSeq) — no window where
+        // a committed message's cost is unseen by the spend budget.
+
+        // Relay: a turn-final @mention schedules the named model's turn.
+        // Parsed before allocateSeq so the wake rides the same atomic write.
         const turnFinal = !toolCalls || toolCalls.length === 0;
         const roster = session.participants?.length ? session.participants : null;
         const relayHit = turnFinal && roster
@@ -740,20 +498,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           'usage.input': usage.input,
           'usage.output': usage.output,
           'usage.cost': accruedCost(usage, config.pricing),
-          // The system-turn budget is spent HERE rather than at the park
-          // (system-turn spec decision 14), so a turn that was dispatched but
-          // never ran is never billed. The park only checks the bound. Once
-          // per turn, not once per iteration — see `systemUnbilled`.
+          // System-turn budget billed here (decision 14), not at park — a
+          // turn that never ran is never billed. See `systemUnbilled`.
           ...(systemUnbilled ? { 'budgetSpent.systemTurns': 1 } : {}),
         }, relaying ? {
           pendingRelay: { agent: relayHit!.agent, token: Random.id() },
           relay: relayCount + 1,
         } : undefined,
-        // The relay's CONSUMPTION (decision 7): the addressee's first commit
-        // clears the marker it answers — never turn entry, so a crash before
-        // any commit leaves the wake standing for recovery. A commit that
-        // itself relays onward OVERWRITES instead (the $set above). A standing
-        // system intent is cleared on the same terms.
+        // Relay/intent consumption (decision 7): cleared on first commit,
+        // not turn entry, so a crash leaves the wake standing for recovery.
         {
           ...(!relaying && consumingRelay ? { pendingRelay: 1 as const } : {}),
           ...(consumingSystem ? { pendingSystem: 1 as const } : {}),
@@ -764,18 +517,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // no write, so the latch stays true for a clean single bill on recovery.)
         systemUnbilled = false;
 
-        // The TURN-FINAL row (no toolCalls) claims the session's staged
-        // attachment refs and embeds them — the reply becomes a file-bearing
-        // message (email v2 spec §8). After the seq allocation proved we still
-        // own the lease, before the insert. A crash between claim and insert
-        // strands the claimed refs unstaged and undelivered; the file survives
-        // in the store, the re-run turn's `create` re-stages it idempotently,
-        // and delivery follows the row that actually commits.
-        //
-        // A RELAY-ADDRESSED reply claims nothing (participants spec decision
-        // 13): it is internal deliberation the channel planner skips, and a
-        // file claimed onto it would be silently undeliverable. The refs stay
-        // staged for the eventual outward reply.
+        // Claim staged attachment refs on turn-final rows (§8). Relay-addressed
+        // replies skip this (decision 13) — refs stay for the outward reply.
         const staged = (turnFinal && !relayHit)
           ? await claimStagedRefs(sessionId)
           : [];
@@ -785,21 +528,14 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           content: text, thinking: thinking || undefined,
           toolCalls, usage,
           ...(staged.length > 0 ? { attachments: staged } : {}),
-          // Attribution (decision 4) on ROSTERED rows only — a 1:1 row stays
-          // byte-identical and projects under the primary default. The
-          // addressee is stamped whenever a relay resolved — capped relays
-          // included, so the transcript still shows who was asked even when
-          // nothing was scheduled.
+          // Attribution (decision 4) on rostered rows only.
           ...(roster ? { from: modelFrom(selfAgent) } : {}),
           ...(relayHit ? { to: relayHit.id } : {}),
           createdAt: new Date(),
         });
 
-        // The near miss: a turn-final rostered reply that NAMED another model
-        // but did not address one, so nothing was scheduled and the roster is
-        // about to sit idle holding an unanswered question. Note-only, and it
-        // changes no routing — see `unroutedMention` for why auto-addressing a
-        // buried mention is the wrong fix.
+        // Note-only near-miss: a model was named but not addressed.
+        // See `unroutedMention` for why auto-addressing is the wrong fix.
         if (turnFinal && roster && !relayHit) {
           const missed = unroutedMention(text, session, selfAgent);
           if (missed) {
@@ -837,12 +573,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           }
         }
 
-        // The committed message supersedes its deltas; remove them now rather
-        // than letting them accumulate. Without this, subscribing to an old
-        // session ships every token ever streamed in it, and the client
-        // re-merges the full delta history on every flush of the NEXT turn.
-        // Ordering is safe: the client receives the committed message first,
-        // and mergeView already suppresses deltas by committed id.
+        // Committed message supersedes its deltas — remove so old sessions
+        // don't ship every token ever streamed.
         await AgentDeltas.removeAsync({ messageId });
 
         if (!toolCalls || toolCalls.length === 0) {
@@ -850,24 +582,15 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // wake is durable (`pendingRelay`) and the wind-down self-check
           // fires it in-process; the watcher is the cross-crash net.
           if (relaying) return;
-          // A send that landed mid-stream committed a user message this turn
-          // never saw (its history was read before the interjection). Ending
-          // the turn here would strand that message unanswered until the user
-          // sends AGAIN — so loop instead, still bounded by maxIterations.
+          // A send that landed mid-stream would be stranded unanswered
+          // unless we loop to pick it up.
           const interjected = await AgentMessages.findOneAsync({
             sessionId, role: 'user', seq: { $gt: historyMaxSeq },
           });
           if (interjected) {
-            // Rostered sessions RE-RESOLVE the interjection's addressee
-            // (participants spec §4.3): its own deferred wake was dropped by
-            // the running/lease guards, and continuing here would answer a
-            // message mechanically addressed to a colleague under the wrong
-            // config. The handoff is DURABLE (a reviewer-confirmed strand:
-            // the bare tail predicate reads this exact ordering — our reply
-            // committed after the interjection — as answered): the same
-            // `pendingRelay` marker a model relay writes, fired by the
-            // wind-down self-check and swept by the watcher. Same-addressee
-            // interjections keep today's continue.
+            // Re-resolve a rostered interjection's addressee (§4.3) — its
+            // deferred wake was dropped by the running/lease guards.
+            // Same-addressee interjections keep the continue.
             if (roster) {
               const target = resolveAddressee(interjected.content, interjected.to, session);
               if (target && target.agent !== selfAgent) {
@@ -900,14 +623,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       }
     } finally {
       clearInterval(beat);
-      // `stopped` is a deliberate terminal state set by an interrupt, `error`
-      // is the terminal state this turn just set on a fatal or exhausted
-      // provider failure, and `awaiting` is a live approval request — idling
-      // any of them back would erase the decision (the user's stop, the
-      // failure the transcript note just recorded, or the question a human is
-      // being asked) that the phase exists to preserve. For `awaiting` the
-      // damage would be worse than cosmetic: approve/deny only fire on that
-      // phase, so idling it back would strand the parked call permanently.
+      // `stopped`, `error`, and `awaiting` are deliberate terminal states —
+      // idling them back would erase the decision they preserve.
       const current = await AgentSessions.findOneAsync(sessionId);
       if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
@@ -917,24 +634,9 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
   } finally {
     running.delete(sessionId);
 
-    // The wake is otherwise not durable. `agent.approve`/`agent.deny` record a
-    // verdict and defer a resume; if that verdict lands in the window between
-    // this turn's park write and the two lines above (the `releaseLease` in the
-    // inner `finally`, then `running.delete`), the deferred resume hits
-    // `running.has` in this process — or `claimLease` from another server —
-    // returns immediately, and NOTHING retries. What is left is a recorded
-    // verdict, `phase: 'idle'`, a tool that never ran, and a UI that says the
-    // turn is done. This closes that window: the state is re-read once here,
-    // after the lease is released and the in-process guard is clear, so a
-    // verdict that raced the wind-down still gets a run of its own.
-    //
-    // Bounded, not a watcher. It fires only for a run that actually held the
-    // lease (`owned`) and that did not itself resume a verdict (`resumed`) —
-    // the pair that stops a rescued run from rescuing itself forever, and stops
-    // a run that never got the lease from spinning against the server that did.
-    // `awaiting` means the batch re-parked on its NEXT gate (nobody's verdict to
-    // spend), and `stopped` means an interrupt outranks the verdict until a
-    // send clears it: neither is ours to wake.
+    // Durable-wake self-check: a verdict/relay/intent/tail that raced the
+    // wind-down gets a run of its own. Bounded (not a watcher) — fires only
+    // for a lease-holding run that did not itself resume a verdict.
     if (owned) {
       const after = await AgentSessions.findOneAsync(sessionId).catch(() => null);
       // 'error' belongs in this exclusion list for the same reason it is in
@@ -943,71 +645,31 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
       const wakeable = after
         && !DECIDED_PHASES.includes(after.phase)
         && !running.has(sessionId);
-      // THREE wake kinds now feed one self-check (participants spec §4.3):
-      //   - a standing VERDICT (the original case; still excluded for a run
-      //     that itself resumed one, which would otherwise rescue itself
-      //     forever);
-      //   - a standing RELAY — the wake this turn's own commit scheduled, or
-      //     one left by a turn that died after writing it;
-      //   - an UNANSWERED ADDRESSED TAIL (rostered sessions only): a send
-      //     addressed to a different model landed mid-turn, its own deferred
-      //     wake was dropped by the running/lease guards, and the interjection
-      //     branch deliberately ended this turn instead of answering it under
-      //     the wrong config. Restricted to a tail whose addressee is NOT the
-      //     model this turn ran as, so a classic maxIterations exhaustion
-      //     still ends quietly.
+      // Four wake kinds: verdict, relay, system intent, unanswered tail.
       const verdictWake = !!(wakeable && !resumed && after.pending?.verdict);
       const relayWake = !!(wakeable && after.pendingRelay);
-      // A FOURTH kind (system-turn spec §4.6): a standing SYSTEM INTENT —
-      // scheduled work that arrived while this turn held the session, or that
-      // this turn's own commit did not consume. It is the one wake whose
-      // transcript row does not exist yet, which is why its arm below calls
-      // `consumeSystemIntent` rather than `runTurn`: waking straight into the
-      // loop would make a billed provider call against an unchanged transcript
-      // and commit an assistant row answering nothing.
+      // System intent (§4.6): its transcript row doesn't exist yet, so
+      // the arm below calls `consumeSystemIntent` rather than `runTurn`.
       const intentWake = !!(wakeable && after.pendingSystem);
       let tailWake = false;
       if (wakeable && !verdictWake && !relayWake && !intentWake
         && after.participants?.length && !after.pending) {
-        // ADDRESSEE-AWARE (a reviewer-confirmed strand): "any assistant row
-        // after the user row" reads a colleague-addressed interjection as
-        // answered the moment OUR OWN reply commits — the helper counts only
-        // an answer FROM the addressee.
+        // Addressee-aware: counts only an answer FROM the addressee.
         const owed = await unansweredAddressee(after).catch(() => null);
         tailWake = !!owed && owed.agent !== (config.agentName ?? after.agent);
       }
       if (verdictWake || relayWake || intentWake || tailWake) {
-        // WHICH verdict this wake is for. `writeVerdict` stamps a fresh token
-        // with every verdict, so this is identity where the old re-check had
-        // only a boolean: a verdict consumed, the batch re-parked on its next
-        // gate, and a SECOND verdict written (with its own deferred resume
-        // already queued) all before this timer fires is three writes that
-        // still leave "a verdict stands" true — and this callback would then
-        // run a turn nobody asked for, behind the resume that already owns it.
-        // Undefined only for a verdict written before the field existed, where
-        // the comparison degrades to the old boolean form rather than
-        // stranding the session.
+        // Token-based identity: prevents a stale callback from waking a turn
+        // that a newer verdict's own resume already owns.
         const wakeToken = after!.pending?.wakeToken;
         const relayToken = after!.pendingRelay?.token;
         const intentToken = after!.pendingSystem?.token;
-        // `setTimeout(…, 0)` rather than `Meteor.defer`: this module is
-        // deliberately free of the Meteor namespace (methods.ts owns that
-        // plumbing and calls in), and the only thing `defer` would add is an
-        // environment binding a fresh `runTurn` has no use for — it reads its
-        // own session and takes no ambient method invocation. The `.catch` is
-        // the same load-bearing one `deferTurn` uses: an unhandled rejection is
-        // fatal by default on Node >= 15.
+        // `setTimeout(0)` not `Meteor.defer` — this module stays free of the
+        // Meteor namespace. `.catch` is load-bearing (Node >= 15).
         setTimeout(() => {
           void (async () => {
-            // Re-read INSIDE the deferred callback, not before it: the
-            // legitimate resume can start AND finish between the check above
-            // and this timer firing. It spends the verdict (or consumes the
-            // relay); a woken run that then finds nothing standing would fall
-            // straight into the think loop and make a provider call nobody
-            // asked for — a charge, and an assistant row appended to a turn
-            // the user considered finished. Each wake kind re-verifies its own
-            // condition by IDENTITY where one exists (the verdict token, the
-            // relay token), and the tail wake re-derives from the transcript.
+            // Re-read inside the callback: the legitimate resume can finish
+            // before this timer fires, spending the verdict/relay.
             const still = await AgentSessions.findOneAsync(sessionId).catch(() => null);
             if (!still || DECIDED_PHASES.includes(still.phase) || running.has(sessionId)) return;
             if (verdictWake) {
@@ -1015,21 +677,11 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             } else if (relayWake) {
               if (still.pendingRelay?.token !== relayToken) return;
             } else if (intentWake) {
-              // Identity, never presence: a different intent standing here is
-              // somebody else's wake, and consuming it would run a turn this
-              // callback was not scheduled for. This arm must sit BEFORE the
-              // final `else`, which assumes "not verdict, not relay" means
-              // "tail" and would otherwise swallow the intent silently.
+              // Identity check — a different intent is somebody else's wake.
+              // Must sit BEFORE the final `else` (tail).
               if (still.pendingSystem?.token !== intentToken) return;
-              // The one wake that MATERIALIZES before it runs — see
-              // `intentWake` above. It also clears its own re-entry: the turn
-              // it dispatches consumes the marker on its first commit.
-              //
-              // The dispatcher is our own `runTurn`, not `deferTurn`: this
-              // module stays free of methods.ts's Meteor plumbing, and the
-              // consume policy is shared without a module cycle by taking the
-              // dispatcher as an argument. Same `setTimeout` + `.catch` shape
-              // the other arms below use.
+              // The one wake that materializes its transcript row before
+              // running. Dispatches via `runTurn`, not `deferTurn`.
               await consumeSystemIntent(sessionId, (id, target, userId, opts) => {
                 setTimeout(() => {
                   void runTurn(id, buildRunConfig(target, userId, opts)).catch((e) => {
@@ -1045,17 +697,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               // the check above used.
               if (!(await unansweredAddressee(still).catch(() => null))) return;
             }
-            // The woken turn runs as the participant the durable state names
-            // (participants spec decision 6) — the parked turn's model, the
-            // relay's addressee, the tail's addressee — composed with the
-            // PRIMARY's budget and the OWNER's identity, exactly as
-            // `deferResolvedTurn` composes it for the recovery paths.
+            // Resolve which participant the woken turn runs as (decision 6).
             const agentName = await resolveWakeAgent(still);
-            // The SAME config when the wake belongs to the model this run
-            // already was — which is every 1:1 wake, and what lets a test's
-            // hand-built RunConfig (mock provider included) survive its own
-            // verdict wake. A different addressee builds fresh from the
-            // registry: the addressee's config, the primary's budget.
+            // Reuse config for same-model wakes (preserves test mocks);
+            // build fresh from registry for a different addressee.
             if (agentName === (config.agentName ?? still.agent)) {
               await runTurn(sessionId, config);
               return;
