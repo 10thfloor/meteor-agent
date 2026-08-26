@@ -252,7 +252,18 @@ export function createPiAiProvider(
 let singleton: Provider | null = null;
 let builtins: Promise<PiAiModels> | null = null;
 
-/** Lazy singleton. Keys come from the environment (pi-ai's own resolution). */
+/** Options for the default adapter. An explicit key wins over pi-ai's
+ * provider-specific environment lookup; an absent key leaves that lookup
+ * untouched. Exported for deterministic configuration tests, not re-exported
+ * from the package's public server barrel. */
+export function piAiOptionsFromEnv(
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, unknown> {
+  const apiKey = env.PROVIDER_API_KEY;
+  return apiKey === undefined || apiKey === '' ? {} : { apiKey };
+}
+
+/** Lazy singleton. Credentials come from the environment. */
 export function piAiProvider(): Provider {
   if (singleton) return singleton;
   singleton = createPiAiProvider(() => {
@@ -265,6 +276,6 @@ export function piAiProvider(): Provider {
       builtins.catch(() => { builtins = null; });
     }
     return builtins;
-  });
+  }, piAiOptionsFromEnv());
   return singleton;
 }

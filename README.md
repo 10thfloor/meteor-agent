@@ -1,7 +1,7 @@
 # meteor-agent
 
-**A Meteor-native agent harness, powered by
-[pi-ai](https://github.com/earendil-works/pi).** Durable conversations,
+**A Meteor-native agent harness with
+[pi-ai](https://github.com/earendil-works/pi) as its default model adapter.** Durable conversations,
 streaming, tools, authorization, and recovery are built from the primitives
 your Meteor app already uses—without a second realtime stack.
 
@@ -71,7 +71,8 @@ meteor run --port 3400
 
 No API key is needed: the demo provider streams scripted responses through
 the real transcript, tool, and approval paths. Try `what time is it?` or
-`refund my order`. Set `ANTHROPIC_API_KEY` and restart to use a real model.
+`refund my order`. Set `PROVIDER_API_KEY` to an Anthropic key (or set
+`ANTHROPIC_API_KEY`) and restart to use its real model.
 
 ### Install in an app
 
@@ -87,7 +88,7 @@ cp -R ../meteor-agent-v0.1.0/app/packages/agent packages/agent
 meteor add 10thfloor:agent
 meteor npm install --save @earendil-works/pi-ai typebox
 meteor remove insecure autopublish
-export ANTHROPIC_API_KEY=sk-...       # or OPENAI_API_KEY, GOOGLE_API_KEY, etc.
+export PROVIDER_API_KEY=...          # one API-key provider; see Providers below
 ```
 
 Need Slack, Telegram, WhatsApp, SMS, or email too? Vendor the matching
@@ -482,14 +483,44 @@ refused rather than run with partially checked arguments.
 
 ## Providers
 
-The default talks to any model [pi-ai](https://github.com/earendil-works/pi)
-supports — Anthropic, OpenAI, Google, Bedrock, OpenRouter — with one env var
-and one model string.
+The default adapter uses [pi-ai](https://github.com/earendil-works/pi) for its
+model catalog, request conversion, streaming, authentication, and provider
+APIs. The Meteor-native durable loop, transcript, tools, authorization, and
+recovery remain this package's job.
+
+For a deployment using one API-key provider, set a generic key and select that
+provider in the model string:
+
+```bash
+export PROVIDER_API_KEY=...
+```
 
 ```ts
-// server — no provider needed; env ANTHROPIC_API_KEY is enough
+// server — PROVIDER_API_KEY must be valid for the "anthropic" provider
 Support.define({ model: 'anthropic/claude-sonnet-5', instructions: '…' });
 ```
+
+`PROVIDER_API_KEY` is passed to pi-ai as an explicit key, so it takes precedence
+over provider-specific authentication. It is intended for a deployment where
+all default-adapter agents share one provider credential (including a compatible
+gateway). For agents using several providers at once, leave it unset and use
+pi-ai's provider-specific environment variables instead:
+
+```bash
+unset PROVIDER_API_KEY
+export ANTHROPIC_API_KEY=...
+export OPENAI_API_KEY=...
+export OPENROUTER_API_KEY=...
+```
+
+```ts
+new Agent('support', { model: 'anthropic/claude-sonnet-5', instructions: '…' });
+new Agent('writer', { model: 'openai/gpt-5', instructions: '…' });
+```
+
+Ambient and interactive credentials—such as AWS credentials for Bedrock,
+Google ADC, or OAuth—continue to use pi-ai's native resolution; the generic
+API-key override does not replace those flows.
 
 Swap to a mock for tests and demos — no key, no network, full suite:
 

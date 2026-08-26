@@ -1,7 +1,7 @@
 Package.describe({
   name: '10thfloor:agent',
   version: '0.1.0',
-  summary: 'A Pi-based agent harness for Meteor 3.5+',
+  summary: 'A Meteor-native agent harness with pi-ai as its default model adapter',
   git: 'https://github.com/10thfloor/meteor-agent.git',
   documentation: 'README.md',
 });

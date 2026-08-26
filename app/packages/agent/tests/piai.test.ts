@@ -1,7 +1,7 @@
 import { assert } from 'chai';
 import { loadPiAi } from '../server/providers/loader';
 import {
-  createPiAiProvider, piAiProvider, toPiAiRequest, translateEvent,
+  createPiAiProvider, piAiOptionsFromEnv, piAiProvider, toPiAiRequest, translateEvent,
 } from '../server/providers/piai';
 import type { ProviderChunk, ProviderRequest } from '../server/providers/types';
 
@@ -284,7 +284,7 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
     // loop's per-attempt controller and no configured option may displace it.
     const provider = createPiAiProvider(
       async () => fakeModels as any,
-      { apiKey: 'k', signal: stale.signal },
+      { ...piAiOptionsFromEnv({ PROVIDER_API_KEY: 'k' }), signal: stale.signal },
     );
     for await (const _c of provider.stream({ ...streamReq, signal: controller.signal })) {
       /* drain */
@@ -490,6 +490,15 @@ describe('Anthropic converter request body (injected fetch, no network)', () => 
 });
 
 describe('piAiProvider()', () => {
+  it('maps PROVIDER_API_KEY to pi-ai\'s explicit apiKey option', () => {
+    assert.deepEqual(
+      piAiOptionsFromEnv({ PROVIDER_API_KEY: 'one-provider-key' }),
+      { apiKey: 'one-provider-key' },
+    );
+    assert.deepEqual(piAiOptionsFromEnv({}), {});
+    assert.deepEqual(piAiOptionsFromEnv({ PROVIDER_API_KEY: '' }), {});
+  });
+
   it('is a lazy singleton exposing the Provider seam', () => {
     const a = piAiProvider();
     assert.strictEqual(a, piAiProvider());
