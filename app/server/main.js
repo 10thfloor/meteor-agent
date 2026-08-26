@@ -13,12 +13,12 @@ import { email } from 'meteor/10thfloor:agent-channel-email';
 /**
  * The demo agent behind the chat UI in `client/`.
  *
- * With ANTHROPIC_API_KEY in the environment, it talks to the real model
- * (claude-haiku-4-5 via pi-ai) — `provider` is simply omitted.
+ * With ANTHROPIC_API_KEY or PROVIDER_API_KEY in the environment, it talks to
+ * the real model (claude-haiku-4-5 via pi-ai) — `provider` is simply omitted.
  * Without one it runs a scripted mock that still exercises the interesting
  * surface: streaming, a tool call, and an ask-gated tool the UI must approve.
  */
-const live = !!process.env.ANTHROPIC_API_KEY;
+const live = !!(process.env.ANTHROPIC_API_KEY || process.env.PROVIDER_API_KEY);
 
 // The scripted turns the mock provider plays back. The mock streams one
 // CHARACTER per chunk (providers/mock.ts), so the demo visibly streams
@@ -46,7 +46,7 @@ const demoScript = (() => {
       text:
         'Hello! I am the demo agent, running on a SCRIPTED provider — no API '
         + 'key, no network. Say something with "time" in it to watch a tool '
-        + 'call, or "refund" to hit an approval gate. Set ANTHROPIC_API_KEY '
+        + 'call, or "refund" to hit an approval gate. Set PROVIDER_API_KEY '
         + 'and restart to talk to a real model instead.',
     };
   };
@@ -244,7 +244,7 @@ Meteor.methods({
 
 Meteor.startup(() => {
   console.log(
-    `[demo] agent ready (${live ? 'LIVE provider via pi-ai' : 'scripted mock — set ANTHROPIC_API_KEY for live'})`,
+    `[demo] agent ready (${live ? 'LIVE provider via pi-ai' : 'scripted mock — set PROVIDER_API_KEY for live'})`,
   );
   if (registeredChannels.length > 0) {
     console.log(

@@ -79,7 +79,12 @@ export declare function translateEvent(ev: any): ProviderChunk[];
 /** Provider over a pi-ai Models collection. Exported so tests can inject a
  *  fauxProvider without a network call. */
 export declare function createPiAiProvider(resolveModels: () => Promise<PiAiModels>, options?: Record<string, unknown>): Provider;
-/** Lazy singleton. Keys come from the environment (pi-ai's own resolution). */
+/** Options for the default adapter. An explicit key wins over pi-ai's
+ * provider-specific environment lookup; an absent key leaves that lookup
+ * untouched. Exported for deterministic configuration tests, not re-exported
+ * from the package's public server barrel. */
+export declare function piAiOptionsFromEnv(env?: Readonly<Record<string, string | undefined>>): Record<string, unknown>;
+/** Lazy singleton. Credentials come from the environment. */
 export declare function piAiProvider(): Provider;
 export {};
 //# sourceMappingURL=piai.d.ts.map

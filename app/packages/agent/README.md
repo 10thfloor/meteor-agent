@@ -1,7 +1,8 @@
 # 10thfloor:agent
 
-A Pi-based agent harness for Meteor 3.5+. The transcript is a Mongo collection,
-streaming tokens are a capped collection, and tools are Meteor methods.
+A Meteor-native agent harness with pi-ai as its default model adapter. The
+transcript is a Mongo collection, streaming tokens are a capped collection,
+and tools are Meteor methods.
 
 ## Install
 
@@ -41,9 +42,28 @@ export const Support = new Agent('support', {
 
 `model` is `<provider>/<model-id>` as pi-ai names them (`anthropic/claude-sonnet-5`,
 `openai/gpt-5`, `openrouter/moonshotai/kimi-k2`). With no `provider` of your own,
-the turn streams through pi-ai, which reads its API key from the environment —
-`ANTHROPIC_API_KEY`, `OPENAI_API_KEY` and friends, resolved per provider. This
-package adds no key plumbing of its own.
+the turn streams through pi-ai.
+
+For a deployment using one API-key provider, set `PROVIDER_API_KEY`. The default
+adapter passes it to pi-ai as an explicit key, so it overrides provider-specific
+authentication and must match the provider in `model`:
+
+```bash
+export PROVIDER_API_KEY=...
+```
+
+For several providers at once, leave the generic override unset and use pi-ai's
+provider-specific variables:
+
+```bash
+unset PROVIDER_API_KEY
+export ANTHROPIC_API_KEY=...
+export OPENAI_API_KEY=...
+export OPENROUTER_API_KEY=...
+```
+
+AWS credentials for Bedrock, Google ADC, OAuth, and other non-API-key flows
+continue through pi-ai's native credential resolution.
 
 The full config surface:
 
@@ -1993,7 +2013,7 @@ Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
 
 ## Scope and stability
 
-Version `0.1.0` is the first public package surface: durable transcripts,
+Version `0.2.0` is the current public package surface: durable transcripts,
 streaming, tools and gates, budgets, recovery, compaction, subagents, forking,
 MCP, skills, hooks, the optional chat element, five channel adapters,
 participants, attachments, system turns, and memory. The sections above define
