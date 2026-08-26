@@ -527,21 +527,21 @@ import { tool } from 'meteor/10thfloor:agent';
 
 tools: [
   tool({
-    name: 'lookup_offering',
-    description: 'Look one up by slug.',
+    name: 'lookup_order',
+    description: 'Look one up by reference.',
     args: {
       type: 'object',
       properties: {
-        slug: { type: 'string' },
+        ref: { type: 'string' },
         limit: { type: 'integer' },
-        verdict: { type: 'string', enum: ['ready', 'stretch', 'gap'] },
+        status: { type: 'string', enum: ['open', 'shipped', 'cancelled'] },
       },
-      required: ['slug'],
+      required: ['ref'],
     },
-    run: async ({ slug, limit, verdict }) => {
-      //      slug: string
+    run: async ({ ref, limit, status }) => {
+      //      ref: string
       //      limit: number | undefined        (not in `required`)
-      //      verdict: 'ready' | 'stretch' | 'gap' | undefined
+      //      status: 'open' | 'shipped' | 'cancelled' | undefined
     },
   }),
 ]
@@ -844,48 +844,61 @@ The element renders `@handle` as a chip and completes it in the composer.
 
 The session's own **model participants** are mentionable for free, because those
 are the handles that actually address a turn — `@risk` at the start of a message
-is what routes it to `risk`, and the chip is that fact made visible. Everything
-else your users talk about goes on the `mentionables` **property**:
+is what routes it to `risk`, and the chip is that fact made visible.
+
+Everything else your users talk about is declared with `mentionSources`, keyed
+**by the symbol**. The element owns the UI — matching, the typeahead, the
+keyboard, the chips — and you own only where the records come from:
 
 ```js
-chat.mentionables = [
-  { handle: 'priya-natarajan', label: 'Priya Natarajan', kind: 'guest', detail: 'guest' },
-];
+chat.mentionSources = {
+  '@': { collection: Customers, handle: (c) => slug(c.name), label: 'name', kind: 'customer' },
+  '#': { list: () => tickets.open(), handle: 'id', label: 'title', kind: 'ticket' },
+};
 ```
+
+A source takes one of three forms:
+
+| Form | Use it when |
+| --- | --- |
+| `collection` | A live cursor. Read inside the element's own `Tracker.autorun`, so chips repaint when the data changes with nothing to wire up. |
+| `list` | An array, or a function returning one — anything static or computed. |
+| `search` / `lookup` | Neither fits. Two functions: everything matching what has been typed, and one exact handle. |
+
+For the first two, name the fields:
 
 | Field | Meaning |
 | --- | --- |
-| `handle` | **Required.** What follows the symbol. No whitespace. |
-| `label` | What the chip and the typeahead show. Defaults to `handle`. |
-| `kind` | Free-form, becomes a `part` token: `::part(mention guest)`. Model participants get `agent`; anything else defaults to `subject`. |
+| `handle` | **Required.** What follows the symbol, and what resolves it. A field name, or a function of the record — a function is what a stored column cannot express, like a handle slugged from a display name. |
+| `label` | What the chip and the typeahead show. Defaults to the handle. Field name or function. |
+| `kind` | Free-form, becomes a `part` token: `::part(mention ticket)`. Model participants get `agent`. |
 | `detail` | A second line in the typeahead, and the chip's tooltip. |
-| `prefix` | The symbol that summons it. Defaults to `@`. |
+| `limit` | How many the typeahead offers at once. Default 8. |
+| `max` | Ceiling on records read from a collection at once. Default 1000 — a guard against an unbounded publication, not a page size. |
+
+The package never looks at a record beyond the fields you name here, so nothing
+about your domain reaches it.
 
 ### A second symbol
 
-`prefix` gives you another namespace in the same composer:
-
-```js
-chat.mentionables = [
-  { handle: 'priya-natarajan', label: 'Priya Natarajan', kind: 'guest' },
-  { handle: 'ast-1-course', label: 'AST 1', kind: 'offering', prefix: '#' },
-];
-```
-
 Each symbol offers only what it names — typing `#` will not suggest a person —
-and the two namespaces are independent, so `@ast-1` and `#ast-1` are different
+and the namespaces are independent, so `@acme` and `#acme` are different
 subjects rather than one overwriting the other.
 
+`@` always carries the session's model participants, layered **under** whatever
+you put there: you can add subjects to `@`, but you cannot shadow a real
+addressee with an inert one of the same name.
+
 Reach for a second symbol when the things being named are of a different
-**order**, not merely a different type: `@` reaches people, and for a model
-participant it actually routes the turn, while `#` might point at a catalogue
-item that could never take one. Only `@` is ever parsed as an addressee, so
-anything under another symbol is inert by construction.
+**order**, not merely a different type: `@` reaches someone who could answer,
+and for a model participant it actually routes the turn, while `#` might name a
+row in a price list that could never take one. Only `@` is ever parsed as an
+addressee, so anything under another symbol is inert by construction.
 
 App-supplied subjects are **inert on purpose**: they render and they complete,
 but naming one schedules nothing. Only a model participant can take a turn, and
 the package will not invent a routing rule for a noun it cannot see — if you
-want `@priya` to *do* something, give the agent a tool that resolves the handle.
+want `@acme` to *do* something, give the agent a tool that resolves the handle.
 
 A token that matches nothing stays plain text. That is the same rule
 `resolveAddressee` uses, and keeping the two in step is the point: a chip that

@@ -48,27 +48,126 @@ export interface Mentionable {
   handle: string;
   /** Shown in the chip and the typeahead. Defaults to `handle`. */
   label?: string;
-  /** Free-form; becomes a `part` token, so `::part(mention guest)` works. */
+  /** Free-form; becomes a `part` token, so `::part(mention ticket)` works. */
   kind?: string;
-  /** A second line in the typeahead — an email, a role, a last-seen date. */
+  /** A second line in the typeahead — an address, a role, a price, a date. */
   detail?: string;
-  /**
-   * The symbol that summons it. Defaults to `@`.
-   *
-   * A second symbol is worth having when the things being named are of a
-   * different ORDER, not merely a different type: `@` reaches people (and, for
-   * model participants, actually routes the turn), while something like `#`
-   * points at an item in a catalogue that could never take a turn. One symbol
-   * for both makes the composer offer a product where a person belongs.
-   *
-   * Only `@` is ever parsed as an addressee — see `resolveAddressee` — so a
-   * mentionable under any other symbol is inert by construction, whatever kind
-   * it claims.
-   */
-  prefix?: string;
+}
+
+/** A field name on the record, or a function derived from it. A function is
+ *  what a stored column cannot express: a handle slugged from a display name,
+ *  a label joined from two columns. */
+type Field<T> = string | ((record: never) => T | undefined);
+
+/** The shape this element needs from a live collection: a reactive `find` it
+ *  can `fetch`. Structural on purpose — the package neither imports Mongo nor
+ *  requires that the thing on the other side IS Mongo. */
+export interface MentionCollection {
+  find(selector: unknown, options: unknown): { fetch(): unknown[] };
+}
+
+interface MentionShape {
+  /** The `part` token every entry from this source carries. */
+  kind?: string;
+  /** What follows the symbol. Required — nothing else identifies the record. */
+  handle: Field<string>;
+  /** Defaults to the handle. */
+  label?: Field<string>;
+  detail?: Field<string>;
+  /** How many the typeahead offers at once. Default 8. */
+  limit?: number;
+  /** Ceiling on records pulled from a collection in one read. Default 1000 —
+   *  a guard against an unbounded publication, not a page size. */
+  max?: number;
+}
+
+/**
+ * Where the things one symbol names come from.
+ *
+ * Three forms, because the shapes an app actually has are not all the same:
+ * a live collection whose contents change under the user, a plain list that is
+ * computed or static, or — when neither fits — the two functions the element
+ * really needs. The first two are conveniences over the third.
+ *
+ * A collection is read inside the element's own `Tracker.autorun`, so chips
+ * repaint when the underlying data changes with nothing to wire up.
+ */
+export type MentionSource =
+  | (MentionShape & { collection: MentionCollection; list?: never })
+  | (MentionShape & { list: unknown[] | (() => unknown[]); collection?: never })
+  | {
+    kind?: string;
+    /** Everything matching what has been typed so far. `''` means "the symbol
+     *  was just typed" — answer with a sensible opening set, not everything. */
+    search(query: string): Mentionable[];
+    /** One exact handle, for rendering a chip in text already written. Omit it
+     *  and `search(handle)` is used, which is correct but does more work. */
+    lookup?(handle: string): Mentionable | null | undefined;
+  };
+
+/** What a symbol resolves to once the three source forms are flattened. */
+interface ResolvedSource {
+  search(query: string): Mentionable[];
+  lookup(handle: string): Mentionable | null;
 }
 
 const DEFAULT_PREFIX = '@';
+const DEFAULT_LIMIT = 8;
+const DEFAULT_MAX = 1000;
+
+function fieldOf<T>(record: unknown, field: Field<T> | undefined): T | undefined {
+  if (field === undefined) return undefined;
+  if (typeof field === 'function') return (field as (r: unknown) => T | undefined)(record);
+  return (record as Record<string, T> | null)?.[field];
+}
+
+function matches(m: Mentionable, needle: string): boolean {
+  return `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(needle);
+}
+
+/**
+ * One source, whatever form it arrived in, as `search` + `lookup`.
+ *
+ * The collection and list forms MATERIALISE ONCE per resolver and cache, so a
+ * paint that renders forty rows reads the collection once rather than forty
+ * times. The cache is safe because a resolver is built fresh per paint and per
+ * keystroke — it never outlives the read it was made for, so it cannot go
+ * stale against the data it came from.
+ */
+function normalizeSource(src: MentionSource): ResolvedSource {
+  if ('search' in src && typeof src.search === 'function') {
+    const ok = (list: Mentionable[] | undefined) => (list ?? []).filter((m) => m && m.handle);
+    return {
+      search: (q) => ok(src.search(q)),
+      lookup: (h) => (src.lookup
+        ? src.lookup(h) ?? null
+        : ok(src.search(h)).find((m) => m.handle === h) ?? null),
+    };
+  }
+  const cfg = src as MentionShape & {
+    collection?: MentionCollection; list?: unknown[] | (() => unknown[]);
+  };
+  let cache: Mentionable[] | null = null;
+  const all = (): Mentionable[] => {
+    if (cache) return cache;
+    const records: unknown[] = cfg.collection
+      ? cfg.collection.find({}, { limit: cfg.max ?? DEFAULT_MAX }).fetch()
+      : (typeof cfg.list === 'function' ? cfg.list() : cfg.list ?? []);
+    cache = records
+      .map((r) => ({
+        handle: String(fieldOf<string>(r, cfg.handle) ?? ''),
+        label: fieldOf<string>(r, cfg.label),
+        detail: fieldOf<string>(r, cfg.detail),
+        kind: cfg.kind,
+      }))
+      .filter((m) => m.handle !== '');
+    return cache;
+  };
+  return {
+    search: (q) => all().filter((m) => matches(m, q.toLowerCase())).slice(0, cfg.limit ?? DEFAULT_LIMIT),
+    lookup: (h) => all().find((m) => m.handle === h) ?? null,
+  };
+}
 /** Same character class as `LEADING_MENTION` in common/participants.ts. The two
  *  must agree for `@`: a token this renders as a chip but the parser will not
  *  accept as an addressee is a chip that promises routing it cannot deliver. */
@@ -332,7 +431,7 @@ function renderRow(
   m: ViewMessage, names: Map<string, string>,
   download?: (attachmentId: string) => void,
   quiet = false,
-  mentions: Map<string, Mentionable> = new Map(),
+  mentions: Map<string, ResolvedSource> = new Map(),
 ): HTMLElement | null {
   if (quiet) {
     // A tool result is the machine's working, not the answer.
@@ -436,10 +535,10 @@ function renderRow(
  * against `resolveAddressee`: if the roster does not know the name, the message
  * did not address anyone, and it should not look as though it did.
  */
-function renderText(text: string, mentions: Map<string, Mentionable>): Node[] {
+function renderText(text: string, mentions: Map<string, ResolvedSource>): Node[] {
   if (!text) return [];
   if (mentions.size === 0) return [document.createTextNode(text)];
-  const prefixes = [...new Set([...mentions.values()].map((m) => m.prefix ?? DEFAULT_PREFIX))];
+  const prefixes = [...mentions.keys()];
   const nodes: Node[] = [];
   let cursor = 0;
   // A fresh regex per call: /g carries `lastIndex` between uses, and one shared
@@ -454,10 +553,11 @@ function renderText(text: string, mentions: Map<string, Mentionable>): Node[] {
     const prefix = hit[1];
     const raw = hit[2];
     const trimmed = raw.replace(/[.-]+$/, '');
-    const found = mentions.get(prefix + raw)
-      ?? (trimmed !== raw ? mentions.get(prefix + trimmed) : undefined);
+    const source = mentions.get(prefix);
+    const exact = source?.lookup(raw) ?? null;
+    const found = exact ?? (trimmed !== raw ? source?.lookup(trimmed) ?? null : null);
     if (found) {
-      const handle = mentions.get(prefix + raw) ? raw : trimmed;
+      const handle = exact ? raw : trimmed;
       if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
       const chip = document.createElement('span');
       const kind = found.kind ?? 'subject';
@@ -532,9 +632,12 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     /** App-supplied `@`-able subjects. A property, not an attribute: this is a
      *  list of objects, and a JSON attribute would make every roster change a
      *  re-parse of a string the host already had in hand. */
-    private appMentions: Mentionable[] = [];
+    private sources: Record<string, MentionSource> = {};
     /** The suggestions currently offered, and which one Enter would take. */
     private suggestions: Mentionable[] = [];
+    /** The symbol that opened the list. Carried separately because a record no
+     *  longer knows its own symbol — the source it came from is keyed by one. */
+    private suggestPrefix: string = DEFAULT_PREFIX;
     private cursorAt = -1;
     private client: Agent | null = null;
     private sid: string | null = null;
@@ -605,47 +708,74 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     get agentInstance(): Agent | null { return this.client; }
 
     /**
-     * Extra `@`-able subjects, on top of the session's own model participants.
+     * What each symbol names, keyed BY the symbol.
      *
-     * Set it to the nouns THIS app's users talk about — customers, tickets,
-     * accounts. They render as chips and complete in the composer; they do not
-     * route, because only a model participant can take a turn.
+     * ```js
+     * chat.mentionSources = {
+     *   '@': { collection: Customers, handle: (c) => slug(c.name), label: 'name', kind: 'customer' },
+     *   '#': { list: () => tickets.open(), handle: 'id', label: 'title', kind: 'ticket' },
+     * };
+     * ```
      *
-     * Copied on the way in, so a host mutating the array it passed cannot
-     * silently change what the element believes without a repaint.
+     * The element owns the UI — matching, the typeahead, the keyboard, chips in
+     * the transcript — and the app owns only WHERE the records come from. It
+     * never inspects a record beyond the fields named here, so nothing about
+     * the app's domain reaches the package.
+     *
+     * `@` always carries the session's own MODEL participants, layered UNDER
+     * anything set here: an app can add subjects to `@` but cannot shadow a
+     * real addressee with an inert one of the same name. Every other symbol is
+     * inert by construction, because `resolveAddressee` parses one leading `@`
+     * and nothing else.
+     *
+     * A second symbol earns its place when the things named are of a different
+     * ORDER, not merely a different type: `@` reaches someone who could answer;
+     * `#` might name a row in a price list that could never take a turn. One
+     * symbol for both makes the composer offer a product where a person belongs.
      */
-    get mentionables(): Mentionable[] { return [...this.appMentions]; }
+    get mentionSources(): Record<string, MentionSource> { return { ...this.sources }; }
 
-    set mentionables(list: Mentionable[]) {
-      this.appMentions = Array.isArray(list) ? list.filter((m) => m && m.handle) : [];
+    set mentionSources(next: Record<string, MentionSource>) {
+      this.sources = next && typeof next === 'object' ? { ...next } : {};
       this.paint();
     }
 
     /**
-     * `prefix + handle` → subject, for both the transcript and the typeahead.
+     * Symbol → resolved source, for both the transcript and the typeahead.
      *
-     * Keyed WITH the prefix so `@ast-1` and `#ast-1` are different subjects
-     * rather than one overwriting the other — which is the whole point of a
-     * second symbol.
-     *
-     * The session's MODEL participants come first and the app's list is layered
-     * over them, so an app can relabel `@risk` but cannot accidentally shadow a
-     * real addressee with an inert subject of the same name.
+     * Built FRESH on every read, which is what makes the collection form
+     * reactive: `find().fetch()` runs inside the caller's `Tracker.autorun`, so
+     * a paint re-registers its dependency each time and re-runs when the data
+     * changes. It is also what makes each source's internal cache safe.
      */
-    private mentionMap(): Map<string, Mentionable> {
-      const out = new Map<string, Mentionable>();
+    private mentionMap(): Map<string, ResolvedSource> {
+      const out = new Map<string, ResolvedSource>();
+      for (const [prefix, src] of Object.entries(this.sources)) {
+        if (src) out.set(prefix, normalizeSource(src));
+      }
+
       const session = this.client && this.sid ? this.client.session(this.sid) : null;
+      const roster: Mentionable[] = [];
       for (const p of session?.participants ?? []) {
         if (p.kind !== 'model' || !p.agent) continue;
-        out.set(DEFAULT_PREFIX + p.agent, {
-          handle: p.agent, label: p.agent, kind: 'agent',
-          detail: p.displayName, prefix: DEFAULT_PREFIX,
-        });
+        roster.push({ handle: p.agent, label: p.agent, kind: 'agent', detail: p.displayName });
       }
-      for (const m of this.appMentions) {
-        const prefix = m.prefix ?? DEFAULT_PREFIX;
-        out.set(prefix + m.handle, { kind: 'subject', ...m, prefix });
-      }
+      if (roster.length === 0 && !out.has(DEFAULT_PREFIX)) return out;
+
+      // The roster goes FIRST in both directions, so a real addressee always
+      // wins the name over an app subject that happens to share it.
+      const app = out.get(DEFAULT_PREFIX);
+      out.set(DEFAULT_PREFIX, {
+        search: (q) => {
+          const needle = q.toLowerCase();
+          const hits = roster.filter((m) => matches(m, needle));
+          const extra = (app?.search(q) ?? []).filter(
+            (m) => !roster.some((r) => r.handle === m.handle),
+          );
+          return [...hits, ...extra];
+        },
+        lookup: (h) => roster.find((m) => m.handle === h) ?? app?.lookup(h) ?? null,
+      });
       return out;
     }
 
@@ -843,9 +973,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       // A range selection has no single insertion point to complete at.
       if (input.selectionStart === null || input.selectionStart !== input.selectionEnd) return null;
       const caret = input.selectionStart;
-      const prefixes = [...new Set(
-        [...this.mentionMap().values()].map((m) => m.prefix ?? DEFAULT_PREFIX),
-      )];
+      const prefixes = [...this.mentionMap().keys()];
       if (prefixes.length === 0) return null;
       const hit = tokenPattern(prefixes, true).exec(input.value.slice(0, caret));
       if (!hit) return null;
@@ -859,18 +987,20 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     private refreshSuggestions() {
       const token = this.tokenAtCaret();
       if (!token) { this.closeSuggestions(); return; }
-      const q = token.query.toLowerCase();
-      const all = [...this.mentionMap().values()];
-      const matches = all
-        // Only what THIS symbol names: typing `#` must not offer a person.
-        .filter((m) => (m.prefix ?? DEFAULT_PREFIX) === token.prefix)
-        .filter((m) => `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(q));
-      if (matches.length === 0) { this.closeSuggestions(); return; }
-      // Agents before subjects: in a chat the addressable thing is the more
-      // likely intent, and a roster is short enough that it never buries the
-      // subject list.
-      matches.sort((a, b) => Number(a.kind === 'subject') - Number(b.kind === 'subject'));
-      this.suggestions = matches.slice(0, 8);
+      // Only what THIS symbol names: typing `#` must not offer a person. The
+      // source does its own matching, so a big collection can filter at the
+      // query rather than shipping everything here to be sieved.
+      const source = this.mentionMap().get(token.prefix);
+      const hits = source ? source.search(token.query) : [];
+      if (hits.length === 0) { this.closeSuggestions(); return; }
+      // Agents before everything else: in a chat the addressable thing is the
+      // likelier intent, and a roster is short enough that it never buries the
+      // rest.
+      const ranked = [...hits].sort(
+        (a, b) => Number(a.kind !== 'agent') - Number(b.kind !== 'agent'),
+      );
+      this.suggestions = ranked.slice(0, 8);
+      this.suggestPrefix = token.prefix;
       this.cursorAt = 0;
       this.paintSuggestions();
     }
@@ -887,7 +1017,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         const handle = document.createElement('span');
         handle.className = 'suggestion-handle';
         handle.setAttribute('part', 'suggestion-handle');
-        handle.textContent = `${m.prefix ?? DEFAULT_PREFIX}${m.label ?? m.handle}`;
+        handle.textContent = `${this.suggestPrefix}${m.label ?? m.handle}`;
         row.append(handle);
         if (m.detail) {
           const detail = document.createElement('span');
@@ -942,7 +1072,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const caret = input.selectionStart ?? input.value.length;
       // The trailing space is what ends the token: without it the next
       // keystroke re-opens the list against a handle that is already complete.
-      const insert = `${chosen.prefix ?? DEFAULT_PREFIX}${chosen.handle} `;
+      const insert = `${token.prefix}${chosen.handle} `;
       input.value = input.value.slice(0, token.start) + insert + input.value.slice(caret);
       const at = token.start + insert.length;
       input.setSelectionRange(at, at);
