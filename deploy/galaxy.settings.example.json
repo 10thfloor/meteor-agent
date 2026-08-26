@@ -1,0 +1,23 @@
+{
+  "galaxy.meteor.com": {
+    "env": {
+      "ROOT_URL": "https://YOUR-APP.meteorapp.com",
+      "MONGO_URL": "mongodb+srv://USER:PASSWORD@HOST/DATABASE?retryWrites=true&w=majority"
+    }
+  },
+  "packages": {
+    "10thfloor:agent": {
+      "attachments": {
+        "retentionDays": 7
+      },
+      "rateLimit": {
+        "starts": { "count": 5, "intervalMs": 60000 },
+        "sends": { "count": 20, "intervalMs": 60000 },
+        "interrupts": { "count": 20, "intervalMs": 60000 },
+        "approvals": { "count": 20, "intervalMs": 60000 },
+        "compacts": { "count": 5, "intervalMs": 60000 },
+        "memories": { "count": 30, "intervalMs": 60000 }
+      }
+    }
+  }
+}

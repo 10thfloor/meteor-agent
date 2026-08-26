@@ -109,6 +109,15 @@ Support.define({ model: 'mock', instructions: '…',
 
 The default package suite runs entirely network-free.
 
+### Deploy to Meteor Galaxy
+
+The first documented host target is Meteor Galaxy. `10thfloor:agent` deploys
+inside **your own Meteor application**—it is not a separate agent service.
+Follow the **[Galaxy deployment runbook](docs/deployment/galaxy.md)** to build
+that host app, prepare secret-safe settings, and validate MongoDB reactivity
+and model-spend controls. This repository's `app/` is documented separately in
+the runbook as an optional platform smoke test, not a production starter.
+
 ## Why this exists
 
 Every agent framework rebuilds the same four things: a durable transcript, a
@@ -708,9 +717,11 @@ app/packages/agent-channel-telegram/  Telegram surface  │ one lens, one
 app/packages/agent-channel-whatsapp/  WhatsApp surface  │ transport each
 app/packages/agent-channel-sms/       SMS (Twilio)      │
 app/packages/agent-channel-email/     Email (Postmark)  ┘
-app/                                  host app: test harness + the demo chat
+app/                                  reference/test host; not an app template
+docs/deployment/                      production-host deployment runbooks
 docs/superpowers/specs/               historical architectural decisions
 scripts/verify-build.sh               proves the loader against a real production bundle
+deploy/galaxy.settings.example.json   host-app Galaxy settings starting point
 ```
 
 Development workflow, the test command, and the npm-dependency policy are in
