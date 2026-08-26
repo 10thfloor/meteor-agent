@@ -106,6 +106,36 @@ describe('participants', () => {
       assert.deepEqual(resolveRelay('@analyst over to you', session, 'prime'), { id: 'm:analyst', agent: 'analyst' });
     });
 
+    it('names the near miss: a model mentioned but not addressed', async () => {
+      const { unroutedMention } = await import('../common/participants');
+      const session = {
+        agent: 'prime',
+        participants: [
+          { id: 'h:u1', kind: 'human' as const, role: 'owner' as const, userId: 'u1', displayName: 'o', joinedAt: new Date() },
+          model('prime'), model('analyst'),
+        ],
+      };
+
+      // The shape that keeps happening: a sentence of preamble, then the
+      // mention. It reads as addressed and schedules nothing.
+      assert.strictEqual(
+        unroutedMention('Let me correct course and consult @analyst as the process requires.', session, 'prime'),
+        'analyst',
+      );
+      // Punctuation retry, same as the addressee parse.
+      assert.strictEqual(unroutedMention('over to @analyst.', session, 'prime'), 'analyst');
+
+      // It DID address someone: nothing was missed, so nothing to say.
+      assert.isNull(unroutedMention('@analyst please look', session, 'prime'));
+      // Naming yourself is not a missed relay — a model cannot relay to itself.
+      assert.isNull(unroutedMention('I, @prime, will handle it', session, 'prime'));
+      // Not a participant, so not a near miss — just text.
+      assert.isNull(unroutedMention('ask @nobody about it', session, 'prime'));
+      assert.isNull(unroutedMention('no mentions at all', session, 'prime'));
+      // No roster, no addressing, so no near miss either.
+      assert.isNull(unroutedMention('ask @analyst', { agent: 'prime' }, 'prime'));
+    });
+
     it('prefixes only when attribution disambiguates, and the block names colleagues', async () => {
       const { needsAttribution, participantsBlock } = await import('../common/participants');
       const owner = { id: 'h:u1', kind: 'human' as const, role: 'owner' as const, userId: 'u1', displayName: 'Mackenzie', joinedAt: new Date() };

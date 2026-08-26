@@ -152,6 +152,50 @@ export function resolveRelay(
   return hit && hit.agent !== selfAgent ? hit : null;
 }
 
+/**
+ * A mention that ALMOST routed.
+ *
+ * The addressee parse reads exactly one position — the leading token — and that
+ * narrowness is deliberate (decision 5): a message is addressed, or it merely
+ * mentions. The failure it admits is silent, though, and models walk into it.
+ * A model that opens with a sentence of preamble and puts `@risk` in the second
+ * paragraph has written something that LOOKS addressed, reads as addressed to a
+ * person scrolling the transcript, and schedules nothing at all. The turn ends,
+ * the roster sits idle, and the question hangs unanswered with no indication
+ * that anything went wrong.
+ *
+ * So: name the near miss. This finds an `@token` naming another MODEL
+ * participant in text that addressed nobody, and the caller writes a note row
+ * saying so. It changes no routing — auto-addressing on a buried mention would
+ * make the parse ambiguous, which is exactly what decision 5 refused — it only
+ * ends the silence.
+ *
+ * Returns the agent name, or null when the text addressed someone (nothing
+ * missed) or named no model at all (nothing to say).
+ */
+export function unroutedMention(
+  text: string | undefined, session: Roster, selfAgent?: string,
+): string | null {
+  if (!text) return null;
+  // It routed. Nothing was missed.
+  if (resolveAddressee(text, undefined, session)) return null;
+  const models = modelParticipants(session);
+  if (models.length === 0) return null;
+  const scan = /@([\w.-]{1,64})/g;
+  let hit: RegExpExecArray | null = scan.exec(text);
+  while (hit !== null) {
+    // Same punctuation retry as the addressee parse, so "@risk." counts.
+    const raw = hit[1];
+    const trimmed = raw.replace(/[.-]+$/, '');
+    const found = models.find((p) => p.agent === raw)
+      ?? models.find((p) => p.agent === trimmed);
+    // Naming yourself is not a missed relay — a model cannot relay to itself.
+    if (found && found.agent !== selfAgent) return found.agent!;
+    hit = scan.exec(text);
+  }
+  return null;
+}
+
 /** Do attribution prefixes disambiguate anything (decision 9)? Only in a
  *  roster with ≥2 humans or ≥2 models — the 1:1 provider payload must stay
  *  byte-identical to the rosterless one. */

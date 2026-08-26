@@ -423,7 +423,11 @@ export interface AgentMessage {
    * reachable from the conversation again (§4.3). It answers no tool call and
    * carries no result: the child's own transcript is the record of what it did.
    */
-  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child';
+  kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child'
+    | 'unrouted-mention';
+  /** `kind: 'unrouted-mention'` notes only: the agent the text named but did
+   *  not address. */
+  mentioned?: string;
   /** `kind: 'budget'` notes only. WHICH limit tripped, so a UI can say
    *  "out of tool calls" rather than "budget exhausted" and an operator can
    *  raise the right one. The human-readable half lives in `error.reason`. */
