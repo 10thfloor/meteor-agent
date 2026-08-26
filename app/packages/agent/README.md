@@ -829,6 +829,7 @@ framework never re-renders it.
 | `agent` | **Required.** The name a server-side `new Agent(name, …)` registered. |
 | `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
 | `placeholder` | Composer hint. |
+| `verbosity` | `full` (default) shows everything. `quiet` renders the conversation without the machine's working — no tool results, no `→ name({…})` traces, and no empty bubble where a tool-only assistant turn was. Errors, budget stops and approval notes always show. It only changes what is drawn, so toggling it re-paints without touching the session. |
 
 Re-pointing the element usually takes two attribute writes
 (`removeAttribute('session-id')`, then `setAttribute('agent', …)`), and

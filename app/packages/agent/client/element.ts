@@ -203,10 +203,37 @@ function noteText(m: ViewMessage): string {
   return m.error?.reason ?? m.kind ?? '';
 }
 
+/**
+ * One transcript row, or `null` for a row this verbosity does not show.
+ *
+ * `quiet` is the reading an OPERATOR wants: the conversation, and the decisions
+ * they have to make. A tool's raw result and the `→ name({…})` trace under an
+ * assistant bubble are the machine's working, and in a business UI they bury
+ * the answer under JSON.
+ *
+ * Dropping them is not enough on its own: an assistant row that only called
+ * tools has NO text of its own, so hiding the trace alone would leave an empty
+ * bubble per tool round. Quiet therefore drops the whole row when nothing human
+ * -readable is left — which is why this is a filter here and not a `::part`
+ * rule in the host page, where the empty row is unaddressable.
+ *
+ * Errors, budget stops and approval notes are never quiet: they are the reasons
+ * a person is needed.
+ */
 function renderRow(
   m: ViewMessage, names: Map<string, string>,
   download?: (attachmentId: string) => void,
-): HTMLElement {
+  quiet = false,
+): HTMLElement | null {
+  if (quiet) {
+    // A tool result is the machine's working, not the answer.
+    if (m.role === 'tool') return null;
+    // Compaction is bookkeeping about the transcript, not about the business.
+    if (m.role === 'note' && m.kind === 'compaction') return null;
+    // An assistant turn that only called tools says nothing a person can read.
+    const speaks = (m.content ?? '').trim() !== '' || !!m.attachments?.length;
+    if (m.role === 'assistant' && !speaks && !m.streaming) return null;
+  }
   const row = document.createElement('div');
   // `part` and `class` carry the same tokens: the class drives the sheet
   // above, the part exposes the identical hook to the host page. Note rows add
@@ -255,7 +282,7 @@ function renderRow(
   // start of this row's text; the ellipsis says so rather than silently
   // presenting a fragment as the whole message.
   row.append(document.createTextNode((m.truncatedHead ? '…' : '') + (m.content ?? '')));
-  if (m.toolCalls?.length) {
+  if (m.toolCalls?.length && !quiet) {
     const calls = document.createElement('span');
     calls.className = 'calls';
     calls.setAttribute('part', 'tool-calls');
@@ -318,7 +345,9 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
   if (existing) return existing;
 
   class AgentChat extends HTMLElement {
-    static get observedAttributes() { return ['agent', 'session-id', 'placeholder']; }
+    static get observedAttributes() {
+      return ['agent', 'session-id', 'placeholder', 'verbosity'];
+    }
 
     private ui!: {
       phase: HTMLElement;
@@ -396,6 +425,9 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     attributeChangedCallback(name: string, before: string | null, after: string | null) {
       if (before === after || !this.live) return;
       if (name === 'placeholder') { this.applyPlaceholder(); return; }
+      // `verbosity` changes only what is DRAWN. Re-subscribing for it would
+      // tear down a live session to change a display filter.
+      if (name === 'verbosity') { this.paint(); return; }
       // `agent` or `session-id`: a clean re-subscribe, COALESCED — see
       // `queueReattach`.
       this.queueReattach();
@@ -516,7 +548,14 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
             .catch((e) => { console.warn('[agent-chat] download refused:', e); });
         }
         : undefined;
-      const nodes: HTMLElement[] = rows.map((m) => renderRow(m, names, download));
+      // `verbosity="quiet"` drops the machine's working (tool results, the
+      // `→ name({…})` traces, and the tool-only assistant rows those leave
+      // behind). Anything else — including an absent attribute — is `full`,
+      // so the default is unchanged for every existing consumer.
+      const quiet = this.getAttribute('verbosity') === 'quiet';
+      const nodes: HTMLElement[] = rows
+        .map((m) => renderRow(m, names, download, quiet))
+        .filter((n): n is HTMLElement => n !== null);
       if (this.failure) nodes.push(failureRow(this.failure));
       this.ui.messages.replaceChildren(...nodes);
       this.ui.messages.scrollTop = this.ui.messages.scrollHeight;
