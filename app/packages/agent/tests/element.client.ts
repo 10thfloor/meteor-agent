@@ -203,6 +203,34 @@ describe('<agent-chat>', () => {
     assert.include(part(el, 'tool-name').textContent ?? '', 'refund');
     assert.include(part(el, 'tool-content').textContent ?? '', 'refunded');
     assert.isTrue(bar.hidden, 'the bar must retract once the verdict is in');
+
+    // VERBOSITY, on the session this test already built — it is the only one
+    // with the shape that matters (a tool-calling assistant row, a tool result,
+    // and a real reply) and re-driving one would spend the shared DDP budget
+    // this file's header warns about. The attribute only re-paints, so the
+    // assertions below are synchronous.
+    el.setAttribute('verbosity', 'quiet');
+    assert.lengthOf(partsAll(el, 'tool'), 0, 'quiet drops the tool result row');
+    assert.lengthOf(partsAll(el, 'tool-calls'), 0, 'and the → name({…}) trace');
+    // The subtle one: an assistant row that ONLY called tools has no text of
+    // its own, so hiding the trace alone would leave an empty bubble behind.
+    assert.isTrue(
+      committed(el, 'assistant').every((t) => t.trim() !== ''),
+      'quiet leaves no empty assistant bubble where a tool-only turn was',
+    );
+    assert.include(
+      committed(el, 'assistant'), 'all done',
+      'the actual reply is the thing quiet keeps',
+    );
+    assert.isTrue(
+      committed(el, 'note').some((t) => t.startsWith('Approved')),
+      'and an approval note is never quiet — it is why a person was needed',
+    );
+
+    // A filter, not a mutation: everything comes back.
+    el.setAttribute('verbosity', 'full');
+    assert.include(part(el, 'tool-content').textContent ?? '', 'refunded');
+    assert.isAbove(partsAll(el, 'tool-calls').length, 0);
   });
 
   it('tears down on disconnect, and re-mounts clean', async function () {
