@@ -38,7 +38,9 @@ const waitFor = (
 type ChatElement = HTMLElement & {
   sessionId: string | null;
   agentInstance: { messages(sessionId: string): { fetch(): any[] } } | null;
-  mentionables: Array<{ handle: string; label?: string; kind?: string; detail?: string }>;
+  mentionables: Array<{
+    handle: string; label?: string; kind?: string; detail?: string; prefix?: string;
+  }>;
 };
 
 const mounted: ChatElement[] = [];
@@ -398,6 +400,64 @@ describe('<agent-chat>', () => {
     // An @ mid-word is an email address, not a mention.
     type('mail me at guillaume@coast');
     assert.isTrue(typeahead.hidden, 'an @ that does not open a word is not a mention');
+  });
+
+  it('keeps a second symbol separate from @, in the composer and the transcript', async function () {
+    this.timeout(60000);
+    assert.isString(streamedSession, 'this test replays the streaming test\'s session');
+    const el = mount({ agent: 'itest', 'session-id': streamedSession! });
+    el.mentionables = [
+      { handle: 'priya', label: 'Priya', kind: 'guest' },
+      { handle: 'ast-1-course', label: 'AST 1', kind: 'offering', prefix: '#' },
+    ];
+    const input = part<HTMLInputElement>(el, 'input');
+    const typeahead = part<HTMLElement>(el, 'typeahead');
+
+    const type = (text: string) => {
+      input.value = text;
+      input.setSelectionRange(text.length, text.length);
+      input.dispatchEvent(new Event('input'));
+    };
+
+    // Each symbol offers only what it names. Offering a person under `#` is the
+    // failure this separation exists to prevent.
+    type('book #');
+    assert.deepEqual(
+      partsAll(el, 'suggestion').map((n) => n.textContent), ['#AST 1'],
+      '# offers offerings only',
+    );
+    part<HTMLButtonElement>(el, 'send').click();
+    assert.strictEqual(input.value, 'book #ast-1-course ', '# completes with its own symbol');
+
+    type('ask @');
+    assert.deepEqual(
+      partsAll(el, 'suggestion').map((n) => n.textContent), ['@Priya'],
+      '@ does not offer the catalogue',
+    );
+    assert.isFalse(typeahead.hidden);
+
+    // Clear the open list before sending. With suggestions showing, Send
+    // COMPLETES rather than submits — which is the behaviour asserted above,
+    // and it silently ate this message until the clear was added.
+    type('');
+    assert.isTrue(typeahead.hidden);
+
+    await waitFor('the transcript to arrive over DDP', 30000, () =>
+      committed(el, 'assistant').includes('live streamed reply'));
+    say(el, 'put @priya on #ast-1-course, not #nonsense');
+    // Waiting on THIS row, not on a chip count: the session is shared with the
+    // test above, whose message already renders two chips here.
+    await waitFor('the new row to render', 30000, () =>
+      partsAll(el, 'user').some((n) => (n.textContent ?? '').includes('nonsense')));
+
+    const row = partsAll(el, 'user').find((n) => (n.textContent ?? '').includes('nonsense'))!;
+    assert.strictEqual(
+      row.textContent, 'put @Priya on #AST 1, not #nonsense',
+      'each chip keeps the symbol it was written with, and an unknown one stays text',
+    );
+    const kinds = Array.from(row.querySelectorAll('[part~="mention"]'))
+      .map((n) => (n.getAttribute('part') ?? '').split(' ')[1]);
+    assert.deepEqual(kinds, ['guest', 'offering'], 'and each carries its own kind');
   });
 
   /**

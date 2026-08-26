@@ -21,6 +21,20 @@ export interface Mentionable {
     kind?: string;
     /** A second line in the typeahead — an email, a role, a last-seen date. */
     detail?: string;
+    /**
+     * The symbol that summons it. Defaults to `@`.
+     *
+     * A second symbol is worth having when the things being named are of a
+     * different ORDER, not merely a different type: `@` reaches people (and, for
+     * model participants, actually routes the turn), while something like `#`
+     * points at an item in a catalogue that could never take a turn. One symbol
+     * for both makes the composer offer a product where a person belongs.
+     *
+     * Only `@` is ever parsed as an addressee — see `resolveAddressee` — so a
+     * mentionable under any other symbol is inert by construction, whatever kind
+     * it claims.
+     */
+    prefix?: string;
 }
 /**
  * Register `<agent-chat>` (or any tag name you prefer) and return its
