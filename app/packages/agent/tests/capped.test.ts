@@ -124,6 +124,45 @@ describe('publications', () => {
     assert.isUndefined(docs[0].lease, 'agent.sessions must not publish `lease`');
   });
 
+  it('shelves an archived session from agent.sessions, and hands it back on request', async () => {
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    const base = {
+      agent: 'support', userId: 'u1', phase: 'idle' as const, model: 'mock', nextSeq: 0,
+      usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    };
+    await AgentSessions.insertAsync({ ...base, _id: 'active' } as any);
+    await AgentSessions.insertAsync({ ...base, _id: 'shelved', archived: new Date() } as any);
+
+    const handler = (Meteor.server as any).publish_handlers['agent.sessions'];
+    const listed = await handler.call({ userId: 'u1' }, 'support').fetchAsync();
+    assert.deepEqual(
+      listed.map((d: any) => d._id), ['active'],
+      'archived is a shelf for the LIST — the default enumeration omits it',
+    );
+
+    const all = await handler.call({ userId: 'u1' }, 'support', true).fetchAsync();
+    assert.deepEqual(
+      all.map((d: any) => d._id).sort(), ['active', 'shelved'],
+      'and there is no second publication: the same one serves the shelf',
+    );
+
+    // The point of the separation. An archived session is still a session:
+    // nothing in the turn path reads the field, so a routine on a clock or an
+    // inbound message still reaches it. `agent.session` is that path's gate,
+    // and it stays open — the handler is async, hence the await before the
+    // cursors are anything to fetch from.
+    const single = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const cursors = await single.call({ userId: 'u1' }, 'support', 'shelved');
+    const served = await Promise.all(cursors.map((c: any) => c.fetchAsync()));
+    assert.isAbove(
+      served.flat().length, 0,
+      'archiving must not make a session unreachable — only unlisted',
+    );
+  });
+
   it('denies a non-owner of agent.session: publishes nothing', async () => {
     const { registerPublications } = await import('../server/publications');
     registerPublications();

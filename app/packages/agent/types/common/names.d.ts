@@ -19,6 +19,8 @@ export declare const NAMES: {
     readonly mFork: 'agent.fork';
     readonly mApprove: 'agent.approve';
     readonly mDeny: 'agent.deny';
+    readonly mArchive: 'agent.archive';
+    readonly mUnarchive: 'agent.unarchive';
     readonly mCompact: 'agent.compact';
     readonly mAttachmentToken: 'agent.attachmentToken';
     readonly pubMemories: 'agent.memories';

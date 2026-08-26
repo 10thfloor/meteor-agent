@@ -23,6 +23,8 @@ export const NAMES = {
   mFork: 'agent.fork',
   mApprove: 'agent.approve',
   mDeny: 'agent.deny',
+  mArchive: 'agent.archive',
+  mUnarchive: 'agent.unarchive',
   mCompact: 'agent.compact',
   mAttachmentToken: 'agent.attachmentToken',
   pubMemories: 'agent.memories',

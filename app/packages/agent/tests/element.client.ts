@@ -38,6 +38,7 @@ const waitFor = (
 type ChatElement = HTMLElement & {
   sessionId: string | null;
   agentInstance: { messages(sessionId: string): { fetch(): any[] } } | null;
+  mentionables: Array<{ handle: string; label?: string; kind?: string; detail?: string }>;
 };
 
 const mounted: ChatElement[] = [];
@@ -315,6 +316,88 @@ describe('<agent-chat>', () => {
       (window as any).__xss,
       'and nothing in it may execute — no onerror, no inline script',
     );
+  });
+
+  it('chips the @handles it knows and leaves the rest as text', async function () {
+    this.timeout(60000);
+    // Reuses the streaming test's session, per the budget note at the top:
+    // one `agent.send`, no `agent.start`.
+    assert.isString(streamedSession, 'this test replays the streaming test\'s session');
+    const el = mount({ agent: 'itest', 'session-id': streamedSession! });
+    el.mentionables = [{ handle: 'priya', label: 'Priya N', kind: 'guest', detail: 'guest' }];
+    await waitFor('the transcript to arrive over DDP', 30000, () =>
+      committed(el, 'assistant').includes('live streamed reply'));
+
+    // Three tokens, one message: a known handle, the same handle with sentence
+    // punctuation stuck to it, and one the element has never heard of.
+    say(el, 'ask @priya, then @priya. but not @nobody');
+    await waitFor('the mention row to render', 30000, () =>
+      partsAll(el, 'mention').length >= 2);
+
+    const chips = partsAll(el, 'mention').map((n) => n.textContent);
+    assert.deepEqual(
+      chips, ['@Priya N', '@Priya N'],
+      'both spellings resolve to one subject, and the label is what shows',
+    );
+    assert.include(
+      (partsAll(el, 'mention')[0].getAttribute('part') ?? '').split(' '), 'guest',
+      'the kind rides the part list so ::part(mention guest) can reach it',
+    );
+
+    // The un-chipped half has to survive EXACTLY — a renderer that rebuilds
+    // text around its chips is a renderer that can drop a character.
+    const row = partsAll(el, 'user').find((n) => (n.textContent ?? '').includes('nobody'))!;
+    assert.strictEqual(
+      row.textContent, 'ask @Priya N, then @Priya N. but not @nobody',
+      'punctuation, spacing and the unresolved token all stay put',
+    );
+    assert.lengthOf(
+      row.querySelectorAll('[part~="mention"]'), 2,
+      '@nobody matches no subject, so it stays plain text — same rule the '
+      + 'addressee parser uses',
+    );
+  });
+
+  it('completes an @mention in the composer instead of sending it', function () {
+    // No session and no DDP at all: the typeahead reads the element's own
+    // `mentionables`, so this costs the shared rate-limit counter nothing.
+    const el = mount({ agent: 'itest', 'session-id': 'no-such-session' });
+    el.mentionables = [
+      { handle: 'priya-natarajan', label: 'Priya Natarajan', detail: 'guest' },
+      { handle: 'marcus-webb', label: 'Marcus Webb', detail: 'guest' },
+    ];
+    const input = part<HTMLInputElement>(el, 'input');
+    const typeahead = part<HTMLElement>(el, 'typeahead');
+    assert.isTrue(typeahead.hidden, 'nothing offered until an @ is typed');
+
+    const type = (text: string) => {
+      input.value = text;
+      input.setSelectionRange(text.length, text.length);
+      input.dispatchEvent(new Event('input'));
+    };
+
+    type('tell me about @pri');
+    assert.isFalse(typeahead.hidden, 'a token under the caret opens the list');
+    assert.deepEqual(
+      partsAll(el, 'suggestion').map((n) => n.textContent),
+      ['@Priya Natarajanguest'],
+      'and it filters to what actually matches',
+    );
+
+    // Enter — via the form's own Send, which is what Enter triggers — must
+    // COMPLETE here, not send. A composer that sends "@pri" because the user
+    // pressed Enter to pick a name is the whole reason this is tested.
+    part<HTMLButtonElement>(el, 'send').click();
+    assert.strictEqual(
+      input.value, 'tell me about @priya-natarajan ',
+      'the HANDLE is inserted (not the label — the handle is what resolves), '
+      + 'with the space that ends the token',
+    );
+    assert.isTrue(typeahead.hidden, 'and the list closes behind it');
+
+    // An @ mid-word is an email address, not a mention.
+    type('mail me at guillaume@coast');
+    assert.isTrue(typeahead.hidden, 'an @ that does not open a word is not a mention');
   });
 
   /**

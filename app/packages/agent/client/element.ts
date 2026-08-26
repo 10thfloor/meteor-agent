@@ -28,6 +28,38 @@ import { prettySize } from '../common/format';
 
 const DEFAULT_TAG = 'agent-chat';
 const DEFAULT_PLACEHOLDER = 'Message the agent…';
+
+/**
+ * Something a message can name with `@`.
+ *
+ * The package resolves the session's own MODEL participants into this shape for
+ * free, because those are the handles that actually address a turn
+ * (`resolveAddressee` in common/participants.ts parses exactly one leading
+ * `@name` against them). An app adds its OWN subjects — a customer, a ticket, an
+ * account — through the `mentionables` property, and those are deliberately
+ * inert: they render and they autocomplete, but naming one schedules nothing,
+ * because the package will not invent a routing rule for a noun it cannot see.
+ *
+ * `handle` is what follows the `@`, and it may not contain whitespace. Anything
+ * that does not match a known handle stays plain text, which is the same rule
+ * the addressee parse uses: an unmatched `@name` is speech, not markup.
+ */
+export interface Mentionable {
+  handle: string;
+  /** Shown in the chip and the typeahead. Defaults to `handle`. */
+  label?: string;
+  /** Free-form; becomes a `part` token, so `::part(mention guest)` works. */
+  kind?: string;
+  /** A second line in the typeahead — an email, a role, a last-seen date. */
+  detail?: string;
+}
+
+/** Same character class as `LEADING_MENTION` in common/participants.ts. The two
+ *  must agree: a token this renders as a chip but the parser will not accept as
+ *  an addressee is a chip that promises routing it cannot deliver. */
+const MENTION_TOKEN = /@([\w.-]{1,64})/g;
+/** The partial token under the caret, for the typeahead. */
+const MENTION_PREFIX = /@([\w.-]{0,64})$/;
 /** The reason the built-in Deny button sends. It reaches the MODEL as the
  *  denied tool result, so it says who refused rather than just "denied". A host
  *  that wants to ask the human why calls `el.agentInstance.deny(el.sessionId,
@@ -127,6 +159,41 @@ const FRAME = `
     background: color-mix(in srgb, #fff 15%, transparent);
   }
 
+  /* A resolved @handle. Inline so it wraps with the sentence it is part of —
+     a chip that cannot break mid-line turns one long mention into a scrollbar. */
+  .mention {
+    border-radius: 0.35rem; padding: 0 0.2rem; font-weight: 600;
+    background: color-mix(in srgb, var(--_accent) 20%, transparent);
+  }
+  /* Anything that is not a model participant is a SUBJECT, not an addressee.
+     It reads as a reference rather than a call, because naming it schedules
+     nothing — see the Mentionable docblock. */
+  .mention.subject {
+    background: color-mix(in srgb, var(--_fg) 13%, transparent); font-weight: 500;
+  }
+  /* On the user bubble the accent IS the background, so the chip has to lift
+     off white instead of off the page. */
+  .message.user .mention { background: color-mix(in srgb, #fff 30%, transparent); }
+
+  .typeahead {
+    position: absolute; left: 1rem; right: 1rem; bottom: calc(100% - 0.25rem);
+    z-index: 2; max-height: 12rem; overflow-y: auto; padding: 0.25rem;
+    border-radius: var(--_radius); background: var(--_bg);
+    border: 1px solid color-mix(in srgb, var(--_fg) 22%, transparent);
+    box-shadow: 0 0.5rem 1.5rem color-mix(in srgb, var(--_fg) 18%, transparent);
+  }
+  .typeahead[hidden] { display: none; }
+  .suggestion {
+    display: flex; align-items: baseline; gap: 0.5rem; width: 100%;
+    padding: 0.35rem 0.5rem; border-radius: 0.4rem; cursor: pointer;
+    background: none; color: var(--_fg); text-align: left; font: inherit;
+  }
+  .suggestion[aria-selected="true"] {
+    background: color-mix(in srgb, var(--_accent) 18%, transparent);
+  }
+  .suggestion-handle { font-weight: 600; }
+  .suggestion-detail { font-size: 0.8rem; opacity: 0.65; margin-left: auto; }
+
   .approval {
     display: flex; gap: 0.5rem; align-items: center; padding: 0.75rem 1rem;
     border-top: 1px solid var(--_warn);
@@ -143,6 +210,8 @@ const FRAME = `
   .composer {
     display: flex; gap: 0.5rem; padding: 0.75rem 1rem;
     border-top: 1px solid color-mix(in srgb, var(--_fg) 15%, transparent);
+    /* The typeahead anchors to this. */
+    position: relative;
   }
   .input {
     flex: 1; padding: 0.5rem 0.75rem; border-radius: 0.5rem; font: inherit;
@@ -168,7 +237,9 @@ const FRAME = `
     <button type="button" class="deny secondary" part="button deny">Deny</button>
   </div>
   <form class="composer" part="composer">
-    <input class="input" part="input" autocomplete="off" />
+    <div class="typeahead" part="typeahead" role="listbox" hidden></div>
+    <input class="input" part="input" autocomplete="off" role="combobox"
+           aria-expanded="false" aria-autocomplete="list" />
     <button type="submit" class="send" part="button send">Send</button>
     <button type="button" class="stop secondary" part="button stop" title="Interrupt the turn">Stop</button>
   </form>
@@ -224,6 +295,7 @@ function renderRow(
   m: ViewMessage, names: Map<string, string>,
   download?: (attachmentId: string) => void,
   quiet = false,
+  mentions: Map<string, Mentionable> = new Map(),
 ): HTMLElement | null {
   if (quiet) {
     // A tool result is the machine's working, not the answer.
@@ -281,7 +353,8 @@ function renderRow(
   // `truncatedHead` means compaction (or a capped-collection gap) dropped the
   // start of this row's text; the ellipsis says so rather than silently
   // presenting a fragment as the whole message.
-  row.append(document.createTextNode((m.truncatedHead ? '…' : '') + (m.content ?? '')));
+  if (m.truncatedHead) row.append(document.createTextNode('…'));
+  row.append(...renderText(m.content ?? '', mentions));
   if (m.toolCalls?.length && !quiet) {
     const calls = document.createElement('span');
     calls.className = 'calls';
@@ -311,6 +384,54 @@ function renderRow(
     row.append(wrap);
   }
   return row;
+}
+
+/**
+ * Message text, with every RESOLVED `@handle` lifted into a chip.
+ *
+ * Returns nodes rather than markup on purpose. Message bodies are model- and
+ * API-shaped strings that nothing in this stack has escaped, so the rule the
+ * FRAME docblock sets — every piece of transcript content goes in through
+ * `textContent` — holds here too: the gaps between mentions become text nodes
+ * and the chips get their label the same way. No `innerHTML` path exists.
+ *
+ * An unresolved token stays in its text node, which keeps the rendering honest
+ * against `resolveAddressee`: if the roster does not know the name, the message
+ * did not address anyone, and it should not look as though it did.
+ */
+function renderText(text: string, mentions: Map<string, Mentionable>): Node[] {
+  if (!text) return [];
+  if (mentions.size === 0) return [document.createTextNode(text)];
+  const nodes: Node[] = [];
+  let cursor = 0;
+  // A fresh regex per call: /g carries `lastIndex` between uses, and a module
+  // -level literal shared across rows would skip matches on every other row.
+  const scan = new RegExp(MENTION_TOKEN.source, 'g');
+  let hit: RegExpExecArray | null = scan.exec(text);
+  while (hit !== null) {
+    // "@risk." — the class admits '.' and '-', so sentence punctuation rides
+    // into the capture. Same two-step as `resolveAddressee`: try the token, then
+    // retry with trailing punctuation trimmed. A real handle cannot END in it,
+    // so the trim can only recover a match, never invent one.
+    const raw = hit[1];
+    const trimmed = raw.replace(/[.-]+$/, '');
+    const found = mentions.get(raw) ?? (trimmed !== raw ? mentions.get(trimmed) : undefined);
+    if (found) {
+      const handle = mentions.get(raw) ? raw : trimmed;
+      if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
+      const chip = document.createElement('span');
+      const kind = found.kind ?? 'subject';
+      chip.className = `mention ${kind}`;
+      chip.setAttribute('part', `mention ${kind}`);
+      chip.textContent = `@${found.label ?? handle}`;
+      if (found.detail) chip.title = found.detail;
+      nodes.push(chip);
+      cursor = hit.index + 1 + handle.length;
+    }
+    hit = scan.exec(text);
+  }
+  if (cursor < text.length) nodes.push(document.createTextNode(text.slice(cursor)));
+  return nodes;
 }
 
 function failureRow(message: string): HTMLElement {
@@ -355,7 +476,15 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       approval: HTMLElement;
       approvalText: HTMLElement;
       input: HTMLInputElement;
+      typeahead: HTMLElement;
     };
+    /** App-supplied `@`-able subjects. A property, not an attribute: this is a
+     *  list of objects, and a JSON attribute would make every roster change a
+     *  re-parse of a string the host already had in hand. */
+    private appMentions: Mentionable[] = [];
+    /** The suggestions currently offered, and which one Enter would take. */
+    private suggestions: Mentionable[] = [];
+    private cursorAt = -1;
     private client: Agent | null = null;
     private sid: string | null = null;
     private computation: Tracker.Computation | null = null;
@@ -387,11 +516,24 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         approval: q<HTMLElement>('.approval'),
         approvalText: q<HTMLElement>('.approval-text'),
         input: q<HTMLInputElement>('.input'),
+        typeahead: q<HTMLElement>('.typeahead'),
       };
       q<HTMLFormElement>('.composer').addEventListener('submit', (e: Event) => {
         e.preventDefault();
+        // Enter with the typeahead open completes the mention; it does not
+        // send. Submit is the only place that can know this, because the
+        // keydown handler cannot cancel a form submission it did not cause.
+        if (this.suggestions.length > 0) { this.acceptSuggestion(); return; }
         void this.submit();
       });
+      this.ui.input.addEventListener('input', () => this.refreshSuggestions());
+      // `click` rather than `mousedown`: the input keeps focus because the
+      // button lives in the same shadow root and we never blur it.
+      this.ui.input.addEventListener('keydown', (e: KeyboardEvent) => this.onKeyDown(e));
+      // Any caret move can leave or enter a token, so the offered list has to
+      // follow the caret and not only the keystrokes that changed the text.
+      this.ui.input.addEventListener('click', () => this.refreshSuggestions());
+      this.ui.input.addEventListener('blur', () => this.closeSuggestions());
       q<HTMLButtonElement>('.stop').addEventListener('click', () => {
         void this.act((a, s) => a.interrupt(s));
       });
@@ -410,6 +552,44 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  itself (`fork`, `usage`, a denial with a typed reason). Null while
      *  detached. */
     get agentInstance(): Agent | null { return this.client; }
+
+    /**
+     * Extra `@`-able subjects, on top of the session's own model participants.
+     *
+     * Set it to the nouns THIS app's users talk about — customers, tickets,
+     * accounts. They render as chips and complete in the composer; they do not
+     * route, because only a model participant can take a turn.
+     *
+     * Copied on the way in, so a host mutating the array it passed cannot
+     * silently change what the element believes without a repaint.
+     */
+    get mentionables(): Mentionable[] { return [...this.appMentions]; }
+
+    set mentionables(list: Mentionable[]) {
+      this.appMentions = Array.isArray(list) ? list.filter((m) => m && m.handle) : [];
+      this.paint();
+    }
+
+    /**
+     * Handle → subject, for both the transcript and the typeahead.
+     *
+     * The session's MODEL participants come first and the app's list is layered
+     * over them, so an app can relabel `@risk` but cannot accidentally shadow a
+     * real addressee with an inert subject of the same name — the kind stays
+     * `agent` unless the app deliberately overrides the whole entry.
+     */
+    private mentionMap(): Map<string, Mentionable> {
+      const out = new Map<string, Mentionable>();
+      const session = this.client && this.sid ? this.client.session(this.sid) : null;
+      for (const p of session?.participants ?? []) {
+        if (p.kind !== 'model' || !p.agent) continue;
+        out.set(p.agent, { handle: p.agent, label: p.agent, kind: 'agent', detail: p.displayName });
+      }
+      for (const m of this.appMentions) {
+        out.set(m.handle, { kind: 'subject', ...m });
+      }
+      return out;
+    }
 
     connectedCallback() {
       this.live = true;
@@ -553,8 +733,9 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       // behind). Anything else — including an absent attribute — is `full`,
       // so the default is unchanged for every existing consumer.
       const quiet = this.getAttribute('verbosity') === 'quiet';
+      const mentions = this.mentionMap();
       const nodes: HTMLElement[] = rows
-        .map((m) => renderRow(m, names, download, quiet))
+        .map((m) => renderRow(m, names, download, quiet, mentions))
         .filter((n): n is HTMLElement => n !== null);
       if (this.failure) nodes.push(failureRow(this.failure));
       this.ui.messages.replaceChildren(...nodes);
@@ -590,6 +771,117 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
           ? `${ask.display}${runsAs}\n\n${clamped}`
           : `The agent wants to run ${ask.name}(${clamped})${runsAs}`;
       }
+    }
+
+    /**
+     * The token being typed, or null.
+     *
+     * Anchored to the CARET, not the whole value: a message may already contain
+     * finished mentions, and completing the one under the cursor is the only
+     * behaviour that does not rewrite text the user has moved on from.
+     */
+    private tokenAtCaret(): { start: number; query: string } | null {
+      const { input } = this.ui;
+      // A range selection has no single insertion point to complete at.
+      if (input.selectionStart === null || input.selectionStart !== input.selectionEnd) return null;
+      const caret = input.selectionStart;
+      const hit = MENTION_PREFIX.exec(input.value.slice(0, caret));
+      if (!hit) return null;
+      // `@` must open a word — mid-token (an email address) it is not a mention.
+      const before = hit.index === 0 ? '' : input.value[hit.index - 1];
+      if (before !== '' && !/\s/.test(before)) return null;
+      return { start: hit.index, query: hit[1] };
+    }
+
+    private refreshSuggestions() {
+      const token = this.tokenAtCaret();
+      if (!token) { this.closeSuggestions(); return; }
+      const q = token.query.toLowerCase();
+      const all = [...this.mentionMap().values()];
+      const matches = all.filter((m) => `${m.handle} ${m.label ?? ''}`.toLowerCase().includes(q));
+      if (matches.length === 0) { this.closeSuggestions(); return; }
+      // Agents before subjects: in a chat the addressable thing is the more
+      // likely intent, and a roster is short enough that it never buries the
+      // subject list.
+      matches.sort((a, b) => Number(a.kind === 'subject') - Number(b.kind === 'subject'));
+      this.suggestions = matches.slice(0, 8);
+      this.cursorAt = 0;
+      this.paintSuggestions();
+    }
+
+    private paintSuggestions() {
+      const { typeahead, input } = this.ui;
+      typeahead.replaceChildren(...this.suggestions.map((m, i) => {
+        const row = document.createElement('button');
+        row.type = 'button';
+        row.className = 'suggestion';
+        row.setAttribute('part', 'suggestion');
+        row.setAttribute('role', 'option');
+        row.setAttribute('aria-selected', String(i === this.cursorAt));
+        const handle = document.createElement('span');
+        handle.className = 'suggestion-handle';
+        handle.setAttribute('part', 'suggestion-handle');
+        handle.textContent = `@${m.label ?? m.handle}`;
+        row.append(handle);
+        if (m.detail) {
+          const detail = document.createElement('span');
+          detail.className = 'suggestion-detail';
+          detail.setAttribute('part', 'suggestion-detail');
+          detail.textContent = m.detail;
+          row.append(detail);
+        }
+        // `mousedown`, not `click`: the input's blur fires first on a click and
+        // would close the list out from under the press.
+        row.addEventListener('mousedown', (e: MouseEvent) => {
+          e.preventDefault();
+          this.cursorAt = i;
+          this.acceptSuggestion();
+        });
+        return row;
+      }));
+      typeahead.hidden = false;
+      input.setAttribute('aria-expanded', 'true');
+    }
+
+    private closeSuggestions() {
+      if (this.suggestions.length === 0) return;
+      this.suggestions = [];
+      this.cursorAt = -1;
+      this.ui.typeahead.hidden = true;
+      this.ui.typeahead.replaceChildren();
+      this.ui.input.setAttribute('aria-expanded', 'false');
+    }
+
+    private onKeyDown(e: KeyboardEvent) {
+      if (this.suggestions.length === 0) return;
+      if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+        e.preventDefault();
+        const step = e.key === 'ArrowDown' ? 1 : -1;
+        const n = this.suggestions.length;
+        this.cursorAt = (this.cursorAt + step + n) % n;
+        this.paintSuggestions();
+        return;
+      }
+      if (e.key === 'Tab') { e.preventDefault(); this.acceptSuggestion(); return; }
+      if (e.key === 'Escape') { e.preventDefault(); this.closeSuggestions(); }
+      // Enter deliberately falls through to the form's submit handler, which
+      // completes instead of sending while this list is open.
+    }
+
+    private acceptSuggestion() {
+      const chosen = this.suggestions[this.cursorAt];
+      const token = this.tokenAtCaret();
+      if (!chosen || !token) { this.closeSuggestions(); return; }
+      const { input } = this.ui;
+      const caret = input.selectionStart ?? input.value.length;
+      // The trailing space is what ends the token: without it the next
+      // keystroke re-opens the list against a handle that is already complete.
+      const insert = `@${chosen.handle} `;
+      input.value = input.value.slice(0, token.start) + insert + input.value.slice(caret);
+      const at = token.start + insert.length;
+      input.setSelectionRange(at, at);
+      this.closeSuggestions();
+      input.focus();
     }
 
     private async submit() {

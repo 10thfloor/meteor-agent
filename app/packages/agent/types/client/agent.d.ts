@@ -64,8 +64,9 @@ export declare class Agent {
     session(sessionId: string): import(".").AgentSession | undefined;
     status(sessionId: string): Phase;
     usage(sessionId: string): import(".").Usage;
-    /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name). */
-    subscribeSessions(): Meteor.SubscriptionHandle;
+    /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name).
+     *  Archived sessions are left out unless asked for. */
+    subscribeSessions(includeArchived?: boolean): Meteor.SubscriptionHandle;
     sessions(selector?: SessionQuery): Mongo.Cursor<import(".").AgentSession, import(".").AgentSession>;
     start(opts?: {
         title?: string;
@@ -129,5 +130,9 @@ export declare class Agent {
     /** `reason` reaches the model as the denied tool result, so it is the model's
      *  only account of why — worth writing for it, not just for the log. */
     deny(sessionId: string, reason?: string): Promise<void>;
+    /** Shelve a session: it drops out of `sessions()` and keeps everything else,
+     *  including the ability to take a turn. */
+    archive(sessionId: string): Promise<void>;
+    unarchive(sessionId: string): Promise<void>;
 }
 //# sourceMappingURL=agent.d.ts.map
