@@ -5,3 +5,6 @@ node_modules/
 # Local credentials (Slack tokens etc.) — never committed; copy settings.example.json
 app/settings.json
 settings.json
+
+# Deployment credentials — copy the tracked example, never commit the copy.
+deploy/galaxy.settings.json
