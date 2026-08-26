@@ -1,5 +1,5 @@
 import { Meteor } from 'meteor/meteor';
-import { check } from 'meteor/check';
+import { check, Match } from 'meteor/check';
 import { NAMES } from '../common/names';
 import {
   AgentDeltas, AgentMemories, AgentMessages, AgentSessions,
@@ -72,8 +72,9 @@ export function registerPublications(): void {
     ];
   });
 
-  Meteor.publish(NAMES.pubSessions, function (agent: string) {
+  Meteor.publish(NAMES.pubSessions, function (agent: string, includeArchived?: boolean) {
     check(agent, String);
+    check(includeArchived, Match.Maybe(Boolean));
     // Anonymous sessions are deliberately NON-ENUMERABLE. `userId: null`
     // matches every anonymous caller equally, so publishing the null-owner
     // list would hand any anonymous browser up to 100 other visitors' session
@@ -93,6 +94,10 @@ export function registerPublications(): void {
     // A member's conversation list includes sessions they were invited into
     // (participants spec §4.2) — the `$or` mirrors `requireSession`, and the
     // `'participants.userId'` index keeps the second clause from scanning.
+    // ARCHIVED ROWS ARE OMITTED BY DEFAULT. This is the only place `archived`
+    // is read: it is a shelf for the LIST, not a stop on the work, so nothing
+    // in the turn path consults it. A caller that wants the shelf back asks for
+    // it — there is no second publication and no separate archived list.
     return AgentSessions.find(
       {
         agent,
@@ -101,6 +106,7 @@ export function registerPublications(): void {
           { participants: { $elemMatch: { kind: 'human', userId: this.userId } } },
         ],
         parent: { $exists: false },
+        ...(includeArchived ? {} : { archived: { $exists: false } }),
       },
       // `lease` and `pending.wakeToken` omitted here too — see the matching
       // comment on `pubSession`.

@@ -1,4 +1,28 @@
 /**
+ * Something a message can name with `@`.
+ *
+ * The package resolves the session's own MODEL participants into this shape for
+ * free, because those are the handles that actually address a turn
+ * (`resolveAddressee` in common/participants.ts parses exactly one leading
+ * `@name` against them). An app adds its OWN subjects — a customer, a ticket, an
+ * account — through the `mentionables` property, and those are deliberately
+ * inert: they render and they autocomplete, but naming one schedules nothing,
+ * because the package will not invent a routing rule for a noun it cannot see.
+ *
+ * `handle` is what follows the `@`, and it may not contain whitespace. Anything
+ * that does not match a known handle stays plain text, which is the same rule
+ * the addressee parse uses: an unmatched `@name` is speech, not markup.
+ */
+export interface Mentionable {
+    handle: string;
+    /** Shown in the chip and the typeahead. Defaults to `handle`. */
+    label?: string;
+    /** Free-form; becomes a `part` token, so `::part(mention guest)` works. */
+    kind?: string;
+    /** A second line in the typeahead — an email, a role, a last-seen date. */
+    detail?: string;
+}
+/**
  * Register `<agent-chat>` (or any tag name you prefer) and return its
  * constructor.
  *

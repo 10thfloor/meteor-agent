@@ -799,5 +799,33 @@ export function registerMethods(): void {
       check(reason, Match.Maybe(String));
       await recordVerdict({ userId: this.userId ?? null }, agent, sessionId, 'denied', reason);
     },
+
+    /**
+     * Shelve a session, or bring it back.
+     *
+     * Deliberately NOT a turn-state operation: no lease is taken, no phase is
+     * touched, nothing is interrupted. Archiving a session mid-stream leaves it
+     * streaming — it just stops appearing in the owner's list. See the
+     * `archived` field's docblock for why that separation is the safe one.
+     *
+     * `requireSession` gates it, so a member of a rostered session can archive
+     * their own view of it — which is the same standing they already have to
+     * send into it.
+     */
+    async [NAMES.mArchive](this: any, agent: string, sessionId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      await requireSession(agent, sessionId, this.userId ?? null);
+      // Not `guardedUpdate`: that path is for writes that must lose to a
+      // running turn's lease, and this one is display state a turn never reads.
+      await AgentSessions.updateAsync(sessionId, { $set: { archived: new Date() } });
+    },
+
+    async [NAMES.mUnarchive](this: any, agent: string, sessionId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      await requireSession(agent, sessionId, this.userId ?? null);
+      await AgentSessions.updateAsync(sessionId, { $unset: { archived: 1 } });
+    },
   });
 }

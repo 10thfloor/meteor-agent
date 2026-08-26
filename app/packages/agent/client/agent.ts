@@ -136,9 +136,10 @@ export class Agent {
     return this.session(sessionId)?.usage ?? { input: 0, output: 0, cost: 0 };
   }
 
-  /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name). */
-  subscribeSessions() {
-    return Meteor.subscribe(NAMES.pubSessions, this.name);
+  /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name).
+   *  Archived sessions are left out unless asked for. */
+  subscribeSessions(includeArchived = false) {
+    return Meteor.subscribe(NAMES.pubSessions, this.name, includeArchived);
   }
 
   sessions(selector: SessionQuery = {}) {
@@ -223,5 +224,15 @@ export class Agent {
    *  only account of why — worth writing for it, not just for the log. */
   deny(sessionId: string, reason?: string): Promise<void> {
     return Meteor.callAsync(NAMES.mDeny, this.name, sessionId, reason);
+  }
+
+  /** Shelve a session: it drops out of `sessions()` and keeps everything else,
+   *  including the ability to take a turn. */
+  archive(sessionId: string): Promise<void> {
+    return Meteor.callAsync(NAMES.mArchive, this.name, sessionId);
+  }
+
+  unarchive(sessionId: string): Promise<void> {
+    return Meteor.callAsync(NAMES.mUnarchive, this.name, sessionId);
   }
 }

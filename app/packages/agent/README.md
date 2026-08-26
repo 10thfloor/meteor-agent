@@ -838,6 +838,55 @@ is coalesced into one microtask**, so a run of synchronous writes re-subscribes
 exactly once, against the attributes as they finally stand — the intermediate
 combination never gets far enough to auto-start a session nothing will render.
 
+### Mentions
+
+The element renders `@handle` as a chip and completes it in the composer.
+
+The session's own **model participants** are mentionable for free, because those
+are the handles that actually address a turn — `@risk` at the start of a message
+is what routes it to `risk`, and the chip is that fact made visible. Everything
+else your users talk about goes on the `mentionables` **property**:
+
+```js
+chat.mentionables = [
+  { handle: 'priya-natarajan', label: 'Priya Natarajan', kind: 'guest', detail: 'guest' },
+];
+```
+
+| Field | Meaning |
+| --- | --- |
+| `handle` | **Required.** What follows the `@`. No whitespace. |
+| `label` | What the chip and the typeahead show. Defaults to `handle`. |
+| `kind` | Free-form, becomes a `part` token: `::part(mention guest)`. Model participants get `agent`; anything else defaults to `subject`. |
+| `detail` | A second line in the typeahead, and the chip's tooltip. |
+
+App-supplied subjects are **inert on purpose**: they render and they complete,
+but naming one schedules nothing. Only a model participant can take a turn, and
+the package will not invent a routing rule for a noun it cannot see — if you
+want `@priya` to *do* something, give the agent a tool that resolves the handle.
+
+A token that matches nothing stays plain text. That is the same rule
+`resolveAddressee` uses, and keeping the two in step is the point: a chip that
+implied routing the parser would not perform would be a lie in the transcript.
+
+Typing `@` opens the list; ↑/↓ move, Tab or Enter accepts, Escape dismisses.
+**Enter completes rather than sends** while the list is open — a composer that
+fires off `@pri` because someone pressed Enter to pick a name is the bug this
+behaviour exists to avoid.
+
+### Archiving a session
+
+`agent.archive(sessionId)` shelves a conversation and `agent.unarchive` brings it
+back. Archiving affects **the list and nothing else**: the session keeps its
+transcript, still answers `agent.session`, and still takes a turn if a routine, an
+inbound channel message, or a resuming approval addresses it. Only
+`subscribeSessions()` filters it out, and `subscribeSessions(true)` asks for it
+back — there is no separate archived publication.
+
+The separation is deliberate. "Archive this chat" means *stop showing it to me*;
+a package that read it as *stop the work* would silently drop a scheduled turn
+nobody cancelled.
+
 ### Auto-start, and remembering the session
 
 With no `session-id`, the element calls `start()` when it connects and then
@@ -890,7 +939,9 @@ element you never theme still follows the OS light/dark setting.
 | `message` | Every transcript row; also carries `user` / `assistant` / `tool` / `note`, plus `streaming` on an in-flight row and the note's `kind` (`::part(note error)`) |
 | `tool-name`, `tool-content` | The two halves of a tool row — the content is line-clamped, `::part(tool-content) { -webkit-line-clamp: none }` unclamps it |
 | `tool-calls` | The ` → name(args)` line under an assistant bubble |
+| `mention` | A resolved `@handle`; also carries its kind (`agent`, or whatever the app set) |
 | `approval`, `approval-text` | The bar and its sentence |
+| `typeahead`, `suggestion` | The mention autocomplete and its rows (`suggestion-handle`, `suggestion-detail`) |
 | `button` | Every button; also carries `send` / `stop` / `approve` / `deny` |
 | `input` | The composer field |
 

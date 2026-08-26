@@ -363,6 +363,21 @@ export interface AgentSession {
      *  it refuses a REPEATED key, and the key-derived row `_id` is what refuses a
      *  second row for a key the slot has since moved past. */
     lastSystemKey?: string;
+    /**
+     * Shelved, not deleted: when the owner archived this session.
+     *
+     * A DISPLAY fact and nothing more. An archived session keeps its transcript,
+     * answers `agent.session`, and still takes a turn if something addresses it —
+     * a routine on a clock, an inbound channel message, an approval resuming.
+     * Only the enumerating publication filters on it, because the thing a person
+     * means by "archive this chat" is "stop showing it to me", and a package that
+     * read it as "stop the work" would silently drop a scheduled turn the owner
+     * never cancelled.
+     *
+     * Absent means active. A date rather than a boolean because "when" is the
+     * question anyone asks of an archive, and it costs the same to store.
+     */
+    archived?: Date;
     createdAt: Date;
     updatedAt: Date;
 }
