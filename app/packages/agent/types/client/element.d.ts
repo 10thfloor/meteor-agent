@@ -17,25 +17,63 @@ export interface Mentionable {
     handle: string;
     /** Shown in the chip and the typeahead. Defaults to `handle`. */
     label?: string;
-    /** Free-form; becomes a `part` token, so `::part(mention guest)` works. */
+    /** Free-form; becomes a `part` token, so `::part(mention ticket)` works. */
     kind?: string;
-    /** A second line in the typeahead — an email, a role, a last-seen date. */
+    /** A second line in the typeahead — an address, a role, a price, a date. */
     detail?: string;
-    /**
-     * The symbol that summons it. Defaults to `@`.
-     *
-     * A second symbol is worth having when the things being named are of a
-     * different ORDER, not merely a different type: `@` reaches people (and, for
-     * model participants, actually routes the turn), while something like `#`
-     * points at an item in a catalogue that could never take a turn. One symbol
-     * for both makes the composer offer a product where a person belongs.
-     *
-     * Only `@` is ever parsed as an addressee — see `resolveAddressee` — so a
-     * mentionable under any other symbol is inert by construction, whatever kind
-     * it claims.
-     */
-    prefix?: string;
 }
+/** A field name on the record, or a function derived from it. A function is
+ *  what a stored column cannot express: a handle slugged from a display name,
+ *  a label joined from two columns. */
+type Field<T> = string | ((record: never) => T | undefined);
+/** The shape this element needs from a live collection: a reactive `find` it
+ *  can `fetch`. Structural on purpose — the package neither imports Mongo nor
+ *  requires that the thing on the other side IS Mongo. */
+export interface MentionCollection {
+    find(selector: unknown, options: unknown): {
+        fetch(): unknown[];
+    };
+}
+interface MentionShape {
+    /** The `part` token every entry from this source carries. */
+    kind?: string;
+    /** What follows the symbol. Required — nothing else identifies the record. */
+    handle: Field<string>;
+    /** Defaults to the handle. */
+    label?: Field<string>;
+    detail?: Field<string>;
+    /** How many the typeahead offers at once. Default 8. */
+    limit?: number;
+    /** Ceiling on records pulled from a collection in one read. Default 1000 —
+     *  a guard against an unbounded publication, not a page size. */
+    max?: number;
+}
+/**
+ * Where the things one symbol names come from.
+ *
+ * Three forms, because the shapes an app actually has are not all the same:
+ * a live collection whose contents change under the user, a plain list that is
+ * computed or static, or — when neither fits — the two functions the element
+ * really needs. The first two are conveniences over the third.
+ *
+ * A collection is read inside the element's own `Tracker.autorun`, so chips
+ * repaint when the underlying data changes with nothing to wire up.
+ */
+export type MentionSource = (MentionShape & {
+    collection: MentionCollection;
+    list?: never;
+}) | (MentionShape & {
+    list: unknown[] | (() => unknown[]);
+    collection?: never;
+}) | {
+    kind?: string;
+    /** Everything matching what has been typed so far. `''` means "the symbol
+     *  was just typed" — answer with a sensible opening set, not everything. */
+    search(query: string): Mentionable[];
+    /** One exact handle, for rendering a chip in text already written. Omit it
+     *  and `search(handle)` is used, which is correct but does more work. */
+    lookup?(handle: string): Mentionable | null | undefined;
+};
 /**
  * Register `<agent-chat>` (or any tag name you prefer) and return its
  * constructor.
@@ -49,4 +87,5 @@ export interface Mentionable {
  * the class is built per call rather than hoisted to module scope.
  */
 export declare function defineAgentChat(tagName?: string): CustomElementConstructor;
+export {};
 //# sourceMappingURL=element.d.ts.map

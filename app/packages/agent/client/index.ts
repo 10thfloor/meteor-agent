@@ -13,3 +13,5 @@ export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections
 // The packaged UI. Exported, never self-registering: `defineAgentChat()` is
 // the app's call to make (see client/element.ts).
 export { defineAgentChat } from './element';
+// The shapes an app needs to type its `mentionSources` without redeclaring them.
+export type { Mentionable, MentionSource, MentionCollection } from './element';

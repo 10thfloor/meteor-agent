@@ -38,10 +38,18 @@ const waitFor = (
 type ChatElement = HTMLElement & {
   sessionId: string | null;
   agentInstance: { messages(sessionId: string): { fetch(): any[] } } | null;
-  mentionables: Array<{
-    handle: string; label?: string; kind?: string; detail?: string; prefix?: string;
-  }>;
+  mentionSources: Record<string, any>;
 };
+
+/** A stand-in for a live collection: the two calls the element makes, and a
+ *  setter so a test can change what it holds mid-run. */
+function fakeCollection(rows: unknown[]) {
+  let docs = rows;
+  return {
+    find: (_sel: unknown, _opts: unknown) => ({ fetch: () => docs }),
+    set: (next: unknown[]) => { docs = next; },
+  };
+}
 
 const mounted: ChatElement[] = [];
 
@@ -326,31 +334,33 @@ describe('<agent-chat>', () => {
     // one `agent.send`, no `agent.start`.
     assert.isString(streamedSession, 'this test replays the streaming test\'s session');
     const el = mount({ agent: 'itest', 'session-id': streamedSession! });
-    el.mentionables = [{ handle: 'priya', label: 'Priya N', kind: 'guest', detail: 'guest' }];
+    el.mentionSources = {
+      '@': { list: [{ id: 'acme', name: 'Acme Ltd' }], handle: 'id', label: 'name', kind: 'account' },
+    };
     await waitFor('the transcript to arrive over DDP', 30000, () =>
       committed(el, 'assistant').includes('live streamed reply'));
 
     // Three tokens, one message: a known handle, the same handle with sentence
     // punctuation stuck to it, and one the element has never heard of.
-    say(el, 'ask @priya, then @priya. but not @nobody');
+    say(el, 'ask @acme, then @acme. but not @nobody');
     await waitFor('the mention row to render', 30000, () =>
       partsAll(el, 'mention').length >= 2);
 
     const chips = partsAll(el, 'mention').map((n) => n.textContent);
     assert.deepEqual(
-      chips, ['@Priya N', '@Priya N'],
+      chips, ['@Acme Ltd', '@Acme Ltd'],
       'both spellings resolve to one subject, and the label is what shows',
     );
     assert.include(
-      (partsAll(el, 'mention')[0].getAttribute('part') ?? '').split(' '), 'guest',
-      'the kind rides the part list so ::part(mention guest) can reach it',
+      (partsAll(el, 'mention')[0].getAttribute('part') ?? '').split(' '), 'account',
+      'the kind rides the part list so ::part(mention account) can reach it',
     );
 
     // The un-chipped half has to survive EXACTLY — a renderer that rebuilds
     // text around its chips is a renderer that can drop a character.
     const row = partsAll(el, 'user').find((n) => (n.textContent ?? '').includes('nobody'))!;
     assert.strictEqual(
-      row.textContent, 'ask @Priya N, then @Priya N. but not @nobody',
+      row.textContent, 'ask @Acme Ltd, then @Acme Ltd. but not @nobody',
       'punctuation, spacing and the unresolved token all stay put',
     );
     assert.lengthOf(
@@ -366,7 +376,9 @@ describe('<agent-chat>', () => {
     const el = mount({ agent: 'itest', 'session-id': streamedSession! });
     // `itest` has no roster, so the agent kind comes from the app list here —
     // what is under test is the POSITION rule, not where the entry came from.
-    el.mentionables = [{ handle: 'analyst', label: 'analyst', kind: 'agent' }];
+    el.mentionSources = {
+      '@': { list: [{ id: 'analyst' }], handle: 'id', label: 'id', kind: 'agent' },
+    };
     await waitFor('the transcript to arrive over DDP', 30000, () =>
       committed(el, 'assistant').includes('live streamed reply'));
 
@@ -390,12 +402,19 @@ describe('<agent-chat>', () => {
 
   it('completes an @mention in the composer instead of sending it', function () {
     // No session and no DDP at all: the typeahead reads the element's own
-    // `mentionables`, so this costs the shared rate-limit counter nothing.
+    // sources, so this costs the shared rate-limit counter nothing.
     const el = mount({ agent: 'itest', 'session-id': 'no-such-session' });
-    el.mentionables = [
-      { handle: 'priya-natarajan', label: 'Priya Natarajan', detail: 'guest' },
-      { handle: 'marcus-webb', label: 'Marcus Webb', detail: 'guest' },
-    ];
+    el.mentionSources = {
+      '@': {
+        list: [
+          { id: 'ada-lovelace', name: 'Ada Lovelace', role: 'contact' },
+          { id: 'grace-hopper', name: 'Grace Hopper', role: 'contact' },
+        ],
+        handle: 'id',
+        label: 'name',
+        detail: 'role',
+      },
+    };
     const input = part<HTMLInputElement>(el, 'input');
     const typeahead = part<HTMLElement>(el, 'typeahead');
     assert.isTrue(typeahead.hidden, 'nothing offered until an @ is typed');
@@ -406,27 +425,27 @@ describe('<agent-chat>', () => {
       input.dispatchEvent(new Event('input'));
     };
 
-    type('tell me about @pri');
+    type('tell me about @ada');
     assert.isFalse(typeahead.hidden, 'a token under the caret opens the list');
     assert.deepEqual(
       partsAll(el, 'suggestion').map((n) => n.textContent),
-      ['@Priya Natarajanguest'],
+      ['@Ada Lovelacecontact'],
       'and it filters to what actually matches',
     );
 
     // Enter — via the form's own Send, which is what Enter triggers — must
-    // COMPLETE here, not send. A composer that sends "@pri" because the user
+    // COMPLETE here, not send. A composer that sends "@ada" because the user
     // pressed Enter to pick a name is the whole reason this is tested.
     part<HTMLButtonElement>(el, 'send').click();
     assert.strictEqual(
-      input.value, 'tell me about @priya-natarajan ',
+      input.value, 'tell me about @ada-lovelace ',
       'the HANDLE is inserted (not the label — the handle is what resolves), '
       + 'with the space that ends the token',
     );
     assert.isTrue(typeahead.hidden, 'and the list closes behind it');
 
     // An @ mid-word is an email address, not a mention.
-    type('mail me at guillaume@coast');
+    type('mail me at someone@example');
     assert.isTrue(typeahead.hidden, 'an @ that does not open a word is not a mention');
   });
 
@@ -434,10 +453,13 @@ describe('<agent-chat>', () => {
     this.timeout(60000);
     assert.isString(streamedSession, 'this test replays the streaming test\'s session');
     const el = mount({ agent: 'itest', 'session-id': streamedSession! });
-    el.mentionables = [
-      { handle: 'priya', label: 'Priya', kind: 'guest' },
-      { handle: 'ast-1-course', label: 'AST 1', kind: 'offering', prefix: '#' },
-    ];
+    // One symbol from a LIVE COLLECTION, one from a plain list — both forms
+    // exercised in the pairing they exist for.
+    const people = fakeCollection([{ id: 'ada', name: 'Ada' }]);
+    el.mentionSources = {
+      '@': { collection: people, handle: 'id', label: 'name', kind: 'contact' },
+      '#': { list: [{ sku: 'sku-42', title: 'Widget' }], handle: 'sku', label: 'title', kind: 'part' },
+    };
     const input = part<HTMLInputElement>(el, 'input');
     const typeahead = part<HTMLElement>(el, 'typeahead');
 
@@ -449,20 +471,29 @@ describe('<agent-chat>', () => {
 
     // Each symbol offers only what it names. Offering a person under `#` is the
     // failure this separation exists to prevent.
-    type('book #');
+    type('order #');
     assert.deepEqual(
-      partsAll(el, 'suggestion').map((n) => n.textContent), ['#AST 1'],
-      '# offers offerings only',
+      partsAll(el, 'suggestion').map((n) => n.textContent), ['#Widget'],
+      '# offers parts only',
     );
     part<HTMLButtonElement>(el, 'send').click();
-    assert.strictEqual(input.value, 'book #ast-1-course ', '# completes with its own symbol');
+    assert.strictEqual(input.value, 'order #sku-42 ', '# completes with its own symbol');
 
     type('ask @');
     assert.deepEqual(
-      partsAll(el, 'suggestion').map((n) => n.textContent), ['@Priya'],
-      '@ does not offer the catalogue',
+      partsAll(el, 'suggestion').map((n) => n.textContent), ['@Ada'],
+      '@ does not offer the parts list',
     );
     assert.isFalse(typeahead.hidden);
+
+    // The collection is LIVE: change what it holds and the next read sees it,
+    // with nothing re-assigned on the element.
+    people.set([{ id: 'ada', name: 'Ada' }, { id: 'grace', name: 'Grace' }]);
+    type('ask @gr');
+    assert.deepEqual(
+      partsAll(el, 'suggestion').map((n) => n.textContent), ['@Grace'],
+      'a row added to the collection is offered without touching mentionSources',
+    );
 
     // Clear the open list before sending. With suggestions showing, Send
     // COMPLETES rather than submits — which is the behaviour asserted above,
@@ -472,7 +503,7 @@ describe('<agent-chat>', () => {
 
     await waitFor('the transcript to arrive over DDP', 30000, () =>
       committed(el, 'assistant').includes('live streamed reply'));
-    say(el, 'put @priya on #ast-1-course, not #nonsense');
+    say(el, 'put @ada on #sku-42, not #nonsense');
     // Waiting on THIS row, not on a chip count: the session is shared with the
     // test above, whose message already renders two chips here.
     await waitFor('the new row to render', 30000, () =>
@@ -480,12 +511,12 @@ describe('<agent-chat>', () => {
 
     const row = partsAll(el, 'user').find((n) => (n.textContent ?? '').includes('nonsense'))!;
     assert.strictEqual(
-      row.textContent, 'put @Priya on #AST 1, not #nonsense',
+      row.textContent, 'put @Ada on #Widget, not #nonsense',
       'each chip keeps the symbol it was written with, and an unknown one stays text',
     );
     const kinds = Array.from(row.querySelectorAll('[part~="mention"]'))
       .map((n) => (n.getAttribute('part') ?? '').split(' ')[1]);
-    assert.deepEqual(kinds, ['guest', 'offering'], 'and each carries its own kind');
+    assert.deepEqual(kinds, ['contact', 'part'], 'and each carries its own kind');
   });
 
   /**
