@@ -488,6 +488,9 @@ export function email(options: EmailChannelOptions): ChannelDef {
       interact: options.approvalUrl ? 'link' : 'menu',
       limit: options.profile?.limit ?? 20_000,
     },
+    preverify: (raw) => verifyPostmarkWebhook(
+      { ...raw, rawBody: '' }, options.webhookUser, options.webhookPassword,
+    ),
     verify: (raw) => verifyPostmarkWebhook(raw, options.webhookUser, options.webhookPassword),
     parse: parsePostmarkInbound,
     // Destination adoption (participants spec §5): a compose pre-bind stores

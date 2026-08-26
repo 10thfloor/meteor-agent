@@ -163,6 +163,9 @@ export async function ensureIndexes(): Promise<void> {
       // eslint-disable-next-line no-await-in-loop
       await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
     } catch (e: any) {
+      const errorKind = typeof e?.codeName === 'string'
+        ? e.codeName
+        : (typeof e?.name === 'string' ? e.name : 'Error');
       // Unique index failure is not just a perf issue — the race stays open.
       if (spec.options?.unique) {
         console.warn(
@@ -170,13 +173,13 @@ export async function ensureIndexes(): Promise<void> {
           + `${JSON.stringify(spec.keys)} — keyed memory saves are NOT race-safe until `
           + 'this builds. The usual cause is duplicate rows already present: remove the '
           + 'duplicate `key` rows for a given (scope, userId, agent) and restart. '
-          + `Error: ${e?.message ?? e}`,
+          + `Error kind: ${errorKind}`,
         );
       } else {
         console.warn(
           `[10thfloor:agent] could not create the ${spec.name} index `
           + `${JSON.stringify(spec.keys)}; the package still works, its queries are just `
-          + `unindexed (grant createIndex, or create it yourself): ${e?.message ?? e}`,
+          + `unindexed (grant createIndex, or create it yourself). Error kind: ${errorKind}`,
         );
       }
     }

@@ -2,6 +2,7 @@ Package.describe({
   name: '10thfloor:agent',
   version: '0.1.0',
   summary: 'A Pi-based agent harness for Meteor 3.5+',
+  git: 'https://github.com/10thfloor/meteor-agent.git',
   documentation: 'README.md',
 });
 
@@ -12,10 +13,8 @@ Package.onUse((api) => {
   api.mainModule('server/index.ts', 'server');
   api.mainModule('client/index.ts', 'client');
 
-  // Types: consuming apps use a `paths` entry pointing at `index.d.ts` (see
-  // README "Types"). zodern:types doesn't work here yet — it resolves against
-  // the isopack build dir, and `package.js` has no `__dirname` to enumerate
-  // the ~50 generated declaration files. Revisit when the package is published.
+  // Generated declarations are exposed through package-types.json. The README
+  // documents a paths entry for vendored-package editor support.
 });
 
 Package.onTest((api) => {

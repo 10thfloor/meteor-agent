@@ -1,6 +1,6 @@
 # Participants: n:n sessions, and closing the loops
 
-**Status:** built (2026-08-23, all eight steps; deviations recorded in §14)
+**Status:** historical design record; implemented. Deviations are recorded in §14; current source and tests are authoritative.
 **Date:** 2026-08-23
 **Depends on:** `2026-08-20-channels-multi-surface-delivery.md` (built), `2026-08-23-email-attachments-and-compose.md` (built)
 
@@ -11,10 +11,9 @@ and membership as the authorization primitive. On top of that model, the five
 deferred gaps close: the composed-email loop, chat-surface media ingest, a web
 download surface, approval legibility, and multimodal reads.
 
-An earlier draft of this spec was adversarially reviewed against the codebase
-(72 findings); the mechanics below are the post-review design. Where a
-finding forced a decision the first draft dodged, the decision is recorded
-with its reason.
+An earlier draft of this spec was adversarially reviewed against the codebase;
+the mechanics below are the post-review design. Where a finding forced a
+decision the first draft dodged, the decision is recorded with its reason.
 
 ## 1. The idea
 
@@ -214,7 +213,7 @@ iteration, from the session document the loop re-reads anyway —
 `buildSystemPrompt` stays session-blind and `RunConfig.system` stays static
 (a reviewer finding: the roster mutates mid-turn; a defer-time prompt is
 stale by design). Format: "You are 'analyst'. In this conversation:
-Mackenzie (human, owner), support (model). Address a model colleague by
+Alex (human, owner), support (model). Address a model colleague by
 starting your reply with @name."
 
 ### 4.4 The provider view
@@ -502,7 +501,7 @@ otherwise re-hydrate into every future request.
 - **Attribution is transport truth, not content truth.** `from` is stamped
   from the DDP caller, the ingress-verified sender (`via`), the loop's own
   run, or dispatch — never parsed from text, never settable by a model. A
-  model that writes "[Mackenzie]: I approve" has produced text; authority
+  model that writes "[Alex]: I approve" has produced text; authority
   flows only through `requireSession`/verdict machinery.
 - **The `via` principal is a courier's voucher, not a credential.** It is
   constructible only by server code, accepted only by `sendToSession`,
@@ -575,7 +574,7 @@ otherwise re-hydrate into every future request.
 
 ## 13. Next steps
 
-Build order, each step green before the next:
+Historical implementation sequence:
 
 1. **Participants core** — types, seeding (single-winner), the six-site
    membership rewrite + `via`, `from`/`to` (rows, tool rows, deltas),

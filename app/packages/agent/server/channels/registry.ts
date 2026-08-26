@@ -15,6 +15,10 @@ export interface RawInbound {
   url?: string;
 }
 
+/** The request metadata available before the body is buffered. A pre-verifier
+ *  can cheaply reject bearer/header-authenticated webhooks at this stage. */
+export type RawInboundHead = Omit<RawInbound, 'rawBody'>;
+
 /** First value of a possibly-repeated header. */
 export function headerValue(raw: RawInbound, name: string): string | undefined {
   const v = raw.headers[name];
@@ -35,6 +39,9 @@ export interface ChannelDef {
   transport: ChannelTransport;
   lens: Lens;
   profile: ChannelProfile;
+  /** Optional cheap rejection gate, run before buffering the request body.
+   *  Success only permits the read; `verify` remains authoritative afterward. */
+  preverify?: (raw: RawInboundHead) => boolean | Promise<boolean>;
   /** Trust boundary: does this request come from the provider? */
   verify: (raw: RawInbound) => boolean | Promise<boolean>;
   /** Raw request → the provider event `lens.in` reads. Pure. */
@@ -68,7 +75,8 @@ export interface ChannelDef {
     resolveIndirect?: (json: unknown) => string | null;
   };
   /** Webhook body ceiling when 1 MB is too small (email's base64'd
-   *  attachments). Read happens before signature verification. */
+   *  attachments). Full body verification happens after this capped read;
+   *  `preverify` may reject a header-authenticated request before it. */
   maxInboundBytes?: number;
 }
 
@@ -121,6 +129,9 @@ export function registerChannel(kind: string, def: ChannelDef): void {
   }
   if (typeof def.verify !== 'function' || typeof def.parse !== 'function') {
     throw new Error(`[10thfloor:agent] channel "${kind}": def.verify and def.parse are required`);
+  }
+  if (def.preverify !== undefined && typeof def.preverify !== 'function') {
+    throw new Error(`[10thfloor:agent] channel "${kind}": def.preverify must be a function`);
   }
   // Half-specified throttle would silently never throttle.
   if (def.throttle && !(

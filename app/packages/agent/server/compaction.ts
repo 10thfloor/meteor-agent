@@ -190,10 +190,7 @@ async function compactNow(
   } catch (e) {
     // Abort = user's stop mid-summarization; anything else is degraded, not fatal.
     if (classifyProviderError(e) !== 'abandon') {
-      console.warn(
-        `[10thfloor:agent] compaction failed for session ${sessionId}; proceeding uncompacted:`,
-        (e as Error)?.message,
-      );
+      console.warn('[10thfloor:agent] compaction failed; proceeding uncompacted');
     }
     return false;
   } finally {

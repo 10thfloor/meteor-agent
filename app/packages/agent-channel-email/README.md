@@ -9,10 +9,14 @@ web route, as "Reply YES to approve").
 
 Per the channels spec, this package is **one lens, one transport, one profile
 default** — Postmark's JSON shapes and the webhook's Basic-auth boundary, and
-nothing else. Bindings, receipts, exactly-once admission, the delivery worker,
+nothing else. Bindings, receipts, deduplicated admission, the delivery worker,
 and account linking all live in the core package. Zero npm dependencies.
 
 ## Install and register
+
+```bash
+meteor add 10thfloor:agent-channel-email
+```
 
 ```js
 // server
@@ -241,8 +245,8 @@ README's lens ladder — spread `emailLens` and replace one item.
 
 ## Delivery guarantees
 
-Admission is exactly-once on Postmark's inbound `MessageID` (it retries failed
-webhooks with the same id). Outbound is receipt-backed effectively-once with
+Admission is deduplicated on Postmark's inbound `MessageID` during the core's
+seven-day retention window. Outbound is receipt-backed effectively-once with
 **`retry`** as the declared recovery: Postmark's send API has no idempotency
 key, so a crash in the one window between post and confirm may re-send
 rather than lose a reply. The receipt key travels in an `X-Agent-Receipt`

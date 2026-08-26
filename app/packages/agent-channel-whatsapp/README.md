@@ -9,10 +9,14 @@ in the web app at the same time.
 Per the channels spec, this package is **one lens, one transport, one profile
 default** — the Cloud API's shapes, the `X-Hub-Signature-256` trust boundary,
 and Meta's GET subscription handshake, nothing else. Bindings, receipts,
-exactly-once admission, the delivery worker, and account linking all live in
+deduplicated admission, the delivery worker, and account linking all live in
 the core. Zero npm dependencies.
 
 ## Install and register
+
+```bash
+meteor add 10thfloor:agent-channel-whatsapp
+```
 
 ```js
 // server
@@ -123,7 +127,8 @@ web URL.
 
 ## Delivery guarantees
 
-Admission is exactly-once (`wamid`). Outbound is receipt-backed
+Admission is deduplicated by `wamid` during the core's seven-day retention
+window. Outbound is receipt-backed
 effectively-once with **`retry`** declared — the Cloud API has no idempotency
 key, so a crash in the window between post and confirm may double-send rather
 than lose. The trust boundary is two checks: the GET handshake by

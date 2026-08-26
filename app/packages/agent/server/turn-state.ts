@@ -15,9 +15,12 @@ export function accruedCost(
   usage: { input: number; output: number; cost?: number },
   pricing?: { input: number; output: number },
 ): number {
-  if (typeof usage.cost === 'number' && Number.isFinite(usage.cost)) return usage.cost;
+  if (typeof usage.cost === 'number'
+    && Number.isFinite(usage.cost)
+    && usage.cost >= 0) return usage.cost;
   if (!pricing) return 0;
-  return (usage.input * pricing.input + usage.output * pricing.output) / 1e6;
+  const calculated = (usage.input * pricing.input + usage.output * pricing.output) / 1e6;
+  return Number.isFinite(calculated) && calculated >= 0 ? calculated : 0;
 }
 
 /** §10: 429/408/5xx and unknowns retry; other 4xx are fatal; aborts abandon.
@@ -34,7 +37,8 @@ export function classifyProviderError(e: any): 'retryable' | 'fatal' | 'abandon'
 }
 
 /** Atomically allocate the next `seq` under the lease guard. Returns null
- *  when the lease is gone — caller must abandon. */
+ *  when the lease is gone or the optional Stop guard loses — caller must
+ *  abandon that write. */
 export async function allocateSeq(
   sessionId: string,
   // Typed to SessionInc so a mistyped counter path is a compile error.
@@ -44,10 +48,18 @@ export async function allocateSeq(
   // Markers to clear atomically — the turn's first commit consumes the relay
   // or system intent so a crash before commit leaves the wake standing.
   unset?: { pendingRelay?: 1; pendingSystem?: 1 },
+  // Turn-output commits use this to make Stop the winner. Tool-result and
+  // repair allocations deliberately do not: an already-committed tool_use
+  // still needs its matching result when a descendant is interrupted.
+  opts: { unlessStopped?: boolean } = {},
 ): Promise<number | null> {
   // Double cast: driver returns the document (not ModifyResult) with v5+ defaults.
   const before = await AgentSessions.rawCollection().findOneAndUpdate(
-    { _id: sessionId, 'lease.serverId': SERVER_ID },
+    {
+      _id: sessionId,
+      'lease.serverId': SERVER_ID,
+      ...(opts.unlessStopped ? { phase: { $ne: 'stopped' as const } } : {}),
+    },
     {
       $inc: { nextSeq: 1, ...inc } satisfies SessionInc,
       $set: { updatedAt: new Date(), ...(set ?? {}) },

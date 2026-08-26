@@ -59,9 +59,42 @@ export function deferTurn(
 ): void {
   Meteor.defer(() => {
     // `opts` composes the addressee's config with the primary's budget (§4.3).
-    runTurn(sessionId, buildRunConfig(config, userId, opts)).catch((e) => {
-      console.error(`[10thfloor:agent] turn failed for session ${sessionId}:`, e);
-    });
+    // Start from a resolved promise so synchronous config/instruction failures
+    // enter the same durable, sanitized error path as async turn failures.
+    void Promise.resolve()
+      .then(() => runTurn(sessionId, buildRunConfig(config, userId, opts)))
+      .catch(async (error: unknown) => {
+        const errorKind = error instanceof Error ? error.name : typeof error;
+        console.error(
+          `[10thfloor:agent] deferred turn failed (${errorKind})`,
+        );
+
+        // Only an idle session belongs to this failed deferred wake. If a
+        // concurrent run is already active, its durable state must win.
+        const before = await AgentSessions.rawCollection().findOneAndUpdate(
+          { _id: sessionId, phase: 'idle', lease: { $exists: false } },
+          {
+            $inc: { nextSeq: 1 } satisfies SessionInc,
+            $set: { phase: 'error', updatedAt: new Date() },
+          },
+          { returnDocument: 'before' },
+        ) as unknown as AgentSession | null;
+        if (!before) return;
+
+        const reason = 'The agent turn could not be started.';
+        await AgentMessages.insertAsync({
+          _id: Random.id(), sessionId, seq: before.nextSeq,
+          role: 'note', kind: 'error',
+          error: { error: 'turn-failed', reason },
+          createdAt: new Date(),
+        });
+      })
+      .catch((error: unknown) => {
+        const errorKind = error instanceof Error ? error.name : typeof error;
+        console.error(
+          `[10thfloor:agent] could not persist deferred turn failure (${errorKind})`,
+        );
+      });
   });
 }
 
@@ -78,7 +111,7 @@ export async function deferResolvedTurn(session: AgentSession): Promise<boolean>
   const addressee = getAgent(name);
   if (!addressee) {
     console.warn(
-      `[10thfloor:agent] session ${session._id}: addressed model "${name}" is not `
+      `[10thfloor:agent] addressed model "${name}" is not `
       + `registered; waking as the primary "${session.agent}" instead`,
     );
     deferTurn(session._id, primary, session.userId);
@@ -156,7 +189,7 @@ async function writeVerdict(
   } else {
     // Session vanished after the verdict; the missing row is an audit gap.
     console.warn(
-      `[10thfloor:agent] session ${sessionId} vanished before its ${verdict} `
+      `[10thfloor:agent] a session vanished before its ${verdict} `
       + 'note could be written; the approval has no audit row',
     );
   }
@@ -323,7 +356,7 @@ export async function sendToSession(
       return sessionId;
     }
     console.warn(
-      `[10thfloor:agent] session ${sessionId}: addressed model "${addressee.agent}" `
+      `[10thfloor:agent] addressed model "${addressee.agent}" `
       + `is not registered; the primary "${agent}" answers instead`,
     );
   }

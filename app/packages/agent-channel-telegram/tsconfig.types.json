@@ -1,0 +1,15 @@
+{
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": true,
+    "outDir": "./types",
+    "rootDir": "./server",
+    "stripInternal": true,
+    "paths": { "meteor/10thfloor:agent": ["../agent/index.d.ts"] }
+  },
+  "include": ["server/index.ts", "../../types/**/*.d.ts"],
+  "exclude": ["types", "tests"]
+}

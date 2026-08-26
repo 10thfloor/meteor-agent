@@ -102,8 +102,8 @@ export function mountDownloadRoute(webAppHandlers: {
         const out = await handleDownload(token);
         res.writeHead(out.status, out.headers ?? { 'content-type': 'text/plain' });
         res.end(out.body ?? '');
-      } catch (e) {
-        console.error('[10thfloor:agent] attachment download failed:', e);
+      } catch {
+        console.error('[10thfloor:agent] attachment download failed');
         try { res.writeHead(500); res.end(); } catch { /* socket gone */ }
       }
     })();

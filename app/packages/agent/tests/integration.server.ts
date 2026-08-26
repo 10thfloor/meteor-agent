@@ -100,4 +100,48 @@ Meteor.methods({
     for (const s of rows) counts[s.agent] = (counts[s.agent] ?? 0) + 1;
     return counts;
   },
+  /** Claim an anonymous fixture while its browser subscription is live. The
+   *  publication must retract the transcript immediately, not on reconnect. */
+  async 'itest.claimAnonymous'(sessionId: string) {
+    return AgentSessions.updateAsync(
+      { _id: sessionId, userId: null },
+      { $set: { userId: 'claimed-by-test' } },
+    );
+  },
+  /** Give the one browser DDP connection a stable test identity. This is a
+   *  fixture-only equivalent of an accounts login, without adding accounts to
+   *  the package test app. */
+  'itest.setUserId'(userId: string | null) {
+    if (userId !== null && typeof userId !== 'string') throw new Meteor.Error('bad-user');
+    this.setUserId(userId);
+  },
+  /** Move a session owned by the current test user under another owner while
+   *  retaining access through the human-participant roster selector. */
+  async 'itest.makeCurrentUserParticipant'(sessionId: string) {
+    if (!this.userId) throw new Meteor.Error('not-authorized');
+    return AgentSessions.updateAsync(
+      { _id: sessionId, userId: this.userId },
+      {
+        $set: {
+          userId: 'other-test-owner',
+          participants: [{
+            id: `h:${this.userId}`,
+            kind: 'human',
+            role: 'member',
+            userId: this.userId,
+            displayName: 'Live test member',
+            joinedAt: new Date(),
+          }],
+        },
+      },
+    );
+  },
+  /** Remove the caller from the roster while its publication is live. */
+  async 'itest.removeCurrentParticipant'(sessionId: string) {
+    if (!this.userId) throw new Meteor.Error('not-authorized');
+    return AgentSessions.updateAsync(
+      { _id: sessionId, userId: 'other-test-owner' },
+      { $pull: { participants: { kind: 'human', userId: this.userId } } } as any,
+    );
+  },
 });

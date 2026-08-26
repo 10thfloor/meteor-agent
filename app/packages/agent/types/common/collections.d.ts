@@ -1,10 +1,5 @@
 import type { DeltasCollection, MemoriesCollection, MessagesCollection, SessionsCollection } from './db';
-/**
- * The three collections, typed through the `db.ts` facade so every selector and
- * modifier is field-name-checked and no call site needs an `as any`. The
- * `as unknown as …` here is the ONE place per collection the driver's loose
- * types are crossed — see `db.ts` for why the facade is shaped the way it is.
- */
+/** Collections typed through the db.ts facade — one `as unknown as` per collection. */
 export declare const AgentSessions: SessionsCollection;
 export declare const AgentMessages: MessagesCollection;
 export declare const AgentDeltas: DeltasCollection;

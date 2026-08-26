@@ -50,22 +50,15 @@ export ANTHROPIC_API_KEY=sk-...     # or OPENAI_API_KEY, etc.
 
 `typebox` checks model-supplied tool arguments; it is a transitive dependency of pi-ai today, so install
 it directly in case a pi-ai bump drops it. `insecure` would hand clients direct write access to the
-transcript collections — the package registers a blanket client-write `deny` on all three at startup as
-a backstop, but removing `insecure` is the fix.
+transcript collections — the package registers a blanket client-write `deny` on its collections as a
+backstop, but removing `insecure` is the fix.
 
 ### The quickstart every other page assumes
 
 ```ts
-// imports/agents.ts — isomorphic
+// server/agents.ts
 import { Agent } from 'meteor/10thfloor:agent';
-export const Support = new Agent('support');
-```
-
-```ts
-// server
-import { Support } from '/imports/agents';
-
-Support.define({
+export const Support = new Agent('support', {
   model: 'anthropic/claude-sonnet-5',
   instructions: ({ userId }) => `You help user ${userId} with their orders.`,
   tools: ['orders.lookup'],                 // a Meteor method you already have
@@ -86,12 +79,12 @@ Meteor.startup(() => { defineAgentChat(); });
 <agent-chat agent="support"></agent-chat>
 ```
 
-The `agent` attribute is the registry name the server passed to `new Agent(...)`. The client `Agent`
-class takes only a name and has no `define()`, so one shared `imports/agents.ts` hands both bundles a
-handle while instructions, tools and budgets stay server-side. `new Agent(name, config)` defines in one
-step — the constructor calls `define()` when given a config, and `define()` returns `this` so per-agent
-hooks chain off it. Defining the same name again replaces the entry, which is what makes Meteor's hot
-reload re-running your server files harmless.
+The `agent` attribute is the registry name the server passed to `new Agent(...)`.
+The client class is a separate, reactive handle; TypeScript code that builds a
+custom UI imports it as `ClientAgent`. `new Agent(name, config)` defines the
+server agent in one step, and `define()` returns `this` so per-agent hooks chain
+off it. Defining the same name again replaces the entry, which makes Meteor hot
+reload re-running server modules harmless.
 
 ### The whole config surface
 
@@ -945,29 +938,28 @@ Highest wins; each rung down warns exactly once, and none of them throws:
 1. a validator installed with `setToolArgsValidator` — over everything below;
 2. `Compile(schema).Check(args)`, one compile per schema object;
 3. the interpreted `Value.Check(schema, args)` — same enforcement, slower;
-4. the minimal structural checker: `type`, object `required`/`properties`, array
-   `items`, accepting anything it cannot model.
+4. the structural checker for schemas made entirely of `type`, object
+   `required`/`properties`, and array `items`; richer schemas are refused.
 
-Rung 2 is cached weakly on the `args` object's identity, so a registered tool
+Rung 2 is cached weakly on the schema object's identity, so a registered tool
 compiles once per process and a rediscovered MCP schema does not pin its
-predecessors. A cache hit and a miss return the same verdict, so there is a seam
-for observing it:
+predecessors. Cache hits and misses deliberately return the same public result:
 
 ```ts
 // server
-import { validateToolArgs, _isSchemaCompiled } from 'meteor/10thfloor:agent';
+import { validateToolArgs } from 'meteor/10thfloor:agent';
 
 const schema = { type: 'object', properties: { q: { type: 'string' } }, required: ['q'] };
-_isSchemaCompiled(schema);                    // false — nothing compiled yet
 await validateToolArgs(schema, { q: 'x' });   // { ok: true }
-_isSchemaCompiled(schema);                    // true — every later call reuses it
+await validateToolArgs(schema, { q: 'y' });   // { ok: true }, cached checker reused
 ```
 
-Dropping from 2 to 3 costs speed only; dropping to 4 narrows what is enforced,
-which is what `fullValidationAvailable()` reports. `setToolArgsValidator(fn)`
-installs your own checker and returns a restore function — call it *before*
-registering any `Agent.method` endpoint; `setToolArgsValidator(null)` disables
-validation entirely, with one warning, and arguments then pass through unchecked.
+Dropping from 2 to 3 costs speed only. At rung 4, a schema is accepted only when
+the structural checker can enforce all of it; otherwise the tool call is
+refused. `fullValidationAvailable()` reports whether a full checker is active.
+`setToolArgsValidator(fn)` installs your own checker and returns a restore
+function — call it *before* registering tools. Passing `null` deliberately
+disables validation and is unsafe for untrusted model or DDP input.
 
 Discovered MCP schemas are the one exception to "the whole schema": `pattern`,
 `format` and `patternProperties` are stripped from a third-party `inputSchema`
@@ -976,12 +968,11 @@ attacker-influenced regexes onto a single-threaded event loop. A property
 literally *named* `format` survives — only the keyword position is stripped. An
 `args` you wrote yourself is app-authored and keeps all three.
 
-### Fail-closed on public endpoints
+### Fail-closed validation
 
-"Accept what I cannot check" is the right bias for the model, which retries, and
-the wrong one for a public DDP endpoint. `Agent.method` therefore refuses at
-registration when no full validator is available and the schema leans on a
-keyword the structural checker ignores:
+No tool call is allowed merely because the active checker cannot understand its
+schema. `Agent.method` also refuses at registration when no full validator is
+available and the schema leans on a keyword the structural checker ignores:
 
 ```ts
 // server — throws at startup if neither typebox nor an installed validator is reachable

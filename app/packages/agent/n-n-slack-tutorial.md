@@ -224,7 +224,7 @@ This is important to get right mentally. When the analyst takes a turn, its prov
 - Its own prior responses as `assistant` rows (the normal way)
 - The support agent's final responses as attributed `user` rows — like `[support]: I've processed the refund.`
 - The support agent's tool calls, thinking, and working? **Dropped.** Each agent sees colleagues' spoken conclusions, not their scratch work.
-- Human messages show up with names when there are 2+ humans or 2+ models — like `[Mackenzie]: what about last quarter?`
+- Human messages show up with names when there are 2+ humans or 2+ models — like `[Alex]: what about last quarter?`
 
 This keeps each agent's context window clean. The full transcript lives in Mongo — your web UI renders everything — but each model's view is filtered to what's useful.
 
@@ -329,7 +329,7 @@ When a session has a roster, the harness appends a participants block to the sys
 
 ```
 You are 'analyst'. In this conversation:
-Mackenzie (human, owner), Dana (human, member), support (model), analyst (model).
+Alex (human, owner), Dana (human, member), support (model), analyst (model).
 Address a model colleague by starting your reply with @name.
 ```
 
@@ -421,7 +421,7 @@ import './channels';
 ### What a Slack thread looks like
 
 ```
-[Mackenzie]  Hey, I got charged twice for order #8812
+[Alex]       Hey, I got charged twice for order #8812
 
 [Support]    Let me look that up for you.
              Order #8812: Bluetooth speaker, $49.99, placed June 3.
@@ -442,7 +442,7 @@ import './channels';
              me know and I'll look into it further.
 ```
 
-Mackenzie sees a clean, natural conversation. Behind the scenes: three turns, two relays, one session, full attribution in the transcript.
+Alex sees a clean, natural conversation. Behind the scenes: three turns, two relays, one session, full attribution in the transcript.
 
 ---
 
@@ -477,7 +477,7 @@ When a Slack user shares a file in a thread, the harness fetches it automaticall
 The agent sees the file as an attachment ref in the transcript. If the agent's model supports images (`Provider.capabilities.imageInput`), the agent can read image files using the `read_attachment` tool — the harness hydrates the bytes at request time, not upfront.
 
 ```
-[Mackenzie]  Here's a screenshot of the double charge [screenshot.png]
+[Alex]       Here's a screenshot of the double charge [screenshot.png]
 
 [Support]    Let me take a look at that screenshot.
              [calls read_attachment for screenshot.png]

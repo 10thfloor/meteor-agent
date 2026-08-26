@@ -1,8 +1,6 @@
 # System turns: work that starts without a person
 
-**Status:** design, verified against the codebase (nine-area recon, then a
-four-lens adversarial review: 49 findings, 25 survived independent refutation
-and are folded in — four were blockers, and the first of them rewrote §4.5)
+**Status:** historical design record; implemented. Current source and tests are authoritative.
 **Date:** 2026-08-25
 **Package:** `10thfloor:agent` (core — no new package)
 **Depends on:** `2026-08-23-participants-and-closing-the-loops.md` (built — decision 7 is amended here), `2026-08-15-meteor-agent-harness-design.md` (built)
@@ -691,7 +689,7 @@ appears) are the ones a cron framing would make second-class.
 
 ## 13. Next steps
 
-Build order, each step green before the next:
+Historical implementation sequence:
 
 1. **Types + budget** — `role: 'system'`, `SessionCounterPath`,
    `budgetSpent.systemTurns` (optional), `pendingSystem`, `lastSystemKey`,

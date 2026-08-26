@@ -1,7 +1,7 @@
 export * from '../common/types';
 export { NAMES } from '../common/names';
 export { mergeView } from '../common/merge';
-export { Agent } from './agent';
+export { Agent, Agent as ClientAgent } from './agent';
 // The raw collections for cross-agent views (approvals queue, inbox).
 // Client-side these are minimongo caches holding only published data.
 export { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';

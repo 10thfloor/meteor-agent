@@ -290,6 +290,12 @@ describe('MCP tool specs', () => {
       'The MCP tool reported an error.');
     assert.equal(sanitizeMcpReason('failed in /Users/someone/keys/prod.json'),
       'The MCP tool reported an error.');
+    assert.equal(sanitizeMcpReason('account person@example.com was refused'),
+      'The MCP tool reported an error.');
+    assert.equal(sanitizeMcpReason('upstream 10.20.30.40 did not answer'),
+      'The MCP tool reported an error.');
+    assert.equal(sanitizeMcpReason('call +1 (555) 867-5309'),
+      'The MCP tool reported an error.');
     assert.equal(sanitizeMcpReason(undefined), 'The MCP tool reported an error.');
   });
 

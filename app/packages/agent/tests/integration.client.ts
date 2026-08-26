@@ -39,6 +39,54 @@ const waitFor = (
  * past it, raise `HEADROOM` — do not ration calls here.
  */
 describe('live DDP round trip', () => {
+  it('retracts a live anonymous transcript as soon as the session is claimed', async function () {
+    this.timeout(30000);
+    await Meteor.callAsync('itest.reset');
+
+    const support = new Agent(AGENT);
+    const sessionId: string = await support.start({ title: 'claim-revocation' });
+    const handle = support.subscribe(sessionId);
+    try {
+      await waitFor('the anonymous subscription to become ready', 20000, () => handle.ready());
+      await support.send(sessionId, 'private before claim');
+      await waitFor('the transcript before claim', 20000, () =>
+        support.messages(sessionId).fetch().some((m: any) => m.role === 'user'));
+
+      assert.equal(await Meteor.callAsync('itest.claimAnonymous', sessionId), 1);
+      await waitFor('the revoked transcript to be retracted', 20000, () =>
+        support.messages(sessionId).fetch().length === 0
+        && support.session(sessionId) === undefined);
+    } finally {
+      support.stop();
+    }
+  });
+
+  it('retracts a live transcript as soon as its human participant is removed', async function () {
+    this.timeout(30000);
+    await Meteor.callAsync('itest.reset');
+    await Meteor.callAsync('itest.setUserId', 'live-member');
+
+    const support = new Agent(AGENT);
+    try {
+      const sessionId: string = await support.start({ title: 'participant-revocation' });
+      assert.equal(await Meteor.callAsync('itest.makeCurrentUserParticipant', sessionId), 1);
+
+      const handle = support.subscribe(sessionId);
+      await waitFor('the participant subscription to become ready', 20000, () => handle.ready());
+      await support.send(sessionId, 'private participant message');
+      await waitFor('the participant transcript', 20000, () =>
+        support.messages(sessionId).fetch().some((m: any) => m.role === 'user'));
+
+      assert.equal(await Meteor.callAsync('itest.removeCurrentParticipant', sessionId), 1);
+      await waitFor('the removed participant transcript to be retracted', 20000, () =>
+        support.messages(sessionId).fetch().length === 0
+        && support.session(sessionId) === undefined);
+    } finally {
+      support.stop();
+      await Meteor.callAsync('itest.setUserId', null);
+    }
+  });
+
   it('delivers a streamed reply into the merged cursor', async function () {
     this.timeout(60000);
     await Meteor.callAsync('itest.reset');

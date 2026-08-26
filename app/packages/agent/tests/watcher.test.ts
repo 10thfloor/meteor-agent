@@ -421,8 +421,8 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => warnings.some((m) => m.includes('s-unregistered')),
-        'a warning naming the skipped session',
+        async () => warnings.some((m) => m.includes('unregistered agent')),
+        'a warning about the skipped session',
       );
       await settle(200);
       assert.equal(
@@ -435,6 +435,8 @@ describe('orphan-claim watcher', () => {
         warnings.some((m) => m.includes('watch-agent-that-never-existed')),
         'the warning must name the agent so an operator can fix it',
       );
+      assert.notInclude(warnings.join('\n'), 's-unregistered',
+        'bearer-capability session ids must not enter logs');
     } finally {
       console.warn = originalWarn;
       await w.stop();
@@ -665,8 +667,8 @@ describe('orphaned-child re-link', () => {
     const w = startWatcher({ sweepMs: 60, relinkGraceMs: 50 });
     try {
       await waitFor(
-        async () => warnings.some((m) => m.includes('c-no-parent')),
-        'a warning naming the parentless child',
+        async () => warnings.some((m) => m.includes('child session names a parent')),
+        'a warning about the parentless child',
       );
       await waitFor(
         async () => (await noteCount('p-control-gone')) === 1,
@@ -683,17 +685,14 @@ describe('orphaned-child re-link', () => {
         0, 'and there is no transcript to write the pointer into',
       );
       assert.equal(
-        warnings.filter((m) => m.includes('c-no-parent')).length, 1,
+        warnings.filter((m) => m.includes('child session names a parent')).length, 1,
         'one warning per process, not one per sweep',
       );
-      assert.isTrue(
-        warnings.some((m) => m.includes('p-vanished')),
-        'the warning names the parent an operator would go looking for',
-      );
+      assert.notInclude(warnings.join('\n'), 'c-no-parent');
+      assert.notInclude(warnings.join('\n'), 'p-vanished');
     } finally {
       console.warn = originalWarn;
       await w.stop();
     }
   });
 });
-

@@ -6,8 +6,8 @@ import type { ChannelBinding } from '../server/channels/collections';
 
 /**
  * Channels (channels spec): the planner's line, the lens law, the
- * single-winner claim/advance, binding-first creation, exactly-once admission,
- * effectively-once delivery through receipts, the expects grammar with its
+ * single-winner claim/advance, binding-first creation, deduplicated admission,
+ * receipt-backed delivery, the expects grammar with its
  * staleness rule, and account linking with history claiming.
  */
 
@@ -761,6 +761,124 @@ describe('channels', () => {
       assert.equal(status, 413);
     });
 
+    it('preverifies headers before buffering, then still runs full verification', async () => {
+      let verifyCalls = 0;
+      await registerTestChannel({
+        preverify: (head) => {
+          if (head.headers['x-preverify'] === 'throw') {
+            throw new Error('SECRET pre-verifier detail');
+          }
+          return head.headers['x-preverify'] === 'ok';
+        },
+        verify: (request) => {
+          verifyCalls += 1;
+          return request.headers['x-sig'] === 'ok';
+        },
+      });
+      const { mountChannelRoutes } = await import('../server/channels/ingress');
+      let handler: ((req: any, res: any) => void) | null = null;
+      mountChannelRoutes({ use(_path: string, fn: any) { handler = fn; } });
+
+      let rejectedStatus = 0;
+      let rejectedEnded!: () => void;
+      const rejectedDone = new Promise<void>((resolve) => { rejectedEnded = resolve; });
+      let drained = false;
+      handler!({
+        headers: { 'x-preverify': 'bad', 'x-sig': 'ok' },
+        url: '/agent/channels/test',
+        setEncoding() { throw new Error('body buffering must not start'); },
+        on() { throw new Error('body listeners must not be installed'); },
+        resume() { drained = true; },
+      }, {
+        writeHead(next: number) { rejectedStatus = next; },
+        end() { rejectedEnded(); },
+      });
+      await rejectedDone;
+      assert.equal(rejectedStatus, 401);
+      assert.isTrue(drained, 'the rejected request is drained without buffering');
+      assert.equal(verifyCalls, 0, 'full body verification is not reached after rejection');
+
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      let thrownStatus = 0;
+      let thrownEnded!: () => void;
+      const thrownDone = new Promise<void>((resolve) => { thrownEnded = resolve; });
+      try {
+        handler!({
+          headers: { 'x-preverify': 'throw', 'x-sig': 'ok' },
+          url: '/agent/channels/test',
+          setEncoding() { throw new Error('body buffering must not start'); },
+          on() { throw new Error('body listeners must not be installed'); },
+          resume() {},
+        }, {
+          writeHead(next: number) { thrownStatus = next; },
+          end() { thrownEnded(); },
+        });
+        await thrownDone;
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.equal(thrownStatus, 401, 'a pre-verifier exception fails closed');
+      assert.include(warnings.join('\n'), 'pre-verification failed closed');
+      assert.notInclude(warnings.join('\n'), 'SECRET');
+      assert.equal(verifyCalls, 0);
+
+      const listeners: Record<string, (chunk?: any) => void> = {};
+      let acceptedStatus = 0;
+      let acceptedEnded!: () => void;
+      const acceptedDone = new Promise<void>((resolve) => { acceptedEnded = resolve; });
+      handler!({
+        headers: { 'x-preverify': 'ok', 'x-sig': 'ok' },
+        url: '/agent/channels/test',
+        setEncoding() {},
+        on(event: string, fn: (chunk?: any) => void) { listeners[event] = fn; },
+        destroy() {},
+      }, {
+        writeHead(next: number) { acceptedStatus = next; },
+        end() { acceptedEnded(); },
+      });
+      // `preverify` may be async, so body listeners are installed only after
+      // its promise permits the request.
+      await new Promise((resolve) => { setTimeout(resolve, 0); });
+      const body = JSON.stringify({ type: 'noop' });
+      listeners.data(body);
+      listeners.end();
+      await acceptedDone;
+      assert.equal(acceptedStatus, 200);
+      assert.equal(verifyCalls, 1, 'preverification never replaces full verification');
+    });
+
+    it('does not copy raw webhook exceptions into the server log', async () => {
+      await registerTestChannel();
+      const { mountChannelRoutes } = await import('../server/channels/ingress');
+      let handler: ((req: any, res: any) => void) | null = null;
+      mountChannelRoutes({ use(_path: string, fn: any) { handler = fn; } });
+
+      const logs: string[] = [];
+      const originalError = console.error;
+      console.error = (...args: unknown[]) => { logs.push(args.map(String).join(' ')); };
+      let status = 0;
+      let ended!: () => void;
+      const done = new Promise<void>((resolve) => { ended = resolve; });
+      try {
+        handler!({
+          headers: { 'x-sig': 'ok' },
+          url: '/agent/channels/test',
+          setEncoding() { throw new Error('SECRET body or credential detail'); },
+        }, {
+          writeHead(next: number) { status = next; },
+          end() { ended(); },
+        });
+        await done;
+      } finally {
+        console.error = originalError;
+      }
+      assert.equal(status, 500);
+      assert.include(logs.join('\n'), 'webhook failed');
+      assert.notInclude(logs.join('\n'), 'SECRET');
+    });
+
     it('settles a verified event the lens cannot interpret with 200 — never a retry-inviting 500', async () => {
       const { def } = await registerTestChannel();
       const base = def.lens.in.bind(def.lens);
@@ -769,8 +887,17 @@ describe('channels', () => {
         return base(event);
       };
       const { handleInbound } = await import('../server/channels/ingress');
-      const out = await handleInbound('test', raw({ type: 'poison' }));
-      assert.equal(out.status, 200);
+      const warnings: string[] = [];
+      const originalWarn = console.warn;
+      console.warn = (...args: unknown[]) => { warnings.push(args.map(String).join(' ')); };
+      try {
+        const out = await handleInbound('test', raw({ type: 'poison' }));
+        assert.equal(out.status, 200);
+      } finally {
+        console.warn = originalWarn;
+      }
+      assert.include(warnings.join('\n'), 'lens could not interpret');
+      assert.notInclude(warnings.join('\n'), 'Cannot read properties');
       // And the pipeline is intact afterwards.
       const ok = await handleInbound('test', raw({ type: 'msg', text: 'still here', id: 'p1', user: 'u', convo: 'c' }));
       assert.equal(ok.status, 200);

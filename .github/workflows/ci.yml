@@ -28,22 +28,21 @@ jobs:
             app/.meteor/local
           key: meteor-3.5-typecheck-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
 
-      - name: npm install
+      - name: Install dependencies
         working-directory: app
-        run: meteor npm ci || meteor npm install
+        run: meteor npm ci
+
+      - name: Audit production dependencies
+        working-directory: app
+        run: meteor npm audit --omit=dev --audit-level=moderate
 
       - name: Type-check the package
         working-directory: app
-        # No emit — Meteor transpiles by stripping types, so this is the only
-        # gate that type-checks the package at all: signatures, imports,
-        # property access, return drift, and — because the session counters go
-        # through the `SessionInc` union — a mistyped `$inc` path like
-        # `budgetSpent.toolCall` that would otherwise compile and silently
-        # disable a budget. A type error MUST fail the build; `tsc` exits
-        # non-zero on any diagnostic. (Arbitrary string modifier paths OUTSIDE
-        # the counter set remain unchecked — the `as any` collection casts are
-        # the follow-on burndown, tracked in the ledger.)
-        run: npx tsc --noEmit
+        run: npm run typecheck
+
+      - name: Verify published declarations are current
+        working-directory: app
+        run: npm run types:check
 
   test:
     name: Package suite (server + client)
@@ -63,9 +62,9 @@ jobs:
             app/.meteor/local
           key: meteor-3.5-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
 
-      - name: npm install
+      - name: Install dependencies
         working-directory: app
-        run: meteor npm ci || meteor npm install
+        run: meteor npm ci
 
       - name: Install Playwright browser
         working-directory: app
@@ -80,11 +79,7 @@ jobs:
           TEST_BROWSER_DRIVER: playwright
         # Port 3200 mirrors local convention; any free port works on a runner.
         #
-        # EVERY package, not just the core. The five surface packages were
-        # absent here until the display clause landed, so their lens suites —
-        # the round-trip law included — ran only on developers' machines, and a
-        # lens could drop an affordance without CI noticing. tsconfig has always
-        # type-checked them; that gate catches a bad import, never a bad render.
+        # List every package explicitly so all five channel lens suites run.
         run: >
           meteor test-packages --once --port 3200 --driver-package meteortesting:mocha
           ./packages/agent
@@ -112,9 +107,9 @@ jobs:
             app/.meteor/local
           key: meteor-3.5-build-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
 
-      - name: npm install
+      - name: Install dependencies
         working-directory: app
-        run: meteor npm ci || meteor npm install
+        run: meteor npm ci
 
       - name: Verify the loader against a real bundle
         # Exercises the pi-ai resolution chain against meteor build's

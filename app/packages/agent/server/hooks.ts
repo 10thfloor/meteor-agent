@@ -156,11 +156,10 @@ export async function runBeforeProviderRequest(
         continue;
       }
       current = next;
-    } catch (e) {
+    } catch {
       warnHook(
         'beforeProviderRequest:threw',
-        'a beforeProviderRequest hook threw and was skipped; the request stands: '
-        + `${(e as Error)?.message}`,
+        'a beforeProviderRequest hook threw and was skipped; the request stands',
       );
     }
   }
@@ -187,11 +186,10 @@ export async function runAfterToolResult(
         continue;
       }
       current = next;
-    } catch (e) {
+    } catch {
       warnHook(
         'afterToolResult:threw',
-        'an afterToolResult hook threw and was skipped; the result stands: '
-        + `${(e as Error)?.message}`,
+        'an afterToolResult hook threw and was skipped; the result stands',
       );
     }
   }

@@ -1,6 +1,14 @@
 {
   "packages": {
     "10thfloor:agent": {
+      "rateLimit": {
+        "starts": { "count": 5, "intervalMs": 60000 },
+        "sends": { "count": 20, "intervalMs": 60000 },
+        "interrupts": { "count": 20, "intervalMs": 60000 },
+        "approvals": { "count": 20, "intervalMs": 60000 },
+        "compacts": { "count": 5, "intervalMs": 60000 },
+        "memories": { "count": 30, "intervalMs": 60000 }
+      },
       "slack": {
         "botToken": "xoxb-YOUR-BOT-TOKEN",
         "signingSecret": "YOUR-SIGNING-SECRET"

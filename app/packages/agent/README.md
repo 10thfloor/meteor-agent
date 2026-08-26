@@ -24,20 +24,15 @@ autopublish`) — the defaults Meteor ships in every new app. `autopublish` woul
 push transcripts to every client, and `insecure` grants clients direct write
 access to collections, which voids the method-and-publication auth model
 wholesale. The package registers a blanket client-write `deny` on every one of
-its collections at startup — the three transcript collections and the six
-channel collections (see **Channels**) — as a backstop against `insecure`, but
-removing it is the correct fix.
+its collections at startup as a backstop against `insecure`, but removing it is
+the correct fix.
 
 ## Define an agent
 
 ```ts
-// imports/agents.ts — isomorphic
+// server/agents.ts
 import { Agent } from 'meteor/10thfloor:agent';
-export const Support = new Agent('support');
-
-// server/agents.ts — server only
-import { Support } from '/imports/agents';
-Support.define({
+export const Support = new Agent('support', {
   model: 'anthropic/claude-sonnet-5',
   instructions: ({ userId }) => `You help user ${userId}.`,
   tools: ['orders.lookup'],
@@ -204,11 +199,11 @@ arguments that never matched it. Unknown format names are still tolerated. The
 tools suite pins this (`ENFORCES \`format\`` in `tests/tools.test.ts`) so a
 typebox bump that reverted to annotation-only would fail loudly.
 
-If typebox cannot be loaded, the package logs **one** warning and falls back to
-a minimal structural checker — `type`, object `required`/`properties`, array
-`items`, accepting anything it cannot model. Validation narrows; it never
-disappears and never takes a turn down with it. `fullValidationAvailable()`
-reports which of the two is in force.
+If typebox cannot be loaded, the package logs **one** warning. A schema composed
+only of `type`, object `required`/`properties`, and array `items` is checked by
+the structural fallback; a richer schema is refused because that fallback
+cannot enforce the whole contract. `fullValidationAvailable()` reports whether
+a full checker is active.
 
 An app can install its own validator instead, and it wins over both:
 
@@ -358,9 +353,9 @@ one rung at a time and never throws: a validator you installed with
 `setToolArgsValidator` wins over everything; otherwise the compiled checker;
 otherwise the interpreted `Value.Check` (same enforcement, slower — used when
 `typebox/compile` is unreachable, or for one schema the compiler chokes on);
-otherwise the minimal structural checker, which enforces `type`, `required` and
-nested shape only. Each step down warns once. See the probe notes at the top of
-the validation section in `server/tools.ts`.
+otherwise the structural checker for schemas it can enforce completely. Richer
+schemas are refused, never partially accepted. Each step down warns once. See
+the probe notes at the top of the validation section in `server/tools.ts`.
 
 ### `runAs` — a tool with a fixed identity
 
@@ -495,16 +490,20 @@ The package is TypeScript, and ships generated declarations. Point your app's
 {
   "compilerOptions": {
     "paths": {
-      "meteor/10thfloor:agent": ["./packages/agent/index.d.ts"]
+      "meteor/10thfloor:agent": ["./packages/agent/index.d.ts"],
+      "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/index.d.ts"],
+      "meteor/10thfloor:agent-channel-telegram": ["./packages/agent-channel-telegram/index.d.ts"],
+      "meteor/10thfloor:agent-channel-whatsapp": ["./packages/agent-channel-whatsapp/index.d.ts"],
+      "meteor/10thfloor:agent-channel-sms": ["./packages/agent-channel-sms/index.d.ts"],
+      "meteor/10thfloor:agent-channel-email": ["./packages/agent-channel-email/index.d.ts"]
     }
   }
 }
 ```
 
-That is the whole setup. `npm run types` regenerates `packages/agent/types/`
-from source with `tsc --emitDeclarationOnly`, so declarations cannot drift from
-the implementation, and `npm run types:check` fails if the working tree changes
-as a result — wire it into CI beside `tsc --noEmit`.
+That is the whole setup. `npm run types` regenerates declarations for the core
+and all five channel packages from source with `tsc --emitDeclarationOnly`.
+`npm run types:check` is the CI drift gate beside `tsc --noEmit`.
 
 A `.js` app gets hover and completion from this immediately; no `checkJs`, no
 conversion. `declarationMap` is on, so cmd-click lands in the real source rather
@@ -514,9 +513,8 @@ than in a `.d.ts`.
 architecture, and both export a class called `Agent` with different surfaces.
 TypeScript cannot model that, so the default `Agent` is the SERVER one — that is
 where configs, tools, gates and hooks live. Client code imports `ClientAgent`
-for the browser surface (`subscribe`, `messages`, `status`, `pending`). The
-residue: a client file importing a server-only export type-checks and fails at
-run time.
+for the browser surface (`subscribe`, `messages`, `status`, `pending`). Keep
+server-only imports in server modules; they do not exist in the client bundle.
 
 ### Typed tool arguments
 
@@ -1317,10 +1315,9 @@ import { Agent, mockProvider } from 'meteor/10thfloor:agent';
 Agent.provider('canned', mockProvider(() => ({ text: 'hi' })));
 ```
 
-It buys two things. An agent config can live in an **isomorphic** file — the
-string names a server-only implementation without dragging it into the client
-bundle. And a deployment swaps its backend behind one registration instead of
-editing every agent.
+It buys two things. Agent configs can name a server-only implementation without
+importing it into every config module, and a deployment can swap its backend
+behind one registration instead of editing every agent.
 
 Names resolve on the first **turn**, not at `define()`: agents and providers
 register in whatever order their server files load, so an agent may name a
@@ -1418,7 +1415,7 @@ minimum; treat the aggregate ceiling as the operator's responsibility.
 ## Channels
 
 A channel puts the same agent on an external surface — Slack, Telegram,
-WhatsApp, SMS — as two adapters over the machinery above. **Inbound** is a
+WhatsApp, SMS, or email — as two adapters over the machinery above. **Inbound** is a
 verified webhook that calls the same core the web client's `send`/`approve`/
 `deny` call, with an explicit `userId`. **Outbound** is a worker that observes
 committed rows and posts them to every surface bound to the session, exactly
@@ -1438,9 +1435,9 @@ Agent.channel('sms', sms({
 }));
 ```
 
-Four surface packages ship — `10thfloor:agent-channel-slack`, `-telegram`,
-`-whatsapp` and `-sms` — each exactly one lens, one transport and one profile
-default, zero npm dependencies; each README carries the provider-side setup.
+Five surface packages ship — `10thfloor:agent-channel-slack`, `-telegram`,
+`-whatsapp`, `-sms`, and `-email` — each exactly one lens, one transport and one
+profile default, zero npm dependencies; each README carries provider setup.
 Server-side `agent.send(sessionId, text, { userId })`,
 `agent.approve(sessionId, { userId })` and `agent.deny(sessionId, reason,
 { userId })` landed with channels: the same core the DDP methods call, always
@@ -1532,7 +1529,7 @@ never a summary: the worker never calls a model. A `prompt`'s `choices` are
 `{ token: 'approve' | 'deny', label, match?, url? }` — `token` is canonical,
 and the grammar fields are filled per the profile before the lens sees the
 item. In the envelope, `eventId` must be the provider's **redelivery-stable**
-id (it powers exactly-once admission); `externalUserId` keys the identities
+id (it powers deduplicated admission); `externalUserId` keys the identities
 table and `conversationRef` the bindings table; `destination` is where replies
 go, stored on the binding, opaque to the core; `audience` is `'direct'` (one
 recipient) or `'group'`, defaulting to `'group'` — the safe direction, since an
@@ -1765,7 +1762,7 @@ one delivery collide on the insert, and one wins.
 | `agent_channel_identities` | `<kind>:<externalUserId>` | Who an external sender is: `{ kind, externalUserId, userId, assurance, linkedAt }`. One app user, many rows; no row means unlinked. |
 | `agent_channel_bindings` | `<kind>:<conversationRef>` | Which conversation maps to which session: `destination`, `audience`, `agent`, `sessionId`, `userId`, the opener's `externalUserId` and `assurance`, `deliveredSeq` (this surface's cursor), `claim` (the delivering worker's lease). One session, many bindings. Inserted **before** the session, so a lost race creates nothing. |
 | `agent_delivery_receipts` | `deliver:<bindingId>:<suffix>` | The three-phase intent log: `state` (`sending` \| `sent` \| `abandoned`), `providerMessageId`, `expects` (the reply grammar a prompt delivery registered), `attempts`, `at`. |
-| `agent_inbound_submissions` | `<kind>:<eventId>` | Exactly-once admission: one row per admitted provider event. TTL-reaped after a week — the replay horizon for signatures that carry no timestamp. |
+| `agent_inbound_submissions` | `<kind>:<eventId>` | Deduplicated admission: one row per admitted provider event. TTL-reaped after a week, which defines the deduplication window. |
 | `agent_channel_link_tokens` | `Random.secret()` | Single-use linking tokens, bound to one external identity. |
 | `agent_channel_verdict_tokens` | `Random.secret()` | Single-use approval tokens for `link`-interact prompts, bound to one pending verdict — a separate table from link tokens so the two can never be presented for each other. |
 
@@ -1994,93 +1991,18 @@ safe.
 
 Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
 
-## Scope
+## Scope and stability
 
-**Five milestones shipped — v1, v2, and the v3 backlog: the whole list.**
+Version `0.1.0` is the first public package surface: durable transcripts,
+streaming, tools and gates, budgets, recovery, compaction, subagents, forking,
+MCP, skills, hooks, the optional chat element, five channel adapters,
+participants, attachments, system turns, and memory. The sections above define
+those supported entry points and their operational caveats.
 
-The production core (milestone 2): the pi-ai provider by default, retry with
-backoff and error surfacing, approval gates, budgets and cost accounting, DDP
-rate limits. The working surface (milestone 3): compaction, an interrupt that
-cancels the provider request, the orphan-claim watcher with approval timeouts,
-`Agent.method()` co-registration with validated tool arguments, `Agent.ask()`
-for headless one-shots, the `canUse` backstop, `maxResultChars` truncation,
-client teardown via `stop()`, and the production-bundle verification sweep (see
-**Verifying a production build**).
+The extension surface is deliberately small. Use `beforeProviderRequest` and
+`afterToolResult` hooks to change provider requests or tool results; use a
+custom provider for model transport; use the lens contract for a new channel.
+Test loaders, cache probes, and worker internals are not public exports.
 
-Milestone 4 finished the v2 list:
-
-- **Full JSON-Schema validation** of tool arguments through typebox when it is
-  reachable, degrading to a structural checker with one warning when it is not.
-- **Per-tool-call attribution** of streamed arguments, so parallel tool calls
-  arrive as separate streams (`toolArgs` on an in-flight row).
-- **Subagents** — a named agent behind a tool call, running a child session with
-  a live, persistent transcript (see **Subagents**).
-- **Session forking** at batch-safe cut points (see **Forking**).
-- **MCP servers** as tool sources (see **MCP servers**).
-- **Skills** — on-demand prompt fragments, listed in the prompt and loaded
-  through a built-in tool (see **Skills**).
-- **Hooks** — the two-seam extension surface (see **Hooks**).
-- **`<agent-chat>`** — the packaged UI, one tag, no framework (see **The
-  packaged UI**).
-- The small candidates the reviews had been carrying: **`Agent.provider()`**
-  name registry (see **Providers**), **manual `compact()`** (see **Define an
-  agent**), **`runAs`** on tool specs (see **`runAs` — a tool with a fixed
-  identity**), and a **rate-limit entry for approvals**.
-
-Milestone 5 (v3) shipped on top of that list:
-
-- **Predicate gates** — `gate` may be a function that reads the arguments and
-  the caller, not only the tool name (see **Tools**).
-- **Per-agent hooks** — `agentInstance.hook(...)` beside the global
-  `Agent.hook(...)`, globals running first (see **Hooks**).
-- **Idempotent subagent dispatch** — a recovered parent turn reuses the child
-  it already created rather than running a second one (see **Subagents**).
-- **Orphan re-link** — the sweep writes an `orphan-child` pointer into the
-  parent transcript when a dispatch died before committing its result, so no
-  child is stranded (see *Recovery runs itself*).
-- **Interrupt propagation** — Stop walks the `activeChild` chain and stops the
-  subagent work the user can actually see.
-- **Compiled argument validation** — the default checker compiles each schema
-  once with typebox's `Compile` and caches it, with `Value.Check` as the
-  interpreted fallback rung (see **Operations**).
-- **Startup indexes** — the transcript read and the watcher's sweeps stopped
-  being collection scans.
-- **A `tool_args` delta clamp** — one runaway argument stream can no longer
-  evict every other session's tokens from the capped delta collection.
-
-The sixth addition is **channels** (see **Channels**): the lens contract with
-its round-trip test, the watcher-shaped egress worker, the generic webhook
-pipeline, exactly-once admission, receipt-backed delivery, account linking,
-and server-side `send`/`approve`/`deny` with an explicit `userId`. The core
-takes no provider SDK dependency; four surface packages prove the contract,
-each one lens + one transport + zero npm dependencies —
-`10thfloor:agent-channel-slack`, `-telegram`, `-whatsapp` and `-sms`, the last
-being the design's stress test (no buttons, no threads: approvals ride the
-receipt-registered "Reply YES/NO" grammar).
-
-The seventh addition is **participants** (see **Participants — n:n
-sessions**): the roster, membership as the authorization primitive, the
-trusted ingress principal for unlinked channel members, mechanical
-`@`-addressing with durable budgeted relays, per-model provider projection
-with attribution, the composed-email loop (`onReply: 'continue'`), chat
-media ingest through the def-owned SSRF-gated fetcher, the download surface,
-approval legibility (`describe` → `pending.display`), and multimodal reads
-behind a provider capability gate.
-
-**The extension surface is hooks, and only hooks.** `beforeProviderRequest` and
-`afterToolResult` are the two seams this package offers an app for changing what
-the harness does, and they replace Pi's extension API rather than reproducing
-it: an extension there is a module a host process installs, and here the host
-process is your Meteor server. A custom summarizer needs no option of its own —
-it is `beforeProviderRequest` with `ctx.purpose === 'compaction'`.
-
-**Two items from the original design are retired, not pending.** Pi's **RPC
-mode** and **print mode** describe a standalone process that needs a way to be
-driven and a way to answer once. Here the RPC layer *is* DDP — `agent.start` /
-`agent.send` / `agent.approve` are the RPC surface, published transcripts are
-the streaming half, and adding a second protocol beside them would be inventing
-a worse one. Print mode *is* `Agent.ask()`: one question in, one string out, no
-session left behind. They are satisfied by the architecture rather than by code,
-which is why you will not find them on a backlog.
-
-See `docs/superpowers/specs/` for the full design.
+Historical decision records live under `docs/superpowers/specs/`. The current
+source, generated declarations, and test suite are authoritative.

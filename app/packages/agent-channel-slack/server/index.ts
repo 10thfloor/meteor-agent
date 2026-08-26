@@ -403,9 +403,8 @@ export function slackTransport(options: SlackTransportOptions): ChannelTransport
 
 /**
  * The factory's options: Slack's own three, the profile override, the test
- * seam — and the core's five pass-through knobs (`statuses`,
- * `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`), typed and
- * documented once on `ChannelDef` and forwarded untouched. The one default
+ * seam — and the core's `ChannelKnobs`, typed and documented once on
+ * `ChannelDef` and forwarded untouched. The one default
  * this package sets: `statuses` is `['error', 'approval']` — a failed turn and
  * a decided approval are worth saying in the thread. `linkUrl` is what turns
  * a "link" DM into an answer (spec §12); without it, link requests are

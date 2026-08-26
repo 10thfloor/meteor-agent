@@ -25,6 +25,8 @@ new Agent('support', {
 Or skip the element and build your own UI on a plain reactive cursor:
 
 ```ts
+import { ClientAgent as Agent } from 'meteor/10thfloor:agent';
+
 const Support = new Agent('support');
 const sessionId = await Support.start();
 Support.subscribe(sessionId);
@@ -53,7 +55,7 @@ Define an agent on the server, drop `<agent-chat>` on a page (after calling
 
 ```bash
 git clone https://github.com/10thfloor/meteor-agent && cd meteor-agent/app
-meteor npm install
+meteor npm ci
 meteor run --port 3400
 ```
 
@@ -69,7 +71,7 @@ Support.define({ model: 'mock', instructions: '…',
   provider: mockProvider(() => ({ text: 'hi' })) });
 ```
 
-The package's own 322-test suite runs entirely network-free.
+The default package suite runs entirely network-free.
 
 ## Why this exists
 
@@ -94,7 +96,7 @@ The consequences are the interesting part:
   deploys until someone approves, denies, or a timeout does.
 - **Cost has brakes.** Turn, tool-call, and dollar budgets are enforced
   before the spend they govern; provider-reported cost is preferred over
-  price-table math; DDP rate limits guard every entry point.
+  price-table math; configurable DDP rate limits can guard every entry point.
 
 ## Streaming
 
@@ -439,8 +441,9 @@ tools: [{
 ```
 
 Schemas are compiled once per process (typebox). If the compiler is unavailable,
-validation degrades gracefully: a documented ladder from compiled check to
-`typeof` probe to pass-through, each logged.
+the interpreted checker takes over. If no full checker is available, schemas
+made only of structural keywords are checked structurally; richer schemas are
+refused rather than run with partially checked arguments.
 
 ## Providers
 
@@ -564,17 +567,19 @@ committed reply to every surface bound to the session. One conversation can be
 live in Slack, mirrored over SMS, and open in the web app at once — each
 surface tracks its own cursor, so a downed gateway delays only itself.
 
-Four surfaces ship today, each a package of exactly one lens, one transport,
+Five surfaces ship today, each a package of exactly one lens, one transport,
 and one profile — **Slack** (threads, buttons, mrkdwn), **Telegram** (inline
 keyboards, secret-token webhooks), **WhatsApp** (reply buttons, the signed
 Cloud API, the 24-hour window handled honestly), and **SMS via Twilio** (the
-reply-menu grammar: "Reply YES to approve"). The same parked approval renders
-as buttons on three of them and as reply words on the fourth, and any surface
-decides it — first answer wins.
+reply-menu grammar: "Reply YES to approve"), and **Email via Postmark**
+(threaded replies and single-use approval links). The same parked approval is
+rendered in the native interaction style of each surface; first answer wins.
 
-What you inherit without writing it: **exactly-once admission** (a provider
-retry never runs a second turn), **effectively-once delivery** (a three-phase
-receipt log — a redeploy re-sends nothing), **approvals over any surface**
+What you inherit without writing it: **deduplicated admission** (provider
+retries with the same event id are ignored during the seven-day retention
+window), **receipt-backed delivery** (confirmed sends
+survive redeploys; each channel declares whether an uncertain send is retried,
+reconciled, or abandoned), **approvals over any surface**
 (buttons where the surface has them, "Reply YES to approve" where it doesn't,
 single-use links where replies are awkward — same single-winner verdict
 either way), and **account linking with assurance levels**, so a gate can say
@@ -599,10 +604,9 @@ reference — config surface, tools, budgets, gates, subagents, MCP, skills,
 hooks, theming, channels, and the operational notes that matter in production.
 **[by-example.md](docs/by-example.md)** covers the same ground as working
 code — including a failure drill that kills the server mid-stream and watches
-the transcript put itself back together. The design specs behind each release
-live in **[docs/superpowers/specs/](docs/superpowers/specs/)**, each one
-recording the decisions it made and, where a build disagreed with its spec, the
-deviation and why.
+the transcript put itself back together. Historical architectural decisions
+live in **[docs/superpowers/specs/](docs/superpowers/specs/)**; source and tests
+are authoritative where an older record describes an earlier release.
 
 ## Requirements
 
@@ -611,8 +615,9 @@ deviation and why.
   observers fall back to ~10s polling and streaming feels like a teleprinter.
   This is Meteor's constraint, not this package's; Atlas or a single-node
   `--replSet` is fine.
-- `@earendil-works/pi-ai` as an app dependency (unless you bring your own
-  provider), `@modelcontextprotocol/sdk` only if you use MCP tools.
+- `typebox` for full tool-argument validation.
+- `@earendil-works/pi-ai` as an app dependency unless you bring your own
+  provider; `@modelcontextprotocol/sdk` only if you use MCP tools.
 
 ## How it holds together
 
@@ -623,11 +628,9 @@ send() ─▶ method (authorize, atomic seq) ─▶ lease claim ─▶ turn loop
                      └──done──▶ [messages]  (committed at boundaries only)
 ```
 
-The design reasoning — the lease model, the repair invariants, the
-approval-gate semantics, why the merge walks backward — lives in the design
-spec ([`docs/superpowers/specs/`](docs/superpowers/specs/)), and the five
-milestone plans that built on it are in
-[`docs/superpowers/plans/`](docs/superpowers/plans/).
+The design reasoning — the lease model, repair invariants, approval-gate
+semantics, and why the merge walks backward — is preserved in the historical
+design records under [`docs/superpowers/specs/`](docs/superpowers/specs/).
 
 ## Project layout
 
@@ -639,7 +642,7 @@ app/packages/agent-channel-whatsapp/  WhatsApp surface  │ transport each
 app/packages/agent-channel-sms/       SMS (Twilio)      │
 app/packages/agent-channel-email/     Email (Postmark)  ┘
 app/                                  host app: test harness + the demo chat
-docs/superpowers/                     design spec + per-milestone implementation plans
+docs/superpowers/specs/               historical architectural decisions
 scripts/verify-build.sh               proves the loader against a real production bundle
 ```
 
@@ -648,67 +651,16 @@ Development workflow, the test command, and the npm-dependency policy are in
 
 ## Status
 
-Five milestones shipped: the spec's v1 (streaming, tools, gates, budgets,
-compaction, recovery), the v2 features (subagents, forking, MCP, skills,
-hooks, the element), and the v3 backlog:
+The package metadata targets the first public release, `0.1.0`. Until the
+Atmosphere packages are published, vendor the package directories from this
+repository as described in the package README. CI type-checks source and
+published declarations, runs the core and all five channel suites, and verifies
+a production Meteor bundle.
 
-- **predicate gates** — `gate` may be a function, so authorization can read
-  the arguments and the caller instead of only the tool's name;
-- **per-agent hooks** — `agentInstance.hook(...)` beside the global
-  `Agent.hook(...)`, globals first;
-- **idempotent subagent dispatch** — a recovered parent turn reuses the child
-  it already created instead of running a second one;
-- **orphan re-link** — the sweep writes a pointer into the parent transcript
-  when a dispatch died before committing its result, so no child is stranded;
-- **interrupt propagation** — Stop walks the `activeChild` chain and stops the
-  work the user can actually see;
-- **wake tokens** — a deferred wake proceeds only if the verdict it captured
-  still stands;
-- **compiled argument validation** — one compiled JSON-Schema checker per tool
-  schema, cached for the process, with a documented degrade ladder;
-- **startup indexes** — the transcript read and the watcher's sweeps stopped
-  being collection scans;
-- **a `tool_args` delta clamp** — one runaway argument stream can no longer
-  evict every other session's tokens from the capped delta collection.
-
-The sixth addition is **channels** — multi-surface delivery per the
-[channels spec](docs/superpowers/specs/2026-08-20-channels-multi-surface-delivery.md):
-the lens contract with its round-trip test, the watcher-shaped egress worker,
-the generic webhook pipeline, exactly-once admission, receipt-backed delivery,
-and account linking. Server-side `agent.send/approve/deny({ userId })` landed
-with it. The core takes no provider SDK dependency; five surface packages
-prove the contract, each one lens + one transport + zero npm dependencies:
-**[Slack](app/packages/agent-channel-slack/README.md)**,
-**[Telegram](app/packages/agent-channel-telegram/README.md)**,
-**[WhatsApp](app/packages/agent-channel-whatsapp/README.md)**,
-**[SMS/Twilio](app/packages/agent-channel-sms/README.md)** — the design's
-stress test (no buttons, no threads: approvals ride the receipt-registered
-"Reply YES/NO" grammar) — and **[Email/Postmark](app/packages/agent-channel-email/README.md)**,
-where the conversation is a thread recovered statelessly from our own
-Reply-To address and approvals are single-use Approve/Deny links.
-
-The seventh is **participants** — a session generalized to *n* humans and *n*
-models per the
-[participants spec](docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md):
-an optional roster that becomes the authorization primitive, per-message
-attribution stamped by the harness rather than claimed by a model, mechanical
-`@name` addressing, and durable model-to-model relays with their own budget.
-The same release closed the deferred loops — composed email that continues its
-own conversation, chat media ingest behind an allowlisted fetcher, click-minted
-download tokens, tool-authored approval text, and multimodal reads.
-
-The eighth is **memory** — durable recall per the
-[memory spec](docs/superpowers/specs/2026-08-23-agent-memory-design.md):
-a second Mongo collection the user can subscribe to and delete from, person
-memory that follows the human across every agent on a roster, an approval-gated
-shared pool for facts about the work, and a search ladder from `$vectorSearch`
-down to regex that narrows rather than breaking.
-
-CI runs the full suite plus a production-bundle verification on every push.
-
-Honest caveats: the package is **not yet published to Atmosphere** (install
-from this repo until then), and the live-provider smoke test is the one test
-that needs a real API key — everything else is verified network-free.
+The default suite uses mock providers. Separate opt-in live smokes cover a real
+provider and MCP process. Channel providers differ in their guarantees around a
+crash between sending and recording a receipt; each channel README names that
+tradeoff explicitly.
 
 ## License
 

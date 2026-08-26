@@ -1,7 +1,7 @@
 # Channels: letting your agent talk on Slack, SMS, and email
 
 **Date:** 2026-08-21
-**Status:** as built (shipped 2026-08-22); see errata below. Revised twice before building: once after examining the Flue framework, once after a survey of cross-channel rendering prior art (§13).
+**Status:** historical design record; implemented. See errata below; current source and tests are authoritative.
 **Package:** `10thfloor:agent`
 
 **As built — errata.** The design shipped as written, with these concrete differences folded into the sections below. The source of truth is `app/packages/agent/common/channel-contract.ts` (the lens contract — pure and isomorphic, so the channel packages and the core share one module) and `app/packages/agent/server/channels/{registry,ingress,egress,plan,linking,collections}.ts`; the channel packages are `app/packages/agent-channel-{slack,telegram,whatsapp,sms}`.

@@ -1,13 +1,5 @@
 import type { AgentSession, SessionParticipant } from './types';
-/**
- * The PURE half of the participants model (participants spec §4): id
- * derivation, roster lookups, the mechanical addressing parse, and the
- * system-prompt block. Isomorphic — the web element renders names with the
- * same helpers the server stamps them with. No I/O, no Meteor imports.
- */
-/** Display-string discipline for names that land in prompts, transcripts and
- *  the element: control characters stripped, length-capped, never empty. The
- *  same rule the attachment store applies to file names, for the same reason. */
+/** Control chars stripped, length-capped, never empty. */
 export declare function sanitizeDisplayName(raw: string): string;
 /** `h:<userId>` | `h:anon` — the id of an ACCOUNT human (or the anonymous
  *  capability-URL owner). */
@@ -24,26 +16,12 @@ export declare function modelFrom(agent: string): {
     participant: string;
     name: string;
 };
-/**
- * `s:<source>` — the id of a NON-HUMAN, non-model origin: the clock, a webhook,
- * a job runner. System-turn spec decision 2.
- *
- * It is deliberately not a roster kind. `participantsBlock` renders every roster
- * row's `kind` into the prompt and `needsAttribution` counts every non-human row
- * as a model, so a `kind: 'system'` row would rewrite the system prompt of every
- * rostered session and flip `[name]: ` prefixing on 1:1 ones. An id outside the
- * roster resolves through `nameOf`'s fallback instead — the same trick a
- * subagent's stamp uses.
- *
- * The `s:` prefix must stay disjoint from `h:`, `x:` and `m:`: a system origin
- * that could be mistaken for a human id would be matched by the ownership and
- * publication checks that key on one.
- */
+/** `s:<source>` — a non-human, non-model origin (clock, webhook, job runner).
+ *  Deliberately NOT a roster kind — adding one would rewrite the system prompt
+ *  and flip attribution prefixing. Resolves through `nameOf`'s fallback. */
 export declare function systemParticipantId(source?: string): string;
-/** The `from` stamp for a system-originated row. Stamped whether or not the
- *  session has a roster (decision 3) — a system row is net-new, so there is no
- *  byte-identical 1:1 payload to preserve, and roster-gating it would drop
- *  attribution in exactly the case scheduled work uses. */
+/** `from` stamp for a system row. Always stamped (decision 3) — roster-gating
+ *  would drop attribution for scheduled work. */
 export declare function systemFrom(source?: string): {
     participant: string;
     name: string;
@@ -56,59 +34,27 @@ export declare function participantByIdentity(session: Roster, kind: string, ext
 /** The human roster row an ACCOUNT matches, or undefined. Null never matches a
  *  member — the anonymous rule is the owner's alone (§4.2). */
 export declare function participantByUserId(session: Roster, userId: string | null): SessionParticipant | undefined;
-/**
- * Resolve a message's addressee against the roster, mechanically:
- * an explicit `to` (a participant id or a bare agent name) wins, else the
- * leading `@` token, else null — the caller's default (the primary model).
- * Only MODEL participants resolve: addressing a human schedules nothing, so a
- * `to` naming one is recorded by the caller but never returned from here.
- */
+/** Resolve addressee: explicit `to` wins, else leading `@`, else null.
+ *  Only model participants resolve. */
 export declare function resolveAddressee(text: string | undefined, to: string | undefined, session: Roster): {
     id: string;
     agent: string;
 } | null;
-/**
- * A RELAY: the addressee of a MODEL's own reply, excluding itself — a model
- * cannot relay to itself, and only another model participant schedules
- * anything. Same parse as `resolveAddressee`, same mechanical contract.
- */
+/** Relay addressee — like `resolveAddressee` but excludes self. */
 export declare function resolveRelay(text: string | undefined, session: Roster, selfAgent: string): {
     id: string;
     agent: string;
 } | null;
-/**
- * A mention that ALMOST routed.
- *
- * The addressee parse reads exactly one position — the leading token — and that
- * narrowness is deliberate (decision 5): a message is addressed, or it merely
- * mentions. The failure it admits is silent, though, and models walk into it.
- * A model that opens with a sentence of preamble and puts `@risk` in the second
- * paragraph has written something that LOOKS addressed, reads as addressed to a
- * person scrolling the transcript, and schedules nothing at all. The turn ends,
- * the roster sits idle, and the question hangs unanswered with no indication
- * that anything went wrong.
- *
- * So: name the near miss. This finds an `@token` naming another MODEL
- * participant in text that addressed nobody, and the caller writes a note row
- * saying so. It changes no routing — auto-addressing on a buried mention would
- * make the parse ambiguous, which is exactly what decision 5 refused — it only
- * ends the silence.
- *
- * Returns the agent name, or null when the text addressed someone (nothing
- * missed) or named no model at all (nothing to say).
- */
+/** Find an `@model` mention in text that addressed nobody (decision 5 makes
+ *  addressing leading-token only). Returns the agent name so the caller can
+ *  write a note about the near miss; null when nothing was missed. */
 export declare function unroutedMention(text: string | undefined, session: Roster, selfAgent?: string): string | null;
 /** Do attribution prefixes disambiguate anything (decision 9)? Only in a
  *  roster with ≥2 humans or ≥2 models — the 1:1 provider payload must stay
  *  byte-identical to the rosterless one. */
 export declare function needsAttribution(participants: SessionParticipant[]): boolean;
-/**
- * The system-prompt participants block (§4.3), appended INSIDE the loop per
- * iteration — never baked into `RunConfig.system`, because the roster mutates
- * mid-conversation (compose's `'continue'` joins a recipient mid-turn) and a
- * defer-time prompt would be stale by design. Mechanical: names, kinds, the
- * addressing rule, and the impersonation injunction.
- */
+/** System-prompt participants block (§4.3). Appended per iteration because
+ *  the roster can mutate mid-conversation. */
 export declare function participantsBlock(session: Roster, selfAgent: string): string;
 export {};
 //# sourceMappingURL=participants.d.ts.map

@@ -6,8 +6,8 @@ import type { Provider } from '../server/providers/types';
  *
  * Two of these tests exist to PRODUCE A NUMBER as much as to assert: the
  * compiled-validation speedup and the tool_args delta pressure are both
- * recorded in `.superpowers/sdd/task-4-report.md`, and both are measured here
- * rather than in a benchmark suite so they stay honest when the code moves.
+ * measured here rather than in a separate benchmark suite, so the measurements
+ * stay honest when the code moves.
  * The assertions are deliberately loose (an order of magnitude, not a
  * threshold) — a CI box under load must not fail a correctness suite because
  * a JIT was slow to warm.

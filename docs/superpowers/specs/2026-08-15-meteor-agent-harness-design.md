@@ -1,7 +1,7 @@
 # Design: a Pi-based agent harness for Meteor 3.5+
 
 **Date:** 2026-08-15
-**Status:** approved design; de-risking spikes run 2026-08-15 (§12); not yet implemented
+**Status:** historical design record; implemented. Current source and tests are authoritative.
 **Package:** `10thfloor:agent` (Atmosphere, TypeScript)
 
 ---
@@ -594,8 +594,10 @@ correct.
 
 The four planned spikes plus one follow-up (S2b) ran against a real Meteor
 3.5.0 app (Node 24.15.0, MongoDB via `meteor run`), with S1 additionally
-verified against a production `meteor build` bundle. Spike source is in `spike/`
-at the repo root.
+verified against a production `meteor build` bundle. The throwaway spike
+workspace was removed before the public release; production bundle verification
+now lives in `scripts/verify-build.sh` and the durable cases live in package
+tests.
 
 | # | Spike | Result |
 |---|---|---|
@@ -628,9 +630,9 @@ particular removes the fallback-to-TTL-collection contingency.
 
 **S5 changed §4.1 and §4.4.** The merge as originally specified would have
 rendered an empty string for any message whose head had been evicted — the exact
-case the capped collection makes routine. Reference implementation and its 14
-adversarial cases are in `spike/imports/merge.js` and `spike/server/s5.js`; they
-carry over into the package as its first unit tests.
+case the capped collection makes routine. The reference behavior and its
+adversarial cases were carried into the package merge tests before the spike
+workspace was removed.
 
 **Not covered by S5, and deliberately left to implementation:** the merge was
 tested as a pure function, not across a live DDP connection. What remains

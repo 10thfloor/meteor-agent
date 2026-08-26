@@ -460,23 +460,34 @@ describe('validateToolArgs — the full checker (typebox Value.Check)', () => {
     assert.include((item as any).reason, 'ids[1]');
   });
 
-  it('degrades to the structural checker, with ONE warning, when typebox will not load', async () => {
+  it('refuses rich schemas, but safely checks plain ones, when typebox will not load', async () => {
     const { validateToolArgs, setTypeboxValueLoader } = await import('../server/tools');
     const warnings: string[] = [];
     const originalWarn = console.warn;
     console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
     // The forced outage: a loader that rejects is exactly what a renamed
     // typebox export or a pruned production tree looks like at runtime.
-    const restore = setTypeboxValueLoader(async () => { throw new Error('forced outage'); });
+    const restore = setTypeboxValueLoader(async () => {
+      throw new Error('SECRET loader detail must not be logged');
+    });
     try {
-      // Rich constraints are no longer enforced — the documented narrowing.
-      assert.isTrue((await validateToolArgs(rich, { op: 'nope', n: 999 })).ok);
-      assert.isTrue((await validateToolArgs(rich, { op: 'add', n: 5, sneak: 1 })).ok);
-      // But structure still is: this is a DEGRADE, not a disable.
-      const missing = await validateToolArgs(rich, { n: 5 });
-      assert.isFalse(missing.ok, 'the structural checker must still enforce required');
+      // Neither known-bad NOR apparently-good rich arguments may pass: without
+      // the full checker we cannot establish either verdict.
+      const badRich = await validateToolArgs(rich, { op: 'nope', n: 999 });
+      assert.isFalse(badRich.ok);
+      assert.include((badRich as any).reason, 'schema keyword');
+      assert.isFalse((await validateToolArgs(rich, { op: 'add', n: 5 })).ok);
+
+      // A schema wholly inside the minimal checker's contract still degrades
+      // safely and remains useful.
+      const plain = {
+        type: 'object', properties: { op: { type: 'string' } }, required: ['op'],
+      };
+      assert.isTrue((await validateToolArgs(plain, { op: 'add' })).ok);
+      const missing = await validateToolArgs(plain, {});
+      assert.isFalse(missing.ok);
       assert.include((missing as any).reason, 'op');
-      const wrongType = await validateToolArgs(rich, { op: 4, n: 5 });
+      const wrongType = await validateToolArgs(plain, { op: 4 });
       assert.isFalse(wrongType.ok);
       assert.include((wrongType as any).reason, 'op');
 
@@ -485,6 +496,30 @@ describe('validateToolArgs — the full checker (typebox Value.Check)', () => {
         'one warning per outage, not one per tool call',
       );
       assert.include(warnings[0], 'typebox');
+      assert.notInclude(warnings[0], 'SECRET');
+    } finally {
+      restore();
+      console.warn = originalWarn;
+    }
+  });
+
+  it('fails closed when an injected validator throws', async () => {
+    const { validateToolArgs, setToolArgsValidator } = await import('../server/tools');
+    const warnings: string[] = [];
+    const originalWarn = console.warn;
+    console.warn = (...a: unknown[]) => { warnings.push(a.map(String).join(' ')); };
+    const restore = setToolArgsValidator(async () => {
+      throw new Error('SECRET validator detail must not be logged');
+    });
+    try {
+      const result = await validateToolArgs(
+        { type: 'object', properties: { amount: { type: 'number' } } },
+        { amount: 5 },
+      );
+      assert.isFalse(result.ok, 'a validator exception must never authorize the call');
+      assert.equal((result as any).reason, 'tool-argument validation is unavailable');
+      assert.lengthOf(warnings.filter((w) => w.includes('validator threw')), 1);
+      assert.notInclude(warnings.join('\n'), 'SECRET');
     } finally {
       restore();
       console.warn = originalWarn;
@@ -696,6 +731,9 @@ describe('Agent.method fail-closed registration (final-review ruling)', () => {
     assert.equal(unenforceableKeyword({
       type: 'array', items: { oneOf: [{ type: 'string' }] },
     }), 'oneOf');
+    assert.equal(unenforceableKeyword({ type: 'wat' }), 'type');
+    assert.equal(unenforceableKeyword({ type: 'array', items: [{ type: 'string' }] }), 'items');
+    assert.equal(unenforceableKeyword(false), 'false schema');
   });
 
   it('Agent.method throws at define time when NO full validator is available', async () => {

@@ -2,35 +2,54 @@
 
 ## Reporting a vulnerability
 
-Please **do not** open a public issue for security problems. Email the
-maintainer (the address on the commits) with a description and, if you can, a
-minimal reproduction. You'll get an acknowledgement within a few days; fixes
-land on `main` and are noted in the commit message.
+Please **do not** open a public issue. Use [GitHub private vulnerability
+reporting](https://github.com/10thfloor/meteor-agent/security/advisories/new) and
+include the affected version, impact, and a minimal reproduction when possible.
+Reports are acknowledged privately; coordinated fixes land on `main` before
+public details are disclosed.
 
-## What to expect from the code
+## Security model
 
-- **Client writes are denied on every collection** (the three core ones and
-  the six channel ones), so Meteor's `insecure` package grants nothing even if
-  a host app still has it installed. All legitimate writes go through server
-  methods with `check()`-validated arguments and per-session ownership checks.
-- **Anonymous sessions are capability-URLs**: knowing a session id is the
-  credential, and such sessions are deliberately non-enumerable (the list
-  publication returns nothing to an anonymous caller).
-- **Channel webhooks verify the provider's signature first** (Slack v0 HMAC
-  with a replay window, WhatsApp `X-Hub-Signature-256`, Twilio HMAC-SHA1 over
-  URL + params, Telegram `secret_token`), in constant time, before any state
-  is touched; request bodies are size-capped before verification; every
-  provider event is admitted exactly once by its redelivery-stable id.
-- **Account linking completes only from the authenticated side** with
-  single-use, expiring, unguessable tokens; an external identity is never
-  trusted by itself, and a profile email is never auto-linked.
-- **Secrets live in `Meteor.settings` / the environment**, never in the
-  repo — `settings.json` is git-ignored and `settings.example.json` carries
-  placeholders only.
+- **Client writes are denied on every package collection.** This covers the
+  session, message, delta, memory, attachment, download-token, channel-binding,
+  channel-identity, delivery-receipt, inbound-submission, link-token, and
+  verdict-token stores. Legitimate writes use checked server methods with
+  session authorization.
+- **Anonymous sessions are bearer capabilities.** Knowing an anonymous session
+  id grants access to that session, so ids must not appear in logs or analytics.
+  Anonymous sessions cannot be listed by anonymous callers.
+- **Channel webhooks authenticate before use.** Slack, WhatsApp, Twilio, and
+  Telegram requests are verified with their provider-specific mechanism before
+  state changes; request bodies are capped and stable provider event ids are
+  admitted once. Email uses a constant-time checked Basic-auth credential and
+  should also be protected by an edge IP allowlist.
+- **Linking is completed from the authenticated side.** Single-use expiring
+  tokens connect an external identity to an account; provider profile data is
+  not sufficient by itself.
+- **Secrets belong in `Meteor.settings` or the environment.** `settings.json`
+  is ignored and `settings.example.json` contains placeholders only.
+
+## Release hygiene
+
+Create release archives from tracked Git, using `git archive` or a clean
+checkout. Never distribute a tarball of a working directory: ignored files such
+as `settings.json` and `.meteor/local` can contain credentials, transcripts,
+MongoDB data, or build artifacts that do not belong in a release.
+
+## Data retention
+
+Retention is host-managed. Package-owned durable data includes sessions,
+committed messages, memories, channel bindings and identities, delivery
+receipts, and attachment metadata and bytes; these remain until the host
+application removes them. Streaming deltas live in a capped collection and are
+discarded as turns commit. Inbound submission deduplication rows expire after
+seven days. Link, verdict, and download tokens carry short expiries and are
+TTL-reaped. Attachment bytes are retained by default; set
+`Meteor.settings.packages['10thfloor:agent'].attachments.retentionDays` to a
+positive value to create a TTL policy. Memory entries expire only when the app
+sets an expiry.
 
 ## Scope
 
-The package (`app/packages/agent`) and the channel packages
-(`app/packages/agent-channel-*`) are the product. `app/` is a demo host app
-and test harness — treat its accounts setup as a demo, not a reference for
-production identity.
+The core and channel packages are the product. `app/` is a demo and test host;
+its account setup is not a production identity reference.
