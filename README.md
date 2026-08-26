@@ -5,7 +5,7 @@
 streaming, tools, authorization, and recovery are built from the primitives
 your Meteor app already uses—without a second realtime stack.
 
-[v0.1.0](https://github.com/10thfloor/meteor-agent/tree/v0.1.0) ·
+[v0.2.0](https://github.com/10thfloor/meteor-agent/tree/v0.2.0) ·
 [CI](https://github.com/10thfloor/meteor-agent/actions/workflows/ci.yml) ·
 Meteor 3.5+ · [MIT](LICENSE)
 
@@ -63,7 +63,7 @@ JavaScript, and needs no client-side AI library.
 ### Run the demo
 
 ```bash
-git clone --branch v0.1.0 --depth 1 https://github.com/10thfloor/meteor-agent
+git clone --branch v0.2.0 --depth 1 https://github.com/10thfloor/meteor-agent
 cd meteor-agent/app
 meteor npm ci
 meteor run --port 3400
@@ -80,10 +80,10 @@ The packages are not yet on Atmosphere. From your Meteor app's root, vendor the
 tagged core package at `packages/agent`, then install it normally:
 
 ```bash
-git clone --branch v0.1.0 --depth 1 \
-  https://github.com/10thfloor/meteor-agent ../meteor-agent-v0.1.0
+git clone --branch v0.2.0 --depth 1 \
+  https://github.com/10thfloor/meteor-agent ../meteor-agent-v0.2.0
 mkdir -p packages
-cp -R ../meteor-agent-v0.1.0/app/packages/agent packages/agent
+cp -R ../meteor-agent-v0.2.0/app/packages/agent packages/agent
 
 meteor add 10thfloor:agent
 meteor npm install --save @earendil-works/pi-ai typebox
@@ -718,8 +718,8 @@ Development workflow, the test command, and the npm-dependency policy are in
 
 ## Status
 
-The first public source release is
-[`v0.1.0`](https://github.com/10thfloor/meteor-agent/tree/v0.1.0). Until the
+The current public source release is
+[`v0.2.0`](https://github.com/10thfloor/meteor-agent/tree/v0.2.0). Until the
 Atmosphere packages are published, vendor the package directories from this
 repository as described above. CI type-checks source and published
 declarations, runs the core and all five channel suites, audits production

@@ -2013,7 +2013,7 @@ Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
 
 ## Scope and stability
 
-Version `0.1.0` is the first public package surface: durable transcripts,
+Version `0.2.0` is the current public package surface: durable transcripts,
 streaming, tools and gates, budgets, recovery, compaction, subagents, forking,
 MCP, skills, hooks, the optional chat element, five channel adapters,
 participants, attachments, system turns, and memory. The sections above define
