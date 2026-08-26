@@ -276,10 +276,9 @@ export function telegramTransport(options: TelegramTransportOptions): ChannelTra
 
 // ---- The factory (§8.7 tier 1) ---------------------------------------------
 
-/** The credentials plus the core's five pass-through knobs (`ChannelKnobs`:
- *  `statuses`, `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`),
- *  forwarded to the `ChannelDef` untouched — except `statuses`, which defaults
- *  to `['error', 'approval']`. */
+/** The credentials plus the core's `ChannelKnobs`, forwarded to the
+ *  `ChannelDef` untouched — except `statuses`, which defaults to
+ *  `['error', 'approval']`. */
 export interface TelegramChannelOptions extends ChannelKnobs {
   /** The registered agent this bot fronts. */
   agent: string;
@@ -303,6 +302,9 @@ export function telegram(options: TelegramChannelOptions): ChannelDef {
     transport: telegramTransport({ botToken: options.botToken, fetchImpl: options.fetchImpl }),
     lens: telegramLens,
     profile: { interact: 'native', limit: 4096, ...options.profile },
+    preverify: (raw) => verifyTelegramSecret(
+      { ...raw, rawBody: '' }, options.webhookSecret,
+    ),
     verify: (raw) => verifyTelegramSecret(raw, options.webhookSecret),
     parse: parseTelegramUpdate,
     statuses: options.statuses ?? ['error', 'approval'],

@@ -7,10 +7,14 @@ buttons, and the same transcript open in the web app at the same time.
 
 Per the channels spec, this package is **one lens, one transport, one profile
 default** — Slack's signing scheme and payload shapes, and nothing else.
-Bindings, receipts, exactly-once admission, the delivery worker, and account
+Bindings, receipts, deduplicated admission, the delivery worker, and account
 linking all live in the core package.
 
 ## Install and register
+
+```bash
+meteor add 10thfloor:agent-channel-slack
+```
 
 ```js
 // server
@@ -143,7 +147,8 @@ README's lens ladder — spread `slackLens` and replace one item.
 
 ## Delivery guarantees
 
-Admission is exactly-once (`event_id`). Outbound is receipt-backed
+Admission is deduplicated by `event_id` during the core's seven-day retention
+window. Outbound is receipt-backed
 effectively-once with **`retry`** as the declared recovery for a crash between
 post and confirm: each delivery carries its receipt key in message metadata,
 but metadata read-back on the thread-replies endpoint is unverified (the

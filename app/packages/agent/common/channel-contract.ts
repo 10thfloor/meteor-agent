@@ -134,7 +134,7 @@ export type InboundIntent =
   | { kind: 'noop' };
 
 /** What `lens.in` returns: intent plus routing envelope. `eventId` must be
- *  redelivery-stable (exactly-once admission). */
+ *  redelivery-stable (deduplicated admission within the retention window). */
 export interface InboundReading {
   intent: InboundIntent;
   eventId?: string;

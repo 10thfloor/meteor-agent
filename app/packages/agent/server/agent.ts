@@ -149,10 +149,8 @@ export class Agent {
         // session's bytes must not outlive its transcript.
         await AgentAttachments.removeAsync({ sessionId });
         await AgentSessions.removeAsync({ _id: sessionId });
-      } catch (e) {
-        console.error(
-          `[10thfloor:agent] ask() could not clean up throwaway session ${sessionId}:`, e,
-        );
+      } catch {
+        console.error('[10thfloor:agent] ask() could not clean up its throwaway session');
       }
     }
   }

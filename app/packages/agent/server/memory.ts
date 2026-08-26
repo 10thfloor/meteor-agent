@@ -298,11 +298,10 @@ export async function searchMemory(
         ? rows.filter((r) => inScope(r, opts.config.scopes, opts.userId, opts.agent))
           .slice(0, limit)
         : [];
-    } catch (e) {
+    } catch {
       // An app's own search throwing is the app's bug, but it must not be the
       // conversation's death. Warn and fall through to the built-in rungs.
-      warnMemory(`the installed memory search fn threw; falling back to the built-in `
-        + `ladder: ${(e as Error)?.message}`);
+      warnMemory('the installed memory search fn threw; falling back to the built-in ladder');
     }
   }
 

@@ -9,10 +9,14 @@ This is the channel design's stress test on purpose: no buttons, no threads,
 no markup, weak identity, hard length limits. Per the channels spec, the
 package is **one lens, one transport, one profile default** — Twilio's
 signature scheme and wire shapes, nothing else. Bindings, receipts,
-exactly-once admission, the delivery worker, the reply-menu grammar, and
+deduplicated admission, the delivery worker, the reply-menu grammar, and
 account linking all live in the core. Zero npm dependencies.
 
 ## Install and register
+
+```bash
+meteor add 10thfloor:agent-channel-sms
+```
 
 ```js
 // server
@@ -105,7 +109,8 @@ under Twilio's hard 1600-character cap.
 
 ## Delivery guarantees — read this one
 
-Admission is exactly-once. Outbound is receipt-backed effectively-once with
+Admission is deduplicated by Twilio's stable message id during the core's
+seven-day retention window. Outbound is receipt-backed effectively-once with
 **`retry`** as the declared recovery tier, and here that declaration has
 teeth: **Twilio's Messages API accepts no idempotency key**, so a crash in
 the one window between a successful post and its confirmation may send a

@@ -325,7 +325,6 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           toolCalls = undefined;
           usage = { input: 0, output: 0 };
           interrupted = false;
-          let lastPhaseCheck = Date.now();
           let providerError: unknown = null;
           // Whether THIS attempt's request carried hydrated images — the
           // strip-and-degrade branch below keys on it (participants spec §9).
@@ -333,6 +332,29 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // Fresh per attempt: an aborted attempt's signal must not poison its
           // retry, and a signal is single-shot.
           const abort = new AbortController();
+          let interruptPoll: Promise<void> | null = null;
+          const pollForInterrupt = (): void => {
+            if (interruptPoll || abort.signal.aborted) return;
+            interruptPoll = (async () => {
+              try {
+                const live = await AgentSessions.findOneAsync(sessionId, {
+                  fields: { phase: 1 },
+                });
+                if (!live || live.phase === 'stopped') {
+                  interrupted = true;
+                  abort.abort();
+                }
+              } catch {
+                // Lease and commit guards remain authoritative if a poll fails.
+              }
+            })().finally(() => {
+              interruptPoll = null;
+            });
+          };
+          const interruptTimer = setInterval(
+            pollForInterrupt,
+            Math.max(1, interruptCheckMs),
+          );
 
           try {
             // Hooks run per ATTEMPT so a retry re-runs the chain. `signal` is
@@ -394,20 +416,10 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                   toolCalls = chunk.toolCalls;
                   usage = chunk.usage ?? usage;
                 }
-                // Honor an interrupt WHILE streaming — without this the stream
-                // runs to completion and dispatches its tools anyway.
-                if (Date.now() - lastPhaseCheck >= interruptCheckMs) {
-                  lastPhaseCheck = Date.now();
-                  const s = await AgentSessions.findOneAsync(sessionId);
-                  if (!s || s.phase === 'stopped') {
-                    // Abort BEFORE breaking: the break only stops consuming;
-                    // the abort is what cancels the HTTP request behind the
-                    // stream, which otherwise keeps arriving and billing.
-                    abort.abort();
-                    interrupted = true;
-                    break;
-                  }
-                }
+                // Most adapters cancel their underlying request on AbortSignal.
+                // Also stop consuming a non-cooperative iterator at its next
+                // yield so an interrupt cannot drain and bill the whole stream.
+                if (interrupted || abort.signal.aborted) break;
               }
             } finally {
               // Tail-flush rejection is NOT a provider failure — a Mongo blip
@@ -418,6 +430,12 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
             }
           } catch (e) {
             providerError = e;
+          } finally {
+            clearInterval(interruptTimer);
+            // Do not let a late poll mutate this attempt after it has advanced
+            // into retry/commit handling.
+            const pendingInterruptPoll = interruptPoll;
+            if (pendingInterruptPoll) await pendingInterruptPoll;
           }
 
           if (providerError) {
@@ -453,18 +471,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
 
             // Fatal or exhausted: commit a sanitized note. NEVER the raw
             // provider message — it can carry key fragments.
-            const noteSeq = await allocateSeq(sessionId);
+            const noteSeq = await allocateSeq(
+              sessionId, {}, { phase: 'error' }, undefined, { unlessStopped: true },
+            );
             if (noteSeq !== null) {
               await AgentMessages.insertAsync({
                 _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'error',
                 error: { error: 'provider-failed', reason: 'The model request failed.' },
                 createdAt: new Date(),
               });
-              await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'error' } });
             } else {
               // Lost lease between failure and note — session may show stale phase.
               console.warn(
-                `[10thfloor:agent] lost lease before error note; session ${sessionId} `
+                '[10thfloor:agent] lost lease before error note; the session '
                 + 'may display a stale phase',
               );
             }
@@ -501,16 +520,19 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           // System-turn budget billed here (decision 14), not at park — a
           // turn that never ran is never billed. See `systemUnbilled`.
           ...(systemUnbilled ? { 'budgetSpent.systemTurns': 1 } : {}),
-        }, relaying ? {
-          pendingRelay: { agent: relayHit!.agent, token: Random.id() },
-          relay: relayCount + 1,
-        } : undefined,
+        }, relaying
+          ? {
+            pendingRelay: { agent: relayHit!.agent, token: Random.id() },
+            relay: relayCount + 1,
+          }
+          : (!turnFinal ? { phase: 'calling' } : undefined),
         // Relay/intent consumption (decision 7): cleared on first commit,
         // not turn entry, so a crash leaves the wake standing for recovery.
         {
           ...(!relaying && consumingRelay ? { pendingRelay: 1 as const } : {}),
           ...(consumingSystem ? { pendingSystem: 1 as const } : {}),
-        });
+        },
+        { unlessStopped: true });
         if (commitSeq === null) { await discardTurn(sessionId, messageId, msgSeq); return; }
         // A real commit landed and carried the charge; every later commit this
         // turn makes must not repeat it. (A null return meant a lost lease and
@@ -606,7 +628,6 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         }
 
         const callIds = toolCalls.map((c) => c.id);
-        await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'calling' } });
 
         const outcome = await dispatchCalls(sessionId, toolCalls, tools, {
           userId: session.userId,
@@ -620,6 +641,22 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
         // abandonment has already erased it. Only a fully answered batch may
         // go round again and ask the model what to do with the results.
         if (outcome !== 'completed') return;
+      }
+
+      // Falling out of the bounded loop used to look like a successful idle
+      // turn even though no terminal model answer existed. Preserve the last
+      // valid tool result and expose a durable, structured terminal failure.
+      const exhaustedSeq = await allocateSeq(
+        sessionId, {}, { phase: 'error' }, undefined, { unlessStopped: true },
+      );
+      if (exhaustedSeq !== null) {
+        const reason = `The agent reached the configured limit of ${maxIterations} model iterations.`;
+        await AgentMessages.insertAsync({
+          _id: Random.id(), sessionId, seq: exhaustedSeq,
+          role: 'note', kind: 'error',
+          error: { error: 'max-iterations', reason },
+          createdAt: new Date(),
+        });
       }
     } finally {
       clearInterval(beat);
@@ -684,10 +721,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
               // running. Dispatches via `runTurn`, not `deferTurn`.
               await consumeSystemIntent(sessionId, (id, target, userId, opts) => {
                 setTimeout(() => {
-                  void runTurn(id, buildRunConfig(target, userId, opts)).catch((e) => {
-                    console.error(
-                      `[10thfloor:agent] system turn failed for session ${id}:`, e,
-                    );
+                  void runTurn(id, buildRunConfig(target, userId, opts)).catch(() => {
+                    console.error('[10thfloor:agent] system turn failed');
                   });
                 }, 0);
               });
@@ -716,8 +751,8 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
                 budget: resolveBudget(primary.budget),
                 ...memoryOpt(primary),
               }));
-          })().catch((e) => {
-            console.error(`[10thfloor:agent] wake-up turn failed for session ${sessionId}:`, e);
+          })().catch(() => {
+            console.error('[10thfloor:agent] wake-up turn failed');
           });
         }, 0);
       }

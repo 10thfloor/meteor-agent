@@ -157,6 +157,9 @@ export function sanitizeMcpReason(raw: unknown, fallback: string = GENERIC): str
   if (!text) return fallback;
   if (hasControlChars(text)) return fallback;
   if (STACKISH.test(text)) return fallback;
+  if (/[\w.+-]+@[\w.-]+\.[a-z]{2,}/i.test(text)) return fallback;
+  if (/\b(?:\d{1,3}\.){3}\d{1,3}\b/.test(text)) return fallback;
+  if (/\+?\d[\d\s().-]{6,}\d/.test(text)) return fallback;
   if (/\S{24,}/.test(text)) return fallback;
   const oneLine = text.replace(/\s+/g, ' ');
   return oneLine.length > MAX_REASON ? `${oneLine.slice(0, MAX_REASON - 1)}…` : oneLine;

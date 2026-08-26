@@ -304,10 +304,10 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
   };
 
   const notice = (bindingId: string): void => {
-    chain = chain.then(() => deliver(bindingId)).catch((e) => {
+    chain = chain.then(() => deliver(bindingId)).catch(() => {
       // A failed delivery is the next sweep's business; an unhandled
       // rejection is fatal by default on Node >= 15.
-      console.error(`[10thfloor:agent] egress(${kind}): delivery failed for binding ${redact(bindingId)}:`, e);
+      console.error(`[10thfloor:agent] egress(${kind}): delivery failed for binding ${redact(bindingId)}`);
     });
   };
 
@@ -322,8 +322,8 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
     for (const b of bindings) {
       if (stopped) return;
       // eslint-disable-next-line no-await-in-loop
-      await deliver(b._id).catch((e) => {
-        console.error(`[10thfloor:agent] egress(${kind}): sweep delivery failed for binding ${redact(b._id)}:`, e);
+      await deliver(b._id).catch(() => {
+        console.error(`[10thfloor:agent] egress(${kind}): sweep delivery failed for binding ${redact(b._id)}`);
       });
     }
   };
@@ -332,8 +332,8 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
   const runSweep = (): void => {
     if (stopped || sweeping) return;   // never overlap: a slow sweep skips a tick
     sweeping = sweep()
-      .catch((e) => {
-        console.error(`[10thfloor:agent] egress(${kind}) sweep failed:`, e);
+      .catch(() => {
+        console.error(`[10thfloor:agent] egress(${kind}) sweep failed`);
       })
       .then(() => { sweeping = null; });
   };
@@ -353,8 +353,8 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
         { kind, sessionId: fields.sessionId }, { fields: { _id: 1 } },
       ).fetchAsync().then((bindings) => {
         for (const b of bindings) notice(b._id);
-      }).catch((e) => {
-        console.error(`[10thfloor:agent] egress(${kind}): binding lookup failed:`, e);
+      }).catch(() => {
+        console.error(`[10thfloor:agent] egress(${kind}): binding lookup failed`);
       });
     },
   }).then((h: any) => {
@@ -363,8 +363,8 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
     handle = h;
     if (stopped) h.stop();
     return undefined;
-  }).catch((e: unknown) => {
-    console.error(`[10thfloor:agent] egress(${kind}): could not observe messages:`, e);
+  }).catch(() => {
+    console.error(`[10thfloor:agent] egress(${kind}): could not observe messages`);
   });
 
   return {

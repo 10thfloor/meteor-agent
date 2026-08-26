@@ -138,7 +138,7 @@ describe('participants', () => {
 
     it('prefixes only when attribution disambiguates, and the block names colleagues', async () => {
       const { needsAttribution, participantsBlock } = await import('../common/participants');
-      const owner = { id: 'h:u1', kind: 'human' as const, role: 'owner' as const, userId: 'u1', displayName: 'Mackenzie', joinedAt: new Date() };
+      const owner = { id: 'h:u1', kind: 'human' as const, role: 'owner' as const, userId: 'u1', displayName: 'Alex', joinedAt: new Date() };
       assert.isFalse(needsAttribution([owner, model('prime')]), '1 human + 1 model = the classic pair');
       assert.isTrue(needsAttribution([owner, human('u2'), model('prime')]));
       assert.isTrue(needsAttribution([owner, model('prime'), model('analyst')]));
@@ -147,7 +147,7 @@ describe('participants', () => {
         { agent: 'prime', participants: [owner, model('prime'), model('analyst')] }, 'prime',
       );
       assert.include(block, 'You are "prime"');
-      assert.include(block, 'Mackenzie (human, owner)');
+      assert.include(block, 'Alex (human, owner)');
       assert.include(block, '@analyst');
       assert.notInclude(block, '- prime (model)', 'the block never lists the model it addresses');
       assert.equal(participantsBlock({ agent: 'prime' }, 'prime'), '', 'rosterless = no block');
@@ -707,7 +707,7 @@ describe('participants', () => {
       role: 'user', createdAt: now, ...partial,
     } as AgentMessage);
     const roster: SessionParticipant[] = [
-      { id: 'h:u1', kind: 'human', role: 'owner', userId: 'u1', displayName: 'Mackenzie', joinedAt: now },
+      { id: 'h:u1', kind: 'human', role: 'owner', userId: 'u1', displayName: 'Alex', joinedAt: now },
       { id: 'x:email:dana@x.co', kind: 'human', role: 'member', identity: { kind: 'email', externalUserId: 'dana@x.co' }, displayName: 'dana@x.co', joinedAt: now },
       { id: 'm:prime', kind: 'model', role: 'member', agent: 'prime', displayName: 'prime', joinedAt: now },
       { id: 'm:analyst', kind: 'model', role: 'member', agent: 'analyst', displayName: 'analyst', joinedAt: now },
@@ -726,7 +726,7 @@ describe('participants', () => {
       const view = { self: 'm:analyst', primary: 'm:prime', participants: roster };
       const out = toProviderMessages(msgs(), view);
       assert.deepEqual(out.map((p) => [p.role, p.content]), [
-        ['user', '[Mackenzie]: pre-roster question'],       // from-less user row → the owner
+        ['user', '[Alex]: pre-roster question'],       // from-less user row → the owner
         // prime's toolCall assistant and tool rows DROP — a colleague's working
         ['user', '[prime]: prime\'s answer'],               // prime's turn-final → attributed input
         ['user', '[dana@x.co]: dana\'s reply'],
@@ -739,7 +739,7 @@ describe('participants', () => {
       const view = { self: 'm:prime', primary: 'm:prime', participants: roster };
       const out = toProviderMessages(msgs(), view);
       assert.deepEqual(out.map((p) => [p.role, p.content ?? '']), [
-        ['user', '[Mackenzie]: pre-roster question'],
+        ['user', '[Alex]: pre-roster question'],
         ['assistant', ''],                                   // own toolCall row survives
         ['tool', '"done"'],
         ['assistant', 'prime\'s answer'],
@@ -754,7 +754,7 @@ describe('participants', () => {
       const view = { primary: 'm:prime', participants: roster };
       const out = toProviderMessages(msgs(), view);
       assert.deepEqual(out.map((p) => [p.role, p.content ?? '']), [
-        ['user', '[Mackenzie]: pre-roster question'],
+        ['user', '[Alex]: pre-roster question'],
         ['assistant', ''],
         ['tool', '"done"'],
         ['assistant', '[prime]: prime\'s answer'],
@@ -768,11 +768,11 @@ describe('participants', () => {
       const pair: SessionParticipant[] = [roster[0], roster[1], roster[2]];
       const view = { self: 'm:prime', primary: 'm:prime', participants: pair };
       const out = toProviderMessages([
-        row({ seq: 0, role: 'user', content: 'hi', from: { participant: 'h:u1', name: 'Mackenzie' } }),
+        row({ seq: 0, role: 'user', content: 'hi', from: { participant: 'h:u1', name: 'Alex' } }),
         row({ seq: 1, role: 'assistant', content: 'hello', from: { participant: 'm:prime', name: 'prime' } }),
       ], view);
       assert.deepEqual(out.map((p) => [p.role, p.content]), [
-        ['user', '[Mackenzie]: hi'],
+        ['user', '[Alex]: hi'],
         ['assistant', 'hello'],
       ]);
     });

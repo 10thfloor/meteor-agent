@@ -8,11 +8,15 @@ same time.
 
 Per the channels spec, this package is **one lens, one transport, one profile
 default** — Telegram's `secret_token` webhook auth and the Bot API's shapes,
-and nothing else. Bindings, receipts, exactly-once admission, the delivery
+and nothing else. Bindings, receipts, deduplicated admission, the delivery
 worker, and account linking all live in the core package. Zero npm
 dependencies: the Bot API is JSON over `fetch`.
 
 ## Install and register
+
+```bash
+meteor add 10thfloor:agent-channel-telegram
+```
 
 ```js
 // server
@@ -106,7 +110,8 @@ Known wart, v1: the button's loading spinner is not answered
 
 ## Delivery guarantees
 
-Admission is exactly-once (`update_id`). Outbound is receipt-backed
+Admission is deduplicated by `update_id` during the core's seven-day retention
+window. Outbound is receipt-backed
 effectively-once with **`retry`** as the declared recovery tier — the Bot API
 has no idempotency key, so a crash in the one window between post and confirm
 may double-send rather than lose. The webhook's trust boundary is the

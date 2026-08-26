@@ -313,9 +313,8 @@ export function whatsappTransport(options: WhatsAppTransportOptions): ChannelTra
 
 // ---- The factory (§8.7 tier 1) ---------------------------------------------
 
-/** The core's pass-through knobs (`ChannelKnobs`: `statuses`,
- *  `onUncertainDelivery`, `sessionUrl`, `linkUrl`, `throttle`) ride along
- *  untouched; `statuses` defaults to `['error', 'approval']` here. */
+/** The core's `ChannelKnobs` ride along untouched; `statuses` defaults to
+ *  `['error', 'approval']` here. */
 export interface WhatsAppChannelOptions extends ChannelKnobs {
   /** The registered agent this number fronts. */
   agent: string;

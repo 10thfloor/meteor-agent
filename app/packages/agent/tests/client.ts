@@ -7,3 +7,4 @@
 // connection, and `element.client.ts` resets the transcript when it starts.
 import './integration.client';
 import './element.client';
+import './public-exports.client';

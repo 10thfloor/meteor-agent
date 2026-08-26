@@ -1,8 +1,6 @@
 # Memory: a Mongo collection the user can read
 
-**Status:** approved design, verified against the codebase (65 findings,
-19 synthesized amendments folded in — the blockers rewrote decision 7);
-building
+**Status:** historical design record; implemented. Current source and tests are authoritative.
 **Date:** 2026-08-23
 **Package:** `10thfloor:agent` (core — no new package)
 **Depends on:** `2026-08-15-meteor-agent-harness-design.md` (built), participants model (built — decision 10 is load-bearing here)
@@ -227,7 +225,7 @@ direct `findAsync`, capped by `index` config, two sections:
 
 ```
 ## Memory
-About Mackenzie (7 entries): 
+About Alex (7 entries):
 - prefers email over Slack for anything billing-related
 - order #8812 dispute resolved 2026-08-20 — auth hold, not double charge
 About this work (3 entries):

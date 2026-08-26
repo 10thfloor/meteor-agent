@@ -22,10 +22,10 @@ import { startEgress, type EgressWorker } from './channels/egress';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
-// Memory: core, types, and test seam. App reaches the store via `Agent.memory`.
+// Memory: core and types. App reaches the store via `Agent.memory`.
 export {
   saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint,
-  readSelector, _setMemorySearch, _activeRung, _forceRegexRung,
+  readSelector,
   type SaveArgs, type SaveResult, type ForgetResult, type SearchRung,
   type ListedMemories,
 } from './memory';
@@ -39,8 +39,7 @@ export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
-  fullValidationAvailable, setTypeboxValueLoader, setTypeboxCompileLoader,
-  _isSchemaCompiled, SUBAGENT_ARGS, SKILL_TOOL_NAME,
+  fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME,
   type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool,
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
   type ArgsValidator, type TypeboxValue, type TypeboxCompile,
@@ -57,7 +56,7 @@ export type {
 } from './hooks';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
 export {
-  stopMcp, _setMcpClientFactory,
+  stopMcp,
   type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
 } from './mcp/client';
 export { mcpSdkResolvable } from './mcp/loader';
@@ -84,7 +83,7 @@ export {
   type RoundTripOptions,
 } from '../common/channel-contract';
 export {
-  type ChannelDef, type ChannelKnobs, type RawInbound,
+  type ChannelDef, type ChannelKnobs, type RawInbound, type RawInboundHead,
   listChannels, getChannel, headerValue, safeEqual, channelKnobs, CHANNEL_KNOB_KEYS,
 } from './channels/registry';
 export {

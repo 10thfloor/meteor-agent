@@ -717,6 +717,9 @@ describe('agent-channel-email', () => {
       assert.deepEqual(menu.profile, { interact: 'menu', limit: 20_000 });
       assert.isUndefined(menu.approvalUrl);
       assert.deepEqual(menu.statuses, ['error', 'approval']);
+      assert.isTrue(await menu.preverify!({ headers: basic('u', 'p') }));
+      assert.isFalse(await menu.preverify!({ headers: basic('u', 'x') }));
+      assert.isFalse(await menu.preverify!({ headers: {} }));
       assert.isTrue(await menu.verify({ headers: basic('u', 'p'), rawBody: '{}' }));
       assert.isFalse(await menu.verify({ headers: basic('u', 'x'), rawBody: '{}' }));
     });

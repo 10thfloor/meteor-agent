@@ -754,6 +754,171 @@ describe('turn loop', () => {
     assert.equal((await AgentSessions.findOneAsync('s-abort'))!.phase, 'stopped');
   });
 
+  it('aborts a provider stalled before its first chunk', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages, AgentDeltas } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-abort-silent', 'hello');
+    let started!: () => void;
+    const providerStarted = new Promise<void>((resolve) => { started = resolve; });
+    let sawAbort = false;
+    const silent: Provider = {
+      async *stream(req) {
+        started();
+        await new Promise<void>((_resolve, reject) => {
+          const onAbort = () => {
+            sawAbort = true;
+            const error = new Error('aborted');
+            error.name = 'AbortError';
+            reject(error);
+          };
+          if (req.signal?.aborted) onAbort();
+          else req.signal?.addEventListener('abort', onAbort, { once: true });
+        });
+        yield { kind: 'done', usage: { input: 0, output: 0 } };
+      },
+    };
+
+    const runningTurn = runTurn('s-abort-silent', {
+      model: 'mock', system: '', tools: [], provider: silent, interruptCheckMs: 5,
+    });
+    await providerStarted;
+    await AgentSessions.updateAsync('s-abort-silent', {
+      $set: { phase: 'stopped', updatedAt: new Date() },
+    } as any);
+    await runningTurn;
+
+    assert.isTrue(sawAbort, 'interrupt polling must not depend on receiving a chunk');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-abort-silent', role: 'assistant' }).countAsync(),
+      0,
+    );
+    assert.equal(await AgentDeltas.find({ sessionId: 's-abort-silent' }).countAsync(), 0);
+    assert.equal((await AgentSessions.findOneAsync('s-abort-silent'))!.phase, 'stopped');
+  });
+
+  it('a stop immediately before commit atomically prevents the assistant row', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-stop-at-commit', 'hello');
+    const stopping: Provider = {
+      async *stream() {
+        await AgentSessions.updateAsync('s-stop-at-commit', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+        yield { kind: 'text', chunk: 'must not commit' };
+        yield { kind: 'done', usage: { input: 1, output: 3 } };
+      },
+    };
+    await runTurn('s-stop-at-commit', {
+      model: 'mock', system: '', tools: [], provider: stopping,
+      // Keep the independent poll out of this fixture: the conditional seq
+      // allocation itself is what must observe the completed-stream race.
+      interruptCheckMs: 60_000,
+    });
+
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-stop-at-commit', role: 'assistant' }).countAsync(),
+      0,
+    );
+    assert.equal((await AgentSessions.findOneAsync('s-stop-at-commit'))!.phase, 'stopped');
+  });
+
+  it('commits tool use and the calling phase at one atomic boundary', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-calling-atomic', 'use the tool');
+    let calls = 0;
+    let phaseAtAssistantInsert: string | undefined;
+    const original = (AgentMessages as any).insertAsync.bind(AgentMessages);
+    const descriptor = Object.getOwnPropertyDescriptor(AgentMessages, 'insertAsync');
+    (AgentMessages as any).insertAsync = async (doc: any, ...rest: any[]) => {
+      if (doc.sessionId === 's-calling-atomic' && doc.role === 'assistant'
+        && doc.toolCalls?.length) {
+        phaseAtAssistantInsert = (await AgentSessions.findOneAsync(doc.sessionId))!.phase;
+      }
+      return original(doc, ...rest);
+    };
+
+    try {
+      await runTurn('s-calling-atomic', {
+        model: 'mock', system: '',
+        tools: [{
+          name: 'ping', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => 'pong',
+        }],
+        provider: {
+          async *stream() {
+            calls += 1;
+            if (calls === 1) {
+              yield {
+                kind: 'done',
+                toolCalls: [{ id: 'atomic-call', name: 'ping', args: {} }],
+                usage: { input: 1, output: 1 },
+              };
+            } else {
+              yield { kind: 'text', chunk: 'done' };
+              yield { kind: 'done', usage: { input: 1, output: 1 } };
+            }
+          },
+        },
+      });
+    } finally {
+      if (descriptor) Object.defineProperty(AgentMessages, 'insertAsync', descriptor);
+      else delete (AgentMessages as any).insertAsync;
+    }
+
+    assert.equal(
+      phaseAtAssistantInsert, 'calling',
+      'the tool-use row must never be externally visible while phase still says streaming',
+    );
+  });
+
+  it('records a terminal error when maxIterations is exhausted', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-max-iterations', 'keep using the tool');
+    let modelCalls = 0;
+    let toolCalls = 0;
+    const looping: Provider = {
+      async *stream() {
+        modelCalls += 1;
+        yield {
+          kind: 'done',
+          toolCalls: [{ id: `loop-${modelCalls}`, name: 'again', args: {} }],
+          usage: { input: 1, output: 1 },
+        };
+      },
+    };
+
+    await runTurn('s-max-iterations', {
+      model: 'mock', system: '', maxIterations: 2, provider: looping,
+      tools: [{
+        name: 'again', description: 'x', args: { type: 'object', properties: {} },
+        run: async () => { toolCalls += 1; return 'continue'; },
+      }],
+    });
+
+    const messages = await AgentMessages
+      .find({ sessionId: 's-max-iterations' }, { sort: { seq: 1 } }).fetchAsync();
+    assert.equal(modelCalls, 2, 'the configured bound is exact');
+    assert.equal(toolCalls, 2, 'the final valid tool call is still answered');
+    assert.deepEqual(unansweredToolUses(messages), []);
+    const note = messages.find((m) => m.role === 'note' && m.kind === 'error');
+    assert.deepEqual(note?.error, {
+      error: 'max-iterations',
+      reason: 'The agent reached the configured limit of 2 model iterations.',
+    });
+    assert.equal((await AgentSessions.findOneAsync('s-max-iterations'))!.phase, 'error');
+  });
+
   it('interrupt during tool dispatch discards the turn instead of stranding tool_use', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -964,6 +1129,36 @@ describe('turn loop', () => {
     // the transcript, and both user messages are still there.
     assert.isDefined(await AgentMessages.findOneAsync('err-note'));
     assert.lengthOf(msgs.filter((m) => m.role === 'user'), 2);
+  });
+
+  it('persists a sanitized error when deferred config construction throws', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { deferTurn } = await import('../server/methods');
+
+    await seed('s-defer-build-failure', 'hello');
+    deferTurn('s-defer-build-failure', {
+      model: 'mock',
+      instructions: () => {
+        throw new Error('PRIVATE customer@example.com sk-SECRET');
+      },
+    }, 'u1');
+
+    await waitFor(
+      async () => !!(await AgentMessages.findOneAsync({
+        sessionId: 's-defer-build-failure', role: 'note', kind: 'error',
+      } as any)),
+      'the deferred build failure note',
+    );
+    const note = await AgentMessages.findOneAsync({
+      sessionId: 's-defer-build-failure', role: 'note', kind: 'error',
+    } as any);
+    assert.deepEqual(note!.error, {
+      error: 'turn-failed', reason: 'The agent turn could not be started.',
+    });
+    assert.notInclude(JSON.stringify(note), 'customer@example.com');
+    assert.notInclude(JSON.stringify(note), 'sk-SECRET');
+    assert.equal((await AgentSessions.findOneAsync('s-defer-build-failure'))!.phase, 'error');
   });
 
   it('retries a retryable provider failure and then succeeds', async function () {
@@ -2482,6 +2677,31 @@ describe('budgets', () => {
     );
   });
 
+  it('never lets a negative provider cost reduce accrued spend', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+
+    await seed('s-cost-negative', 'hello');
+    const reporting: Provider = {
+      async *stream() {
+        yield { kind: 'text', chunk: 'x' };
+        yield { kind: 'done', usage: { input: 1000, output: 1000, cost: -10 } };
+      },
+    };
+    await runTurn('s-cost-negative', {
+      model: 'mock', system: '', tools: [], provider: reporting,
+      pricing: { input: 2, output: 3 },
+    });
+
+    assert.closeTo(
+      (await AgentSessions.findOneAsync('s-cost-negative'))!.usage.cost,
+      0.005,
+      1e-9,
+      'an invalid negative report falls back to configured non-negative pricing',
+    );
+  });
+
   it('computes cost from pricing when none is reported, and accrues zero with neither', async function () {
     this.timeout(30000);
     const { AgentSessions } = await import('../common/collections');
@@ -2538,6 +2758,44 @@ describe('parseSpend()', () => {
       } as any),
       /spend/,
     );
+  });
+
+  it('validates iteration, streamed-argument, and pricing bounds at define()', async () => {
+    const { Agent } = await import('../server/agent');
+    const base = { model: 'mock', instructions: '' };
+
+    for (const value of [0, 1.5, Number.POSITIVE_INFINITY]) {
+      assert.throws(
+        () => new Agent(`bad-iterations-${String(value)}`, {
+          ...base, maxIterations: value,
+        }),
+        /maxIterations/,
+      );
+      assert.throws(
+        () => new Agent(`bad-arg-bytes-${String(value)}`, {
+          ...base, maxToolArgBytes: value,
+        }),
+        /maxToolArgBytes/,
+      );
+    }
+    assert.throws(
+      () => new Agent('bad-input-price', {
+        ...base, pricing: { input: -1, output: 1 },
+      }),
+      /pricing\.input/,
+    );
+    assert.throws(
+      () => new Agent('bad-output-price', {
+        ...base, pricing: { input: 1, output: Number.NaN },
+      }),
+      /pricing\.output/,
+    );
+    assert.doesNotThrow(() => new Agent('valid-runtime-bounds', {
+      ...base,
+      maxIterations: 1,
+      maxToolArgBytes: 1,
+      pricing: { input: 0, output: 0 },
+    }));
   });
 });
 

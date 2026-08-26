@@ -58,7 +58,7 @@ function toolResultContent(
       warnedSerialization.add(kind);
       console.warn(
         '[10thfloor:agent] a tool result could not be serialized for the transcript '
-        + `(${kind}: ${(e as Error)?.message}); the row records `
+        + `(${kind}); the row records `
         + 'unserializable-result (warned once per kind)',
       );
     }

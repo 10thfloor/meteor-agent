@@ -1,15 +1,10 @@
 {
   // Type-check-ONLY config (never emits): Meteor transpiles by stripping types,
   // so nothing here compiles the app — `tsc --noEmit` exists purely to catch the
-  // one class of bug Meteor's build silently ships, a mistyped field name in a
-  // `$set`/`$inc`/selector/insert (e.g. `budgetSpent.toolCall`) that quietly
-  // disables a budget or misses a row. The `common/db.ts` typed-collection facade
-  // now catches that WHOLE class: selectors and modifiers are field-name-checked
-  // (a top-level typo is a compile error) while dotted paths stay legal via
-  // template-literal index signatures. The residual `as any` is down to ~7 genuine
-  // @types-gap boundaries (Meteor.settings, DDP/DDPCommon internals, dynamic MCP
-  // ESM imports, a pi-ai model field, native driver methods) — documented, not
-  // laziness. `strict` is on; the burndown is recorded in .superpowers/sdd/progress.md.
+  // one class of bug Meteor's build silently ships: a mistyped field name in a
+  // `$set`/`$inc`/selector/insert that quietly disables a budget or misses a row.
+  // The typed-collection facade checks top-level selector and modifier fields;
+  // dotted paths stay legal through template-literal index signatures.
   "compilerOptions": {
     "noEmit": true,
     "strict": true,
@@ -26,14 +21,10 @@
     "noImplicitAny": false,
     "useUnknownInCatchVariables": false,
     "paths": {
-      // Off the Meteor build there is no `meteor/10thfloor:agent` module, so
-      // `tsc` needs telling what that id resolves to. Every type-checked
-      // importer of it is a SERVER-ONLY channel package (`api.use('10thfloor:agent',
-      // 'server')`), and the server entry is exactly the module they resolve at
-      // runtime — so that is what the id points at. `paths` cannot split by
-      // architecture: a client-side TypeScript importer of the id would need its
-      // own id/entry (none exists today — the demo app's client is plain JS,
-      // outside this config's `include`).
+      // Outside Meteor's build, TypeScript needs explicit paths for package ids.
+      // Channel packages are server-only and therefore resolve the core id to
+      // its server entry. Meteor still selects architecture-specific entry
+      // modules for application imports at runtime.
       "meteor/10thfloor:agent": ["./packages/agent/server/index.ts"],
       "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/server/index.ts"],
       "meteor/10thfloor:agent-channel-telegram": ["./packages/agent-channel-telegram/server/index.ts"],

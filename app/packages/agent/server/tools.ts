@@ -279,7 +279,7 @@ function checkStructure(schema: unknown, value: unknown, path: string): string |
   return null;
 }
 
-const structuralValidator: ArgsValidator = (schema, args) => {
+const structuralValidator = (schema: unknown, args: unknown): ValidationResult => {
   const reason = checkStructure(schema, args, '');
   return reason === null ? { ok: true } : { ok: false, reason };
 };
@@ -389,11 +389,11 @@ async function compileChecker(): Promise<TypeboxCompile | null> {
     const loader = compileLoader;
     compilePromise = loader()
       .then((C) => { compileModule = C; return C; })
-      .catch((e) => {
+      .catch(() => {
         compileDegraded = true;
         warnUnavailable(
           'the compiled JSON-Schema checker (typebox/compile) could not be loaded; validation '
-          + `still runs, interpreted, through Value.Check: ${(e as Error)?.message}`,
+          + 'still runs, interpreted, through Value.Check',
         );
         return null;
       })
@@ -415,14 +415,14 @@ async function compiledFor(schema: object): Promise<TypeboxValidator | null> {
     }
     compiledCache.set(schema, compiled);
     return compiled;
-  } catch (e) {
+  } catch {
     // THIS schema, not the process: a compiler that chokes on one tool's
     // schema leaves every other tool compiled. Negative-cached so the throw
     // costs one attempt rather than one per call.
     compiledCache.set(schema, null);
     warnUnavailable(
       'a tool schema could not be compiled; the interpreted checker (Value.Check) stands in '
-      + `for it: ${(e as Error)?.message}`,
+      + 'for it',
     );
     return null;
   }
@@ -461,8 +461,12 @@ export function _isSchemaCompiled(schema: object): boolean {
 async function fullCheck(
   V: TypeboxValue, schema: unknown, args: unknown,
 ): Promise<ValidationResult> {
-  // `Value.Check` throws on a non-object schema (`Cannot use 'in' operator`).
-  // Nothing to enforce there anyway — the structural checker accepts it too.
+  // Boolean schemas are valid JSON Schema. Avoid handing them to a checker
+  // version that only accepts objects, while preserving their exact meaning.
+  if (schema === false) return { ok: false, reason: 'arguments do not match the tool schema' };
+  if (schema === true) return { ok: true };
+  // Other non-object values are not schemas and historically constrain
+  // nothing on this extension seam.
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return { ok: true };
 
   const compiled = await compiledFor(schema as object);
@@ -535,11 +539,11 @@ async function fullChecker(): Promise<TypeboxValue | null> {
     const loader = valueLoader;
     valuePromise = loader()
       .then((V) => { valueModule = V; return V; })
-      .catch((e) => {
+      .catch(() => {
         degraded = true;
         warnUnavailable(
           'the full JSON-Schema checker (typebox) could not be loaded; falling back to the '
-          + `minimal structural checker, which does not enforce enum/bounds/oneOf/…: ${(e as Error)?.message}`,
+          + 'safe structural checker where the schema permits it',
         );
         return null;
       })
@@ -564,20 +568,34 @@ export function fullValidationAvailable(): boolean {
   }
 }
 
-/** Default validator: compiled typebox -> interpreted -> structural fallback. */
+/** Use the structural checker only when it can enforce the entire schema.
+ *  A rich schema accepted after the full checker disappears is not degraded
+ *  validation; it is a bypass. */
+function safeStructuralFallback(schema: unknown, args: unknown): ValidationResult {
+  const keyword = unenforceableKeyword(schema);
+  if (keyword) {
+    return {
+      ok: false,
+      reason: `tool-argument validation is unavailable for schema keyword "${keyword}"`,
+    };
+  }
+  return structuralValidator(schema, args);
+}
+
+/** Default validator: compiled typebox -> interpreted -> safe structural fallback. */
 const defaultValidator: ArgsValidator = async (schema, args) => {
   const V = await fullChecker();
-  if (!V) return structuralValidator(schema, args);
+  if (!V) return safeStructuralFallback(schema, args);
   try {
     return await fullCheck(V, schema, args);
-  } catch (e) {
-    // A schema typebox itself chokes on. Degrade THIS call rather than the
-    // process: the structural checker still catches the shape errors.
+  } catch {
+    // A schema typebox itself chokes on. A plain structural schema can still
+    // be checked safely; a rich one must be refused rather than passed through.
     warnUnavailable(
-      `the full JSON-Schema checker threw on a tool schema; falling back to the minimal `
-      + `structural checker for it: ${(e as Error)?.message}`,
+      'the full JSON-Schema checker threw on a tool schema; using the safe '
+      + 'structural fallback where possible',
     );
-    return structuralValidator(schema, args);
+    return safeStructuralFallback(schema, args);
   }
 };
 
@@ -595,7 +613,7 @@ export function setToolArgsValidator(next: ArgsValidator | null): () => void {
   return () => { validator = previous; warnedUnavailable = previouslyWarned; };
 }
 
-/** Check `args` against a tool schema. Degrades rather than fails. */
+/** Check `args` against a tool schema. Validator failures fail closed. */
 export async function validateToolArgs(
   schema: unknown, args: unknown,
 ): Promise<ValidationResult> {
@@ -606,13 +624,13 @@ export async function validateToolArgs(
   }
   try {
     return await current(schema, args);
-  } catch (e) {
-    // The message goes to the SERVER log only. It is the validator's own
-    // failure, not a verdict, and never reaches the transcript.
+  } catch {
+    // Do not interpolate the exception: a host validator may include argument
+    // or provider content in it, and server logs are a separate trust surface.
     warnUnavailable(
-      `the tool-argument validator threw; arguments are passed through unchecked: ${(e as Error)?.message}`,
+      'the tool-argument validator threw; the tool call is refused',
     );
-    return { ok: true };
+    return { ok: false, reason: 'tool-argument validation is unavailable' };
   }
 }
 
@@ -693,11 +711,11 @@ export async function evaluateGate(
   let verdict: unknown;
   try {
     verdict = await gate(ctx);
-  } catch (e) {
+  } catch {
     warnGate(
       'threw',
       `a gate predicate threw and the call was DENIED (a broken gate must not run the tool): `
-      + `tool "${ctx.name}": ${(e as Error)?.message}`,
+      + `tool "${ctx.name}"`,
     );
     return 'denied';
   }
@@ -1136,21 +1154,33 @@ const UNENFORCED_KEYWORDS = [
   'minimum', 'maximum', 'exclusiveMinimum', 'exclusiveMaximum',
   'minLength', 'maxLength', 'minItems', 'maxItems', 'uniqueItems',
   'multipleOf', 'if', 'then', 'else', 'dependencies', 'dependentRequired',
-  'dependentSchemas',
+  'dependentSchemas', 'minProperties', 'maxProperties', 'propertyNames',
+  'contains', 'minContains', 'maxContains', 'prefixItems', 'additionalItems',
+  'unevaluatedProperties', 'unevaluatedItems',
 ] as const;
+
+const STRUCTURAL_TYPES = new Set([
+  'object', 'array', 'string', 'number', 'integer', 'boolean', 'null',
+]);
 
 /** First keyword in `schema` (walking properties/items) that the built-in
  *  minimal checker silently does NOT enforce, or null. */
 export function unenforceableKeyword(schema: unknown): string | null {
+  if (schema === false) return 'false schema';
   if (!schema || typeof schema !== 'object' || Array.isArray(schema)) return null;
   const s = schema as Record<string, unknown>;
   for (const k of UNENFORCED_KEYWORDS) if (k in s) return k;
+  const types = typeof s.type === 'string'
+    ? [s.type]
+    : (Array.isArray(s.type) ? s.type : []);
+  if (types.some((type) => typeof type !== 'string' || !STRUCTURAL_TYPES.has(type))) return 'type';
   if (s.properties && typeof s.properties === 'object') {
     for (const sub of Object.values(s.properties as Record<string, unknown>)) {
       const found = unenforceableKeyword(sub);
       if (found) return found;
     }
   }
+  if (Array.isArray(s.items)) return 'items';
   if (s.items) return unenforceableKeyword(s.items);
   return null;
 }

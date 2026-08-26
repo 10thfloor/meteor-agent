@@ -60,8 +60,8 @@ function warnUnregisteredOnce(session: AgentSession, why: string): void {
   if (warnedUnregistered.has(session._id)) return;
   warnedUnregistered.add(session._id);
   console.warn(
-    `[10thfloor:agent] watcher: session ${session._id} names unregistered agent `
-    + `"${session.agent}"; skipping ${why} (warned once per process)`,
+    `[10thfloor:agent] watcher: a session names unregistered agent `
+    + `"${session.agent}"; skipping ${why} (warned once per session per process)`,
   );
 }
 
@@ -69,13 +69,13 @@ function warnUnregisteredOnce(session: AgentSession, why: string): void {
 const warnedParentless = new Set<string>();
 
 /** Warn once about a child whose parent session no longer exists.
- *  The sweep never deletes session data; retention is a v4 concern. */
+ *  The sweep never deletes session data; retention belongs to the host. */
 function warnParentlessOnce(child: AgentSession): void {
   if (warnedParentless.has(child._id)) return;
   warnedParentless.add(child._id);
   console.warn(
-    `[10thfloor:agent] watcher: child session ${child._id} names parent `
-    + `${child.parent?.sessionId} which no longer exists; leaving it in place `
+    '[10thfloor:agent] watcher: a child session names a parent that no longer '
+    + 'exists; leaving it in place '
     + '(warned once per process)',
   );
 }
@@ -256,9 +256,9 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
   const runSweep = (): void => {
     if (stopped || sweeping) return;   // never overlap: a slow sweep skips a tick
     sweeping = sweep()
-      .catch((e) => {
+      .catch(() => {
         // One bad document must not stop the next tick.
-        console.error('[10thfloor:agent] watcher sweep failed:', e);
+        console.error('[10thfloor:agent] watcher sweep failed');
       })
       .then(() => { sweeping = null; });
   };
@@ -282,8 +282,8 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
   };
 
   const notice = (sessionId: string): void => {
-    chain = chain.then(() => consider(sessionId)).catch((e) => {
-      console.error(`[10thfloor:agent] watcher: orphan check failed for ${sessionId}:`, e);
+    chain = chain.then(() => consider(sessionId)).catch(() => {
+      console.error('[10thfloor:agent] watcher: orphan check failed');
     });
   };
 
@@ -298,8 +298,8 @@ export function startWatcher(opts: WatcherOptions = {}): Watcher {
     handle = h;
     if (stopped) h.stop();
     return undefined;
-  }).catch((e: unknown) => {
-    console.error('[10thfloor:agent] watcher: could not observe sessions:', e);
+  }).catch(() => {
+    console.error('[10thfloor:agent] watcher: could not observe sessions');
   });
 
   return {

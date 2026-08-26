@@ -65,6 +65,16 @@ describe('capped delta collection', () => {
 });
 
 describe('publications', () => {
+  const waitFor = async (label: string, predicate: () => boolean): Promise<void> => {
+    const deadline = Date.now() + 5000;
+    while (!predicate()) {
+      if (Date.now() > deadline) throw new Error(`timed out waiting for ${label}`);
+      // Mongo observers settle asynchronously after the update.
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    }
+  };
+
   it('registers both publication names', async () => {
     const { registerPublications } = await import('../server/publications');
     registerPublications();
@@ -256,6 +266,73 @@ describe('publications', () => {
     const sessionDocs = await result[0].fetchAsync();
     assert.equal(sessionDocs.length, 1);
     assert.isUndefined(sessionDocs[0].lease, 'agent.session must not publish `lease`');
+  });
+
+  it('stops a live agent.session publication when a participant is removed', async () => {
+    const { registerPublications } = await import('../server/publications');
+    registerPublications();
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+
+    await AgentSessions.insertAsync({
+      _id: 'revoked-member', agent: 'support', userId: 'owner', phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      participants: [{
+        id: 'h:member', kind: 'human', role: 'member', userId: 'member',
+        displayName: 'Member', joinedAt: new Date(),
+      }],
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    let stopped = false;
+    const cleanups: Array<() => void> = [];
+    const publication = {
+      userId: 'member',
+      onStop(fn: () => void) { cleanups.push(fn); },
+      stop() {
+        if (stopped) return;
+        stopped = true;
+        for (const fn of cleanups) fn();
+      },
+    };
+    const handler = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const cursors = await handler.call(publication, 'support', 'revoked-member');
+    assert.lengthOf(cursors, 3, 'membership authorizes the initial subscription');
+
+    await AgentSessions.updateAsync('revoked-member', {
+      $pull: { participants: { id: 'h:member' } },
+    } as any);
+    await waitFor('the publication to stop after membership removal', () => stopped);
+  });
+
+  it('stops a live anonymous publication when its capability session is claimed', async () => {
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.removeAsync({});
+    await AgentSessions.insertAsync({
+      _id: 'claimed-anon', agent: 'support', userId: null, phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+
+    let stopped = false;
+    const cleanups: Array<() => void> = [];
+    const publication = {
+      userId: null,
+      onStop(fn: () => void) { cleanups.push(fn); },
+      stop() {
+        if (stopped) return;
+        stopped = true;
+        for (const fn of cleanups) fn();
+      },
+    };
+    const handler = (Meteor.server as any).publish_handlers[NAMES.pubSession];
+    const cursors = await handler.call(publication, 'support', 'claimed-anon');
+    assert.lengthOf(cursors, 3, 'the capability authorizes the initial subscription');
+
+    await AgentSessions.updateAsync('claimed-anon', { $set: { userId: 'new-owner' } });
+    await waitFor('the publication to stop after claim', () => stopped);
   });
 });
 

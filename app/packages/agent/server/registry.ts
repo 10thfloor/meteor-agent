@@ -212,6 +212,29 @@ function assertFiniteNumber(value: unknown, field: string, opts: { min?: number;
   }
 }
 
+function assertPositiveIntegerOption(value: unknown, field: string): void {
+  if (value === undefined) return;
+  if (typeof value !== 'number' || !Number.isFinite(value)
+    || !Number.isInteger(value) || value < 1) {
+    throw new Error(
+      `[10thfloor:agent] ${field} must be a positive integer; `
+      + `got ${JSON.stringify(value)}`,
+    );
+  }
+}
+
+function assertPricing(pricing: AgentConfig['pricing']): void {
+  if (pricing === undefined) return;
+  if (typeof pricing !== 'object' || pricing === null || Array.isArray(pricing)) {
+    throw new Error(
+      `[10thfloor:agent] pricing must be an object with input/output rates; `
+      + `got ${JSON.stringify(pricing)}`,
+    );
+  }
+  assertFiniteNumber(pricing.input, 'pricing.input', { min: 0 });
+  assertFiniteNumber(pricing.output, 'pricing.output', { min: 0 });
+}
+
 /** Frozen at define() time so the loop reads settled values. Unknown keys
  *  throw to catch typos on this new option surface. */
 export function resolveMemory(memory?: MemoryConfig): ResolvedMemory | undefined {
@@ -292,6 +315,9 @@ export function defineAgent(name: string, config: AgentConfig): void {
   assertFiniteNumber(config.retry?.baseMs, 'retry.baseMs', { min: 0 });
   assertFiniteNumber(config.retry?.maxDelayMs, 'retry.maxDelayMs', { min: 0 });
   assertFiniteNumber(config.maxResultChars, 'maxResultChars', { min: 1 });
+  assertPositiveIntegerOption(config.maxIterations, 'maxIterations');
+  assertPositiveIntegerOption(config.maxToolArgBytes, 'maxToolArgBytes');
+  assertPricing(config.pricing);
   validateSkills(config.skills);
   const memory = resolveMemory(config.memory);
   // The three model-facing names are reserved the way SKILL_TOOL_NAME is: a

@@ -2,18 +2,27 @@
 
 ## Layout
 
-- `app/packages/agent` — the package (`10thfloor:agent`). Everything shippable
-  lives here.
+- `app/packages/agent` — the core package (`10thfloor:agent`).
+- `app/packages/agent-channel-*` — the five optional channel packages.
 - `app/` — the host app: test harness, and the demo chat UI (`meteor run` it).
-- `docs/superpowers/` — the design spec and the per-milestone plans, including
-  the review history that shaped the invariants. Read the spec's §4.3/§6/§9/§10
-  before touching `server/loop.ts`.
+- `docs/superpowers/specs/` — historical design records. The source and tests
+  are authoritative where a record describes an earlier release.
 - `scripts/verify-build.sh` — production-bundle verification (see README).
-- `spike/` — throwaway probe app from the design phase. Not the product.
+
+From `app/`, install dependencies with `meteor npm ci` and run the static gates:
+
+```bash
+npm run typecheck
+npm run types:check
+```
+
+`types:check` regenerates the declarations shipped by the core and all five
+channel packages and fails if the committed output has drifted.
 
 ## Running the suite
 
-From `app/` (port 3200 — 3000 is often taken; a blocked port hangs silently):
+From `app/` (port 3200 — 3000 is often taken; a blocked port hangs silently),
+`npm test` runs the same command as CI:
 
 ```bash
 TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 \
@@ -29,9 +38,9 @@ core alone passes while a surface package is broken, which is how five lens
 suites came to run only on developers' machines.
 
 Budget 3–5 minutes. The client half needs Playwright's Chromium
-(`npx playwright install chromium`). The two `pending` tests are the live
-smokes: the pi-ai one un-skips itself when `ANTHROPIC_API_KEY` is set, the MCP
-one when `MCP_LIVE_TEST=1` is.
+(`npx playwright install chromium`). Live smoke tests remain pending unless
+their opt-in environment is present: pi-ai uses `ANTHROPIC_API_KEY`, and MCP
+uses `MCP_LIVE_TEST=1`.
 
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
@@ -74,9 +83,9 @@ package survives all three because of three rules — keep them:
    `Check(value)` and `Errors(value)` produce the SAME ajv-shaped records
    `Value.Check`/`Value.Errors` do — which is why one `reasonFor` serves both
    and why the compiled path was a drop-in. A bump that reshapes either key
-   must keep the four-rung degrade ladder in `server/tools.ts` intact: an app
-   validator, then compiled, then interpreted, then structural, each rung
-   warning once and none of them throwing.
+   must keep the four-rung validation ladder in `server/tools.ts` intact: an app
+   validator, then compiled, then interpreted, then the safe structural subset.
+   Schemas outside that subset are refused when no full checker is available.
 3. **A version bump is a verification event, not a routine update.** After
    `meteor npm install @earendil-works/pi-ai@<new>` or
    `meteor npm install @modelcontextprotocol/sdk@<new>`:
@@ -110,10 +119,9 @@ through the pi-ai default, and the default must stay lazy. Either regression
 puts an app-level npm peer back on the critical path for every agent, which is
 exactly what the loader seam exists to avoid.
 
-## Invariants that reviews keep re-proving
+## Turn-loop invariants
 
-If you change `server/loop.ts`, the review history says you will break one of
-these unless you check it explicitly: assistant messages commit only at
+When changing `server/loop.ts`, check these explicitly: assistant messages commit only at
 boundaries; every session write is lease-guarded, atomic, or conditional on the
 parked state; `$`-operator modifiers only (a replacement doc strips the lease);
 a stop outranks everything; discard fails toward the repairable state; the

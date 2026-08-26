@@ -9,10 +9,12 @@ export function registerPublications(): void {
   Meteor.publish(NAMES.pubSession, async function (agent: string, sessionId: string) {
     check(agent, String);
     check(sessionId, String);
-    // Authorize via session before returning cursors — messages carry no userId.
-    // Membership check mirrors `requireSession`.
+    // Messages carry no userId, so their cursors cannot carry the authorization
+    // selector themselves. Keep a tiny observer on the session row and stop the
+    // whole subscription the moment ownership/membership no longer matches.
+    // `stop()` retracts every document this publication contributed.
     const uid = this.userId ?? null;
-    const session = await AgentSessions.findOneAsync({
+    const authorized = {
       _id: sessionId,
       agent,
       $or: [
@@ -21,8 +23,50 @@ export function registerPublications(): void {
           ? [{ participants: { $elemMatch: { kind: 'human', userId: uid } } }]
           : []),
       ],
-    });
-    if (!session) return []; // publishes nothing and marks the sub ready
+    };
+
+    // Unit tests also call publication handlers directly with only `userId`.
+    // A real Meteor subscription always supplies stop/onStop; keep the direct
+    // handler useful while making the live path revocation-safe.
+    const canObserve = typeof this.stop === 'function' && typeof this.onStop === 'function';
+    let stopped = false;
+    let authHandle: { stop(): void } | null = null;
+    if (canObserve) {
+      this.onStop(() => {
+        stopped = true;
+        if (authHandle) { authHandle.stop(); authHandle = null; }
+      });
+      try {
+        authHandle = await AgentSessions.find(
+          authorized,
+          { fields: { _id: 1 } },
+        ).observeChangesAsync({
+          // Leaving the selector means access was revoked (participant removed,
+          // anonymous session claimed, owner changed, or session deleted).
+          removed: () => { this.stop(); },
+        }) as unknown as { stop(): void };
+      } catch {
+        // An unavailable revocation observer must never degrade to standing
+        // transcript access. Stop without publishing anything.
+        this.stop();
+        return [];
+      }
+      // The client may have stopped while observeChangesAsync was resolving.
+      if (stopped) {
+        if (authHandle) { authHandle.stop(); authHandle = null; }
+        return [];
+      }
+    }
+
+    // Read after the observer is attached: removal before/during this read is
+    // either seen here or by `removed`, closing the subscribe-time TOCTOU gap.
+    const session = await AgentSessions.findOneAsync(authorized);
+    if (!session) {
+      // An unauthorized subscription has nothing that can later be revoked,
+      // so do not leave its authorization observer resident.
+      if (authHandle) { authHandle.stop(); authHandle = null; }
+      return []; // publishes nothing and marks the sub ready
+    }
     return [
       // `lease` and `pending.wakeToken` are server-internal bookkeeping —
       // never needed by any client code.

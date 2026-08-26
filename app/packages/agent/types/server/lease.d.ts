@@ -3,14 +3,8 @@ import type { SessionModifier } from '../common/db';
 export declare const SERVER_ID: string;
 export declare let LEASE_MS: number;
 export declare let HEARTBEAT_MS: number;
-/**
- * Test seam, NOT a public API: shrink the lease/heartbeat timings so a test
- * can observe heartbeat-renewal behavior without waiting out the real
- * 30s/10s intervals. `claimLease`/`heartbeat` read the module-level `let`s at
- * call time, so a caller need only set this BEFORE starting the turn under
- * test. Returns the previous values so a `finally` can restore them — a
- * leaked timing change would corrupt every later test in the suite.
- */
+/** Test seam: shrink lease/heartbeat timings. Returns previous values
+ *  so a `finally` can restore them. */
 export declare function _setLeaseTimings({ leaseMs, heartbeatMs }: {
     leaseMs?: number;
     heartbeatMs?: number;

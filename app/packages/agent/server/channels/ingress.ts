@@ -131,8 +131,8 @@ async function ensureSession(kind: string, binding: ChannelBinding): Promise<boo
   const config = getAgent(binding.agent);
   if (!config) {
     console.warn(
-      `[10thfloor:agent] channel "${kind}": the binding for session ${binding.sessionId} names `
-      + `unregistered agent "${binding.agent}"; dropping the event`,
+      `[10thfloor:agent] channel "${kind}": a binding names unregistered agent `
+      + `"${binding.agent}"; dropping the event`,
     );
     return false;
   }
@@ -194,8 +194,10 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   let reading: InboundReading;
   try {
     reading = def.lens.in(def.parse(raw));
-  } catch (e) {
-    console.warn(`[10thfloor:agent] channel "${kind}": lens could not interpret a verified event:`, e);
+  } catch {
+    // A lens may throw with parsed provider/user content in its message. Keep
+    // the operational signal without copying that content into server logs.
+    console.warn(`[10thfloor:agent] channel "${kind}": lens could not interpret a verified event`);
     return { status: 200 };
   }
 
@@ -208,7 +210,7 @@ export async function handleInbound(kind: string, raw: RawInbound): Promise<Inbo
   const sender = reading.externalUserId ?? reading.conversationRef ?? 'unknown';
   if (throttled(`${kind}:${sender}`, t.limit, t.intervalMs)) return { status: 200 };
 
-  // 4. CLAIM the event id — exactly-once admission (§11). A provider retry
+  // 4. CLAIM the event id — deduplicated admission (§11). A provider retry
   // collides on the derived _id and is answered 200 without running twice.
   const claimId = reading.eventId !== undefined ? `${kind}:${reading.eventId}` : null;
   if (claimId && !(await insertOrLose(InboundSubmissions, { _id: claimId, at: new Date() }))) {
@@ -387,7 +389,7 @@ async function route(
         text: `To link your account, send me the word "${LINK_GESTURE}" in a direct message — not here.`,
       }, `link-hint:${reading.eventId ?? reading.externalUserId}`);
       if (outcome !== 'delivered') {
-        console.warn(`[10thfloor:agent] channel "${kind}": link hint for session ${binding.sessionId} not delivered (${outcome})`);
+        console.warn(`[10thfloor:agent] channel "${kind}": link hint not delivered (${outcome})`);
       }
       return { status: 200 };
     }
@@ -398,17 +400,16 @@ async function route(
     }, `link:${reading.eventId ?? token}`);
     if (outcome !== 'delivered') {
       // Not a seq row — no sweep retries it; the user can send "link" again.
-      console.warn(`[10thfloor:agent] channel "${kind}": link reply for session ${binding.sessionId} not delivered (${outcome}); nothing retries it`);
+      console.warn(`[10thfloor:agent] channel "${kind}": link reply not delivered (${outcome}); nothing retries it`);
     }
     return { status: 200 };
   } catch (e) {
     // Meteor.Errors are settled refusals (no-session, over budget, nothing
     // pending) — answer 200. Only unexpected failures propagate to 500.
     if (e instanceof Meteor.Error) {
-      // Session id, never binding id (binding ids embed phone numbers).
       console.warn(
-        `[10thfloor:agent] channel "${kind}": ${intent.kind} for session ${binding.sessionId} `
-        + `refused (${String(e.error)}); the event is settled`,
+        `[10thfloor:agent] channel "${kind}": ${intent.kind} refused `
+        + `(${String(e.error)}); the event is settled`,
       );
       return { status: 200 };
     }
@@ -418,8 +419,8 @@ async function route(
 
 // ---- The mount -------------------------------------------------------------
 
-/** Cap on webhook bodies — read BEFORE signature verification, so without
- *  it an unauthenticated sender could stream GB into process memory. */
+/** Cap on webhook bodies — read before full raw-body verification, so without
+ *  it a channel lacking header pre-verification could stream GB into memory. */
 export const MAX_INBOUND_BYTES = 1024 * 1024;
 
 class BodyTooLarge extends Error {
@@ -464,13 +465,34 @@ export function mountChannelRoutes(webAppHandlers: {
     webAppHandlers.use(`/agent/channels/${kind}`, (req: any, res: any) => {
       void (async () => {
         try {
-          const rawBody = await readRawBody(req, maxBytes);
           // `originalUrl`: express strips the mount prefix from `req.url`,
           // but signatures need the full path.
           const url = req.originalUrl ?? req.url;
-          const out = await handleInbound(kind, {
-            headers: req.headers ?? {}, rawBody,
+          const head = {
+            headers: req.headers ?? {},
             ...(url ? { url } : {}),
+          };
+          if (def.preverify) {
+            let allowed = false;
+            try {
+              allowed = await def.preverify(head);
+            } catch {
+              // A verifier exception may contain credential/provider content.
+              // Fail closed and log only the failure category.
+              console.warn(`[10thfloor:agent] channel "${kind}" webhook pre-verification failed closed`);
+            }
+            if (!allowed) {
+              res.writeHead(401, { 'content-type': 'text/plain' });
+              res.end('');
+              // Drain without buffering so a keep-alive connection remains
+              // usable while an attacker cannot grow process memory.
+              if (typeof req.resume === 'function') req.resume();
+              return;
+            }
+          }
+          const rawBody = await readRawBody(req, maxBytes);
+          const out = await handleInbound(kind, {
+            ...head, rawBody,
           });
           res.writeHead(out.status, { 'content-type': 'text/plain' });
           res.end(out.body ?? '');
@@ -480,7 +502,9 @@ export function mountChannelRoutes(webAppHandlers: {
             try { res.writeHead(413); res.end(); } catch { /* socket gone */ }
             return;
           }
-          console.error(`[10thfloor:agent] channel "${kind}" webhook failed:`, e);
+          // Request/parser/provider exceptions may carry body or credential
+          // content. Keep the signal generic at this trust boundary.
+          console.error(`[10thfloor:agent] channel "${kind}" webhook failed`);
           res.writeHead(500);
           res.end();
         }
@@ -488,4 +512,3 @@ export function mountChannelRoutes(webAppHandlers: {
     });
   }
 }
-

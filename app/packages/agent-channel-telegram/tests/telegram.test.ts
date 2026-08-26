@@ -293,6 +293,13 @@ describe('agent-channel-telegram', () => {
       assert.equal(def.agent, 'demo');
       assert.deepEqual(def.profile, { interact: 'native', limit: 1000 });
       assert.deepEqual(def.statuses, ['error', 'approval']);
+      assert.isTrue(await def.preverify!({
+        headers: { 'x-telegram-bot-api-secret-token': 'hush' },
+      }));
+      assert.isFalse(await def.preverify!({
+        headers: { 'x-telegram-bot-api-secret-token': 'nope' },
+      }));
+      assert.isFalse(await def.preverify!({ headers: {} }));
       assert.isTrue(await def.verify(raw({}, 'hush')));
       assert.isFalse(await def.verify(raw({}, 'nope')));
     });

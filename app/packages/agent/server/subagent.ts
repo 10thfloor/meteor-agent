@@ -249,11 +249,9 @@ export async function runSubagent(
     });
 
     await runTurn(childSessionId, buildRunConfig(config, userId));
-  } catch (e) {
+  } catch {
     // Harness failure — never expose the raw message in the transcript.
-    console.error(
-      `[10thfloor:agent] subagent "${name}" (child session ${childSessionId}) threw:`, e,
-    );
+    console.error(`[10thfloor:agent] subagent "${name}" failed`);
     return {
       result: failure('subagent-failed', `The subagent "${name}" could not run.`),
       childSessionId,

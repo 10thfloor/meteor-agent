@@ -2,10 +2,6 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meteor Agent Harness</title>
 <meta name="description" content="10thfloor:agent — durable AI agents built into your Meteor app. The transcript is a Mongo collection, streaming is a capped collection, tools are Meteor methods.">
-<link rel="preconnect" href="https://fonts.googleapis.com">
-<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Instrument+Sans:wght@400;500;600;700&family=Inter:wght@400;500;600&family=JetBrains+Mono:wght@400;500&display=swap">
-
 <style>
 /* ══════════════════════════════════════════════════════════
    Palette derived from Meteor's own design tokens, observed in
@@ -119,7 +115,7 @@
 *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
 body {
-  font-family: 'Inter', system-ui, -apple-system, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   background: var(--bg);
   color: var(--text);
   line-height: 1.6;
@@ -146,7 +142,7 @@ body {
   height: 58px; display: flex; align-items: center; justify-content: space-between;
 }
 .nav-brand {
-  font-family: 'Instrument Sans', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-weight: 700; font-size: 0.98rem; color: var(--text);
   text-decoration: none; letter-spacing: -0.01em;
 }
@@ -165,7 +161,7 @@ body {
 .section + .section { border-top: 1px solid var(--border); }
 
 h1, h2, h3 {
-  font-family: 'Instrument Sans', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   text-wrap: balance; letter-spacing: -0.025em; line-height: 1.15;
 }
 h2 { font-size: clamp(1.55rem, 3vw, 2.05rem); font-weight: 600; margin-bottom: 14px; }
@@ -195,7 +191,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 
 .eyebrow {
   display: inline-flex; align-items: center; gap: 9px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.74rem; font-weight: 500;
   text-transform: uppercase; letter-spacing: 0.09em;
   color: var(--text-2); margin-bottom: 20px;
@@ -221,7 +217,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   line-height: 1.68; margin-bottom: 26px;
 }
 .hero-deck code {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.88em; color: var(--text);
   background: var(--card); padding: 1px 5px; border-radius: 4px;
 }
@@ -236,7 +232,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   flex: 1 1 50%; padding: 11px 14px;
   border-right: 1px solid var(--border-soft);
   border-bottom: 1px solid var(--border-soft);
-  font-family: 'JetBrains Mono', monospace; font-size: 0.775rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.775rem;
   color: var(--text-3); line-height: 1.45;
 }
 .thesis-item:nth-child(2n) { border-right: none; }
@@ -249,7 +245,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 }
 .btn {
   display: inline-flex; align-items: center; gap: 8px;
-  font-family: 'Instrument Sans', system-ui, sans-serif;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
   font-size: 0.9rem; font-weight: 600;
   padding: 10px 18px; border-radius: 8px;
   text-decoration: none; border: 1px solid transparent;
@@ -268,7 +264,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   display: inline-flex; align-items: center; gap: 10px;
   background: var(--code-bg); border: 1px solid var(--code-border);
   border-radius: 8px; padding: 9px 14px;
-  font-family: 'JetBrains Mono', monospace; font-size: 0.82rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.82rem;
   color: var(--text); cursor: pointer; transition: border-color 0.15s;
 }
 .copy-cmd:hover { border-color: var(--text-3); }
@@ -289,7 +285,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 
 /* ══ Pillars — own band, below the hero ══ */
 .band-label {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.72rem; text-transform: uppercase;
   letter-spacing: 0.11em; color: var(--text-3); margin-bottom: 20px;
 }
@@ -299,7 +295,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   border-radius: 11px; padding: 24px;
 }
 .pillar-tag {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.68rem; text-transform: uppercase; letter-spacing: 0.09em;
   color: var(--text-3); margin-bottom: 12px; display: block;
 }
@@ -313,12 +309,12 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 .code-header {
   display: flex; align-items: center; gap: 8px;
   padding: 9px 16px; border-bottom: 1px solid var(--code-border);
-  font-family: 'JetBrains Mono', monospace; font-size: 0.72rem; color: var(--text-3);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.72rem; color: var(--text-3);
 }
 .code-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--text-3); opacity: 0.45; }
 .code-block pre {
   padding: 16px; overflow-x: auto;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.815rem; line-height: 1.62; color: var(--text);
 }
 .kw { color: var(--kw); } .str { color: var(--str); } .fn { color: var(--fn); }
@@ -332,7 +328,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   display: inline-flex; align-items: center; justify-content: center;
   width: 24px; height: 24px; border-radius: 6px;
   background: var(--card-2); color: var(--text-2);
-  font-family: 'JetBrains Mono', monospace; font-size: 0.75rem; font-weight: 500;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.75rem; font-weight: 500;
   flex-shrink: 0;
 }
 .qs-step > p { color: var(--text-2); font-size: 0.885rem; line-height: 1.6; }
@@ -348,7 +344,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 .feature h3 { font-size: 0.96rem; margin-bottom: 6px; }
 .feature p { color: var(--text-2); font-size: 0.85rem; line-height: 1.6; }
 .feature code {
-  font-family: 'JetBrains Mono', monospace; font-size: 0.85em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em;
   color: var(--text); background: var(--card); padding: 1px 4px; border-radius: 3px;
 }
 
@@ -369,7 +365,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   border-left: 2px solid var(--accent);
   border-radius: 0 9px 9px 0;
   padding: 18px 20px;
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.79rem;
   line-height: 1.75;
   overflow-x: auto;
@@ -394,7 +390,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 }
 .conv-header {
   padding: 12px 18px; border-bottom: 1px solid var(--border);
-  font-family: 'JetBrains Mono', monospace; font-size: 0.78rem;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.78rem;
   color: var(--text-2); display: flex; align-items: center; gap: 7px;
 }
 .conv-header-hash { color: var(--text-3); }
@@ -403,19 +399,19 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
 .conv-avatar {
   width: 32px; height: 32px; border-radius: 7px;
   display: flex; align-items: center; justify-content: center;
-  font-family: 'Instrument Sans', sans-serif; font-size: 0.72rem;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-size: 0.72rem;
   font-weight: 700; color: #fff; flex-shrink: 0;
 }
 .av-human { background: var(--p-human); }
 .av-model { background: var(--p-model); }
 .av-alt   { background: var(--p-alt); }
 .conv-name {
-  font-family: 'Instrument Sans', sans-serif; font-weight: 600;
+  font-family: system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; font-weight: 600;
   font-size: 0.84rem; margin-bottom: 3px;
   display: flex; align-items: center; gap: 7px; flex-wrap: wrap;
 }
 .conv-badge {
-  font-family: 'JetBrains Mono', monospace;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   font-size: 0.6rem; font-weight: 500; text-transform: uppercase;
   letter-spacing: 0.06em; padding: 2px 5px; border-radius: 3px;
   background: var(--card-2); color: var(--text-3);
@@ -437,7 +433,7 @@ h3 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; letter-spacing: -
   background: var(--text-3);
 }
 .nn-features code {
-  font-family: 'JetBrains Mono', monospace; font-size: 0.85em;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 0.85em;
   color: var(--text); background: var(--card); padding: 1px 4px; border-radius: 3px;
 }
 
@@ -522,9 +518,9 @@ a:focus-visible, button:focus-visible {
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
           GitHub
         </a>
-        <button type="button" class="copy-cmd" id="copyBtn" aria-label="Copy install command">
+        <button type="button" class="copy-cmd" id="copyBtn" aria-label="Copy source command">
           <span class="sigil">$</span>
-          <span id="cmdText">meteor add 10thfloor:agent</span>
+          <span id="cmdText">git clone https://github.com/10thfloor/meteor-agent.git</span>
           <svg class="ico" viewBox="0 0 24 24" id="copyIco">
             <rect x="9" y="9" width="13" height="13" rx="2"/>
             <path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/>
@@ -536,7 +532,7 @@ a:focus-visible, button:focus-visible {
         <span>Meteor 3.5+</span>
         <span>MIT</span>
         <span>TypeScript</span>
-        <span>555 tests</span>
+        <span>Network-free test suite</span>
         <span>No external orchestrator</span>
       </div>
     </div>
@@ -545,9 +541,9 @@ a:focus-visible, button:focus-visible {
     <div class="conversation">
       <div class="conv-header"><span class="conv-header-hash">#</span> support-desk</div>
       <div class="conv-msg">
-        <div class="conv-avatar av-human">MK</div>
+        <div class="conv-avatar av-human">A</div>
         <div>
-          <div class="conv-name">Mackenzie</div>
+          <div class="conv-name">Alex</div>
           <div class="conv-text">Hey, I got charged twice for order #8812</div>
         </div>
       </div>

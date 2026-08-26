@@ -54,7 +54,7 @@ export class DeltaWriter {
         if (!this.warnedClamp) {
           this.warnedClamp = true;
           console.warn(
-            `[10thfloor:agent] session ${this.sessionId}: tool_args deltas exceeded `
+            '[10thfloor:agent] tool_args deltas exceeded '
             + `maxToolArgBytes (${this.maxToolArgBytes}); the rest of this turn's argument `
             + `streaming is not published. Tool dispatch is unaffected.`,
           );

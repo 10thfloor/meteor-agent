@@ -76,7 +76,7 @@ export const receiptIdFor = (bindingId: string, suffix: string): string => `deli
 /** Suffix for a delivered prompt: one receipt per ask. */
 export const promptSuffix = (toolCallId: string): string => `prompt:${toolCallId}`;
 
-/** Effectively-once delivery log: sending → sent. Derived `_id` is
+/** Receipt-backed delivery log: sending → sent. Derived `_id` is
  *  per-binding so fan-out produces one receipt per surface. */
 export interface DeliveryReceipt {
   _id: string;                    // `deliver:${bindingId}:${suffix}`
@@ -90,7 +90,7 @@ export interface DeliveryReceipt {
   at: Date;
 }
 
-// ---- Inbound admissions (§11) — exactly-once on the way in -----------------
+// ---- Inbound admissions (§11) — deduplicated during retention -------------
 
 /** Admitted provider event. Derived `_id` from the provider's redelivery-stable
  *  id so retries collide on the PK. Rows expire by TTL index. */

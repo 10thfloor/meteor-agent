@@ -1,7 +1,7 @@
 # Email v2: attachments, and compose as a tool
 
 **Date:** 2026-08-23
-**Status:** built — 2026-08-23, all five build-order steps green (493 package tests across the six packages). Answers the channels spec's §15 open question ("Attachments and media") at the framework level, with email as the proving surface. Companion to `2026-08-20-channels-multi-surface-delivery.md`; section references of the form §N point there.
+**Status:** historical design record; implemented. Answers the channels spec's §15 open question ("Attachments and media") at the framework level, with email as the proving surface. Current source and tests are authoritative.
 
 > **Deviations from the plan as written, recorded:** (1) the five shipped lenses' naming-clause lines (step 3's last item) landed with step 1, because the law + file-bearing exemplar would otherwise fail every lens's round-trip test between steps; (2) a `maxInboundBytes` per-channel webhook body ceiling was added (registry + mount + email default 50 MB) — §11 assumed the 35 MB Postmark inbound payload parses, but the shared 1 MB mount cap would have 413'd it before the lens ever ran; (3) the derived attachment id hashes `sessionId` along with `toolCallId + name`, because tool-call ids are only unique within one provider response; (4) `Agent.ask`'s throwaway cleanup also removes the session's attachment rows; (5) a fork's copied rows keep refs that deliberately do NOT hydrate in the fork — a ref is a capability only inside its own conversation (§12); the fork shows honest not-found on read.
 **Packages:** `10thfloor:agent` (contract, store, loop, one shipped tool), `10thfloor:agent-channel-email` (lens both ways, compose tool)
@@ -250,7 +250,7 @@ group-ownership answer this section was waiting on:
 
 ## 15. Next steps
 
-Build order, each step green before the next:
+Historical implementation sequence:
 
 1. **Contract + store** — types, collection, caps, `create` (with derived-id idempotency), the law's naming clause + exemplar; unit tests.
 2. **Inbound** — email lens parse, admission caps + bracket notes, model-view suffix, `readTool`; the attachment-only-mail case.
