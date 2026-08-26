@@ -5,6 +5,7 @@ import { memoryBlock, memoryHint } from './memory';
 import { withMemoryTools } from './memory-tools';
 import {
   modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
+  unroutedMention,
 } from '../common/participants';
 import { resolveWakeAgent, unansweredAddressee } from './participants';
 import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
@@ -793,6 +794,30 @@ export async function runTurn(sessionId: string, config: RunConfig): Promise<voi
           ...(relayHit ? { to: relayHit.id } : {}),
           createdAt: new Date(),
         });
+
+        // The near miss: a turn-final rostered reply that NAMED another model
+        // but did not address one, so nothing was scheduled and the roster is
+        // about to sit idle holding an unanswered question. Note-only, and it
+        // changes no routing — see `unroutedMention` for why auto-addressing a
+        // buried mention is the wrong fix.
+        if (turnFinal && roster && !relayHit) {
+          const missed = unroutedMention(text, session, selfAgent);
+          if (missed) {
+            const noteSeq = await allocateSeq(sessionId);
+            if (noteSeq !== null) {
+              await AgentMessages.insertAsync({
+                _id: Random.id(), sessionId, seq: noteSeq, role: 'note',
+                kind: 'unrouted-mention', mentioned: missed,
+                error: {
+                  error: 'unrouted-mention',
+                  reason: `@${missed} was named but not addressed — only a mention at the `
+                    + 'START of a message schedules a turn, so nothing was sent.',
+                },
+                createdAt: new Date(),
+              });
+            }
+          }
+        }
 
         // The capped relay's explanation — note-ONLY, deliberately not
         // `commitBudgetNote`, which stops the session: a conversation that

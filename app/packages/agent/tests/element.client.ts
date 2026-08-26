@@ -360,6 +360,34 @@ describe('<agent-chat>', () => {
     );
   });
 
+  it('marks a mention that ADDRESSES differently from one that only names', async function () {
+    this.timeout(60000);
+    assert.isString(streamedSession, 'this test replays the streaming test\'s session');
+    const el = mount({ agent: 'itest', 'session-id': streamedSession! });
+    // `itest` has no roster, so the agent kind comes from the app list here —
+    // what is under test is the POSITION rule, not where the entry came from.
+    el.mentionables = [{ handle: 'analyst', label: 'analyst', kind: 'agent' }];
+    await waitFor('the transcript to arrive over DDP', 30000, () =>
+      committed(el, 'assistant').includes('live streamed reply'));
+
+    say(el, '@analyst please look, and later ask @analyst again');
+    await waitFor('the row to render', 30000, () =>
+      partsAll(el, 'user').some((n) => (n.textContent ?? '').includes('later ask')));
+
+    const row = partsAll(el, 'user').find((n) => (n.textContent ?? '').includes('later ask'))!;
+    const chips = Array.from(row.querySelectorAll('[part~="mention"]'));
+    assert.lengthOf(chips, 2);
+    // Only the leading one schedules a turn, so only it may look like it did.
+    assert.include(
+      (chips[0].getAttribute('part') ?? '').split(' '), 'addressed',
+      'the leading mention is the one that routes',
+    );
+    assert.notInclude(
+      (chips[1].getAttribute('part') ?? '').split(' '), 'addressed',
+      'a mid-text mention schedules nothing and must not claim otherwise',
+    );
+  });
+
   it('completes an @mention in the composer instead of sending it', function () {
     // No session and no DDP at all: the typeahead reads the element's own
     // `mentionables`, so this costs the shared rate-limit counter nothing.

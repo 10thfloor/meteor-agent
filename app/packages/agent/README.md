@@ -891,6 +891,23 @@ A token that matches nothing stays plain text. That is the same rule
 `resolveAddressee` uses, and keeping the two in step is the point: a chip that
 implied routing the parser would not perform would be a lie in the transcript.
 
+**Addressed vs named.** Only a mention at the *start* of a message schedules a
+turn. `@risk take a look` routes; `let me ask @risk about it` does not. The
+element renders the two differently — the leading one carries an `addressed`
+part token, the accent, and an arrow; everything else gets the quiet treatment:
+
+```css
+agent-chat::part(mention addressed) { /* the one that routed */ }
+```
+
+When a model's turn-final reply *names* another model without addressing one,
+the package writes an `unrouted-mention` note into the transcript saying so. It
+changes no routing — auto-addressing a buried mention would make the parse
+ambiguous, which is what the one-position rule exists to avoid — it just ends
+the silence. Without it a model that opens with a sentence of preamble and puts
+`@risk` in the second paragraph leaves the roster idle holding an unanswered
+question, and nothing anywhere says why.
+
 Typing `@` opens the list; ↑/↓ move, Tab or Enter accepts, Escape dismisses.
 **Enter completes rather than sends** while the list is open — a composer that
 fires off `@pri` because someone pressed Enter to pick a name is the bug this

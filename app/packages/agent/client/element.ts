@@ -182,21 +182,29 @@ const FRAME = `
     background: color-mix(in srgb, #fff 15%, transparent);
   }
 
-  /* A resolved @handle. Inline so it wraps with the sentence it is part of —
-     a chip that cannot break mid-line turns one long mention into a scrollbar. */
+  /* A resolved handle. Inline so it wraps with the sentence it is part of —
+     a chip that cannot break mid-line turns one long mention into a scrollbar.
+     The QUIET treatment is the default, because merely naming something is the
+     common case and it schedules nothing. */
   .mention {
-    border-radius: 0.35rem; padding: 0 0.2rem; font-weight: 600;
-    background: color-mix(in srgb, var(--_accent) 20%, transparent);
+    border-radius: 0.35rem; padding: 0 0.2rem; font-weight: 500;
+    background: color-mix(in srgb, var(--_fg) 13%, transparent);
   }
-  /* Anything that is not a model participant is a SUBJECT, not an addressee.
-     It reads as a reference rather than a call, because naming it schedules
-     nothing — see the Mentionable docblock. */
-  .mention.subject {
-    background: color-mix(in srgb, var(--_fg) 13%, transparent); font-weight: 500;
+  /* ADDRESSED: a leading at-sign naming a model participant, which is the only
+     mention that actually schedules a turn. It gets the accent and the arrow,
+     because it is the one that DID something. (No backticks in this sheet —
+     it is a template literal.) */
+  .mention.addressed {
+    background: color-mix(in srgb, var(--_accent) 22%, transparent);
+    font-weight: 600;
   }
-  /* On the user bubble the accent IS the background, so the chip has to lift
-     off white instead of off the page. */
-  .message.user .mention { background: color-mix(in srgb, #fff 30%, transparent); }
+  .mention.addressed::before {
+    content: '→'; margin-right: 0.15rem; opacity: 0.75; font-weight: 400;
+  }
+  /* On the user bubble the accent IS the background, so a chip has to lift off
+     white instead of off the page. */
+  .message.user .mention { background: color-mix(in srgb, #fff 22%, transparent); }
+  .message.user .mention.addressed { background: color-mix(in srgb, #fff 38%, transparent); }
 
   .typeahead {
     position: absolute; left: 1rem; right: 1rem; bottom: calc(100% - 0.25rem);
@@ -288,6 +296,12 @@ function noteText(m: ViewMessage): string {
     return `${verdict}${m.reason ? ` — ${m.reason}` : ''}`;
   }
   if (m.kind === 'compaction') return '· earlier conversation compacted ·';
+  // The near miss. Says what was meant and what to do, because the fix is a
+  // rewrite by whoever (or whatever) wrote the message.
+  if (m.kind === 'unrouted-mention') {
+    return m.error?.reason
+      ?? `@${m.mentioned} was named but not addressed — nothing was sent.`;
+  }
   // The watcher's re-link. The row exists to be a HANDLE (it carries
   // `childSessionId` + `childAgent`), so the sentence names the agent a reader
   // would go looking for rather than the slug.
@@ -447,10 +461,21 @@ function renderText(text: string, mentions: Map<string, Mentionable>): Node[] {
       if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
       const chip = document.createElement('span');
       const kind = found.kind ?? 'subject';
-      chip.className = `mention ${kind}`;
-      chip.setAttribute('part', `mention ${kind}`);
+      // ADDRESSED vs merely NAMED. `resolveAddressee` reads one position — the
+      // leading token — so `@risk` at the front of a message schedules Risk's
+      // turn and `@risk` in the second paragraph schedules nothing. Rendering
+      // both identically is a chip that promises routing it cannot deliver:
+      // the transcript then shows a confident mention beside a roster that
+      // never woke, and the reader has no way to tell which happened.
+      const addressed = kind === 'agent'
+        && prefix === DEFAULT_PREFIX
+        && /^\s*$/.test(text.slice(0, hit.index));
+      const flags = addressed ? `${kind} addressed` : kind;
+      chip.className = `mention ${flags}`;
+      chip.setAttribute('part', `mention ${flags}`);
       chip.textContent = `${prefix}${found.label ?? handle}`;
-      if (found.detail) chip.title = found.detail;
+      chip.title = found.detail
+        ?? (addressed ? `Addressed to ${handle} — schedules their turn` : '');
       nodes.push(chip);
       cursor = hit.index + prefix.length + handle.length;
     }
