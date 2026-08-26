@@ -10,44 +10,22 @@ import type { ChannelAttachment } from '../common/channel-contract';
 import { insertOrLose } from './channels/collections';
 import type { InlineTool } from './tools';
 
-/**
- * The attachment store (email v2 spec §5): file BYTES in one side collection,
- * REFS on message rows. Transcript rows are read constantly — by the loop, the
- * publication, the planner's tail scan — and a 5 MB base64 string on a row
- * would ride every one of those reads; here it is read exactly twice, once at
- * admission/creation and once at delivery (or through `read_attachment`).
- *
- * Bytes are base64 STRINGS end to end: providers emit and demand base64, the
- * channel contract stays isomorphic, and one Mongo document holds a 6.7 MB
- * string without ceremony (16 MB ceiling). The store is a seam — swapping it
- * for GridFS or S3 later changes `createAttachment`/`hydrateRefs`, not the
- * contract.
- *
- * SERVER-ONLY, like the channel collections: no client ever subscribes to
- * bytes, and the blanket client-write deny in server/index.ts covers it. No
- * download route exists either — bytes leave the store only inside an outbound
- * payload to a destination the binding or a recipients policy chose (§12).
- */
+/* Attachment store (§5): bytes in a side collection, separate from transcript rows.
+ * Server-only — bytes leave only inside outbound payloads. */
 
 // ---- The document ----------------------------------------------------------
 
 export interface AgentAttachment {
-  /** Random for inbound files; DERIVED (`session + toolCallId + name`) for
-   *  tool-created rows, so a crash-recovery re-run collides and adopts. */
+  /** Random for inbound; derived for tool-created (crash-recovery idempotent). */
   _id: string;
-  /** The scope — every read and every hydration checks it. A ref is a
-   *  capability only inside its own conversation. */
+  /** Scoping key — a ref is a capability only inside its own session. */
   sessionId: string;
-  /** A display string, never a path (§12): control characters stripped,
-   *  length-capped at write. The store is a collection, not a filesystem, so
-   *  `../` has nothing to traverse — the sanitizing is about log/UI hygiene. */
+  /** Display string, never a path — control chars stripped, length-capped. */
   name: string;
   contentType: string;
-  /** DECODED byte count — computed from the actual bytes at write time, never
-   *  trusted from a provider's declared length. */
+  /** Decoded byte count, computed at write time (never trusted from provider). */
   size: number;
-  /** The bytes, base64. Checked at the door: decode-validity is verified so
-   *  garbage cannot occupy the store under a small declared size. */
+  /** The bytes, base64. Decode-validity verified at write time. */
   content: string;
   origin: 'inbound' | 'tool';
   /** Present only while awaiting the turn-final flush: `attach: true` marks
@@ -73,13 +51,8 @@ export const AgentAttachments =
 
 // ---- Caps ------------------------------------------------------------------
 
-/**
- * Write-time caps, per MESSAGE (email v2 spec §5). Defaults chosen under
- * Postmark's outbound ceiling — 10 MB total per send INCLUDING base64, which
- * inflates 4/3: one 5 MB file is ~6.7 MB encoded, and a full 6 MB message is
- * ~8 MB encoded plus bodies, both clear of the wire cap with headroom. Inbound,
- * Postmark itself allows 35 MB cumulative — we accept less, on purpose.
- */
+/** Write-time caps per message (§5). Defaults sit under Postmark's outbound
+ *  ceiling after base64 inflation (4/3). */
 export interface AttachmentCaps {
   /** Per file, decoded bytes. Default 5 MB — also keeps every Mongo document
    *  comfortably under the 16 MB ceiling. */
@@ -102,9 +75,7 @@ function capsOf(caps?: AttachmentCaps): Required<AttachmentCaps> {
 
 // ---- Hygiene helpers -------------------------------------------------------
 
-/** Display-string discipline (§12): control characters stripped, length-capped,
- *  never empty. Names land in transcripts, logs, admission notes and provider
- *  payloads — all places a raw header value has no business steering. */
+/** Control chars stripped, length-capped, never empty. */
 export function sanitizeAttachmentName(raw: string): string {
   // eslint-disable-next-line no-control-regex
   const cleaned = String(raw ?? '').replace(/[\x00-\x1f\x7f]/g, '').trim();
@@ -119,9 +90,8 @@ function sanitizeContentType(raw: string): string {
   return capped === '' ? 'application/octet-stream' : capped;
 }
 
-/** Base64 checked at the door (§12): shape first (Node's decoder silently
- *  skips invalid characters, so a regex does the refusing), then the DECODED
- *  size — the number every cap and every size line uses. Null = not base64. */
+/** Validate base64 shape (Node silently skips invalid chars) and return
+ *  decoded size. Null = not valid base64. */
 export function decodedBase64Size(content: string): number | null {
   if (typeof content !== 'string') return null;
   const s = content.replace(/[\r\n]/g, '');
@@ -129,9 +99,7 @@ export function decodedBase64Size(content: string): number | null {
   return Buffer.from(s, 'base64').length;
 }
 
-// Moved to common/ so the element's chips render the same sizes (participants
-// spec §7.3); imported back and re-exported so every existing import site —
-// and this module's own notes — hold unchanged.
+// Re-exported from common/ for existing import sites.
 export { prettySize };
 
 const refOf = (row: Pick<AgentAttachment, '_id' | 'name' | 'contentType' | 'size'>): AttachmentRef => ({
@@ -149,29 +117,14 @@ export interface CreateAttachmentOptions {
   /** Stage the file for the turn's reply: the loop claims every staged ref at
    *  the turn-final commit and embeds them on the assistant row. */
   attach?: boolean;
-  /**
-   * Idempotency. With it, the `_id` DERIVES from session + toolCallId + name:
-   * tool dispatch re-runs on crash recovery (the dispatch comment calls that
-   * window irreducible), and a re-run's `create` collides on the derived key
-   * and ADOPTS the existing row instead of duplicating it — re-staging it when
-   * `attach` asks, so the recovered turn's reply still carries the file.
-   */
+  /** Idempotency: derives the `_id` so a crash-recovery re-run adopts. */
   toolCallId?: string;
   /** Override the default write caps — admission callers pass the channel's. */
   caps?: AttachmentCaps;
 }
 
-/**
- * Insert one file into the store and return its REF. The API for tool bodies
- * (`Agent.attachments.create`) and for inbound admission — never a model
- * surface: the model handles refs and prose only; content exists because
- * trusted code wrote it.
- *
- * Enforces the per-file cap always, and — when staging — the per-message
- * count and total caps against the session's currently staged set. Refusals
- * are `Meteor.Error`s a tool body can let propagate: the dispatch layer turns
- * them into a structured failed result the model routes around.
- */
+/** Insert one file and return its ref. Enforces per-file cap always, and
+ *  per-message count/total caps when staging. Refusals are `Meteor.Error`s. */
 export async function createAttachment(opts: CreateAttachmentOptions): Promise<AttachmentRef> {
   const { sessionId, attach, toolCallId } = opts;
   if (!sessionId) throw new Meteor.Error('attachment-invalid', 'create needs a sessionId');
@@ -202,10 +155,8 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
     );
   }
   if (attach) {
-    // The per-MESSAGE caps, applied to the staged set this file would join.
-    // Read-then-insert, tolerantly: two parallel tool calls can overshoot by
-    // one file's worth — the caps bound a message, they are not billing, and
-    // the delivery-side wire ceiling still has ~2 MB of headroom (§5).
+    // Per-message caps against the staged set. Tolerant: two parallel calls
+    // can overshoot by one file.
     const staged = await AgentAttachments.find(
       { sessionId, staged: true }, { fields: { size: 1 } },
     ).fetchAsync();
@@ -224,9 +175,8 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
     }
   }
 
-  // Derived id when the caller carries a toolCallId — the receipts idiom.
-  // The session is in the hash because tool-call ids are only unique within
-  // one provider response (the mock reuses `t1` every turn).
+  // Derived id for idempotency; session is in the hash because tool-call
+  // ids are only unique within one response.
   const _id = toolCallId !== undefined
     ? `att${createHash('sha256').update(`${sessionId}:${toolCallId}:${name}`).digest('hex').slice(0, 24)}`
     : `att${Random.id()}`;
@@ -239,16 +189,11 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
   };
   if (await insertOrLose(AgentAttachments, doc)) return refOf(doc);
 
-  // The race's (or the re-run's) loser adopts the winner's row. When this
-  // create wants the file staged and the existing row is not — the crash
-  // window between a previous commit's claim and its insert — re-stage it, so
-  // the recovered turn's reply still carries the file. A row whose turn DID
-  // commit is never re-created: dispatch does not re-run completed turns.
+  // Race loser adopts. Re-stage if the existing row lost its staged flag
+  // in the crash window.
   const existing = await AgentAttachments.findOneAsync({ _id, sessionId });
   if (!existing) {
-    // Same derived id under a DIFFERENT session — the hash includes the
-    // session, so this is unreachable short of a hash collision; refuse
-    // loudly rather than hand back someone else's file.
+    // Hash collision — unreachable in practice; refuse loudly.
     throw new Meteor.Error('attachment-conflict', `attachment id collision for "${name}"`);
   }
   if (attach && !existing.staged) {
@@ -259,14 +204,8 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
 
 // ---- Staging → the reply (§8) ----------------------------------------------
 
-/**
- * Claim every staged ref of a session — one atomic unstage per row, the
- * single-winner shape: of two racing claimants each row goes to exactly one.
- * Called by the loop when it commits the turn-final assistant row; the claimed
- * refs become that row's `attachments`. A crash between claim and commit
- * strands the rows unstaged and undelivered — the files survive in the store,
- * and the re-run turn's `create` re-stages them idempotently (above).
- */
+/** Claim staged refs for the turn-final assistant row. Single-winner per row;
+ *  crash-recovery re-stages idempotently via `createAttachment`. */
 export async function claimStagedRefs(sessionId: string): Promise<AttachmentRef[]> {
   const staged = await AgentAttachments.find(
     { sessionId, staged: true },
@@ -285,14 +224,8 @@ export async function claimStagedRefs(sessionId: string): Promise<AttachmentRef[
 
 // ---- Hydration (the delivery thunk's read, §8) ------------------------------
 
-/**
- * Refs → hydrated `ChannelAttachment[]`, session-checked. Runs only on
- * `deliverOnce`'s POST path (a settled receipt or a backoff window loads
- * nothing). A ref that no longer hydrates — pruned by the retention TTL — is
- * returned in `missing` so the caller can note it in the text: the courier
- * never claims to have delivered a file it didn't, and never wedges the
- * conversation over one.
- */
+/** Refs to hydrated attachments, session-checked. Missing refs (expired by
+ *  retention TTL) are returned separately so the caller can note them. */
 export async function hydrateRefs(
   sessionId: string, refs: AttachmentRef[],
 ): Promise<{ attachments: ChannelAttachment[]; missing: AttachmentRef[] }> {
@@ -323,12 +256,8 @@ export interface AdmittedAttachments {
   notes: string[];
 }
 
-/**
- * Apply the caps in order — count, then per-file, then running total — keep
- * what passes, and say what was dropped. Sizes are recomputed from the actual
- * base64 (a declared length is advisory); content that does not decode is
- * dropped with its own note rather than occupying the store as garbage.
- */
+/** Apply caps (count, per-file, total) in order; sizes recomputed from actual
+ *  base64. Returns kept refs and notes for each rejected file. */
 export async function admitInboundAttachments(
   sessionId: string, incoming: ChannelAttachment[], caps?: AttachmentCaps,
 ): Promise<AdmittedAttachments> {
@@ -371,29 +300,15 @@ export async function admitInboundAttachments(
 
 // ---- Request-time image hydration (participants spec §9) --------------------
 
-/**
- * Attach image bytes to an ASSEMBLED provider request — the separate async
- * step the loop runs immediately before the provider call, AFTER the
- * compaction estimate (base64 in the estimator would read as megatokens and
- * wedge compaction forever) and never on the summarizer path. Correlated by
- * `toolCallId`: the read stamped image refs onto its committed `tool` row,
- * and this loads their bytes onto the matching assembled message. Rows the
- * compaction cut removed simply have no assembled twin and cost nothing;
- * refs whose bytes the retention TTL reaped hydrate to nothing and the text
- * result stands alone. Returns whether any image rode the request — the
- * strip-and-degrade retry keys on it.
- */
+/** Attach image bytes to assembled provider messages, correlated by toolCallId.
+ *  Runs after compaction estimate, never on the summarizer path. */
 export async function hydrateImageRefs(
   sessionId: string,
   rows: Array<Pick<AgentMessage, 'role' | 'toolCallId' | 'attachments' | 'kind' | 'seq' | 'upto'>>,
   messages: import('./providers/types').ProviderMessage[],
 ): Promise<boolean> {
-  // The compaction cut, replicated inline (importing `latestCompaction` would
-  // close a module cycle through transcript.ts): rows the newest note
-  // summarized away have NO assembled twin, and — because tool-call ids are
-  // only unique within one provider response (the mock reuses `t1` every
-  // turn) — letting them pair would attach a dead row's bytes to a LIVE
-  // row's result.
+  // Inline compaction cut — importing `latestCompaction` would cycle.
+  // Tool-call ids repeat across responses, so dead rows must not pair.
   let upto = -1;
   for (let i = rows.length - 1; i >= 0; i -= 1) {
     const r = rows[i];
@@ -403,10 +318,7 @@ export async function hydrateImageRefs(
     }
   }
 
-  // OCCURRENCE pairing, not first-match (a reviewer-confirmed mis-attach):
-  // both sides walk in order, and the Nth surviving tool row with a given
-  // id pairs with the Nth assembled tool message carrying it — the same
-  // window discipline every other id consumer in the package applies.
+  // OCCURRENCE pairing: Nth surviving tool row pairs with Nth assembled message.
   const queues = new Map<string, import('./providers/types').ProviderMessage[]>();
   for (const m of messages) {
     if (m.role !== 'tool' || !m.toolCallId) continue;
@@ -438,12 +350,8 @@ export async function hydrateImageRefs(
 
 // ---- The model's view of a row's refs (§6) ----------------------------------
 
-/**
- * The mechanical suffix a ref-carrying row gains in the PROVIDER REQUEST —
- * request-view only; the committed row's `content` stays exactly what was
- * written. No model call, no parsing, no summaries — the same "mechanical,
- * derived at delivery time" rule the planner lives by.
- */
+/** Mechanical suffix for ref-carrying rows in the provider request.
+ *  Request-view only; the committed row's content is unchanged. */
 export function attachmentSuffix(refs: AttachmentRef[]): string {
   const count = refs.length;
   const lines = refs.map((r) => `- ${r.name} (${r.contentType}, ${r.size} bytes) id=${r.id}`);
@@ -470,28 +378,11 @@ function isTextLike(contentType: string): boolean {
  *  keeps the refusal. */
 const IMAGE_TYPES = /^image\/(png|jpe?g|gif|webp)$/i;
 
-/** The provider-bound ceiling on ONE attached image, decoded — matches the
- *  strictest common per-image limit (Anthropic's 5 MB). Store caps usually
- *  bound this already; the check is for deployments that raised them, and
- *  pixel-dimension caps a byte gate cannot see are handled by the loop's
- *  strip-and-degrade retry. */
+/** Per-image ceiling, decoded — matches the strictest provider limit (5 MB). */
 export const READ_IMAGE_CAP = 5 * 1024 * 1024;
 
-/**
- * The one tool the core ships for attachments — a SPEC the app lists in
- * `tools` like any inline spec (nothing auto-registers, §7's idiom):
- *
- *   tools: [Agent.attachments.readTool, …]
- *
- * Scope: the row must match `ctx.sessionId` — a ref from another session
- * reads as not-found; the id is a capability only inside its own conversation.
- * Text-like content returns as UTF-8, capped. An IMAGE, when the running
- * model's provider declared vision (participants spec §9), is ATTACHED: the
- * ref stamps this call's tool row through the collector, and request-time
- * hydration carries the bytes — the one way an image ever enters context,
- * by the model's own choice. Otherwise binary returns a structured refusal
- * the model can route around, with the reason.
- */
+/** The shipped read_attachment tool spec. Session-scoped; text returns as
+ *  UTF-8, images attach via the collector, binary gets a structured refusal. */
 export const readTool: InlineTool = {
   name: 'read_attachment',
   description:

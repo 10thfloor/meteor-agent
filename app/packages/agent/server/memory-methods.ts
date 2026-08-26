@@ -5,43 +5,19 @@ import { MEMORY_SCOPES, type MemoryScope } from '../common/types';
 import type { ResolvedMemory } from '../common/types';
 import { forgetMemory, saveMemory, searchMemory } from './memory';
 
-/**
- * The USER's memory surface: three DDP methods, so "what does this app
- * remember about me" is a subscription plus an edit button.
- *
- * NARROWER than the model's surface, deliberately (memory spec decision 7a).
- * Gates run at exactly one place in this package — the loop's dispatch path —
- * so a `gate: 'ask'` on the model's save does NOT protect this route. A client
- * calling `memory.save { scope: 'app' }` would otherwise write the shared work
- * pool that every session's system prompt reads, with no approval anywhere: a
- * prompt-injection primitive handed to any signed-in account. These bodies
- * therefore refuse app-scope writes and app-row deletes outright. Shared
- * knowledge is written by an approved model proposal, or server-side through
- * `Agent.memory`.
- */
+/* User's DDP memory surface — narrower than the model's (decision 7a).
+ * App-scope writes and deletes refused outright; shared knowledge is
+ * written only by an approved model proposal. */
 
-/** Registration is LATCHED, not per-agent. `Meteor.methods` throws on a
- *  duplicate name and `defineAgent` is re-entrant — hot reload redefines every
- *  agent on every save, and a suite may define two memory agents in one
- *  process — so "register when an agent declares memory" must mean "once". */
+/** Latched: Meteor.methods throws on duplicate names, and hot reload
+ *  re-enters defineAgent. */
 let registered = false;
 
-/** TEST SEAM, not public API: lets a suite assert the latch without a second
- *  process. Not re-exported from `server/index.ts`. */
+/** Test seam: assert the latch without a second process. */
 export function _memoryMethodsRegistered(): boolean { return registered; }
 
-/**
- * Which memory config governs a DDP call.
- *
- * The client names no agent, and it should not have to: person memory follows
- * the HUMAN, not the model (decision 2), so ANY memory-declaring agent's
- * config resolves the same person store. The first registered wins for caps;
- * the store it points at is identical either way.
- *
- * Installed by `registry` rather than imported FROM it: `registry` calls
- * `ensureMemoryMethods`, so importing the registry back here would close a
- * cycle. An injected resolver keeps this module a leaf.
- */
+/** Which memory config governs a DDP call. Injected by `registry` to
+ *  avoid a circular import. */
 export type GoverningConfig = () => { config?: ResolvedMemory; agent: string };
 
 let governingConfig: GoverningConfig = () => ({ agent: '' });
@@ -71,10 +47,7 @@ export function ensureMemoryMethods(resolve: GoverningConfig): void {
           + 'agent and approved by a person.',
         );
       }
-      // Agent-scope rows belong to ONE named agent, and a client names none.
-      // Resolving it to "whichever memory agent was defined first" filed the
-      // note under an arbitrary agent — invisible to the one that should own
-      // it, and visible to one that should not.
+      // Agent-scope rows belong to a specific agent; a client names none.
       if (scope === 'agent') {
         throw new Meteor.Error(
           'denied-scope',
@@ -93,9 +66,7 @@ export function ensureMemoryMethods(resolve: GoverningConfig): void {
         },
         { by: `h:${userId}`, userId, agent, config },
       );
-      // The core answers the MODEL in structured results (a refusal it can
-      // route around); a DDP caller gets the same information as an error,
-      // which is what a client's try/catch expects.
+      // Translate structured refusal → Meteor.Error for DDP callers.
       if (!result.ok) throw new Meteor.Error(result.error, result.reason);
       return result;
     },

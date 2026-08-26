@@ -8,14 +8,8 @@ export const SERVER_ID: string = Random.id();
 export let LEASE_MS = 30_000;
 export let HEARTBEAT_MS = 10_000;
 
-/**
- * Test seam, NOT a public API: shrink the lease/heartbeat timings so a test
- * can observe heartbeat-renewal behavior without waiting out the real
- * 30s/10s intervals. `claimLease`/`heartbeat` read the module-level `let`s at
- * call time, so a caller need only set this BEFORE starting the turn under
- * test. Returns the previous values so a `finally` can restore them — a
- * leaked timing change would corrupt every later test in the suite.
- */
+/** Test seam: shrink lease/heartbeat timings. Returns previous values
+ *  so a `finally` can restore them. */
 export function _setLeaseTimings(
   { leaseMs, heartbeatMs }: { leaseMs?: number; heartbeatMs?: number },
 ): { leaseMs: number; heartbeatMs: number } {

@@ -4,74 +4,30 @@ import { loadMcpSdk } from './loader';
 // vocabulary and there is no second copy of it.
 import type { ToolResult } from '../tools';
 
-/**
- * MCP servers as tool sources.
- *
- * A server is a subprocess speaking MCP over stdio. It is registered by name
- * (`Agent.mcpServer('docs', { command, args, env })`), CONNECTED LAZILY — the
- * first tool use that needs it — and then kept for the life of the process:
- * one connection per SERVER, never per tool.
- *
- * Failure is never a throw. A server that will not start, a `tools/list` that
- * does not answer, a child that dies mid-call — all of it becomes a structured
- * `mcp-unavailable` tool result the model reads and routes around.
- *
- * A failure is remembered only as a COOLDOWN, never as a verdict. See
- * `MCP_FAILURE_COOLDOWN_MS`: a failed open suppresses re-spawning for a bounded
- * window and then expires on its own. That is the M2 catalog-cache lesson kept
- * intact — the lesson was "never cache a failure as if it were an answer", not
- * "re-spawn a dead subprocess on every single tool call". A poisoned cache
- * turns a ten-second outage into a permanently broken agent; a cooldown turns a
- * ten-second outage into a ten-second outage plus at most one cooldown window,
- * and it clears the instant a connect succeeds.
- *
- * Every connect and every discovery is also DEADLINED (`MCP_DISCOVERY_TIMEOUT_MS`).
- * The SDK's own default is 60s per request, and discovery runs on the turn's
- * critical path, so an unbounded wait here is a turn that appears to hang.
- */
+/** MCP servers as lazy stdio subprocesses. Failures become structured
+ *  `mcp-unavailable` results (never throws). Failed opens use a bounded
+ *  cooldown, not a permanent cache. */
 
-/** How a server is started. The three fields a stdio MCP server needs, plus two
- *  per-server budget overrides; the SDK's `StdioServerParameters` has more
- *  (`cwd`, `stderr`, `maxBufferSize`) and adding one here is a one-line
- *  pass-through. */
+/** How a server is started. */
 export interface McpServerDef {
   command: string;
   args?: string[];
   env?: Record<string, string>;
-  /** Deadline for connect AND for `tools/list`, in ms. Defaults to
-   *  `MCP_DISCOVERY_TIMEOUT_MS`. A server that is genuinely slow to boot (a
-   *  container, a cold `npx` download) raises it. */
+  /** Deadline for connect and `tools/list`, in ms. Default: `MCP_DISCOVERY_TIMEOUT_MS`. */
   timeoutMs?: number;
-  /** How long a FAILED open suppresses the next spawn attempt, in ms. Defaults
-   *  to `MCP_FAILURE_COOLDOWN_MS`; 0 disables the cooldown entirely. */
+  /** How long a failed open suppresses the next attempt. Default: `MCP_FAILURE_COOLDOWN_MS`; 0 to disable. */
   cooldownMs?: number;
 }
 
-/**
- * The default deadline for connecting to a server and for its `tools/list`.
- *
- * 15s, against the SDK's 60s default. Discovery happens once per process per
- * server, but it happens INSIDE a turn that holds a lease and a user is
- * watching, and `expandMcpTools` runs every registered server's discovery
- * before the model is called at all. A minute of silence per dead server is not
- * a failure mode this package is willing to have.
- */
+/** 15s deadline for connect + discovery (the SDK's 60s default is too long
+ *  for something that blocks the turn). */
 export const MCP_DISCOVERY_TIMEOUT_MS = 15_000;
 
-/**
- * How long a failed open suppresses the next spawn attempt.
- *
- * NOT a negative cache of the RESULT — the unavailable answer the caller gets
- * during the window is regenerated from the recorded reason, and the window
- * expires on its own with no successful connect required to clear it. A success
- * clears it immediately. The distinction matters: M2's catalog cache remembered
- * a failure with no expiry, so one outage broke an agent until a redeploy.
- */
+/** Cooldown after a failed open. Expires on its own; a success clears it
+ *  immediately. Not a permanent cache — that was an M2 bug. */
 export const MCP_FAILURE_COOLDOWN_MS = 30_000;
 
-/** The slice of the SDK's `RequestOptions` this package sets. Probed off
- *  `dist/esm/shared/protocol.d.ts` (1.30.0): `timeout?: number`, the
- *  per-request override for `DEFAULT_REQUEST_TIMEOUT_MSEC` (60000). */
+/** The slice of the SDK's RequestOptions this package sets. */
 export interface McpRequestOptions {
   timeout?: number;
 }
@@ -94,22 +50,7 @@ export interface McpCallResult {
   [k: string]: unknown;
 }
 
-/**
- * The slice of the SDK's `Client` this package uses — the TEST SEAM.
- *
- * Probed off `dist/esm/client/index.d.ts` (1.30.0):
- *   `listTools(params?, options?): Promise<{ tools: { name, description?,
- *      inputSchema: { type: 'object', properties?, required? }, … }[] }>`
- *   `callTool(params: { name, arguments?, … }, resultSchema?, options?)`
- *      `: Promise<{ content: (…)[]; isError?: boolean; … } | { toolResult }>`
- *   `close(): Promise<void>` (inherited from `Protocol`)
- * `connect(transport)` is deliberately NOT part of this interface: connecting
- * is the FACTORY's job, so a fake never has to model a transport.
- *
- * `listTools` takes the SDK's SECOND argument here — `params` first, `options`
- * second — because that is where the request `timeout` lives. Both are optional,
- * so a fake that declares `async listTools()` still satisfies this.
- */
+/** Test seam for the SDK Client. Connecting is the factory's job. */
 export interface McpClient {
   listTools(
     params?: Record<string, unknown>, options?: McpRequestOptions,
@@ -136,14 +77,7 @@ function assertString(value: unknown, field: string): void {
   }
 }
 
-/**
- * Register an MCP server definition. Validated and THROWN ON at registration,
- * like `defineAgent`: a typo in a command is a startup error, not something a
- * session discovers by failing every tool call.
- *
- * Re-registering a name replaces the definition and drops any live connection,
- * so a redefinition in a hot-reloaded dev server actually takes effect.
- */
+/** Register (or replace) an MCP server definition. Validates eagerly. */
 export function registerMcpServer(name: string, def: McpServerDef): void {
   assertString(name, 'the server name');
   if (!def || typeof def !== 'object') {
@@ -174,9 +108,7 @@ export function registerMcpServer(name: string, def: McpServerDef): void {
     }
   }
   if (servers.has(name)) dropConnection(name);
-  // A redefinition is an operator SAYING they fixed it, so it clears the
-  // cooldown as well as the connection: waiting out a 30s window after editing
-  // the command would be a baffling dev-server experience.
+  // A redefinition clears the cooldown too.
   cooldowns.delete(name);
   servers.set(name, {
     command: def.command,
@@ -196,12 +128,8 @@ export function getMcpServer(name: string): McpServerDef | undefined {
 const GENERIC = 'The MCP tool reported an error.';
 const MAX_REASON = 200;
 
-/**
- * Anything that looks like a stack frame, a filesystem path, a URL or a
- * source location. Text matching this is REPLACED, not trimmed: a reason is
- * fed to the model AND stored in the published transcript, and a third-party
- * subprocess is under no obligation to keep secrets out of its error strings.
- */
+/** Matches stack frames, paths, URLs, and source locations. Replaced because
+ *  these are third-party strings stored in the published transcript. */
 const STACKISH = /\bat\s+\S+\s*\(|\bat\s+\/|file:\/\/|node_modules|[A-Za-z]:\\|(^|\s)\/[\w.-]+\/[\w.\-/]+|:\d+:\d+/;
 
 /** A leading `Error:` / `TypeError:` / `McpError:` label — stripped rather
@@ -209,17 +137,8 @@ const STACKISH = /\bat\s+\S+\s*\(|\bat\s+\/|file:\/\/|node_modules|[A-Za-z]:\\|(
  *  ordinary, useful message. */
 const ERROR_LABEL = /^[\w$]*Error:\s*/;
 
-/**
- * Control characters: terminal escapes and framing junk, which a published row
- * must not carry. Tab, newline and carriage return are ORDINARY whitespace here
- * (they collapse to spaces below); everything else under 0x20, plus DEL, is
- * disqualifying.
- *
- * Written as a code-point scan rather than a regex character class on purpose:
- * a range like that has to be spelled with escapes, and one mistyped escape
- * puts a literal control byte in this source file — which makes the file
- * binary to grep and every other tool that reads it.
- */
+/** Detect control chars (except tab/newline/CR). Code-point scan avoids
+ *  binary-looking regex escapes. */
 function hasControlChars(text: string): boolean {
   for (let i = 0; i < text.length; i += 1) {
     const c = text.charCodeAt(i);
@@ -229,24 +148,9 @@ function hasControlChars(text: string): boolean {
   return false;
 }
 
-/**
- * Third-party error text → something safe to publish.
- *
- * The rules, in order. Any of them firing returns the GENERIC message rather
- * than a redacted version of the original — when in doubt, say nothing:
- *
- *  1. not a non-empty string → generic;
- *  2. a leading `…Error:` label is stripped (a label, not a stack);
- *  3. control characters → generic;
- *  4. stack-shaped, path-shaped, URL-shaped or `line:col`-shaped → generic;
- *  5. any whitespace-free run of 24+ characters → generic. A sentence does not
- *     contain one; a token, a key, a base64 blob, a URL and an absolute path
- *     all do. This is the rule that catches a leaked secret whose shape nobody
- *     anticipated;
- *  6. whitespace collapses to single spaces and the result is clamped to 200
- *     characters, because a tool row is published and a server may answer with
- *     a megabyte.
- */
+/** Sanitize third-party error text for the published transcript. Falls back
+ *  to a generic message on any sign of stack traces, paths, long opaque
+ *  tokens, or control characters. */
 export function sanitizeMcpReason(raw: unknown, fallback: string = GENERIC): string {
   if (typeof raw !== 'string') return fallback;
   const text = raw.trim().replace(ERROR_LABEL, '').trim();
@@ -275,25 +179,8 @@ interface Connection {
   byName: Map<string, McpToolInfo>;
 }
 
-/**
- * The default factory: the real SDK, through the loader seam.
- *
- * `env` MERGES over the SDK's `getDefaultEnvironment()` rather than replacing
- * it. That function returns a curated safe subset of `process.env`
- * (`DEFAULT_INHERITED_ENV_VARS` — PATH, HOME and friends).
- *
- * CORRECTION (M2 review): the installed SDK ALREADY merges. `dist/esm/client/
- * stdio.js` (1.30.0) spawns with `env: { ...getDefaultEnvironment(),
- * ...this._serverParams.env }`, so passing `{ API_KEY: … }` alone does NOT
- * strip PATH today. An earlier note here claimed the SDK used `env` INSTEAD of
- * the defaults; that was wrong.
- *
- * The merge stays anyway, as INSURANCE, not as a fix: it is two lines, it is
- * idempotent against the SDK's own merge (same keys, same precedence — ours
- * wins in both), and the failure it guards against is a silent one. If a future
- * SDK version stops merging, a server spawned with no PATH surfaces as a
- * baffling ENOENT with nothing pointing at the cause.
- */
+/** The default factory. env merges over the SDK's `getDefaultEnvironment()`
+ *  as insurance — the SDK already merges, but a future version might not. */
 const defaultFactory: McpClientFactory = async (_name, def) => {
   const clientNs = await loadMcpSdk('client') as any;
   const stdioNs = await loadMcpSdk('client/stdio.js') as any;
@@ -344,16 +231,7 @@ function dropConnection(name: string): void {
   if (conn) closeQuietly(conn.client);
 }
 
-/**
- * Best-effort teardown at process exit. Registered ONCE, and only after a
- * connection actually exists, so a process that never touches MCP adds no
- * listener.
- *
- * `exit` handlers cannot await, so this is genuinely best effort: `close()`
- * kills the child synchronously enough to matter in practice, and the promise
- * it returns is dropped on the floor. A host that wants a guaranteed clean
- * shutdown calls `stopMcp()` itself.
- */
+/** Best-effort child cleanup on exit; registered lazily. */
 let exitHooked = false;
 function hookExit(): void {
   if (exitHooked) return;
@@ -389,10 +267,7 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
   const budget = budgetFor(def);
   const started = factory(name, def);
   let abandoned = false;
-  // A factory that answers AFTER the deadline has already spawned a subprocess
-  // nobody will ever read from. Close it rather than leak a child for the life
-  // of the process. The rejection arm is swallowed: the deadline (or the await
-  // below) is what reports the failure.
+  // Close a late-arriving subprocess rather than leaking it.
   void started.then(
     (late) => { if (abandoned) closeQuietly(late); },
     () => { /* reported by the await below */ },
@@ -407,16 +282,9 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
   }
 
   try {
-    // Discovery is part of CONNECTING, not a separately cached thing. A client
-    // whose `tools/list` failed is a client this package cannot use, and
-    // keeping it would leave a connection whose catalog is permanently empty.
-    //
-    // The budget is passed BOTH ways on purpose. `{ timeout }` is the SDK's own
-    // per-request option (its default is 60s), and it is the one that actually
-    // cancels the in-flight request and frees the SDK's bookkeeping. The outer
-    // `withDeadline` is insurance for a client that ignores the option — an
-    // injected fake, or an SDK whose option moves — so this call can never be
-    // the thing that hangs a turn.
+    // Discovery is part of connecting — a client with no tool list is useless.
+    // Budget passed both to the SDK (cancels the request) and as a deadline
+    // (insurance against a client that ignores the option).
     const listed = await withDeadline(
       Promise.resolve(client.listTools(undefined, { timeout: budget })),
       budget,
@@ -434,17 +302,8 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
   }
 }
 
-/**
- * The one route to a connected, discovered server. Concurrent callers share a
- * single in-flight attempt; a SUCCESS is cached for the process; a FAILURE
- * starts a bounded COOLDOWN and is otherwise not remembered.
- *
- * The cooldown is what keeps a dead server from costing a spawn, a deadline and
- * (with `expandMcpTools` running every turn) a multi-second stall on every
- * single tool call — while still expiring on its own, with no successful
- * connect needed to clear it. See `MCP_FAILURE_COOLDOWN_MS` for the difference
- * from the M2 catalog cache this deliberately is not.
- */
+/** Connect (or return cached connection). Concurrent callers share one attempt;
+ *  failures start a bounded cooldown. */
 async function connect(name: string): Promise<ConnectResult> {
   const hit = connections.get(name);
   if (hit) return { ok: true, conn: hit };
@@ -497,20 +356,7 @@ export async function discoverMcpTools(server: string): Promise<DiscoveryResult>
   return c.ok ? { ok: true, tools: c.conn.tools } : { ok: false, reason: c.reason };
 }
 
-/**
- * One warn PER DISTINCT MESSAGE KIND, for MCP.
- *
- * A private latch, NOT `tools.ts`'s `warnUnavailable`. That one also flips the
- * module-level `warnedUnavailable` flag which `setToolArgsValidator` and
- * `setTypeboxValueLoader` snapshot and restore — validator state. An MCP server
- * being down has nothing to do with whether a validator is installed, and
- * letting MCP write that flag makes the validator suite's warn-once assertions
- * depend on unrelated MCP noise. Same per-kind `Set` pattern, separate Set.
- *
- * Keyed on the message's stable 40-character prefix, so a variable error suffix
- * does not defeat the latch — put the server and tool name EARLY in a message
- * that needs to distinguish one server from another.
- */
+/** One warn per distinct message kind (separate from tools.ts's own latch). */
 const warnedMcpKinds = new Set<string>();
 export function warnMcp(message: string): void {
   const kind = message.slice(0, 40);
@@ -519,10 +365,7 @@ export function warnMcp(message: string): void {
   console.warn(`[10thfloor:agent] ${message}`);
 }
 
-/** Non-text content is NOTED, not embedded: images and audio are base64 blobs
- *  that would blow the result budget and mean nothing to a text model. The
- *  type name is clamped to a plausible shape — it is server-supplied, and it
- *  lands in the published transcript. */
+/** Non-text content becomes a `[type content omitted]` marker. */
 function renderContent(content: McpCallResult['content']): string {
   if (!Array.isArray(content)) return '';
   const parts: string[] = [];
@@ -548,24 +391,7 @@ function firstText(raw: McpCallResult): string | undefined {
   return undefined;
 }
 
-/**
- * An MCP `tools/call` answer → this package's tool-result vocabulary.
- *
- *  - `isError: true` → a structured `mcp-tool-failed` whose reason is the first
- *    text item, SANITIZED. That text is third-party output on its way into a
- *    published transcript; see `sanitizeMcpReason`.
- *  - text content items concatenate; anything else becomes a
- *    `[<type> content omitted]` marker, so the model knows something was there.
- *  - the pre-content `{ toolResult }` compatibility shape passes through as the
- *    value.
- *
- * SUCCESS output is NOT sanitized. It is the tool's legitimate answer, exactly
- * like an adopted method's return value, and it is truncated by the loop's
- * `maxResultChars` like every other result. Sanitization is for REASONS — the
- * field this package has always promised is safe to publish.
- *
- * Exported so the tests can pin this mapping rather than trust it.
- */
+/** Map an MCP call result to ToolResult. Errors are sanitized. */
 export function mapMcpResult(raw: McpCallResult | undefined | null): ToolResult {
   if (!raw || typeof raw !== 'object') return { ok: true, value: '' };
   if (raw.isError === true) {
@@ -580,12 +406,7 @@ export function mapMcpResult(raw: McpCallResult | undefined | null): ToolResult 
   return { ok: true, value: renderContent(raw.content) };
 }
 
-/**
- * Call one tool on one server. The whole failure surface is structured:
- * `mcp-unavailable` for a server that could not be reached (retried once the
- * failure cooldown expires — nothing is cached as a verdict), `mcp-tool-failed`
- * for a server that answered `isError`.
- */
+/** Call one tool on one server. Failures are structured, never throws. */
 export async function callMcpTool(
   server: string, tool: string, args: unknown,
 ): Promise<ToolResult> {
@@ -601,19 +422,13 @@ export async function callMcpTool(
   try {
     return mapMcpResult(await c.conn.client.callTool(params));
   } catch (e) {
-    // A rejection here is the TRANSPORT, not the tool: the child died, the
-    // request timed out, the protocol framing broke. The connection is suspect,
-    // so drop it — the next call reconnects rather than talking to a corpse.
+    // Transport failure — drop the connection so the next call reconnects.
     dropConnection(server);
     return { ok: false, error: { error: 'mcp-unavailable', reason: unavailable(server, e) } };
   }
 }
 
-/**
- * Close every connection and forget it. Exported for hosts that manage their
- * own shutdown, and for tests, which must not leave subprocesses (or fakes)
- * behind between files.
- */
+/** Close every connection. For shutdown and test cleanup. */
 export async function stopMcp(): Promise<void> {
   const open = [...connections.values()];
   connections.clear();
@@ -624,22 +439,8 @@ export async function stopMcp(): Promise<void> {
   }));
 }
 
-/**
- * Replace the client factory — the seam the network-free tests inject a fake
- * through, mirroring `_setBackoff` and `setTypeboxValueLoader`. `null` restores
- * the real SDK-backed factory.
- *
- * Every cached connection and every failure cooldown is dropped on both the set
- * and the restore, and the restore ALSO puts the server-definitions map back the
- * way it found it: a `Agent.mcpServer(…)` a test registers while the fake is
- * installed names a server only the fake can serve, and leaving it in the
- * registry would let a later test — or the live smoke — connect the real SDK to
- * a command that was never meant to be spawned. Registrations made BEFORE the
- * seam is installed are in the snapshot, so they survive, which is the order
- * every test here uses.
- *
- * Underscored because it is a test seam, not API.
- */
+/** Test seam: replace the client factory. null restores the default.
+ *  Snapshots and restores server definitions so test registrations don't leak. */
 export function _setMcpClientFactory(next: McpClientFactory | null): () => void {
   const previous = factory;
   const previousServers = new Map(servers);

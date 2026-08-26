@@ -4,56 +4,23 @@ import { MEMORY_TEXT_MAX } from '../common/types';
 import { forgetMemory, saveMemory, searchMemory } from './memory';
 import { MEMORY_TOOL_NAMES, warnSkill, type ResolvedTool } from './tools';
 
-/**
- * The MODEL's memory surface: three inline tools built at tool-assembly time,
- * closing over the resolved config and the running model's participant id.
- *
- * Inline rather than co-registered methods, and that is the whole design
- * (memory spec decision 7): an adopted method body receives only the Meteor
- * invocation and its args — no `sessionId`, no agent name, no config, no way
- * to stamp `by`. A closure over the run's own values carries all four, and
- * `ToolContext` supplies the caller's identity. The UI's DDP methods live in
- * `memory-methods.ts` and call the SAME core.
- */
+/* Model's memory surface: three inline tools, closures over the run's
+ * config and participant id. DDP methods in memory-methods.ts call the
+ * same core. */
 
-/** Whether a SAVE must be approved. The default gate is a PREDICATE, not the
- *  `'ask'` literal, because the answer depends on the model's arguments:
- *  promoting a fact to shared work knowledge is the consent moment (spec §7),
- *  while a personal note is not.
- *
- *  An app replaces this wholesale by declaring its own `gate` — this is an
- *  ordinary tool gate, with no privileged status. */
+/** Whether a save needs approval: `app` scope → ask, everything else → auto. */
 function saveGate(ctx: { args: unknown; userId: string | null }): boolean | 'ask' {
-  // A session with no account cannot write ANY scope, so parking one is worse
-  // than useless: it spends a human's attention on a decision whose only
-  // possible outcome is `no-account`, and renders the model's own text into
-  // the approval surface on the way. Gates read the model's RAW arguments —
-  // schema validation happens after dispatch — so a fabricated out-of-enum
-  // `scope: "app"` reaches here even when the tool never offered it. Run it
-  // instead and let the core answer with a refusal the model can route around.
+  // Anonymous session → auto-approve, let the core refuse with `no-account`.
   if (ctx.userId === null) return true;
   const scope = (ctx.args as { scope?: unknown } | null)?.scope;
   return scope === 'app' ? 'ask' : true;
 }
 
-/**
- * Whether a FORGET must be approved — and it cannot be answered from the
- * arguments, which is why this is its own predicate and not `saveGate`.
- *
- * `memory_forget` takes `{ id }` and nothing else: there is no `scope` in the
- * args to read, so reusing the save gate resolved `'auto'` for every delete
- * and let a model quietly remove work knowledge a human had approved —
- * asymmetric in exactly the wrong direction, since writing to the shared pool
- * asked and erasing from it did not.
- *
- * The scope lives on the ROW, so the gate reads the row. A miss (an id that
- * matches nothing, or someone else's row) resolves `'auto'`: the tool body
- * answers those as an ordinary no-op, and parking a human on a delete that
- * was never going to happen is worse than running it.
- */
+/** Whether a forget needs approval — reads scope from the row, not the
+ *  args (forget has no scope arg). App-scope row → ask. */
 function forgetGate(config: ResolvedMemory) {
   return async (ctx: { args: unknown; userId: string | null }): Promise<boolean | 'ask'> => {
-    if (ctx.userId === null) return true;   // see `saveGate`
+    if (ctx.userId === null) return true;
     if (!config.scopes.includes('app')) return true;
     const id = (ctx.args as { id?: unknown } | null)?.id;
     if (typeof id !== 'string' || id === '') return true;
@@ -62,13 +29,7 @@ function forgetGate(config: ResolvedMemory) {
   };
 }
 
-/** What the approver is shown, with the elision MARKED.
- *
- *  A fact may be 2000 characters; the prompt shows 300. Silently cutting made
- *  the approval dialog a place to hide things — innocuous schema notes for the
- *  first 300 characters, anything at all after — while the human read what
- *  looked like the whole text. The marker is the difference between a summary
- *  and a misrepresentation. */
+/** Clip text for the approval dialog, with the elision marked. */
 const DESCRIBE_CHARS = 300;
 function clip(text: string): string {
   const t = text.replace(/\s+/g, ' ').trim();
@@ -79,17 +40,11 @@ function clip(text: string): string {
 
 export interface MemoryToolOptions {
   config: ResolvedMemory;
-  /** The SESSION's owner. Anonymous sessions cannot write any scope, so the
-   *  tools must not advertise one — offering `'app'` there parked the turn on
-   *  an approval, rendered the model's text into the approval surface, and
-   *  only then answered `no-account`. The block is already honest with the
-   *  model about this; the tool schema should be too. */
+  /** Session owner. Null = anonymous (app scope not offered). */
   userId?: string | null;
-  /** The RUNNING model's participant id (`m:<agent>`) — the `by` stamp. Never
-   *  the speaking human's: the member's id lives on the message `from` and
-   *  does not reach a tool body (spec decision 14). */
+  /** Running model's participant id (`m:<agent>`) — the `by` stamp. */
   by: string;
-  /** The running agent's registry name — scopes `agent`-scope rows. */
+  /** Agent registry name — scopes `agent`-scope rows. */
   agent: string;
 }
 
@@ -141,23 +96,13 @@ function saveTool(opts: MemoryToolOptions): ResolvedTool {
     },
     gate: saveGate,
     kind: 'inline',
-    // Rendered to the human at the approval prompt. Carries SCOPE and TEXT
-    // only: `describe`'s ctx is `{ userId, sessionId }` and it runs before
-    // `pending.agent` is written, so the proposing agent is not reachable here
-    // — the UI composes "(proposed by X)" from `pending.agent` instead.
+    // Human-readable description for the approval prompt.
     describe: async (args: any, ctx) => {
       const shown = clip(String(args?.text ?? ''));
       if (args?.scope !== 'app') return `Remember: "${shown}"`;
-      // The lookup below reads a STORED shared fact and renders it. Do that
-      // only for a caller who could act on it: `describe` runs at park time,
-      // before the core's identity refusal, so without this guard an
-      // anonymous capability-URL holder could have work memory echoed into
-      // their own approval surface by guessing a key.
+      // Don't echo stored text to anonymous sessions.
       if (ctx?.userId === null) return `Remember for ALL users: "${shown}"`;
-      // A keyed app save OVERWRITES an approved row in place. Describing it as
-      // a plain addition asked the human to approve the wrong thing: the prior
-      // text and its proposer are unrecoverable afterwards, and the audit row
-      // records an approval for an addition that was really a replacement.
+      // Keyed app save overwrites — show it as a replacement.
       if (typeof args?.key === 'string' && args.key !== '') {
         const prior = await AgentMemories.findOneAsync(
           { scope: 'app', key: args.key } as any,
@@ -202,9 +147,7 @@ function searchTool(opts: MemoryToolOptions): ResolvedTool {
         config: opts.config,
         limit: args?.limit,
       });
-      // Project rather than return rows whole: `_id` the model needs (to
-      // forget), `text`/`scope`/`by`/`at` it can reason about. Nothing else
-      // in the row is its business.
+      // Project only what the model needs.
       return rows.map((r) => ({
         id: r._id, text: r.text, scope: r.scope, by: r.by, at: r.at,
         ...(r.key ? { key: r.key } : {}),
@@ -228,12 +171,10 @@ function forgetTool(opts: MemoryToolOptions): ResolvedTool {
     },
     gate: forgetGate(opts.config),
     kind: 'inline',
-    // The approver is shown WHAT is being forgotten, not just an opaque id —
-    // an id alone is not a decision anyone can make.
+    // Show the text being forgotten, not just an opaque id.
     describe: async (args: any, ctx) => {
       const id = String(args?.id ?? '');
-      // Same guard as the save describe: no echoing stored text to a session
-      // that cannot delete anything.
+      // Don't echo stored text to anonymous sessions.
       if (ctx?.userId === null) return `Forget memory ${id}`;
       const row = await AgentMemories.findOneAsync(id);
       if (!row) return `Forget memory ${id}`;
@@ -244,36 +185,19 @@ function forgetTool(opts: MemoryToolOptions): ResolvedTool {
     run: async (args: any, ctx) => forgetMemory(String(args?.id ?? ''), {
       userId: ctx?.userId ?? null,
       agent: opts.agent,
-      // Only an agent that can WRITE the shared pool may delete from it, and
-      // only after this tool's gate asked. An agent whose config omits 'app'
-      // short-circuits the gate to auto — so passing `true` unconditionally
-      // let a second agent on the same deployment erase another's approved
-      // work knowledge with no approval anywhere in the path.
+      // Only agents that can write app scope may delete from it.
       allowApp: opts.config.scopes.includes('app'),
     }),
   };
 }
 
-/**
- * Append the three memory tools to an agent's expanded tool list.
- *
- * Called AFTER `expandMcpTools` and beside `withSkillTool`, with the same
- * collision policy: an app tool of the same name WINS and the built-in is
- * skipped, with one warning. The app's tool is something it deliberately
- * defined and may already call from a UI; silently overriding it would be the
- * worse surprise. (Define-time reservation catches the common case earlier;
- * this covers a name arriving from a whole-server MCP spec, which is not
- * knowable until expansion.)
- */
+/** Append memory tools. Same-name app tool wins (skipped with a warning). */
 export function withMemoryTools(
   tools: ResolvedTool[], opts?: MemoryToolOptions,
 ): ResolvedTool[] {
   if (!opts) return tools;
   const built = [saveTool(opts), searchTool(opts), forgetTool(opts)];
-  // PER NAME, not all-or-nothing. Dropping all three because one collided —
-  // an MCP server advertising `memory_search`, say — left the standing block
-  // still instructing the model to call `memory_save`, a tool no longer in
-  // front of it: an unknown-tool error on every turn that tried to remember.
+  // Per-name collision, not all-or-nothing.
   const taken = built.filter((t) => tools.some((x) => x.name === t.name)).map((t) => t.name);
   if (taken.length > 0) {
     warnSkill(

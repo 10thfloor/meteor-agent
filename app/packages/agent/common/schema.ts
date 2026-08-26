@@ -1,10 +1,5 @@
-// Maps a tool's JSON Schema `args` to a TypeScript type, so `run` and
-// `describe` know their argument shapes at compile time.
-//
-// Covers what the package's tools actually use: objects with
-// `properties`/`required`, arrays with `items`, primitives, type unions
-// (`['integer','null']`), `enum`, and `const`. Anything else widens to
-// `unknown`.
+// Maps a tool's JSON Schema `args` to a TypeScript type.
+// Covers objects, arrays, primitives, type unions, enum, const; else unknown.
 export type FromSchema<S> =
   // `enum` and `const` outrank `type`.
   S extends { enum: readonly (infer E)[] } ? E

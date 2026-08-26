@@ -6,36 +6,17 @@ import os from 'os';
 
 const PKG = '@earendil-works/pi-ai';
 
-/** typebox — pi-ai's own dependency, and the full JSON-Schema checker behind
- *  `validateToolArgs`. It is `type: module`, has NO `main`, and reaches its
- *  `Value` module only through the `./value` key of its `exports` map, which
- *  is exactly the shape Meteor's resolver cannot follow. Same seam, same
- *  hedge. */
+/** typebox — same exports-map seam as pi-ai. */
 const TYPEBOX = 'typebox';
 
-/**
- * Meteor cannot resolve pi-ai's transitive dep `typebox` (no `main`, exports
- * map only). We reach Node's own resolver through a one-line ESM shim: a real
- * ESM module HAS a dynamic-import callback, which Meteor's CJS server bundle
- * does not.
- *
- * Dev places app npm deps in `node_modules`; a production `meteor build` places
- * them in `npm/node_modules`. Both are searched.
- */
+/** Dev uses `node_modules`; production `meteor build` uses `npm/node_modules`. */
 const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
 
 /** One namespace per package + export key (`@earendil-works/pi-ai|./providers/all`,
  *  `typebox|./value`, …). The `|` is a separator no package name contains. */
 const cache = new Map<string, unknown>();
 
-/**
- * The directory a package's own nested `node_modules` would live in, tried
- * after the hoisted layout. npm hoists `typebox` to the app's top level in
- * every install we have seen, but a version conflict with another dependency
- * would nest it under pi-ai instead — and a checker that vanishes because of
- * someone else's dependency tree is exactly the kind of silent degrade this
- * package refuses.
- */
+/** Fallback to nested node_modules for packages npm didn't hoist. */
 const NESTED_BASES: Record<string, string[]> = {
   [TYPEBOX]: [path.join(...PKG.split('/'), 'node_modules')],
 };
@@ -67,12 +48,7 @@ function pickCondition(entry: unknown): string | undefined {
   return typeof v === 'string' ? v : undefined;
 }
 
-/**
- * Resolve one key of an `exports` map, honoring `*` patterns the way Node
- * does. pi-ai declares `"./providers/*": { import: "./dist/providers/*.js" }`,
- * which is the only way to reach `builtinModels()` — the built-in model
- * catalog is deliberately absent from the root entry so it can be tree-shaken.
- */
+/** Resolve one key of an exports map, including `*` wildcard patterns. */
 function resolveExportKey(exportsMap: unknown, key: string): string | undefined {
   if (typeof exportsMap === 'string') return key === '.' ? exportsMap : undefined;
   if (!exportsMap || typeof exportsMap !== 'object') return undefined;
@@ -98,22 +74,7 @@ function resolveExportKey(exportsMap: unknown, key: string): string | undefined 
   return undefined;
 }
 
-/**
- * Resolve a pi-ai entry file the way Node's own ESM resolver would, which
- * understands `exports` maps (Meteor's does not — the whole reason this file
- * exists). We do NOT use `createRequire(...).resolve()` here: that walks the
- * CJS resolution algorithm, which only honors the `require`/`node`/`default`
- * conditions — never `import`. pi-ai's package.json declares `type: module`
- * and an `exports["."]` with only `types`/`import` conditions (no `require`,
- * no `default`), so `require.resolve` throws ERR_PACKAGE_PATH_NOT_EXPORTED
- * even though a perfectly good ESM entry exists (verified empirically against
- * the installed package). Instead we read the package's own package.json and
- * pick its entry the same way the ESM resolver would: `exports[key].import`
- * (or `.default`), falling back to `main` for CJS-style packages.
- *
- * `subpath` selects a deep export, e.g. `'providers/all'`. Exported as a test
- * seam.
- */
+/** Resolve a package entry through its exports map (Meteor's resolver can't). */
 export function resolvePackageEntry(pkg: string, subpath?: string): string {
   const base = findNodeModulesBase(pkg);
   if (!base) {
@@ -133,8 +94,7 @@ export function resolvePackageEntry(pkg: string, subpath?: string): string {
   return path.join(pkgDir, rel);
 }
 
-/** pi-ai's entry. Kept as its own export: it is the name the M1/M2 tests and
- *  every comment in this package already use. */
+/** pi-ai's entry. */
 export function resolvePiAiEntry(subpath?: string): string {
   return resolvePackageEntry(PKG, subpath);
 }
@@ -144,13 +104,8 @@ export function resolveTypeboxEntry(subpath?: string): string {
   return resolvePackageEntry(TYPEBOX, subpath);
 }
 
-/**
- * Import an absolute file:// URL through a genuine ESM module. The shim lives
- * in the OS temp dir — always writable, unlike node_modules on a read-only
- * container filesystem (the M1 shim's fatal flaw). Because it receives a
- * RESOLVED URL rather than a bare specifier, the shim's own location has no
- * bearing on resolution, which is what makes the temp dir usable at all.
- */
+/** Import a file:// URL through a temp ESM shim (Meteor's CJS bundle has no
+ *  dynamic import). Shim lives in tmpdir so it works on read-only filesystems. */
 export async function shimLoad(urlHref: string): Promise<unknown> {
   const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-loader-'));
   const shimPath = path.join(shimDir, 'loader.mjs');
@@ -163,20 +118,7 @@ export async function shimLoad(urlHref: string): Promise<unknown> {
   }
 }
 
-/**
- * Hedged, in order of preference:
- *  1. plain dynamic import of the bare specifier — becomes the only path the
- *     day Meteor ships `exports` support (PR #13520);
- *  2. dynamic import of the resolved file:// URL — works today in dev, no
- *     writes anywhere;
- *  3. temp-dir shim around the same URL — for a runtime whose import() is
- *     intercepted.
- * Returns the module namespace AS-IS (live bindings preserved); callers must
- * not mutate it.
- *
- * `subpath` loads a deep export instead of the root one — `'providers/all'`
- * for the built-in model catalog. Each key is cached separately.
- */
+/** Three-step hedge: bare import → file:// URL → temp shim. Cached per subpath. */
 export async function loadPackage(pkg: string, subpath?: string): Promise<unknown> {
   const rel = subpath ? subpath.replace(/^\.?\//, '') : '';
   const key = `${pkg}|${rel ? `./${rel}` : '.'}`;
@@ -202,26 +144,12 @@ export function loadPiAi(subpath?: string): Promise<unknown> {
   return loadPackage(PKG, subpath);
 }
 
-/**
- * typebox through the same three-step hedge. `loadTypebox('value')` yields the
- * namespace whose `Value.Check` is the full JSON-Schema checker behind
- * `validateToolArgs` — see `server/tools.ts` for the probe that established
- * this is the ONLY route (pi-ai re-exports `Type`, never `Value`).
- */
+/** typebox through the same hedge. `loadTypebox('value')` for `Value.Check`. */
 export function loadTypebox(subpath?: string): Promise<unknown> {
   return loadPackage(TYPEBOX, subpath);
 }
 
-/**
- * SYNCHRONOUS: is typebox's `value` export present on disk?
- *
- * `Agent.method` registers methods synchronously and its fail-closed check
- * cannot await a dynamic import, so it asks this instead — pure `fs`, the same
- * resolution the async loader would perform, cached after the first answer.
- * A `true` here is a well-founded expectation, not a guarantee: if the import
- * itself later fails, `validateToolArgs` degrades to the structural checker
- * with one warning (which is exactly what that warning is for).
- */
+/** Synchronous check for typebox on disk. Cached after first answer. */
 let typeboxOnDisk: boolean | null = null;
 export function typeboxValueResolvable(): boolean {
   if (typeboxOnDisk === null) {

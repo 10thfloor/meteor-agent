@@ -1,13 +1,7 @@
 import type { AgentDelta, AgentMessage, ViewMessage } from './types';
 
-/**
- * Merge committed messages with in-flight deltas into one ordered view.
- *
- * A capped collection evicts the OLDEST documents, so a gap in delta `seq` is
- * always a missing HEAD. Walking forward from seq 0 would render an empty
- * string for any message whose start had aged out — the routine case. We walk
- * back from the highest seq instead and flag `truncatedHead`.
- */
+/** Merge committed messages with in-flight deltas into one ordered view.
+ *  Walks back from highest seq (capped eviction loses the head). */
 export function mergeView(
   committedMessages: AgentMessage[],
   deltaDocs: AgentDelta[],
@@ -37,11 +31,7 @@ export function mergeView(
     const join = (kind: AgentDelta['kind']) =>
       tail.filter((d) => d.kind === kind).map((d) => d.chunk).join('');
 
-    // Tool arguments are accumulated PER contentIndex, unlike text and
-    // thinking, which are one stream each. Providers interleave parallel tool
-    // calls, so a single joined string would be two calls' JSON spliced
-    // together — valid-looking and unparseable. A delta with no index (a
-    // provider that reports none) buckets under 0.
+    // Per-contentIndex: interleaved parallel calls must not splice into one string.
     let toolArgs: Record<number, string> | undefined;
     for (const d of tail) {
       if (d.kind !== 'tool_args') continue;
@@ -62,9 +52,7 @@ export function mergeView(
       truncatedHead: tail[0].seq !== 0,
       deltaCount: tail.length,
       ...(toolArgs ? { toolArgs } : {}),
-      // Streaming attribution (participants spec §4.1): a rostered turn
-      // stamps its speaker on every delta; the in-flight row carries it so
-      // the element can label who is talking before the commit lands.
+      // Streaming attribution: carry the speaker from deltas before commit lands.
       ...(ds[0].from ? { from: ds[0].from } : {}),
     });
   }
