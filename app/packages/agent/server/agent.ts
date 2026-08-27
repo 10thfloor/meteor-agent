@@ -1,10 +1,8 @@
-import type { AgentSession, ResolvedMemory, SessionInc } from '../common/types';
+import type { AgentSession, ResolvedMemory } from '../common/types';
 import type { SessionQuery } from '../common/db';
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
-import {
-  AgentDeltas, AgentMemories, AgentMessages, AgentSessions,
-} from '../common/collections';
+import { AgentMemories, AgentSessions } from '../common/collections';
 import {
   defineAgent, getAgent, listAgents, buildRunConfig, registerProvider, resolveMemory,
   type AgentConfig,
@@ -26,10 +24,12 @@ import {
   forgetMemory, readSelector, saveMemory, type SaveArgs,
 } from './memory';
 import { registerChannel, type ChannelDef } from './channels/registry';
-import { AgentAttachments, createAttachment, readTool } from './attachments';
+import { createAttachment, readTool } from './attachments';
 import {
   addParticipant, listParticipants, removeParticipant,
 } from './participants';
+import { eraseOwnedSession, type SessionErasure } from './session-lifecycle';
+import { createInitialTranscript } from './transcript';
 
 /** Named agent wins; otherwise first memory-declaring agent (person memory
  *  resolves one store per spec decision 2). */
@@ -69,9 +69,6 @@ export class Agent {
     return this;
   }
 
-  /** One question, one answer — throwaway session, inline turn, no trace.
-   *  Rejects with `ask-parked` or `ask-failed` since headless callers
-   *  cannot notice a stall. */
   /** Start a turn no person asked for (schedule, webhook, job).
    *  Idempotent via `key`; a busy session parks until idle. */
   async systemTurn(
@@ -81,6 +78,9 @@ export class Agent {
     return startSystemTurn(sessionId, prompt, opts);
   }
 
+  /** One question, one answer — throwaway session, inline turn, no trace.
+   *  Rejects with `ask-parked` or `ask-failed` since headless callers
+   *  cannot notice a stall. */
   async ask(text: string, opts?: { userId?: string | null }): Promise<string> {
     const config = getAgent(this.name);
     if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${this.name}`);
@@ -90,35 +90,24 @@ export class Agent {
     // The same document `agent.start` builds, field for field: the loop, the
     // lease and the watcher all read this shape, and a throwaway that differs
     // from a real session would be a second shape to keep in step forever.
-    await AgentSessions.insertAsync({
-      _id: sessionId, agent: this.name, userId,
-      phase: 'idle', model: config.model, nextSeq: 0,
-      usage: { input: 0, output: 0, cost: 0 },
-      budgetSpent: { turns: 0, toolCalls: 0 },
-      // The throwaway marker: tools that would create standing state pointing
-      // back at this session (compose's 'continue' pre-bind) read it and
-      // refuse — the session is deleted in the finally below.
-      ephemeral: true,
-      createdAt: new Date(), updatedAt: new Date(),
-    });
-
+    const now = new Date();
     try {
-      // Same atomic seq allocation as `agent.send` — shared shape so the
-      // ordering invariant has one canonical path. Budget filter omitted
-      // because this session has never sent (filter would always match).
-      const before = await AgentSessions.rawCollection().findOneAndUpdate(
-        { _id: sessionId },
-        { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
-        { returnDocument: 'before' },
-      ) as unknown as AgentSession | null;
-      if (!before) throw new Meteor.Error('ask-failed', 'The throwaway session vanished.');
-
-      await AgentMessages.insertAsync({
-        _id: Random.id(), sessionId, seq: before.nextSeq, role: 'user',
-        content: text, createdAt: new Date(),
+      await createInitialTranscript({
+        _id: sessionId, agent: this.name, userId,
+        phase: 'idle', model: config.model, nextSeq: 0,
+        usage: { input: 0, output: 0, cost: 0 },
+        budgetSpent: { turns: 0, toolCalls: 0 },
+        // The throwaway marker: tools that would create standing state pointing
+        // back at this session (compose's 'continue' pre-bind) read it and
+        // refuse — the session is deleted in the finally below.
+        ephemeral: true,
+        createdAt: now, updatedAt: now,
+      }, {
+        _id: Random.id(), role: 'user', content: text, createdAt: now,
       });
 
-      // Same RunConfig as deferTurn — headless must run on identical terms.
+      // Use the same Turn configuration as an interactive Session; only the
+      // throwaway lifecycle differs.
       await runTurn(sessionId, buildRunConfig(config, userId));
 
       // runTurn records outcomes in session phase, never throws — shared
@@ -143,12 +132,7 @@ export class Agent {
       // Delete in reverse-read order so nothing points at a gone session.
       // Own try/catch: cleanup failure must not replace the caller's outcome.
       try {
-        await AgentDeltas.removeAsync({ sessionId });
-        await AgentMessages.removeAsync({ sessionId });
-        // A tool may have staged files into the attachment store; a throwaway
-        // session's bytes must not outlive its transcript.
-        await AgentAttachments.removeAsync({ sessionId });
-        await AgentSessions.removeAsync({ _id: sessionId });
+        await eraseOwnedSession(this.name, sessionId, userId);
       } catch {
         console.error('[10thfloor:agent] ask() could not clean up its throwaway session');
       }
@@ -161,6 +145,15 @@ export class Agent {
     sessionId: string, text: string, opts?: { userId?: string | null },
   ): Promise<string> {
     return sendToSession(this.name, sessionId, text, opts?.userId ?? null);
+  }
+
+  /** Permanently erase one owned root Session and its subagent descendants.
+   *  Server-only. `userId` is required; explicit null means anonymous owner.
+   *  Memory and account-wide channel identities are preserved. */
+  erase(
+    sessionId: string, opts: { userId: string | null },
+  ): Promise<SessionErasure> {
+    return eraseOwnedSession(this.name, sessionId, opts.userId);
   }
 
   /** Server-side approve — same core as DDP method; racing answerers
@@ -193,7 +186,9 @@ export class Agent {
   ): Promise<boolean> {
     const config = getAgent(this.name);
     if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${this.name}`);
-    const selector: SessionQuery = { _id: sessionId, agent: this.name };
+    const selector: SessionQuery = {
+      _id: sessionId, agent: this.name, erasingAt: { $exists: false },
+    };
     if (opts && 'userId' in opts) selector.userId = opts.userId ?? null;
     const session = await AgentSessions.findOneAsync(selector);
     if (!session) throw new Meteor.Error('no-session', 'Session not found');
@@ -318,4 +313,4 @@ export class Agent {
   }
 }
 
-export type { AgentConfig };
+export type { AgentConfig, SessionErasure };

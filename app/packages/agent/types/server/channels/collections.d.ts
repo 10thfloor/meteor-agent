@@ -68,6 +68,9 @@ export declare const promptSuffix: (toolCallId: string) => string;
 export interface DeliveryReceipt {
     _id: string;
     bindingId: string;
+    /** Owning Session. Legacy rows may lack this in storage and are removed via
+     *  the binding fallback during lifecycle erasure. */
+    sessionId: string;
     state: 'sending' | 'sent' | 'abandoned';
     providerMessageId?: string;
     /** Reply grammar registered by a prompt delivery. Ingress checks it for

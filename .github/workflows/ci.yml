@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
 
 concurrency:
@@ -16,6 +17,8 @@ jobs:
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Install Meteor
         run: curl https://install.meteor.com/?release=3.5 | sh
@@ -39,6 +42,12 @@ jobs:
       - name: Type-check the package
         working-directory: app
         run: npm run typecheck
+
+      - name: Verify the release package set
+        working-directory: app
+        env:
+          RELEASE_TAG: ${{ github.ref_type == 'tag' && github.ref_name || '' }}
+        run: npm run release:check
 
       - name: Verify published declarations are current
         working-directory: app
@@ -77,17 +86,7 @@ jobs:
         working-directory: app
         env:
           TEST_BROWSER_DRIVER: playwright
-        # Port 3200 mirrors local convention; any free port works on a runner.
-        #
-        # List every package explicitly so all five channel lens suites run.
-        run: >
-          meteor test-packages --once --port 3200 --driver-package meteortesting:mocha
-          ./packages/agent
-          ./packages/agent-channel-slack
-          ./packages/agent-channel-telegram
-          ./packages/agent-channel-whatsapp
-          ./packages/agent-channel-sms
-          ./packages/agent-channel-email
+        run: npm test
 
   verify-build:
     name: Production bundle verification

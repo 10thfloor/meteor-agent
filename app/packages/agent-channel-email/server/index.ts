@@ -1,12 +1,14 @@
 import { createHash, randomBytes } from 'crypto';
+import type { ClientSession } from 'mongodb';
 import {
-  Agent, AgentAttachments, AgentSessions, ChannelBindings,
+  AgentAttachments, AgentSessions, ChannelBindings,
   DEFAULT_ATTACHMENT_CAPS, MAX_PARTICIPANTS, channelKnobs, deliverOnce,
-  getChannel, headerValue,
-  insertOrLose, isLinkGesture, prettySize, resolveIdentity, safeEqual,
-  type ChannelAttachment, type ChannelDef, type ChannelKnobs, type ChannelProfile,
-  type ChannelTransport, type DeliveryItem, type Gate, type InboundReading,
-  type InlineTool, type Lens, type RawInbound,
+  getChannel, headerValue, humanParticipantId, identityParticipantId,
+  isLinkGesture, modelParticipantId, prettySize, resolveIdentity, safeEqual,
+  sanitizeDisplayName,
+  type ChannelAttachment, type ChannelDef, type ChannelKnobs, type ChannelPostOptions,
+  type ChannelProfile, type ChannelTransport, type DeliveryItem, type Gate, type InboundReading,
+  type InlineTool, type Lens, type RawInbound, type SessionParticipant,
 } from 'meteor/10thfloor:agent';
 
 /**
@@ -407,7 +409,7 @@ export interface EmailTransportOptions {
 export function emailTransport(options: EmailTransportOptions): ChannelTransport {
   const doFetch = options.fetchImpl ?? fetch;
   return {
-    async post(destination: unknown, payload: unknown, opts: { idempotencyKey: string }) {
+    async post(destination: unknown, payload: unknown, opts: ChannelPostOptions) {
       const dest = (destination ?? {}) as Partial<EmailDestination>;
       const root = dest.rootMessageId ? `<${dest.rootMessageId}>` : undefined;
       const body = {
@@ -435,6 +437,7 @@ export function emailTransport(options: EmailTransportOptions): ChannelTransport
           'x-postmark-server-token': options.serverToken,
         },
         body: JSON.stringify(body),
+        signal: opts.signal,
       });
       const json: any = await res.json();
       if (!res.ok || (json && json.ErrorCode !== undefined && json.ErrorCode !== 0)) {
@@ -603,6 +606,119 @@ async function recipientAllowed(
   }
 }
 
+/** Close a confirmed compose into a standing conversation. The caller runs
+ * this inside deliverOnce's lifecycle-guarded transaction, so erasure either
+ * wins before these recipient-bearing writes or waits and purges them after. */
+async function reconcileContinuedRecipient(
+  input: {
+    sessionId: string;
+    expectedAgent: string;
+    kind: string;
+    to: string;
+    replyKey: string;
+    subject: string;
+    deliveredSeq: number;
+  },
+  mongoSession: ClientSession,
+): Promise<boolean> {
+  const current = await AgentSessions.rawCollection().findOne(
+    {
+      _id: input.sessionId,
+      agent: input.expectedAgent,
+      erasingAt: { $exists: false },
+      purgingAt: { $exists: false },
+    },
+    { session: mongoSession },
+  );
+  if (!current) return false;
+
+  const now = new Date();
+  const participantId = identityParticipantId(input.kind, input.to);
+  const participant: SessionParticipant = {
+    id: participantId,
+    kind: 'human',
+    role: 'member',
+    userId: null,
+    identity: { kind: input.kind, externalUserId: input.to },
+    assurance: 'none',
+    displayName: sanitizeDisplayName(input.to),
+    addedBy: modelParticipantId(current.agent),
+    joinedAt: now,
+  };
+
+  if (!current.participants) {
+    const seeded: SessionParticipant[] = [
+      {
+        id: humanParticipantId(current.userId), kind: 'human', role: 'owner',
+        userId: current.userId, displayName: 'owner', joinedAt: now,
+      },
+      {
+        id: modelParticipantId(current.agent), kind: 'model', role: 'member',
+        agent: current.agent, displayName: current.agent, joinedAt: now,
+      },
+      participant,
+    ];
+    const seededResult = await AgentSessions.rawCollection().updateOne(
+      {
+        _id: input.sessionId,
+        erasingAt: { $exists: false },
+        purgingAt: { $exists: false },
+        participants: { $exists: false },
+      },
+      { $set: { participants: seeded, updatedAt: now } },
+      { session: mongoSession },
+    );
+    if (seededResult.matchedCount !== 1) return false;
+  } else if (!current.participants.some((p) => p.id === participantId)) {
+    if (current.participants.length >= MAX_PARTICIPANTS) return false;
+    const joined = await AgentSessions.rawCollection().updateOne(
+      {
+        _id: input.sessionId,
+        erasingAt: { $exists: false },
+        purgingAt: { $exists: false },
+        'participants.id': { $ne: participantId },
+        [`participants.${MAX_PARTICIPANTS - 1}`]: { $exists: false },
+      },
+      { $push: { participants: participant }, $set: { updatedAt: now } },
+      { session: mongoSession },
+    );
+    if (joined.matchedCount !== 1) return false;
+  }
+
+  const bindingId = `${input.kind}:${input.replyKey}`;
+  await ChannelBindings.rawCollection().updateOne(
+    {
+      _id: bindingId,
+      sessionId: input.sessionId,
+      participant: participantId,
+    },
+    {
+      $setOnInsert: {
+        _id: bindingId,
+        kind: input.kind,
+        conversationRef: input.replyKey,
+        destination: {
+          to: input.to, subject: reSubject(input.subject), replyKey: input.replyKey,
+        },
+        audience: 'direct',
+        agent: current.agent,
+        userId: current.userId,
+        sessionId: input.sessionId,
+        externalUserId: input.to,
+        assurance: 'none',
+        admits: 'members',
+        member: true,
+        participant: participantId,
+        deliveredSeq: input.deliveredSeq,
+        createdAt: now,
+        updatedAt: now,
+      },
+    },
+    { upsert: true, session: mongoSession },
+  );
+  return true;
+}
+
 /**
  * A tool factory: compose and send a NEW email — the §7 side-action pattern
  * with the one parameter §7 forbids (a destination) handled the only
@@ -744,7 +860,7 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       // send: the reply path must exist (the kind's webhook), and the session
       // must be one a correspondence can point at — not a throwaway about to
       // be deleted, not a subagent's private child.
-      let composing: { agent: string; userId: string | null; nextSeq: number } | null = null;
+      let composing: { agent: string; nextSeq: number } | null = null;
       if (continueMode) {
         if (!getChannel(kind)) {
           return {
@@ -783,7 +899,7 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
         // The deliveredSeq SNAPSHOT rides this read, BEFORE the send: the
         // recipient's mailbox starts at the composed message, never the
         // session's backlog.
-        composing = { agent: session.agent, userId: session.userId, nextSeq: session.nextSeq };
+        composing = { agent: session.agent, nextSeq: session.nextSeq };
       }
 
       // The thread key `'continue'` mints — and `'fresh'` (decision 8)
@@ -803,6 +919,7 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
       const binding = {
         _id: `compose:email:${ctx.toolCallId ?? randomBytes(9).toString('hex')}`,
         kind: 'email',
+        sessionId: ctx.sessionId,
         destination,
       };
       const item: DeliveryItem = {
@@ -810,61 +927,36 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
         text: String(args.body ?? ''),
         ...(files.length > 0 ? { attachments: files } : {}),
       };
-      const outcome = await deliverOnce(binding, item, 'send', { def });
+      let joined = false;
+      const outcome = await deliverOnce(binding, item, 'send', {
+        def,
+        ...(continueMode && composing ? {
+          // A settled receipt can be replayed after a crash, so this callback
+          // is deliberately idempotent. deliverOnce keeps its root+target
+          // operation open and supplies one transaction for both writes.
+          afterDelivered: async (mongoSession) => {
+            joined = await reconcileContinuedRecipient({
+              sessionId: ctx.sessionId,
+              expectedAgent: composing.agent,
+              kind,
+              to,
+              replyKey,
+              subject: destination.subject,
+              deliveredSeq: Math.max(0, composing.nextSeq - 1),
+            }, mongoSession);
+          },
+        } : {}),
+      });
       if (outcome === 'delivered') {
         // The loop closes on a CONFIRMED send only (participants spec §5) —
         // an abandoned mail must not leave a phantom participant receiving
-        // every future reply. Both writes are idempotent (derived binding id,
-        // guarded roster push), which is what closes the crash window between
-        // the settled receipt and here: the dispatch re-run completes them.
-        if (continueMode && composing) {
-          await insertOrLose(ChannelBindings, {
-            _id: `${kind}:${replyKey}`,
-            kind,
-            conversationRef: replyKey,
-            // Replies WE send into this conversation thread as "Re:" of the
-            // composed subject; the rootMessageId arrives with the
-            // recipient's first reply (destination adoption, the factory).
-            destination: { to, subject: reSubject(destination.subject), replyKey },
-            audience: 'direct',
-            agent: composing.agent,
-            // The COMPOSING session's owner — pinned so claim-history's
-            // `userId: null` sweep can never re-own this session to the
-            // recipient (its member exclusion is the belt to this brace).
-            userId: composing.userId,
-            sessionId: ctx.sessionId,
-            // The recipient IS this conversation's opener; with `admits:
-            // 'members'` their roster row is what admits their replies.
-            externalUserId: to,
-            assurance: 'none',
-            admits: 'members',
-            member: true,
-            participant: `x:${kind}:${to}`,
-            // Delivery starts at the composed message: everything already in
-            // the session is history the recipient was not part of.
-            deliveredSeq: Math.max(0, composing.nextSeq - 1),
-            createdAt: new Date(),
-            updatedAt: new Date(),
-          });
-          const joinedId = await Agent.participants.add(ctx.sessionId, {
-            id: `x:${kind}:${to}`,
-            kind: 'human',
-            role: 'member',
-            userId: null,
-            identity: { kind, externalUserId: to },
-            assurance: 'none',
-            displayName: to,
-          }, { by: `m:${composing.agent}` });
-          if (joinedId === null) {
-            // The pre-check makes this a racing-joins case only, but a
-            // phantom must still not exist: without the roster row the
-            // binding would deliver forever while refusing every reply.
-            await ChannelBindings.removeAsync(`${kind}:${replyKey}`);
-            return {
-              sent: true, to, subject: destination.subject, joined: false,
-              note: 'roster-full — the mail was sent, but replies will open a fresh conversation',
-            };
-          }
+        // every future reply. The participant and binding commit together; a
+        // racing roster fill therefore leaves neither half behind.
+        if (continueMode && composing && !joined) {
+          return {
+            sent: true, to, subject: destination.subject, joined: false,
+            note: 'roster-full — the mail was sent, but replies will open a fresh conversation',
+          };
         }
         return {
           sent: true, to, subject: destination.subject,

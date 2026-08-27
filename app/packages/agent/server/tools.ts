@@ -923,7 +923,9 @@ function withMcpMetadata(tool: ResolvedTool, info: McpToolInfo | undefined): Res
 
 /** Discover MCP catalogs (concurrent) and expand whole-server specs.
  *  App-authored names always win over discovered MCP names. */
-export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedTool[]> {
+export async function expandMcpTools(
+  tools: ResolvedTool[], reservedNames: readonly string[] = [],
+): Promise<ResolvedTool[]> {
   if (!tools.some((t) => t.kind === 'mcp')) return tools;
 
   const out: ResolvedTool[] = [];
@@ -945,15 +947,17 @@ export async function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedToo
   const appNames = new Set(
     tools.filter((t) => t.kind !== 'mcp').map((t) => t.name),
   );
+  const reserved = new Set([SKILL_TOOL_NAME, ...reservedNames]);
   const pushMcp = (tool: ResolvedTool): void => {
-    if (appNames.has(tool.name) || tool.name === SKILL_TOOL_NAME) {
+    if (appNames.has(tool.name) || reserved.has(tool.name)) {
       // LOUD, not the latched `warnMcp`: an MCP server quietly shadowing an app
-      // tool (or the skill loader) is a security-relevant event an operator
+      // tool (or a reserved built-in) is a security-relevant event an operator
       // must see every time it happens, not once per process.
       console.warn(
         `[10thfloor:agent] a discovered MCP tool named "${tool.name}" collides with `
-        + `${tool.name === SKILL_TOOL_NAME ? 'the reserved built-in "skill" tool'
-          : 'an app-defined tool'} and was DROPPED — the app tool keeps the name and its `
+        + `${appNames.has(tool.name) ? 'an app-defined tool'
+          : `the reserved built-in "${tool.name}" tool`} and was DROPPED — the local `
+        + 'tool keeps the name and its '
         + 'gate. Give the MCP tool an explicit "name" if you need both.',
       );
       return;
@@ -1322,6 +1326,9 @@ export const MEMORY_TOOL_NAMES = ['memory_save', 'memory_search', 'memory_forget
 export function assertMemoryNamesFree(tools?: ToolSpec[]): void {
   if (!tools) return;
   for (const spec of tools) {
+    // MCP names are untrusted discoveries, not authored definitions. The
+    // Prepared Tool Runtime reserves and drops those collisions at discovery.
+    if (typeof spec !== 'string' && 'mcp' in spec) continue;
     const name = typeof spec === 'string'
       ? spec
       : (spec as any).name ?? (spec as any).method;

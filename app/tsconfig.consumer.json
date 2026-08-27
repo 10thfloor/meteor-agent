@@ -1,0 +1,16 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "skipLibCheck": false,
+    "paths": {
+      "meteor/10thfloor:agent": ["./packages/agent/index.d.ts"],
+      "meteor/10thfloor:agent-channel-slack": ["./packages/agent-channel-slack/index.d.ts"],
+      "meteor/10thfloor:agent-channel-telegram": ["./packages/agent-channel-telegram/index.d.ts"],
+      "meteor/10thfloor:agent-channel-whatsapp": ["./packages/agent-channel-whatsapp/index.d.ts"],
+      "meteor/10thfloor:agent-channel-sms": ["./packages/agent-channel-sms/index.d.ts"],
+      "meteor/10thfloor:agent-channel-email": ["./packages/agent-channel-email/index.d.ts"]
+    }
+  },
+  "include": ["tests/consumer-types.ts"],
+  "exclude": ["node_modules", ".meteor"]
+}

@@ -45,6 +45,15 @@ const seed = async (sessionId: string, text: string, agent = 'support') => {
   } as any);
 };
 
+const rawCollectionMethodPrototype = (rawCollection: object, method: string): object => {
+  let holder = Object.getPrototypeOf(rawCollection);
+  while (holder && !Object.prototype.hasOwnProperty.call(holder, method)) {
+    holder = Object.getPrototypeOf(holder);
+  }
+  if (!holder) throw new Error(`Mongo raw Collection has no ${method} implementation`);
+  return holder;
+};
+
 describe('turn loop', () => {
   it('streams deltas then commits one assistant message', async function () {
     this.timeout(30000);
@@ -103,87 +112,134 @@ describe('turn loop', () => {
     assert.equal(fromDeltas, committed!.content);
   });
 
-  it('recovers the unwritten remainder when a delta insert throws mid-batch', async function () {
+  it('bounds deterministic Delta batches and retries only missing rows after a partial write', async function () {
     this.timeout(30000);
-    const { AgentDeltas, AgentMessages } = await import('../common/collections');
-    const { mergeView } = await import('../common/merge');
-    const { runTurn } = await import('../server/loop');
+    const { AgentDeltas } = await import('../common/collections');
+    const { claimLease } = await import('../server/lease');
+    const { DeltaWriter } = await import('../server/loop');
 
     await seed('s-delta-remainder', 'hello');
+    assert.isTrue(await claimLease('s-delta-remainder'));
 
-    // Alternate kinds so consecutive chunks do NOT coalesce — `DeltaWriter.push`
-    // only merges a chunk into the previous buffered item when the kind
-    // matches — giving the flush batch several distinct items to fail partway
-    // through, per the brief's "same-kind chunks coalesce" note.
-    const script: Array<{ kind: 'text' | 'thinking'; chunk: string }> = [
-      { kind: 'thinking', chunk: 'a' },
-      { kind: 'text', chunk: '1' },
-      { kind: 'thinking', chunk: 'b' },
-      { kind: 'text', chunk: '2' },
-      { kind: 'thinking', chunk: 'c' },
-      { kind: 'text', chunk: '3' },
-    ];
-    let captured: any[] = [];
-    const staggered: Provider = {
-      async *stream() {
-        for (const c of script) yield c as any;
-        // Same idiom as the 'reconstructs' test above: > flushMs, and long
-        // enough for the interval's own retry (the injected failure below
-        // fires only once, on the first flush attempt) to have landed before
-        // we snapshot.
-        await new Promise((r) => { setTimeout(r, 400); });
-        captured = await AgentDeltas.find({ sessionId: 's-delta-remainder' }).fetchAsync();
-        yield { kind: 'done', usage: { input: 1, output: 6 } };
-      },
-    };
+    const writer = new DeltaWriter(
+      's-delta-remainder', 'm-delta-remainder', 1, 60_000,
+    );
+    // Alternating kinds prevents coalescing. Seventy rows prove the physical
+    // command ceiling of 64 and leave a six-row tail after reconciliation.
+    for (let seq = 0; seq < 70; seq += 1) {
+      writer.push(seq % 2 === 0 ? 'thinking' : 'text', String(seq));
+    }
 
-    // Fail the SECOND insertAsync call exactly once — mid-batch, since all 6
-    // chunks land in `this.buf` well before the first flush tick fires, so
-    // the first flush's batch holds all of them.
-    const original = (AgentDeltas as any).insertAsync.bind(AgentDeltas);
-    const descriptor = Object.getOwnPropertyDescriptor(AgentDeltas, 'insertAsync');
-    let calls = 0;
+    const rawPrototype = rawCollectionMethodPrototype(
+      AgentDeltas.rawCollection(), 'insertMany',
+    ) as any;
+    const descriptor = Object.getOwnPropertyDescriptor(rawPrototype, 'insertMany')!;
+    const original = descriptor.value;
+    const calls: Array<{ docs: any[]; options: any }> = [];
     let injected = false;
-    (AgentDeltas as any).insertAsync = async (doc: any, ...rest: any[]) => {
-      calls += 1;
-      if (!injected && calls === 2) {
-        injected = true;
-        throw new Error('injected mid-batch delta failure');
-      }
-      return original(doc, ...rest);
-    };
+    Object.defineProperty(rawPrototype, 'insertMany', {
+      ...descriptor,
+      value: async function partiallyWriteDeltaBatch(docs: any[], options: any) {
+        if (docs[0]?.sessionId !== 's-delta-remainder') {
+          return original.call(this, docs, options);
+        }
+        calls.push({ docs: docs.map((doc) => ({ ...doc })), options: { ...options } });
+        if (!injected) {
+          injected = true;
+          await original.call(this, docs.slice(0, 3), options);
+          throw new Error('injected partial ordered Delta write');
+        }
+        return original.call(this, docs, options);
+      },
+    });
 
+    let firstFailure: unknown;
     try {
-      await runTurn('s-delta-remainder', {
-        model: 'mock', system: '', tools: [], provider: staggered,
-      });
+      try {
+        await writer.flush();
+      } catch (error) {
+        firstFailure = error;
+      }
+      assert.equal(
+        await AgentDeltas.find({ sessionId: 's-delta-remainder' }).countAsync(), 3,
+        'the injected ordered write lands only its prefix',
+      );
+      await writer.stop();
     } finally {
-      if (descriptor) Object.defineProperty(AgentDeltas, 'insertAsync', descriptor);
-      else delete (AgentDeltas as any).insertAsync;
+      Object.defineProperty(rawPrototype, 'insertMany', descriptor);
+      await writer.stop().catch(() => { /* preserve the primary assertion failure */ });
     }
 
     assert.isTrue(injected, 'the injected mid-batch failure must actually have fired');
-
-    const committed = await AgentMessages
-      .findOneAsync({ sessionId: 's-delta-remainder', role: 'assistant' });
-    assert.equal(committed!.content, '123', 'the commit is built from in-memory text, unaffected');
-    assert.equal(committed!.thinking, 'abc');
-
-    assert.isAbove(
-      captured.length, 1,
-      'the flush batch must have had more than one item for a mid-batch failure to be meaningful',
+    assert.include(String(firstFailure), 'injected partial ordered Delta write');
+    assert.deepEqual(
+      calls.map((call) => call.docs.length), [64, 64, 3],
+      'the retry fills the next bounded command with missing rows before the queued tail',
     );
-    const seqs = captured.map((d) => d.seq).sort((a, b) => a - b);
-    seqs.forEach((s, i) => assert.equal(
-      s, i, 'delta seqs must be complete and contiguous — a gap is where the failed insert '
-      + 'would have been dropped without the remainder-recovery fix',
-    ));
+    assert.deepEqual(
+      calls[1].docs.slice(0, 61).map((doc) => doc._id),
+      calls[0].docs.slice(3).map((doc) => doc._id),
+      'deterministic ids let reconciliation retry exactly the missing rows',
+    );
+    assert.isEmpty(
+      calls[1].docs.filter((doc) => calls[0].docs.slice(0, 3)
+        .some((landed) => landed._id === doc._id)),
+      'the landed ordered-write prefix is never submitted again',
+    );
+    assert.deepEqual(calls[1].docs.slice(61).map((doc) => doc.seq), [64, 65, 66]);
+    assert.deepEqual(calls[2].docs.map((doc) => doc.seq), [67, 68, 69]);
+    for (const call of calls) {
+      assert.isAtMost(call.docs.length, 64, 'one physical Delta command stays bounded');
+      assert.deepInclude(call.options, {
+        ordered: true, timeoutMS: 5_000, retryWrites: false,
+      });
+    }
 
-    const fromDeltas = mergeView([], captured);
-    assert.lengthOf(fromDeltas, 1, 'all deltas belong to the one in-flight message');
-    assert.equal(fromDeltas[0].content, '123');
-    assert.equal(fromDeltas[0].thinking, 'abc');
+    const standing = (await AgentDeltas.find(
+      { sessionId: 's-delta-remainder' }, { sort: { seq: 1 } },
+    ).fetchAsync()) as any[];
+    assert.lengthOf(standing, 70);
+    assert.deepEqual(standing.map((doc) => doc.seq), Array.from({ length: 70 }, (_, i) => i));
+    assert.equal(new Set(standing.map((doc) => doc._id)).size, 70, 'no retry duplicates land');
   });
+
+  it('suppresses buffered Deltas after either Turn Lease or lifecycle authority is lost',
+    async function () {
+      this.timeout(30000);
+      const { AgentDeltas, AgentSessions } = await import('../common/collections');
+      const { claimLease } = await import('../server/lease');
+      const { DeltaWriter } = await import('../server/loop');
+
+      for (const lost of ['lease', 'lifecycle'] as const) {
+        const sessionId = `s-delta-lost-${lost}`;
+        // eslint-disable-next-line no-await-in-loop
+        await seed(sessionId, 'hello');
+        // eslint-disable-next-line no-await-in-loop
+        assert.isTrue(await claimLease(sessionId));
+        const writer = new DeltaWriter(sessionId, `m-delta-lost-${lost}`, 1, 60_000);
+        writer.push('text', 'must not publish');
+
+        if (lost === 'lease') {
+          // The lifecycle operation may still be acquired, but the Turn Lease
+          // heartbeat must independently suppress the write.
+          // eslint-disable-next-line no-await-in-loop
+          await AgentSessions.updateAsync(sessionId, {
+            $set: { lease: { serverId: 'another-server', until: new Date(Date.now() + 60_000) } },
+          } as any);
+        } else {
+          // eslint-disable-next-line no-await-in-loop
+          await AgentSessions.updateAsync(sessionId, { $set: { erasingAt: new Date() } } as any);
+        }
+
+        // eslint-disable-next-line no-await-in-loop
+        await writer.stop();
+        // eslint-disable-next-line no-await-in-loop
+        assert.equal(
+          await AgentDeltas.find({ sessionId }).countAsync(), 0,
+          `${lost} loss suppresses the buffered Delta batch`,
+        );
+      }
+    });
 
   it('sweeps crash-orphaned deltas on the next turn (repair-on-entry)', async function () {
     this.timeout(30000);
@@ -600,56 +656,43 @@ describe('turn loop', () => {
     await seed('s9', 'look them both up');
     let ranSecond = false;
 
-    // The takeover has to land AFTER the first result commits. Stealing from
-    // inside the first tool's `run` trips the post-hoc `guardedUpdate` instead
-    // — the branch the s6 test above already covers — and the loop returns
-    // before a second dispatch ever happens. Both guards test the identical
-    // lease predicate, so the only way to reach the pre-flight `holdsLease` is
-    // for another server to take over in the window between one tool result
-    // landing and the next dispatch. Hooking the insert puts the steal exactly
-    // there, with no timing race.
-    const original = (AgentMessages as any).insertAsync.bind(AgentMessages);
-    const descriptor = Object.getOwnPropertyDescriptor(AgentMessages, 'insertAsync');
-    (AgentMessages as any).insertAsync = async (doc: any, ...rest: any[]) => {
-      const id = await original(doc, ...rest);
-      if (doc.role === 'tool' && doc.toolCallId === 't1') {
-        await AgentSessions.updateAsync('s9', {
-          $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
-        } as any);
-      }
-      return id;
-    };
-
-    try {
-      let call = 0;
-      await runTurn('s9', {
-        model: 'mock', system: '',
-        tools: [
-          {
-            name: 'first', description: 'x', args: { type: 'object', properties: {} },
-            run: async () => ({ found: 1 }),
-          },
-          {
-            name: 'second', description: 'x', args: { type: 'object', properties: {} },
-            run: async () => { ranSecond = true; return { found: 2 }; },
-          },
-        ],
-        provider: mockProvider(() => {
-          call += 1;
-          return call === 1
-            ? {
-              toolCalls: [
-                { id: 't1', name: 'first', args: {} },
-                { id: 't2', name: 'second', args: {} },
-              ],
-            }
-            : { text: 'never reached' };
-        }),
-      });
-    } finally {
-      if (descriptor) Object.defineProperty(AgentMessages, 'insertAsync', descriptor);
-      else delete (AgentMessages as any).insertAsync;
-    }
+    // `canUse` is evaluated at the start of each dispatch. Taking the Lease
+    // during the second call's check places the takeover deterministically
+    // after the first result transaction committed and before the second
+    // call's independent Lease preflight.
+    let call = 0;
+    await runTurn('s9', {
+      model: 'mock', system: '',
+      canUse: async (name) => {
+        if (name === 'second') {
+          await AgentSessions.updateAsync('s9', {
+            $set: { lease: { serverId: 'other', until: new Date(Date.now() + 60000) } },
+          } as any);
+        }
+        return true;
+      },
+      tools: [
+        {
+          name: 'first', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => ({ found: 1 }),
+        },
+        {
+          name: 'second', description: 'x', args: { type: 'object', properties: {} },
+          run: async () => { ranSecond = true; return { found: 2 }; },
+        },
+      ],
+      provider: mockProvider(() => {
+        call += 1;
+        return call === 1
+          ? {
+            toolCalls: [
+              { id: 't1', name: 'first', args: {} },
+              { id: 't2', name: 'second', args: {} },
+            ],
+          }
+          : { text: 'never reached' };
+      }),
+    });
 
     assert.isFalse(
       ranSecond,
@@ -834,23 +877,45 @@ describe('turn loop', () => {
 
     await seed('s-calling-atomic', 'use the tool');
     let calls = 0;
-    let phaseAtAssistantInsert: string | undefined;
-    const original = (AgentMessages as any).insertAsync.bind(AgentMessages);
-    const descriptor = Object.getOwnPropertyDescriptor(AgentMessages, 'insertAsync');
-    (AgentMessages as any).insertAsync = async (doc: any, ...rest: any[]) => {
-      if (doc.sessionId === 's-calling-atomic' && doc.role === 'assistant'
-        && doc.toolCalls?.length) {
-        phaseAtAssistantInsert = (await AgentSessions.findOneAsync(doc.sessionId))!.phase;
-      }
-      return original(doc, ...rest);
-    };
+    let reachedInsert!: () => void;
+    const atInsert = new Promise<void>((resolve) => { reachedInsert = resolve; });
+    let releaseInsert!: () => void;
+    const insertMayContinue = new Promise<void>((resolve) => { releaseInsert = resolve; });
+    let reachedTool!: () => void;
+    const atTool = new Promise<void>((resolve) => { reachedTool = resolve; });
+    let releaseTool!: () => void;
+    const toolMayContinue = new Promise<void>((resolve) => { releaseTool = resolve; });
 
+    const rawPrototype = rawCollectionMethodPrototype(
+      AgentMessages.rawCollection(), 'insertOne',
+    ) as any;
+    const descriptor = Object.getOwnPropertyDescriptor(rawPrototype, 'insertOne')!;
+    const original = descriptor.value;
+    let paused = false;
+    Object.defineProperty(rawPrototype, 'insertOne', {
+      ...descriptor,
+      value: async function pauseAtomicAssistantInsert(doc: any, ...rest: any[]) {
+        if (!paused && doc.sessionId === 's-calling-atomic' && doc.role === 'assistant'
+          && doc.toolCalls?.length) {
+          paused = true;
+          reachedInsert();
+          await insertMayContinue;
+        }
+        return original.call(this, doc, ...rest);
+      },
+    });
+
+    let running: Promise<void> | undefined;
     try {
-      await runTurn('s-calling-atomic', {
+      running = runTurn('s-calling-atomic', {
         model: 'mock', system: '',
         tools: [{
           name: 'ping', description: 'x', args: { type: 'object', properties: {} },
-          run: async () => 'pong',
+          run: async () => {
+            reachedTool();
+            await toolMayContinue;
+            return 'pong';
+          },
         }],
         provider: {
           async *stream() {
@@ -868,15 +933,41 @@ describe('turn loop', () => {
           },
         },
       });
-    } finally {
-      if (descriptor) Object.defineProperty(AgentMessages, 'insertAsync', descriptor);
-      else delete (AgentMessages as any).insertAsync;
-    }
 
-    assert.equal(
-      phaseAtAssistantInsert, 'calling',
-      'the tool-use row must never be externally visible while phase still says streaming',
-    );
+      await atInsert;
+      const beforeCommit = (await AgentSessions.findOneAsync('s-calling-atomic'))!;
+      assert.equal(
+        beforeCommit.phase, 'streaming',
+        'outside the transaction, the calling transition remains invisible before commit',
+      );
+      assert.equal(
+        await AgentMessages.find({
+          sessionId: 's-calling-atomic', role: 'assistant',
+        }).countAsync(),
+        0,
+        'the tool-use Message is equally invisible before commit',
+      );
+
+      releaseInsert();
+      await atTool;
+      const afterCommit = (await AgentSessions.findOneAsync('s-calling-atomic'))!;
+      const toolUse = await AgentMessages.findOneAsync({
+        sessionId: 's-calling-atomic', role: 'assistant', 'toolCalls.id': 'atomic-call',
+      } as any);
+      assert.equal(afterCommit.phase, 'calling');
+      assert.isDefined(
+        toolUse,
+        'the phase transition and tool-use Message become visible together before dispatch',
+      );
+
+      releaseTool();
+      await running;
+    } finally {
+      releaseInsert();
+      releaseTool();
+      Object.defineProperty(rawPrototype, 'insertOne', descriptor);
+      if (running) await running.catch(() => { /* preserve the primary assertion failure */ });
+    }
   });
 
   it('records a terminal error when maxIterations is exhausted', async function () {
@@ -1131,18 +1222,22 @@ describe('turn loop', () => {
     assert.lengthOf(msgs.filter((m) => m.role === 'user'), 2);
   });
 
-  it('persists a sanitized error when deferred config construction throws', async function () {
+  it('persists a sanitized error when Activation cannot construct a Turn', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
-    const { deferTurn } = await import('../server/methods');
+    const { defineAgent } = await import('../server/registry');
+    const { activate } = await import('../server/activation');
+    // Ensure the production Turn Adapter is installed before nudging.
+    await import('../server/loop');
 
-    await seed('s-defer-build-failure', 'hello');
-    deferTurn('s-defer-build-failure', {
+    defineAgent('activation-build-failure', {
       model: 'mock',
       instructions: () => {
         throw new Error('PRIVATE customer@example.com sk-SECRET');
       },
-    }, 'u1');
+    });
+    await seed('s-defer-build-failure', 'hello', 'activation-build-failure');
+    activate('s-defer-build-failure');
 
     await waitFor(
       async () => !!(await AgentMessages.findOneAsync({
@@ -2026,47 +2121,33 @@ describe('approval gates', () => {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
 
-    // The mirror image of the test above. The wake-check reads the session,
-    // sees a standing verdict, and defers a re-run — but the legitimate resume
-    // can START AND FINISH inside that window, spending the verdict. The woken
-    // run then finds no `pending` at all, falls straight into the think loop,
-    // and makes a provider call nobody asked for: a charge, and an assistant
-    // message appended to a turn the user considered finished.
-    //
-    // The window is forced through the wake-check's own read: the session is
-    // stripped of its verdict the instant a read returns it with the lease
-    // already released, which is exactly the wind-down snapshot the deferred
-    // re-run is scheduled from.
-    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
-    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
+    // Activation plans from a snapshot, but the exact snapshot is asserted in
+    // the atomic Lease claim. Spend the verdict immediately before that claim:
+    // a stale plan must lose rather than enter an unrequested provider Turn.
+    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
+    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
+    let injected = false;
     let spent = false;
-    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
-      const doc = await original(...args);
-      if (!spent && doc?._id === 's-wake-stale' && doc.pending?.verdict && !doc.lease) {
+    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
+      if (!injected && mod?.$set?.pending) {
+        injected = true;
+        const n = await originalUpdate(sel, mod, ...rest);
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-stale' } as any,
+          { $set: {
+            'pending.verdict': 'approved', 'pending.by': 'u1',
+            'pending.wakeToken': 'TOKEN-SPENT', phase: 'idle',
+          } } as any,
+        );
+        return n;
+      }
+      if (!spent && mod?.$set?.lease && JSON.stringify(sel).includes('TOKEN-SPENT')) {
         spent = true;
         await AgentSessions.rawCollection().updateOne(
           { _id: 's-wake-stale' } as any, { $unset: { pending: 1 } } as any,
         );
       }
-      return doc;
-    };
-
-    // Same verdict injection as the test above: written on the park write, with
-    // no defer of its own, so the winding-down run's self-check is the only
-    // thing that can act on it.
-    const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
-    const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
-    let injected = false;
-    (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
-      const n = await originalUpdate(sel, mod, ...rest);
-      if (!injected && mod?.$set?.pending) {
-        injected = true;
-        await AgentSessions.rawCollection().updateOne(
-          { _id: 's-wake-stale' } as any,
-          { $set: { 'pending.verdict': 'approved', 'pending.by': 'u1', phase: 'idle' } } as any,
-        );
-      }
-      return n;
+      return originalUpdate(sel, mod, ...rest);
     };
 
     let state: { ran: string[]; providerCalls: number } | null = null;
@@ -2074,11 +2155,10 @@ describe('approval gates', () => {
       state = await buildFixture('s-wake-stale', 'gate-wake-stale', [
         { id: 'g1', name: 'refund', gate: 'ask' },
       ]);
+      await waitFor(async () => spent, 'the Activation Lease-claim race');
     } finally {
       if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
       else delete (AgentSessions as any).updateAsync;
-      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
-      else delete (AgentSessions as any).findOneAsync;
     }
     assert.isTrue(injected, 'the verdict must have landed on the park write');
     assert.isTrue(spent, 'the verdict must have been spent inside the wake window');
@@ -2108,49 +2188,17 @@ describe('approval gates', () => {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
 
-    // The residual the boolean re-check could not see. "Is a verdict standing?"
-    // is a boolean answer to an IDENTITY question: verdict A can be consumed,
-    // the batch re-park on its NEXT gate, and a second verdict B be recorded —
-    // with its own resume already deferred — before the first timer fires.
-    // Three writes later the boolean still says yes, and the stale callback
-    // runs a turn behind the resume that legitimately owns B.
-    //
-    // Forced here through the wind-down read itself: the moment the self-check
-    // snapshots a session carrying verdict A with the lease already released,
-    // `pending` is replaced wholesale with a DIFFERENT verdict under a
-    // different token — exactly the document B's resume would have left.
-    const original = (AgentSessions as any).findOneAsync.bind(AgentSessions);
-    const descriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'findOneAsync');
-    let superseded = false;
-    (AgentSessions as any).findOneAsync = async (...args: any[]) => {
-      const doc = await original(...args);
-      if (!superseded && doc?._id === 's-wake-token' && doc.pending?.verdict && !doc.lease) {
-        superseded = true;
-        await AgentSessions.rawCollection().updateOne(
-          { _id: 's-wake-token' } as any,
-          {
-            $set: {
-              pending: {
-                toolCallId: 'g2', name: 'refund', args: {},
-                verdict: 'approved', by: 'u1', wakeToken: 'TOKEN-B',
-              },
-            },
-          } as any,
-        );
-      }
-      return doc;
-    };
-
-    // Verdict A, stamped with its own token, injected on the park write with no
-    // defer of its own — so the winding-down run's self-check is the only thing
-    // that can act on it, exactly as the two tests above arrange.
+    // Replace A with B immediately before A's atomic Lease claim. B's own
+    // consumer then spends it. A must not match merely because a verdict still
+    // existed at planning time: identity, not boolean presence, is the guard.
     const originalUpdate = (AgentSessions as any).updateAsync.bind(AgentSessions);
     const updateDescriptor = Object.getOwnPropertyDescriptor(AgentSessions, 'updateAsync');
     let injected = false;
+    let superseded = false;
     (AgentSessions as any).updateAsync = async (sel: any, mod: any, ...rest: any[]) => {
-      const n = await originalUpdate(sel, mod, ...rest);
       if (!injected && mod?.$set?.pending) {
         injected = true;
+        const n = await originalUpdate(sel, mod, ...rest);
         await AgentSessions.rawCollection().updateOne(
           { _id: 's-wake-token' } as any,
           {
@@ -2162,8 +2210,23 @@ describe('approval gates', () => {
             },
           } as any,
         );
+        return n;
       }
-      return n;
+      if (!superseded && mod?.$set?.lease && JSON.stringify(sel).includes('TOKEN-A')) {
+        superseded = true;
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token' } as any,
+          { $set: { 'pending.wakeToken': 'TOKEN-B' } } as any,
+        );
+        const n = await originalUpdate(sel, mod, ...rest);
+        // Simulate the legitimate owner of B spending it before A replans.
+        await AgentSessions.rawCollection().updateOne(
+          { _id: 's-wake-token', 'pending.wakeToken': 'TOKEN-B' } as any,
+          { $unset: { pending: 1 } } as any,
+        );
+        return n;
+      }
+      return originalUpdate(sel, mod, ...rest);
     };
 
     let state: { ran: string[]; providerCalls: number } | null = null;
@@ -2171,11 +2234,10 @@ describe('approval gates', () => {
       state = await buildFixture('s-wake-token', 'gate-wake-token', [
         { id: 'g1', name: 'refund', gate: 'ask' },
       ]);
+      await waitFor(async () => superseded, 'the superseding Activation Lease claim');
     } finally {
       if (updateDescriptor) Object.defineProperty(AgentSessions, 'updateAsync', updateDescriptor);
       else delete (AgentSessions as any).updateAsync;
-      if (descriptor) Object.defineProperty(AgentSessions, 'findOneAsync', descriptor);
-      else delete (AgentSessions as any).findOneAsync;
     }
     assert.isTrue(injected, 'verdict A must have landed on the park write');
     assert.isTrue(superseded, 'verdict B must have replaced it inside the wake window');
@@ -2194,10 +2256,9 @@ describe('approval gates', () => {
       'no extra assistant row may appear',
     );
     assert.deepEqual(state!.ran, [], 'and no tool may run for a verdict this wake never saw');
-    // B is left exactly as found — untouched, for the resume that owns it.
+    // The simulated legitimate owner spent B; stale A added nothing.
     const doc = (await AgentSessions.findOneAsync('s-wake-token'))!;
-    assert.equal(doc.pending?.wakeToken, 'TOKEN-B');
-    assert.equal(doc.pending?.verdict, 'approved');
+    assert.isUndefined(doc.pending);
   });
 
   it('a stop outranks a recorded verdict, and the send that clears it resumes', async function () {
@@ -3201,6 +3262,58 @@ describe('compaction hardening (final-review fixes)', () => {
     );
     assert.equal(
       await AgentMessages.find({ sessionId: 's-comp-int', role: 'assistant', content: 'done' } as any).countAsync(), 0,
+    );
+  });
+
+  it('a stop after the final compaction yield prevents every durable commit', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const pad = 'x'.repeat(120);
+    await seedRows('s-comp-final-stop', [
+      { seq: 0, role: 'user', content: `q1 ${pad}` },
+      { seq: 1, role: 'assistant', content: `a1 ${pad}` },
+      { seq: 2, role: 'user', content: `q2 ${pad}` },
+      { seq: 3, role: 'assistant', content: `a2 ${pad}` },
+      { seq: 4, role: 'user', content: 'now' },
+    ], 5);
+
+    const requests: any[] = [];
+    const finalYieldStop: Provider = {
+      async *stream(req) {
+        requests.push(req);
+        yield { kind: 'text', chunk: 'BRIEF' };
+        yield { kind: 'done', usage: { input: 1, output: 1 } };
+        // Return normally after the last chunk. With the periodic poll kept out
+        // of the fixture, Provider Exchange's final authority read and the
+        // atomic commit guard are the only paths that can observe this stop.
+        await AgentSessions.updateAsync('s-comp-final-stop', {
+          $set: { phase: 'stopped', updatedAt: new Date() },
+        } as any);
+      },
+    };
+
+    await runTurn('s-comp-final-stop', {
+      model: 'mock', system: 'help', tools: [], provider: finalYieldStop,
+      context: { window: 60, compactAt: 0.5, keep: 2 },
+      interruptCheckMs: 60_000,
+    });
+
+    assert.lengthOf(requests, 1, 'the stopped turn must never reach its think request');
+    assert.equal((await AgentSessions.findOneAsync('s-comp-final-stop'))!.phase, 'stopped');
+    assert.equal(
+      await AgentMessages.find({
+        sessionId: 's-comp-final-stop', role: 'note', kind: 'compaction',
+      } as any).countAsync(),
+      0,
+      'the completed summary must not commit after the stop',
+    );
+    assert.equal(
+      await AgentMessages.find({
+        sessionId: 's-comp-final-stop', role: 'assistant', seq: { $gte: 5 },
+      } as any).countAsync(),
+      0,
+      'the turn must not continue into an assistant commit',
     );
   });
 });

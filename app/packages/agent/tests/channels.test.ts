@@ -1044,7 +1044,7 @@ describe('channels', () => {
       // The cap: a receipt at the attempt ceiling is abandoned and the
       // conversation moves on rather than wedging forever.
       await DeliveryReceipts.insertAsync({
-        _id: 'deliver:test:conv:m-sx-3', bindingId: 'test:conv', state: 'sending',
+        _id: 'deliver:test:conv:m-sx-3', bindingId: 'test:conv', sessionId: 'sx', state: 'sending',
         attempts: MAX_DELIVERY_ATTEMPTS, at: new Date(Date.now() - 60_000),
       });
       const { AgentMessages } = await import('../common/collections');
@@ -1096,7 +1096,7 @@ describe('channels', () => {
       await seedConversation();
       // A crash mid-send from some earlier worker:
       await DeliveryReceipts.insertAsync({
-        _id: 'deliver:test:conv:m-sx-1', bindingId: 'test:conv', state: 'sending',
+        _id: 'deliver:test:conv:m-sx-1', bindingId: 'test:conv', sessionId: 'sx', state: 'sending',
         attempts: 1, at: new Date(),
       });
       await deliverBinding('test', 'test:conv');
@@ -1131,7 +1131,7 @@ describe('channels', () => {
       const { DeliveryReceipts } = await import('../server/channels/collections');
       await seedConversation();
       await DeliveryReceipts.insertAsync({
-        _id: 'deliver:test:conv:m-sx-1', bindingId: 'test:conv', state: 'sending',
+        _id: 'deliver:test:conv:m-sx-1', bindingId: 'test:conv', sessionId: 'sx', state: 'sending',
         attempts: 1, at: new Date(),
       });
       await deliverBinding('test', 'test:conv');
@@ -1151,6 +1151,7 @@ describe('channels', () => {
       const promptPost = transport.posts.find((p) => String(p.payload.text).includes('orders.refund'))!;
       assert.include(promptPost.payload.text, 'Reply YES', 'the render used the registered grammar');
       const receipt = (await DeliveryReceipts.findOneAsync('deliver:test:conv:prompt:tc9'))!;
+      assert.equal(receipt.sessionId, 'sx', 'receipt ownership is explicit for lifecycle erasure');
       assert.deepEqual(receipt.expects!.map((e) => e.match), ['YES', 'NO']);
 
       // Re-sweep: the same ask is not re-delivered.
@@ -1343,6 +1344,28 @@ describe('channels', () => {
       assert.isDefined(note, 'the redemption left its audit row');
       assert.isTrue(note!.approved);
       assert.isFalse(await redeemVerdictToken(token), 'single-use');
+    });
+
+    it('does not mint a verdict token for a child under a fenced root', async () => {
+      await registerTestChannel();
+      const { AgentSessions } = await import('../common/collections');
+      const { ChannelVerdictTokens } = await import('../server/channels/collections');
+      const { issueVerdictToken } = await import('../server/channels/linking');
+      await AgentSessions.insertAsync({ ...sessionBase, _id: 'verdict-root', erasingAt: new Date() } as any);
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'verdict-child',
+        parent: { sessionId: 'verdict-root', toolCallId: 'verdict-call' },
+      } as any);
+
+      let code: unknown;
+      try {
+        await issueVerdictToken('channel-agent', 'verdict-child', 'tcv', 'approved');
+      } catch (error: any) {
+        code = error?.error;
+      }
+      assert.equal(code, 'no-session');
+      assert.isUndefined(await ChannelVerdictTokens.findOneAsync({ sessionId: 'verdict-child' }));
     });
   });
 

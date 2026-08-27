@@ -1,9 +1,10 @@
 import { createHash } from 'crypto';
+import type { ClientSession } from 'mongodb';
 import { AgentMessages, AgentSessions } from '../../common/collections';
 import type { AgentSession } from '../../common/types';
 import { SERVER_ID } from '../lease';
 import {
-  ChannelBindings, DeliveryReceipts, insertOrLose,
+  ChannelBindings, DeliveryReceipts, isDuplicateKey,
   type ChannelBinding, type ReceiptExpectation,
   receiptIdFor, promptSuffix,
 } from './collections';
@@ -13,6 +14,10 @@ import { hydrateRefs } from '../attachments';
 import { issueVerdictToken } from './linking';
 import { getChannel, uncertainDeliveryMode, type ChannelDef } from './registry';
 import { VERDICT_FOR, type DeliveryItem } from '../../common/channel-contract';
+import {
+  beginSessionMutationOperation, type SessionOperation,
+  withSessionOperationTransaction,
+} from '../session-operations';
 
 /** Egress worker: one per channel kind, observer + timed sweep.
  *  All multi-server races resolve through atomic conditional writes. */
@@ -51,6 +56,7 @@ export async function claimBinding(
   const n = await ChannelBindings.updateAsync(
     {
       _id: bindingId,
+      erasingAt: { $exists: false },
       $or: [
         { claim: { $exists: false } },
         { claim: null },
@@ -96,24 +102,29 @@ async function settleReceipt(
   );
 }
 
-/** Three-phase delivery: reserve → post → confirm. Receipt-keyed for
- *  idempotency. Returns delivered/abandoned/deferred. Throws on transport
- *  failure (the next sweep retries). Exported for tool-body idempotency. */
+/** What `deliverOnce` reads from a binding. Synthetic side deliveries still
+ * name their originating Session so lifecycle protection stays fail-closed. */
+export type DeliverableBinding = Pick<
+  ChannelBinding, '_id' | 'kind' | 'destination' | 'sessionId'
+>;
 
-/** What `deliverOnce` reads from a binding — a real row satisfies it; a
- *  synthetic one is these three fields and nothing more. */
-export type DeliverableBinding = Pick<ChannelBinding, '_id' | 'kind' | 'destination'>;
+export interface DeliverOnceOptions {
+  expects?: ReceiptExpectation[];
+  /** The transport/lens/tier to deliver through, when the caller holds them
+   *  directly (compose). Default: the registry's def for `binding.kind`. */
+  def?: Pick<ChannelDef, 'transport' | 'lens' | 'onUncertainDelivery'>;
+  /** Idempotent Session-owned reconciliation after a confirmed delivery. It
+   *  runs transactionally while the delivery's root+target lifecycle operation
+   *  is still held, including when a retry finds an already-settled receipt. */
+  afterDelivered?: (mongoSession: ClientSession) => Promise<void>;
+}
 
-export async function deliverOnce(
+async function deliverOnceActive(
+  operation: SessionOperation,
   binding: DeliverableBinding,
   item: DeliveryItem | (() => Promise<DeliveryItem>),
   suffix: string,
-  opts: {
-    expects?: ReceiptExpectation[];
-    /** The transport/lens/tier to deliver through, when the caller holds them
-     *  directly (compose). Default: the registry's def for `binding.kind`. */
-    def?: Pick<ChannelDef, 'transport' | 'lens' | 'onUncertainDelivery'>;
-  } = {},
+  opts: DeliverOnceOptions = {},
 ): Promise<'delivered' | 'abandoned' | 'deferred'> {
   const def = opts.def ?? getChannel(binding.kind);
   if (!def) throw new Error(`[10thfloor:agent] deliverOnce: unknown channel "${binding.kind}"`);
@@ -122,11 +133,23 @@ export async function deliverOnce(
   // RESERVE. The duplicate-key loser reads the winner's state instead of
   // posting: `sent`/`abandoned` are settled; `sending` is the one ambiguous
   // state, resolved per the channel's declared tier (§11).
-  const reserved = await insertOrLose(DeliveryReceipts, {
-    _id: receiptId, bindingId: binding._id, state: 'sending',
-    ...(opts.expects && opts.expects.length > 0 ? { expects: opts.expects } : {}),
-    attempts: 1, at: new Date(),
-  });
+  let reserved = false;
+  try {
+    await withSessionOperationTransaction(operation, async (mongoSession) => {
+      await DeliveryReceipts.rawCollection().insertOne({
+        _id: receiptId,
+        bindingId: binding._id,
+        sessionId: binding.sessionId,
+        state: 'sending',
+        ...(opts.expects && opts.expects.length > 0 ? { expects: opts.expects } : {}),
+        attempts: 1,
+        at: new Date(),
+      }, { session: mongoSession });
+    });
+    reserved = true;
+  } catch (error) {
+    if (!isDuplicateKey(error)) throw error;
+  }
 
   if (!reserved) {
     const existing = await DeliveryReceipts.findOneAsync(receiptId);
@@ -135,12 +158,15 @@ export async function deliverOnce(
     // Mid-`sending`: crash between post and confirm — apply declared recovery.
     const mode = uncertainDeliveryMode(def);
     if (mode === 'abandon') {
+      await operation.assertActive();
       await settleReceipt(receiptId, 'abandoned');
       return 'abandoned';
     }
     if (mode === 'reconcile' && def.transport.reconcile) {
+      await operation.assertActive();
       const landed = await def.transport.reconcile(binding.destination, receiptId);
       if (landed) {
+        await operation.assertActive();
         await settleReceipt(receiptId, 'sent');
         return 'delivered';
       }
@@ -148,11 +174,13 @@ export async function deliverOnce(
     // Retry on a doubling backoff schedule; give up after MAX_DELIVERY_ATTEMPTS.
     // `deferred` means the backoff window has not elapsed yet.
     if (existing.attempts >= MAX_DELIVERY_ATTEMPTS) {
+      await operation.assertActive();
       await settleReceipt(receiptId, 'abandoned');
       return 'abandoned';
     }
     const wait = Math.min(BACKOFF_BASE_MS * 2 ** Math.max(0, existing.attempts - 1), BACKOFF_MAX_MS);
     if (Date.now() - existing.at.getTime() < wait) return 'deferred';
+    await operation.assertActive();
     await DeliveryReceipts.updateAsync(receiptId, { $inc: { attempts: 1 }, $set: { at: new Date() } });
   }
 
@@ -167,9 +195,14 @@ export async function deliverOnce(
     // looks for; later segments are suffixed so a tier-A provider does not
     // collapse them.
     const key = i === 0 ? receiptId : `${receiptId}:${i}`;
+    // Renew immediately before private bytes cross the provider seam. Built-in
+    // transports also observe the signal if a later heartbeat loses.
+    // eslint-disable-next-line no-await-in-loop
+    await operation.assertActive();
     // eslint-disable-next-line no-await-in-loop
     const posted = await def.transport.post(binding.destination, payloads[i], {
       idempotencyKey: key,
+      signal: operation.signal,
     });
     if (i === 0 && posted && typeof posted === 'object' && posted.providerMessageId) {
       providerMessageId = posted.providerMessageId;
@@ -177,8 +210,31 @@ export async function deliverOnce(
   }
 
   // CONFIRM.
+  await operation.assertActive();
   await settleReceipt(receiptId, 'sent', providerMessageId);
   return 'delivered';
+}
+
+/** Three-phase delivery: reserve → post → confirm. Receipt-keyed for
+ *  idempotency. Returns delivered/abandoned/deferred. Throws on transport
+ *  failure (the next sweep retries). Exported for tool-body idempotency. */
+export async function deliverOnce(
+  binding: DeliverableBinding,
+  item: DeliveryItem | (() => Promise<DeliveryItem>),
+  suffix: string,
+  opts: DeliverOnceOptions = {},
+): Promise<'delivered' | 'abandoned' | 'deferred'> {
+  const operation = await beginSessionMutationOperation(binding.sessionId);
+  if (!operation) return 'abandoned';
+  try {
+    const outcome = await deliverOnceActive(operation, binding, item, suffix, opts);
+    if (outcome === 'delivered' && opts.afterDelivered) {
+      await withSessionOperationTransaction(operation, opts.afterDelivered);
+    }
+    return outcome;
+  } finally {
+    await operation.close();
+  }
 }
 
 /** Hydrate attachments lazily (only on the POST path). Expired refs become
@@ -213,7 +269,9 @@ export async function deliverBinding(
 
   const binding = await ChannelBindings.findOneAsync(bindingId);
   if (!binding) return;
-  const session = await AgentSessions.findOneAsync(binding.sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: binding.sessionId, erasingAt: { $exists: false },
+  });
   // A binding whose session does not exist yet is the ingress crash window
   // (§9 — binding first, session second); ingress repairs it on the next
   // message, and there is nothing to deliver from a session with no rows.
@@ -239,6 +297,13 @@ export async function deliverBinding(
     // "already ours" branch is what makes renewal a cheap win.
     // eslint-disable-next-line no-await-in-loop
     if (!(await claimBinding(bindingId, claimMs))) return;
+    // Session erasure is a delivery fence as well as a turn fence. Re-check
+    // after renewing because cleanup may have started while this worker held
+    // the binding claim.
+    // eslint-disable-next-line no-await-in-loop
+    if (!(await AgentSessions.findOneAsync({
+      _id: binding.sessionId, erasingAt: { $exists: false },
+    }))) return;
     if (row.item) {
       // eslint-disable-next-line no-await-in-loop
       const outcome = await deliverOnce(binding, deliverable(binding, row), row.message._id);
@@ -359,7 +424,7 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
     },
   }).then((h: any) => {
     // stop() can win the race against a still-resolving observe — stop the
-    // handle the moment it exists (the watcher's own guard).
+    // handle the moment it exists (the worker's own guard).
     handle = h;
     if (stopped) h.stop();
     return undefined;

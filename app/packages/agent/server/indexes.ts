@@ -8,6 +8,9 @@ import {
 import { AgentAttachments } from './attachments';
 import { AttachmentDownloadTokens } from './downloads';
 import { NAMES } from '../common/names';
+import {
+  MESSAGE_RESERVATIONS_NAME, UserMessageReservations,
+} from './transcript';
 
 /* Startup indexes for this package's queries. Idempotent and non-fatal:
  * a failure warns and moves on — the queries work unindexed, just slower. */
@@ -47,6 +50,30 @@ export async function ensureIndexes(): Promise<void> {
       keys: { 'pendingSystem.at': 1 },
       options: { partialFilterExpression: { pendingSystem: { $exists: true } } },
     },
+    // Human-input activation recovery. The marker closes the crash window
+    // between committing a Message and queuing its Turn.
+    {
+      collection: AgentSessions,
+      name: NAMES.sessions,
+      keys: { 'pendingInput.at': 1 },
+      options: { partialFilterExpression: { pendingInput: { $exists: true } } },
+    },
+    {
+      collection: AgentSessions,
+      name: NAMES.sessions,
+      keys: { 'pendingInputs.at': 1 },
+      options: { partialFilterExpression: { pendingInputs: { $exists: true } } },
+    },
+    {
+      collection: UserMessageReservations,
+      name: MESSAGE_RESERVATIONS_NAME,
+      keys: { sessionId: 1, createdAt: 1 },
+    },
+    {
+      collection: UserMessageReservations,
+      name: MESSAGE_RESERVATIONS_NAME,
+      keys: { createdAt: 1, _id: 1 },
+    },
     // Membership lookups (§4.2): multikey on participants.userId.
     {
       collection: AgentSessions,
@@ -78,6 +105,11 @@ export async function ensureIndexes(): Promise<void> {
       collection: DeliveryReceipts,
       name: NAMES.deliveryReceipts,
       keys: { bindingId: 1 },
+    },
+    {
+      collection: DeliveryReceipts,
+      name: NAMES.deliveryReceipts,
+      keys: { sessionId: 1 },
     },
     // TTL reapers. Admissions: 7 days (replay horizon). Tokens: janitor
     // only — redemption checks expiresAt itself for millisecond precision.

@@ -261,14 +261,16 @@ describe('agent-channel-whatsapp', () => {
         return { ok: true, json: async () => ({ messages: [{ id: 'wamid.out9' }] }) };
       }) as unknown as typeof fetch;
       const transport = whatsappTransport({ accessToken: 'EAAB', fetchImpl });
+      const abort = new AbortController();
       const posted = await transport.post(
         { phoneNumberId: 'PN1', to: '15550001111' },
         { type: 'text', text: { body: 'hi' } },
-        { idempotencyKey: 'k' },
+        { idempotencyKey: 'k', signal: abort.signal },
       );
       assert.deepEqual(posted, { providerMessageId: 'wamid.out9' });
       assert.include(calls[0].url, '/v20.0/PN1/messages');
       assert.equal(calls[0].init.headers.authorization, 'Bearer EAAB');
+      assert.strictEqual(calls[0].init.signal, abort.signal);
       const body = JSON.parse(calls[0].init.body);
       assert.equal(body.messaging_product, 'whatsapp');
       assert.equal(body.to, '15550001111');

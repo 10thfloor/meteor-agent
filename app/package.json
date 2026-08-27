@@ -4,10 +4,12 @@
   "scripts": {
     "start": "meteor run",
     "typecheck": "tsc --noEmit",
+    "release:check": "node ../scripts/check-release.mjs",
     "types": "npm run types:core && npm run types:channels",
     "types:core": "rm -rf packages/agent/types && tsc -p tsconfig.types.json",
     "types:channels": "rm -rf packages/agent-channel-slack/types packages/agent-channel-telegram/types packages/agent-channel-whatsapp/types packages/agent-channel-sms/types packages/agent-channel-email/types && tsc -p packages/agent-channel-slack/tsconfig.types.json && tsc -p packages/agent-channel-telegram/tsconfig.types.json && tsc -p packages/agent-channel-whatsapp/tsconfig.types.json && tsc -p packages/agent-channel-sms/tsconfig.types.json && tsc -p packages/agent-channel-email/tsconfig.types.json",
-    "types:check": "npm run types && git diff --exit-code -- packages/agent/types packages/agent/index.d.ts packages/agent-channel-slack/types packages/agent-channel-slack/index.d.ts packages/agent-channel-telegram/types packages/agent-channel-telegram/index.d.ts packages/agent-channel-whatsapp/types packages/agent-channel-whatsapp/index.d.ts packages/agent-channel-sms/types packages/agent-channel-sms/index.d.ts packages/agent-channel-email/types packages/agent-channel-email/index.d.ts",
+    "types:consumer": "tsc -p tsconfig.consumer.json",
+    "types:check": "npm run types && node ../scripts/check-generated-types.mjs && npm run types:consumer",
     "test": "TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 --driver-package meteortesting:mocha ./packages/agent ./packages/agent-channel-slack ./packages/agent-channel-telegram ./packages/agent-channel-whatsapp ./packages/agent-channel-sms ./packages/agent-channel-email",
     "test-app": "TEST_WATCH=1 meteor test --full-app --driver-package meteortesting:mocha",
     "visualize": "meteor --production --extra-packages bundle-visualizer"

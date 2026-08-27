@@ -7,8 +7,12 @@ import { prettySize } from '../common/format';
 import type { Fields, TypedCollection } from '../common/db';
 import type { AgentMessage, AttachmentRef } from '../common/types';
 import type { ChannelAttachment } from '../common/channel-contract';
-import { insertOrLose } from './channels/collections';
+import { isDuplicateKey } from './channels/collections';
 import type { InlineTool } from './tools';
+import {
+  beginSessionMutationOperation, type SessionOperation,
+  withSessionOperationTransaction,
+} from './session-operations';
 
 /* Attachment store (§5): bytes in a side collection, separate from transcript rows.
  * Server-only — bytes leave only inside outbound payloads. */
@@ -123,9 +127,23 @@ export interface CreateAttachmentOptions {
   caps?: AttachmentCaps;
 }
 
-/** Insert one file and return its ref. Enforces per-file cap always, and
- *  per-message count/total caps when staging. Refusals are `Meteor.Error`s. */
-export async function createAttachment(opts: CreateAttachmentOptions): Promise<AttachmentRef> {
+async function insertAttachmentOrLose(
+  operation: SessionOperation, doc: AgentAttachment,
+): Promise<boolean> {
+  try {
+    await withSessionOperationTransaction(operation, async (mongoSession) => {
+      await AgentAttachments.rawCollection().insertOne(doc, { session: mongoSession });
+    });
+    return true;
+  } catch (error) {
+    if (isDuplicateKey(error)) return false;
+    throw error;
+  }
+}
+
+async function createAttachmentActive(
+  operation: SessionOperation, opts: CreateAttachmentOptions,
+): Promise<AttachmentRef> {
   const { sessionId, attach, toolCallId } = opts;
   if (!sessionId) throw new Meteor.Error('attachment-invalid', 'create needs a sessionId');
   const name = sanitizeAttachmentName(opts.name);
@@ -187,7 +205,7 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
     ...(attach ? { staged: true as const } : {}),
     createdAt: new Date(),
   };
-  if (await insertOrLose(AgentAttachments, doc)) return refOf(doc);
+  if (await insertAttachmentOrLose(operation, doc)) return refOf(doc);
 
   // Race loser adopts. Re-stage if the existing row lost its staged flag
   // in the crash window.
@@ -200,6 +218,19 @@ export async function createAttachment(opts: CreateAttachmentOptions): Promise<A
     await AgentAttachments.updateAsync({ _id, sessionId }, { $set: { staged: true } });
   }
   return refOf(existing);
+}
+
+/** Insert one file and return its ref. Enforces per-file cap always, and
+ *  per-message count/total caps when staging. Refusals are `Meteor.Error`s.
+ *  The Session must exist and not be undergoing erasure. */
+export async function createAttachment(opts: CreateAttachmentOptions): Promise<AttachmentRef> {
+  const operation = await beginSessionMutationOperation(opts.sessionId);
+  if (!operation) throw new Meteor.Error('no-session', 'Session not found');
+  try {
+    return await createAttachmentActive(operation, opts);
+  } finally {
+    await operation.close();
+  }
 }
 
 // ---- Staging → the reply (§8) ----------------------------------------------
@@ -261,41 +292,47 @@ export interface AdmittedAttachments {
 export async function admitInboundAttachments(
   sessionId: string, incoming: ChannelAttachment[], caps?: AttachmentCaps,
 ): Promise<AdmittedAttachments> {
-  const limits = capsOf(caps);
-  const refs: AttachmentRef[] = [];
-  const notes: string[] = [];
-  let kept = 0;
-  let total = 0;
-  for (const file of incoming) {
-    const name = sanitizeAttachmentName(file.name);
-    if (kept >= limits.maxFiles) {
-      notes.push(`[file "${name}" was not kept — this message already carries ${limits.maxFiles} files, the limit]`);
-      continue;
+  const operation = await beginSessionMutationOperation(sessionId);
+  if (!operation) throw new Meteor.Error('no-session', 'Session not found');
+  try {
+    const limits = capsOf(caps);
+    const refs: AttachmentRef[] = [];
+    const notes: string[] = [];
+    let kept = 0;
+    let total = 0;
+    for (const file of incoming) {
+      const name = sanitizeAttachmentName(file.name);
+      if (kept >= limits.maxFiles) {
+        notes.push(`[file "${name}" was not kept — this message already carries ${limits.maxFiles} files, the limit]`);
+        continue;
+      }
+      const size = decodedBase64Size(file.content);
+      if (size === null) {
+        notes.push(`[file "${name}" was not kept — its content did not decode]`);
+        continue;
+      }
+      if (size > limits.maxFileBytes) {
+        notes.push(`[file "${name}" (${prettySize(size)}) exceeded the ${prettySize(limits.maxFileBytes)} limit and was not kept]`);
+        continue;
+      }
+      if (total + size > limits.maxTotalBytes) {
+        notes.push(`[file "${name}" (${prettySize(size)}) was not kept — this message's files exceeded the ${prettySize(limits.maxTotalBytes)} total limit]`);
+        continue;
+      }
+      // eslint-disable-next-line no-await-in-loop
+      const ref = await createAttachmentActive(operation, {
+        sessionId, name, contentType: file.contentType,
+        content: { base64: file.content },
+        caps: limits,
+      });
+      refs.push(ref);
+      kept += 1;
+      total += size;
     }
-    const size = decodedBase64Size(file.content);
-    if (size === null) {
-      notes.push(`[file "${name}" was not kept — its content did not decode]`);
-      continue;
-    }
-    if (size > limits.maxFileBytes) {
-      notes.push(`[file "${name}" (${prettySize(size)}) exceeded the ${prettySize(limits.maxFileBytes)} limit and was not kept]`);
-      continue;
-    }
-    if (total + size > limits.maxTotalBytes) {
-      notes.push(`[file "${name}" (${prettySize(size)}) was not kept — this message's files exceeded the ${prettySize(limits.maxTotalBytes)} total limit]`);
-      continue;
-    }
-    // eslint-disable-next-line no-await-in-loop
-    const ref = await createAttachment({
-      sessionId, name, contentType: file.contentType,
-      content: { base64: file.content },
-      caps: limits,
-    });
-    refs.push(ref);
-    kept += 1;
-    total += size;
+    return { refs, notes };
+  } finally {
+    await operation.close();
   }
-  return { refs, notes };
 }
 
 // ---- Request-time image hydration (participants spec §9) --------------------

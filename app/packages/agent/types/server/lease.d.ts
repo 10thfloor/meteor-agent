@@ -1,4 +1,4 @@
-import type { SessionModifier } from '../common/db';
+import type { SessionModifier, SessionQuery } from '../common/db';
 /** Identity of this app server process, regenerated on every boot. */
 export declare const SERVER_ID: string;
 export declare let LEASE_MS: number;
@@ -14,7 +14,7 @@ export declare function _setLeaseTimings({ leaseMs, heartbeatMs }: {
 };
 /** Claim a run. Succeeds if unleased, expired, or already ours. Atomic on a
  *  single document, so exactly one racing server wins. */
-export declare function claimLease(sessionId: string, serverId?: string): Promise<boolean>;
+export declare function claimLease(sessionId: string, serverId?: string, expected?: SessionQuery): Promise<boolean>;
 export declare function heartbeat(sessionId: string, serverId?: string): Promise<boolean>;
 export declare function releaseLease(sessionId: string, serverId?: string): Promise<void>;
 export declare function holdsLease(sessionId: string, serverId?: string): Promise<boolean>;

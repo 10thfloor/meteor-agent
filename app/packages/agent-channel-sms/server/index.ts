@@ -1,7 +1,8 @@
 import { createHmac } from 'crypto';
 import {
   attachmentNotice, channelKnobs, headerValue, isLinkGesture, promptDisplay, safeEqual,
-  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type ChannelDef, type ChannelKnobs, type ChannelPostOptions, type ChannelProfile,
+  type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
@@ -222,7 +223,7 @@ export function smsTransport(options: SmsTransportOptions): ChannelTransport {
   const doFetch = options.fetchImpl ?? fetch;
   const auth = Buffer.from(`${options.accountSid}:${options.authToken}`).toString('base64');
   return {
-    async post(destination: unknown, payload: unknown) {
+    async post(destination: unknown, payload: unknown, opts: ChannelPostOptions) {
       const dest = (destination ?? {}) as { to?: string; from?: string };
       const body = (payload ?? {}) as { body?: string };
       const form = new URLSearchParams({
@@ -239,6 +240,7 @@ export function smsTransport(options: SmsTransportOptions): ChannelTransport {
             'content-type': 'application/x-www-form-urlencoded',
           },
           body: form.toString(),
+          signal: opts.signal,
         },
       );
       const json: any = await res.json();

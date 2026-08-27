@@ -1,8 +1,8 @@
 import type { AgentMessage, SessionParticipant } from '../common/types';
 import type { ProviderMessage } from './providers/types';
-/** Transcript projection, per-turn windows, repair, and batch-safe boundary walk. */
+export declare const MAX_PENDING_INPUTS = 64;
 /** Projects stored messages into what a provider sees. Omniscient view
- *  (no `self`) is for the compaction summarizer. */
+ * (no `self`) is for the compaction summarizer. */
 export interface TranscriptView {
     /** The running model's participant id; absent = omniscient projection. */
     self?: string;
@@ -24,9 +24,9 @@ export declare function batchSafeBoundary(eligible: AgentMessage[], boundary: nu
 /** Delete an abandoned assistant + its deltas and tool results. Best-effort. */
 export declare function discardTurn(sessionId: string, messageId: string, turnSeq: number, toolCallIds?: string[], upperBoundSeq?: number): Promise<void>;
 /** Delete any assistant with unanswered tool_use (permanent 400 otherwise).
- *  Scans whole transcript; returns false if lease was lost. */
+ * Scans the whole Transcript; returns false if the Lease was lost. */
 export declare function repairUnansweredToolUse(sessionId: string): Promise<boolean>;
 /** Find the turn window owning a parked tool call id. Newest-first;
- *  falls back to answered match for crash recovery. */
+ * falls back to answered match for crash recovery. */
 export declare function locateBatch(msgs: AgentMessage[], toolCallId: string): TurnWindow | null;
 //# sourceMappingURL=transcript.d.ts.map

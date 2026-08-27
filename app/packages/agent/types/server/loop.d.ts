@@ -1,10 +1,11 @@
 import { type ResolvedMemory } from '../common/types';
 import type { Provider } from './providers/types';
-import { type Skill, type ToolSpec } from './tools';
+import type { Skill, ToolSpec } from './tools';
 export { classifyProviderError } from './turn-state';
 export { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } from './deltas';
 export { toProviderMessages } from './transcript';
 export { assembleContext, estimateContext, findCompactionCut } from './compaction';
+import type { SessionQuery } from '../common/db';
 export interface RunConfig {
     model: string;
     system: string;
@@ -71,6 +72,7 @@ export declare function backoffDelay(attemptIndex: number, baseMs: number, maxDe
 /** TEST SEAM: pin a deterministic delay so `retrying` phase is observable.
  *  Pass null to restore the jittered default. */
 export declare function _setBackoff(fn: typeof backoffDelay | null): () => void;
-/** Run one turn to completion. Idempotent: recovery is just calling again. */
-export declare function runTurn(sessionId: string, config: RunConfig): Promise<void>;
+/** Run one Turn to completion. Activation supplies a lazy config factory so
+ * application callbacks run only after this process wins the exact Lease. */
+export declare function runTurn(sessionId: string, configOrFactory: RunConfig | (() => RunConfig), expected?: SessionQuery): Promise<void>;
 //# sourceMappingURL=loop.d.ts.map

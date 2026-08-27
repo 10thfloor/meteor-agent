@@ -42,7 +42,7 @@ export interface AgentConfig {
     spend?: number | string;
     /** §4.3. Ms before an unanswered gate:'ask' is auto-denied. Omit for
      *  forever (right for attended, wrong for unattended). Enforced by the
-     *  watcher's sweep, not the loop. */
+     *  recovery supervisor, not the Turn. */
     approval?: number;
     /** Decision 7: model-to-model relay hop cap after one human message.
      *  Default 4; any human message resets. Read from the primary's budget. */
@@ -81,8 +81,8 @@ export interface ResolvedBudget {
   systemTurns?: number;
   toolCalls?: number;
   spend?: number;
-  /** Passed through unchanged (already a plain ms count). The loop ignores it;
-   *  the watcher's sweep is what enforces it. */
+  /** Passed through unchanged (already a plain ms count). The Turn ignores it;
+   *  the recovery supervisor enforces it. */
   approval?: number;
   /** The relay-hop cap, validated like the counts. */
   relay?: number;

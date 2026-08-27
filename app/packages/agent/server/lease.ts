@@ -1,6 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentSessions } from '../common/collections';
-import type { SessionModifier } from '../common/db';
+import type { SessionModifier, SessionQuery } from '../common/db';
 
 /** Identity of this app server process, regenerated on every boot. */
 export const SERVER_ID: string = Random.id();
@@ -21,16 +21,27 @@ export function _setLeaseTimings(
 
 /** Claim a run. Succeeds if unleased, expired, or already ours. Atomic on a
  *  single document, so exactly one racing server wins. */
-export async function claimLease(sessionId: string, serverId = SERVER_ID): Promise<boolean> {
+export async function claimLease(
+  sessionId: string,
+  serverId = SERVER_ID,
+  expected?: SessionQuery,
+): Promise<boolean> {
   const now = new Date();
   const n = await AgentSessions.updateAsync(
     {
       _id: sessionId,
-      $or: [
-        { lease: { $exists: false } },
-        { lease: null },
-        { 'lease.until': { $lt: now } },
-        { 'lease.serverId': serverId },
+      erasingAt: { $exists: false },
+      purgingAt: { $exists: false },
+      $and: [
+        ...(expected ? [expected] : []),
+        {
+          $or: [
+            { lease: { $exists: false } },
+            { lease: null },
+            { 'lease.until': { $lt: now } },
+            { 'lease.serverId': serverId },
+          ],
+        },
       ],
     },
     { $set: { lease: { serverId, until: new Date(now.getTime() + LEASE_MS) } } },
@@ -40,7 +51,12 @@ export async function claimLease(sessionId: string, serverId = SERVER_ID): Promi
 
 export async function heartbeat(sessionId: string, serverId = SERVER_ID): Promise<boolean> {
   const n = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': serverId },
+    {
+      _id: sessionId,
+      'lease.serverId': serverId,
+      erasingAt: { $exists: false },
+      purgingAt: { $exists: false },
+    },
     { $set: { 'lease.until': new Date(Date.now() + LEASE_MS) } },
   );
   return n === 1;
@@ -55,7 +71,13 @@ export async function releaseLease(sessionId: string, serverId = SERVER_ID): Pro
 
 export async function holdsLease(sessionId: string, serverId = SERVER_ID): Promise<boolean> {
   const doc = await AgentSessions.findOneAsync(
-    { _id: sessionId, 'lease.serverId': serverId },
+    {
+      _id: sessionId,
+      'lease.serverId': serverId,
+      'lease.until': { $gt: new Date() },
+      erasingAt: { $exists: false },
+      purgingAt: { $exists: false },
+    },
   );
   return !!doc;
 }
@@ -66,7 +88,7 @@ export async function guardedUpdate(
   sessionId: string, serverId: string, modifier: SessionModifier,
 ): Promise<boolean> {
   const n = await AgentSessions.updateAsync(
-    { _id: sessionId, 'lease.serverId': serverId },
+    { _id: sessionId, 'lease.serverId': serverId, erasingAt: { $exists: false } },
     modifier,
   );
   return n === 1;

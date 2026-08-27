@@ -1,7 +1,8 @@
 import { createHmac } from 'crypto';
 import {
   attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback, headerValue, isLinkGesture, promptDisplay, safeEqual,
-  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type ChannelDef, type ChannelKnobs, type ChannelPostOptions, type ChannelProfile,
+  type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
@@ -282,7 +283,7 @@ export function whatsappTransport(options: WhatsAppTransportOptions): ChannelTra
   const doFetch = options.fetchImpl ?? fetch;
   const version = options.apiVersion ?? 'v20.0';
   return {
-    async post(destination: unknown, payload: unknown) {
+    async post(destination: unknown, payload: unknown, opts: ChannelPostOptions) {
       const dest = (destination ?? {}) as { phoneNumberId?: string; to?: string };
       const res = await doFetch(
         `https://graph.facebook.com/${version}/${dest.phoneNumberId}/messages`,
@@ -298,6 +299,7 @@ export function whatsappTransport(options: WhatsAppTransportOptions): ChannelTra
             messaging_product: 'whatsapp',
             to: dest.to,
           }),
+          signal: opts.signal,
         },
       );
       const json: any = await res.json();

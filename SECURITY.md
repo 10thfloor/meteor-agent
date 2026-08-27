@@ -38,10 +38,16 @@ MongoDB data, or build artifacts that do not belong in a release.
 
 ## Data retention
 
-Retention is host-managed. Package-owned durable data includes sessions,
-committed messages, memories, channel bindings and identities, delivery
-receipts, and attachment metadata and bytes; these remain until the host
-application removes them. Streaming deltas live in a capped collection and are
+Retention policy is host-managed. For conversation deletion, trusted server
+code can call `Agent#erase(sessionId, { userId })`; it recursively removes the
+owned Session and package-owned Session data while preserving independent
+forks, Memory, and account-wide Channel Identity. Account deletion remains a
+host responsibility because only the application knows whether those shared
+records should also be removed.
+
+Package-owned durable data includes sessions, committed messages, memories,
+channel bindings and identities, delivery receipts, and attachment metadata
+and bytes. Streaming deltas live in a capped collection and are
 discarded as turns commit. Inbound submission deduplication rows expire after
 seven days. Link, verdict, and download tokens carry short expiries and are
 TTL-reaped. Attachment bytes are retained by default; set

@@ -61,6 +61,15 @@ const forkHandler = async () => {
   return (Meteor.server as any).method_handlers[NAMES.mFork];
 };
 
+const rawInsertManyPrototype = (rawCollection: object): object => {
+  let holder = Object.getPrototypeOf(rawCollection);
+  while (holder && !Object.prototype.hasOwnProperty.call(holder, 'insertMany')) {
+    holder = Object.getPrototypeOf(holder);
+  }
+  if (!holder) throw new Error('Mongo raw Collection has no insertMany implementation');
+  return holder;
+};
+
 describe('session forking', () => {
   it('copies the transcript with fresh ids, original seqs and zeroed usage', async function () {
     this.timeout(30000);
@@ -91,6 +100,15 @@ describe('session forking', () => {
         activeChild: { sessionId: 'live-child', toolCallId: 'tc2' },
       },
     );
+    // The source deliberately looks like a child so the test proves a fork is
+    // a new root. Its immutable parent must still exist: lifecycle-scoped fork
+    // construction correctly refuses an orphaned child.
+    await AgentSessions.insertAsync({
+      _id: 'someone-else', agent: 'forker', userId: 'u1', phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
 
     const fork = await forkHandler();
     const forkId: string = await fork.call({ userId: 'u1' }, 'forker', 'f-copy');
@@ -132,6 +150,66 @@ describe('session forking', () => {
     );
     assert.equal(((await AgentSessions.findOneAsync(titled))! as any).title,
       'What if we refunded');
+  });
+
+  it('atomically rolls back the fork Session when copied Message insertion fails', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    await defineForker();
+    await seedSource('f-atomic-failure', [
+      { seq: 0, role: 'user', content: 'source question' },
+      { seq: 1, role: 'assistant', content: 'source answer' },
+    ]);
+
+    const rawPrototype = rawInsertManyPrototype(AgentMessages.rawCollection()) as any;
+    const descriptor = Object.getOwnPropertyDescriptor(rawPrototype, 'insertMany')!;
+    const original = descriptor.value;
+    let forkSessionId: string | undefined;
+    let injected = false;
+    Object.defineProperty(rawPrototype, 'insertMany', {
+      ...descriptor,
+      value: async function injectedForkCopy(docs: any[], ...rest: any[]) {
+        if (!injected && docs.length > 0
+          && docs.every((doc) => doc.sessionId !== 'f-atomic-failure')) {
+          injected = true;
+          forkSessionId = docs[0].sessionId;
+          // Stage one copied row inside the transaction before simulating the
+          // ordered batch failure. The abort must erase this row as well as the
+          // fork Session that was inserted earlier in the same transaction.
+          await original.call(this, docs.slice(0, 1), ...rest);
+          throw new Error('injected copied Message insertion failure');
+        }
+        return original.call(this, docs, ...rest);
+      },
+    });
+
+    let rejected: unknown;
+    try {
+      const fork = await forkHandler();
+      await fork.call({ userId: 'u1' }, 'forker', 'f-atomic-failure');
+    } catch (error) {
+      rejected = error;
+    } finally {
+      Object.defineProperty(rawPrototype, 'insertMany', descriptor);
+    }
+
+    assert.isTrue(injected, 'the copied-message write must cross the injected failure seam');
+    assert.include(String(rejected), 'injected copied Message insertion failure');
+    assert.isString(forkSessionId);
+    if (!forkSessionId) return;
+    assert.isUndefined(
+      await AgentSessions.findOneAsync(forkSessionId),
+      'the fork Session insert rolls back with its copied transcript',
+    );
+    assert.equal(
+      await AgentMessages.find({ sessionId: forkSessionId }).countAsync(), 0,
+      'a failed fork leaves no orphan Message rows',
+    );
+    assert.equal(await AgentSessions.find({}).countAsync(), 1, 'only the source Session remains');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 'f-atomic-failure' }).countAsync(), 2,
+      'the source transcript is unchanged',
+    );
   });
 
   it('diverges independently: a send to one never reaches the other', async function () {

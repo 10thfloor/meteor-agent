@@ -145,10 +145,13 @@ export interface ChannelProfile {
 }
 /** Provider call — supplied by the channel package, not core. `reconcile`
  *  enables tier-B uncertain-delivery recovery (§11). */
+export interface ChannelPostOptions {
+    idempotencyKey: string;
+    /** Cancels the provider request when the caller no longer needs the post. */
+    signal?: AbortSignal;
+}
 export interface ChannelTransport {
-    post(destination: unknown, payload: unknown, opts: {
-        idempotencyKey: string;
-    }): Promise<{
+    post(destination: unknown, payload: unknown, opts: ChannelPostOptions): Promise<{
         providerMessageId?: string;
     } | void>;
     reconcile?(destination: unknown, idempotencyKey: string): Promise<boolean>;

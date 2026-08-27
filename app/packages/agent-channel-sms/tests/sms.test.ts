@@ -199,11 +199,14 @@ describe('agent-channel-sms', () => {
         return { ok: true, json: async () => ({ sid: 'SMout1' }) };
       }) as unknown as typeof fetch;
       const transport = smsTransport({ accountSid: 'AC1', authToken: 'tok', fetchImpl });
+      const abort = new AbortController();
       const posted = await transport.post(
-        { to: '+15550001111', from: '+15559990000' }, { body: 'hi there' }, { idempotencyKey: 'k' },
+        { to: '+15550001111', from: '+15559990000' }, { body: 'hi there' },
+        { idempotencyKey: 'k', signal: abort.signal },
       );
       assert.deepEqual(posted, { providerMessageId: 'SMout1' });
       assert.include(calls[0].url, '/Accounts/AC1/Messages.json');
+      assert.strictEqual(calls[0].init.signal, abort.signal);
       assert.equal(
         calls[0].init.headers.authorization,
         `Basic ${Buffer.from('AC1:tok').toString('base64')}`,

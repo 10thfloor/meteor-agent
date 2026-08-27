@@ -471,6 +471,38 @@ describe('participants', () => {
       assert.deepEqual(cReply!.from, { participant: 'm:pp-q-c', name: 'pp-q-c' },
         'the queued @-message was never answered by the model that happened to be resuming');
     });
+
+    it('recognizes an exact addressee reply beyond fifty later assistant rows', async () => {
+      const { AgentMessages, AgentSessions } = await import('../common/collections');
+      const { unansweredMessageAddressee } = await import('../server/participants');
+      await clean();
+
+      await seedRostered('p-horizon', 'pp-horizon-primary', 'u1', [
+        model('pp-horizon-colleague'),
+      ]);
+      const now = new Date();
+      const user: AgentMessage = {
+        _id: 'p-horizon-user', sessionId: 'p-horizon', seq: 0, role: 'user',
+        content: '@pp-horizon-colleague answer this', to: 'm:pp-horizon-colleague',
+        from: { participant: 'h:u1', name: 'owner' }, createdAt: now,
+      };
+      await AgentMessages.insertAsync(user);
+      await AgentMessages.insertAsync({
+        _id: 'p-horizon-answer', sessionId: 'p-horizon', seq: 1, role: 'assistant',
+        content: 'answered',
+        from: { participant: 'm:pp-horizon-colleague', name: 'pp-horizon-colleague' },
+        createdAt: now,
+      });
+      await AgentMessages.rawCollection().insertMany(Array.from({ length: 51 }, (_, i) => ({
+        _id: `p-horizon-later-${i}`, sessionId: 'p-horizon', seq: i + 2,
+        role: 'assistant', content: `later-${i}`,
+        from: { participant: 'm:pp-horizon-primary', name: 'pp-horizon-primary' },
+        createdAt: now,
+      })));
+
+      const session = (await AgentSessions.findOneAsync('p-horizon'))!;
+      assert.isNull(await unansweredMessageAddressee(session, user));
+    });
   });
 
   describe('relays', () => {

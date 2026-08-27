@@ -1,6 +1,6 @@
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
-  MAX_PARTICIPANTS, type AgentSession, type SessionParticipant,
+  MAX_PARTICIPANTS, type AgentMessage, type AgentSession, type SessionParticipant,
 } from '../common/types';
 import {
   humanParticipantId, modelParticipantId, resolveAddressee, sanitizeDisplayName,
@@ -54,7 +54,9 @@ export async function addParticipant(
     & { displayName?: string },
   opts?: AddParticipantOptions,
 ): Promise<string | null> {
-  const session = await AgentSessions.findOneAsync(sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   if (!session) return null;
 
   const row: SessionParticipant = {
@@ -71,14 +73,16 @@ export async function addParticipant(
 
   if (!session.participants) {
     await AgentSessions.updateAsync(
-      { _id: sessionId, participants: { $exists: false } },
+      { _id: sessionId, erasingAt: { $exists: false }, participants: { $exists: false } },
       { $set: { participants: seedRows(session, opts), updatedAt: new Date() } },
     );
     // Roster now exists regardless of which racer won.
   }
 
   // Already-seeded id is an adopt, not a failure.
-  const seeded = await AgentSessions.findOneAsync(sessionId);
+  const seeded = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   if (!seeded?.participants) return null;
   if (seeded.participants.some((p) => p.id === row.id)) return row.id;
   if (seeded.participants.length >= MAX_PARTICIPANTS) return null;
@@ -86,13 +90,16 @@ export async function addParticipant(
   await AgentSessions.updateAsync(
     {
       _id: sessionId,
+      erasingAt: { $exists: false },
       'participants.id': { $ne: row.id },
       [`participants.${MAX_PARTICIPANTS - 1}`]: { $exists: false },
     },
     { $push: { participants: row }, $set: { updatedAt: new Date() } },
   );
   // Only return the id if the row actually landed.
-  const after = await AgentSessions.findOneAsync(sessionId);
+  const after = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   return after?.participants?.some((p) => p.id === row.id) ? row.id : null;
 }
 
@@ -101,7 +108,9 @@ export async function addParticipant(
 export async function removeParticipant(
   sessionId: string, participantId: string,
 ): Promise<boolean> {
-  const session = await AgentSessions.findOneAsync(sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   const row = session?.participants?.find((p) => p.id === participantId);
   if (!session || !row) return false;
   if (row.role === 'owner') {
@@ -111,7 +120,7 @@ export async function removeParticipant(
     );
   }
   const n = await AgentSessions.updateAsync(
-    { _id: sessionId },
+    { _id: sessionId, erasingAt: { $exists: false } },
     { $pull: { participants: { id: participantId } }, $set: { updatedAt: new Date() } },
   );
   if (n === 1) {
@@ -122,37 +131,52 @@ export async function removeParticipant(
 
 /** Read the roster fresh; empty array when absent. */
 export async function listParticipants(sessionId: string): Promise<SessionParticipant[]> {
-  const session = await AgentSessions.findOneAsync(sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   return session?.participants ?? [];
 }
 
-/** The addressee of the newest user row, if that addressee hasn't answered.
- *  Addressee-aware: only a reply FROM the addressee counts as an answer. */
-export async function unansweredAddressee(
-  session: AgentSession,
+/** The addressee of one exact user row, if that addressee has not answered it.
+ * Addressee-aware: only a later reply FROM that model counts. */
+export async function unansweredMessageAddressee(
+  session: AgentSession, user: AgentMessage,
 ): Promise<{ id: string; agent: string } | null> {
   if (!session.participants?.length) return null;
-  const [lastUser] = await AgentMessages.find(
-    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
-  ).fetchAsync();
-  if (!lastUser) return null;
-  const hit = resolveAddressee(lastUser.content, lastUser.to, session);
+  const hit = resolveAddressee(user.content, user.to, session);
   if (hit) {
-    const [answer] = await AgentMessages.find(
-      { sessionId: session._id, role: 'assistant', seq: { $gt: lastUser.seq } },
-      { sort: { seq: -1 }, limit: 50 },
-    ).fetchAsync().then((rows) => rows.filter(
-      (m) => (m.from?.participant ?? `m:${session.agent}`) === hit.id,
-    ));
+    const primaryId = modelParticipantId(session.agent);
+    const answer = await AgentMessages.findOneAsync({
+      sessionId: session._id,
+      role: 'assistant',
+      seq: { $gt: user.seq },
+      ...(hit.id === primaryId ? {
+        $or: [
+          { 'from.participant': hit.id },
+          { from: { $exists: false } },
+        ],
+      } : { 'from.participant': hit.id }),
+    } as any);
     return answer ? null : hit;
   }
   const [lastAssistant] = await AgentMessages.find(
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
-  if (!lastAssistant || lastAssistant.seq < lastUser.seq) {
+  if (!lastAssistant || lastAssistant.seq < user.seq) {
     return { id: modelParticipantId(session.agent), agent: session.agent };
   }
   return null;
+}
+
+/** Compatibility query for callers that intentionally ask about the newest
+ * user row rather than a durable Transcript Commit link. */
+export async function unansweredAddressee(
+  session: AgentSession,
+): Promise<{ id: string; agent: string } | null> {
+  const [lastUser] = await AgentMessages.find(
+    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+  ).fetchAsync();
+  return lastUser ? unansweredMessageAddressee(session, lastUser) : null;
 }
 
 /** Resolve which agent should answer a wake, from durable state:

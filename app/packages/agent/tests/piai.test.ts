@@ -577,6 +577,20 @@ describe('parallel tool-call attribution, end to end (faux provider, no network)
   // DeltaWriter -> delta document -> mergeView, driven by pi-ai's own faux
   // provider so the contentIndex values are pi-ai's, not the test's.
 
+  async function seedDeltaAuthority(sessionId: string): Promise<void> {
+    const { AgentDeltas, AgentSessions } = await import('../common/collections');
+    const { claimLease } = await import('../server/lease');
+    await AgentDeltas.removeAsync({ sessionId } as any);
+    await AgentSessions.removeAsync({ _id: sessionId } as any);
+    await AgentSessions.insertAsync({
+      _id: sessionId, agent: 'piai-delta-test', userId: 'u1', phase: 'streaming', model: 'mock',
+      nextSeq: 4, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    } as any);
+    assert.isTrue(await claimLease(sessionId));
+  }
+
   async function streamTwoCalls(): Promise<ProviderChunk[]> {
     const piai: any = await loadPiAi();
     // Faux defaults: how many deltas each call's arguments are cut into is the
@@ -624,7 +638,7 @@ describe('parallel tool-call attribution, end to end (faux provider, no network)
     const { mergeView } = await import('../common/merge');
     const sessionId = 's-attribution';
     const messageId = 'm-attribution';
-    await AgentDeltas.removeAsync({ sessionId } as any);
+    await seedDeltaAuthority(sessionId);
 
     const chunks = await streamTwoCalls();
     const writer = new DeltaWriter(sessionId, messageId, 3, 10_000);
@@ -666,7 +680,7 @@ describe('parallel tool-call attribution, end to end (faux provider, no network)
     const { DeltaWriter } = await import('../server/loop');
     const { AgentDeltas } = await import('../common/collections');
     const sessionId = 's-coalesce';
-    await AgentDeltas.removeAsync({ sessionId } as any);
+    await seedDeltaAuthority(sessionId);
 
     const writer = new DeltaWriter(sessionId, 'm-coalesce', 0, 10_000);
     writer.push('tool_args', '{"a":', 0);

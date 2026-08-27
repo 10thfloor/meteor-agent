@@ -19,6 +19,10 @@ import { AttachmentDownloadTokens, mountDownloadRoute } from './downloads';
 import { listChannels } from './channels/registry';
 import { mountChannelRoutes } from './channels/ingress';
 import { startEgress, type EgressWorker } from './channels/egress';
+import {
+  resumeSessionErasures, startSessionLifecycleRecovery,
+} from './session-lifecycle';
+import { UserMessageReservations } from './transcript';
 
 export * from '../common/types';
 export { NAMES } from '../common/names';
@@ -36,7 +40,7 @@ export {
 } from '../common/collections';
 export { mergeView } from '../common/merge';
 // `Agent.provider` / `Agent.compact` are the public doors; internals stay unexported.
-export { Agent, type AgentConfig } from './agent';
+export { Agent, type AgentConfig, type SessionErasure } from './agent';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
   fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME,
@@ -77,7 +81,7 @@ export {
   promptDisplay,
   DELIVERY_ITEM_KINDS, MENU_MATCHES, VERDICT_FOR, LINK_GESTURE, isLinkGesture,
   encodeVerdictPostback, decodeVerdictPostback, isRemoteAttachment,
-  type ChannelAttachment, type ChannelProfile, type ChannelTransport,
+  type ChannelAttachment, type ChannelPostOptions, type ChannelProfile, type ChannelTransport,
   type DeliveryItem, type InboundAttachment, type InboundIntent,
   type InboundReading, type Lens, type PromptChoice, type RemoteAttachment,
   type RoundTripOptions,
@@ -88,7 +92,7 @@ export {
 } from './channels/registry';
 export {
   startEgress, deliverOnce,
-  type DeliverableBinding, type EgressOptions, type EgressWorker,
+  type DeliverableBinding, type DeliverOnceOptions, type EgressOptions, type EgressWorker,
 } from './channels/egress';
 export { handleInbound, mountChannelRoutes } from './channels/ingress';
 export {
@@ -116,15 +120,14 @@ export {
   participantByIdentity, participantByUserId, resolveAddressee,
   participantsBlock, sanitizeDisplayName, needsAttribution,
 } from '../common/participants';
-// Downloads: token mint, handler, collection. Single-use burn is in `handleDownload`.
+// Downloads: token mint + collection. Serving/burning remains an internal route.
 export {
-  AttachmentDownloadTokens, issueAttachmentToken, redeemAttachmentToken,
-  handleDownload, mountDownloadRoute, DOWNLOAD_ROUTE,
+  AttachmentDownloadTokens, issueAttachmentToken, DOWNLOAD_ROUTE,
   type AttachmentDownloadToken,
 } from './downloads';
 export type { ViaIdentity } from './methods';
-// System turns: `Agent#systemTurn` is the blessed door; the free functions
-// are for hosts that schedule without an Agent handle or wire their own loop.
+// System turns: `Agent#systemTurn` is the blessed door. Compatibility free
+// functions still park through the package's private Activation Module.
 export { startSystemTurn, consumeStandingIntent } from './methods';
 export {
   consumeSystemIntent, systemRowId, systemBudgetClause,
@@ -135,6 +138,7 @@ export type { TranscriptView } from './transcript';
 
 /** Boot watcher for this process; null if disabled. Exposed for graceful shutdown. */
 export let watcher: Watcher | null = null;
+let lifecycleRecovery: { stop(): Promise<void> } | null = null;
 
 /** Boot egress workers, one per enabled channel kind. Exposed for graceful shutdown. */
 export const egress = new Map<string, EgressWorker>();
@@ -155,7 +159,7 @@ function denyAllClientWrites(): void {
     ChannelIdentities, ChannelBindings, DeliveryReceipts,
     InboundSubmissions, ChannelLinkTokens, ChannelVerdictTokens,
     // Raw file bytes — same lockout.
-    AgentAttachments,
+    AgentAttachments, UserMessageReservations,
     // Forged download tokens would be an exfiltration primitive via the GET route.
     AttachmentDownloadTokens,
     // Forged memory inserts would be prompt injection with a write primitive.
@@ -194,6 +198,9 @@ Meteor.startup(async () => {
   await ensureCapped();
   // Watcher sweeps and transcript reads depend on these indexes.
   await ensureIndexes();
+  // A crash may leave only the root fence durable. Close its child graph
+  // before any publication, method, webhook, or egress worker is reachable.
+  await resumeSessionErasures({ strict: true });
   registerPublications();
   registerMethods();
   // Undefined when no `--settings` file was passed; `applyRateLimits` treats that as zero rules.
@@ -201,6 +208,11 @@ Meteor.startup(async () => {
   applyRateLimits(settings);
   // Non-fatal: the app may enforce its own ceiling a level up.
   warnUncappedAgents(settings);
+
+  // Data lifecycle recovery is independent of optional Turn recovery.
+  if (!UNDER_TEST && !lifecycleRecovery) {
+    lifecycleRecovery = startSessionLifecycleRecovery();
+  }
 
   // On by default: orphans are recovered only by the next `send` otherwise.
   // Tests start their own watchers; a boot watcher would fight them.

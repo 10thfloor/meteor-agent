@@ -17,7 +17,7 @@ from the demo app in [`app/`](../app), it says so.
 | | Start here |
 |---|---|
 | **Streaming** — token deltas through a capped collection, merged client-side into one ordered cursor | [How a token reaches the browser](#how-a-token-reaches-the-browser) |
-| **Durability** — lease + heartbeat + atomic seq allocation, repair-on-entry, orphan-claim watcher, interrupt aborts the HTTP request | [Durability: what survives a crash](#durability-what-survives-a-crash) |
+| **Durability** — Lease + heartbeat + atomic seq allocation, private Activation recovery, repair-on-entry, interrupt aborts the HTTP request | [Durability: what survives a crash](#durability-what-survives-a-crash) |
 | **Providers** — pi-ai by default, or any object with a `stream()` method | [Swapping providers](#swapping-providers) |
 | **Tools** — Meteor methods, inline functions, co-registered pairs, MCP servers, other agents | [Tools: five ways to give a model hands](#tools-five-ways-to-give-a-model-hands) |
 | **Approval gates** — park by exiting, approve/deny from the client, timeouts, audit rows | [Approval gates](#approval-gates) |
@@ -45,7 +45,9 @@ guide — streaming, tools, gates, subagents, forking — is that entry being re
 meteor add 10thfloor:agent          # not on Atmosphere yet — vendor it into packages/
 meteor npm install --save @earendil-works/pi-ai typebox
 meteor remove insecure autopublish
-export ANTHROPIC_API_KEY=sk-...     # or OPENAI_API_KEY, etc.
+export PROVIDER_API_KEY=...          # one API-key Provider
+# Or, for several Providers, unset it and set ANTHROPIC_API_KEY,
+# OPENAI_API_KEY, GOOGLE_GENERATIVE_AI_API_KEY, etc. independently.
 ```
 
 `typebox` checks model-supplied tool arguments; it is a transitive dependency of pi-ai today, so install
@@ -188,9 +190,11 @@ opened with.
 A `Provider` is one method — `stream(req)` returning an async iterable of chunks.
 
 **Omit it** and the turn streams through pi-ai: Anthropic, OpenAI, Google, Bedrock, OpenRouter and the
-rest of its catalog. pi-ai is imported lazily, on the first turn that actually streams, and reads API
-keys from the environment exactly as it always does (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
-`OPENAI_API_KEY`, …). This package adds no key plumbing of its own.
+rest of its catalog. pi-ai is imported lazily, on the first turn that actually streams. For a
+single-key deployment, `PROVIDER_API_KEY` is passed to pi-ai explicitly for whichever Provider the
+model string selects. For a multi-Provider deployment, leave that generic override unset and use
+pi-ai's provider-specific environment variables (`ANTHROPIC_API_KEY`, `ANTHROPIC_AUTH_TOKEN`,
+`OPENAI_API_KEY`, …), so each Adapter resolves its own credential.
 
 **Name `piAiProvider()`** when you want to wrap it — a lazy singleton, so calling it costs nothing until
 a turn runs, and a wrapper is just an object that forwards the same one method:
@@ -388,13 +392,14 @@ lost tail flush costs nothing durable. `ensureCapped()` creates the collection a
 if `agent_deltas` already exists *uncapped*, telling an operator to drop it — nothing is converted
 automatically.
 
-**The publication authorizes once.** `agent.session` takes `(agent, sessionId)`, looks the session
-up as `{ _id, agent, userId: this.userId ?? null }` **first**, and only then returns three cursors:
-the session (`lease` and `pending.wakeToken` stripped), its messages sorted by `seq`, and its
-deltas. Messages and deltas carry no owner field, so three independently-scoped `find()`s would let
-anyone holding a session id read someone else's transcript. The failure mode is quiet on purpose: a
-non-owner gets `[]` and the subscription goes **ready** with nothing in it, so a UI that skips
-`handle.ready()` shows an empty chat rather than an error.
+**The publication keeps authorization live.** `agent.session` takes `(agent, sessionId)` and first
+attaches an observer to the matching Session authorization row. Owners and human participants may
+subscribe; an anonymous caller is authorized only while the Session remains anonymous. Claiming a
+Session, removing a participant, changing its owner, starting erasure, or deleting it stops the
+subscription and retracts every document it published. Only after that observer is attached does
+the publication return the Session (`lease`, operations, and wake tokens stripped), its messages
+sorted by `seq`, and its deltas. Messages and deltas carry no owner field, so they must remain behind
+this Session-scoped authorization. An unauthorized subscription quietly becomes ready with no data.
 
 ### `mergeView` — one ordered view out of two collections
 
@@ -1515,7 +1520,7 @@ const stamp: BeforeProviderRequestHook = (req) => ({
 // result = { ok, value?, error? }   call = { id, name, args }
 // ctx = { agent, sessionId, userId }
 const audit: AfterToolResultHook = (result, call, ctx) => {
-  console.log(ctx.agent, ctx.sessionId, call.name, result.ok);   // observer: no return
+  console.log(ctx.agent, call.name, result.ok);   // observer: no return
 };
 
 Agent.hook('beforeProviderRequest', stamp);
@@ -1942,25 +1947,42 @@ try {
 ```
 
 **Failure mode:** a server that loses its lease mid-stream commits nothing.
-`allocateSeq` returns `null`, the loop calls `discardTurn` — which also removes
-the deltas streamed under that `messageId` — and returns. The server that stole
-the lease is redoing the turn; two assistant rows for one question is the bug
-this prevents.
+The Transcript transaction fails its exact live-Lease selector, the loop calls
+`discardTurn` — which also removes the deltas streamed under that `messageId` —
+and returns. The server that stole the lease is redoing the turn; two assistant
+rows for one question is the bug this prevents.
 
-### Atomic seq allocation
+### Durable user commits and atomic seq allocation
 
-Every committing write funnels through one `findOneAndUpdate` that `$inc`s
-`nextSeq` and returns the pre-image: `agent.send` for the user row,
-`allocateSeq` for assistant, note and budget rows, the watcher's orphan-child note.
+`Agent.send(sessionId, text)` still has one public contract, but its private
+commit path first records a reconstructable reservation. One Mongo transaction
+then assigns the current `nextSeq`, increments `nextSeq` and the Turn budget,
+records compact Activation evidence, inserts the user Message, and removes the
+reservation. Activation re-reads that evidence and the Transcript; the Turn's
+exact Lease claim chooses one runner.
+
+The ordering matters during a crash. A standing reservation has spent nothing;
+recovery can retry the whole transaction. Once it commits, Session allocation,
+budget charge, wake evidence, and Message all exist together. The compact wake
+evidence remains until the Transcript proves the input was answered. The browser
+supplies a hidden key for Meteor's transparent method retry, so a replay converges
+on the same Message; the application call remains `Agent.send(sessionId, text)`.
+
+Turn-owned assistant, tool, note, and budget rows use the same deep Transcript
+commit under an exact live Lease and root/target lifecycle operation:
 
 ```ts
 // server — server/turn-state.ts, the shape every committer uses
-const before = await AgentSessions.rawCollection().findOneAndUpdate(
-  { _id: sessionId, 'lease.serverId': SERVER_ID },
-  { $inc: { nextSeq: 1, ...inc }, $set: { updatedAt: new Date() } },
-  { returnDocument: 'before' },
-);
-return before ? before.nextSeq : null;   // null = the lease is gone; abandon
+await withSessionOperationTransaction(operation, async (mongoSession) => {
+  const before = await AgentSessions.rawCollection().findOneAndUpdate(
+    { _id: sessionId, 'lease.serverId': SERVER_ID, 'lease.until': { $gt: now } },
+    { $inc: { nextSeq: 1, ...inc }, $set: { updatedAt: now } },
+    { returnDocument: 'before', session: mongoSession },
+  );
+  if (before) await AgentMessages.rawCollection().insertOne(
+    { ...message, sessionId, seq: before.nextSeq }, { session: mongoSession },
+  );
+});
 ```
 
 Read-then-`$inc` was wrong, concretely: the loop used to capture `nextSeq`
@@ -1971,11 +1993,17 @@ between provider yields, then asserting every message owns a unique seq, that
 the interjection is committed, *and* that the loop runs a second iteration to
 answer it rather than stranding it.
 
-The same idiom carries the turn budget: `agent.send` folds
-`'budgetSpent.turns': { $lt: N }` into the selector, so check-and-spend is one
-operation and a budget of N permits exactly N sends under any concurrency. A
-refused send writes nothing at all — no seq, no message — and throws
-`Meteor.Error('budget-exhausted')`.
+The user-commit allocation folds the Turn-budget predicate and increment into
+that same atomic Session update, so a budget of N permits exactly N accepted
+sends under concurrency. A refused send leaves no sequence or Message and
+throws `Meteor.Error('budget-exhausted')`.
+
+The private commit Interface refuses text above 256 KiB of UTF-8 and a 65th
+unanswered input before allocating a sequence or charging the Turn budget. The
+reservation keeps the full draft out of the frequently read Session document.
+Those are safety ceilings, not traffic policy: bound untrusted input at the app
+or Channel edge, configure `rateLimit.sends` for DDP callers, and give the Agent
+a `budget.turns`.
 
 ### Repair on entry
 
@@ -2058,15 +2086,14 @@ iteration. The next `agent.send` clears the stop and is answered normally. A
 not the question — and `approve`/`deny` refuse from then on, because they
 require `phase: 'awaiting'`.
 
-### The orphan-claim watcher
+### The recovery watcher and Activation
 
-Every ordinary entry into a turn needs a person: a send, an approve, a deny. The
-watcher covers the states no user action will ever clear. It starts at boot on
-every server unless settings or a test mode disable it, and it is two mechanisms
-— an **observer** on sessions in an active phase (catches a lease released, or a
-phase entered already unleased, within milliseconds) and a **15s sweep**
-(catches a lease that merely *expires*: no write happens, so there is nothing to
-observe).
+Ordinary `Agent` calls commit durable evidence and nudge the private Activation
+Module. The recovery watcher covers evidence whose original process or nudge
+disappeared. It starts at boot on every server unless settings or a test mode
+disable it, and combines an **observer** with a **15s sweep**. The observer reacts
+to durable activation markers; the sweep catches a Lease that merely *expires*,
+because expiry itself writes nothing.
 
 ```ts
 // server
@@ -2086,34 +2113,37 @@ process.on('SIGTERM', () => { void watcher?.stop(); });   // the boot one, for a
 | Option | Default | What it does |
 |---|---|---|
 | `sweepMs` | `15_000` | sweep interval; a slow sweep skips a tick rather than overlapping |
-| `verdictGraceMs` | `max(sweepMs, 1000)` | how long a standing verdict must sit unconsumed before it counts as a dropped wake |
+| `verdictGraceMs` | `max(sweepMs, 1000)` | compatibility-named grace before a standing verdict, Relay, System intent, or input is recovered |
 | `relinkGraceMs` | `max(sweepMs, 1000)` | how old a child session must be before the sweep will re-link it |
 
-Four cases, each sweep:
+Four recovery classes share the watcher:
 
 1. **Orphan claim** — an active phase (`streaming`, `calling`, `retrying`,
-   `compacting`) with no live lease. Re-runs the turn through the ordinary
-   deferred path with the registry's config, so a recovered turn is identical to
-   a user-initiated one.
+   `compacting`) with no live Lease. Activation re-derives the Agent and queues
+   the same Turn path used after an ordinary call.
 2. **Approval timeout** — a `gate: 'ask'` park older than the agent's
    `budget.approval`. Records a denied verdict (`reason: 'approval timed out'`,
    `timedOut: true`, `by: null`) through the same single-winner conditional write
    a human verdict takes, and the turn continues. An agent with no
    `budget.approval` is *skipped*, never defaulted — unset means "wait for a human".
-3. **Standing verdict** — a verdict recorded whose deferred resume died before
-   consuming it. Excludes `stopped`, `error`, `awaiting` (`DECIDED_PHASES`).
+3. **Standing activation evidence** — a verdict, Relay, System intent, or
+   committed input whose immediate activation did not finish. Halted and parked
+   Sessions remain decided rather than being revived.
 4. **Orphaned child** — a subagent dispatch that died between creating the child
    session and committing its result. Writes one `role: 'note',
    kind: 'orphan-child'` row into the *parent* transcript carrying
    `childSessionId` and `childAgent`. A pointer and nothing else: a sweep never
    deletes session data.
 
-Racing servers need no new coordination — cases 1 and 3 both end in a wake, so
-`claimLease` decides them; the verdict's conditional write decides 2; and case
-4's note has a derived `_id` (`orphan-child-<childId>`), so the loser's insert
-is a duplicate key it swallows. `tests/watcher.test.ts` runs two watchers
-against one orphan and against one timed-out approval, and asserts each is done
-exactly once.
+Racing servers need no new coordination. Cases 1 and 3 nudge Activation, then
+the Turn's exact `claimLease` decides the runner; the verdict's conditional write
+decides 2; and case 4's note has a derived `_id` (`orphan-child-<childId>`), so
+the loser's insert is a duplicate key it swallows. `tests/watcher.test.ts` runs
+two watchers against one orphan and against one timed-out approval, and asserts
+each is done exactly once.
+
+Activation has no public import and requires no application migration. Continue
+to use `Agent#send`, `#approve`, `#deny`, `#systemTurn`, and `startWatcher`.
 
 **In production:** leave it on. Every server running one is safe, and the
 warning you *will* eventually see — a session naming an agent you renamed or
@@ -2126,15 +2156,18 @@ nothing at all.
 
 Runs at startup, after the capped-collection check and before anything serves.
 Mongo creates exactly one index for you — `_id` — so the package creates the
-three its own queries need (the transcript read, and the sweep's two scans),
-listed in [the README's Operations section](../app/packages/agent/README.md#operations).
-Idempotent, so it runs on every boot; **non-fatal**, because a locked-down Atlas
-user may not hold `createIndex`, and refusing to boot over a performance index
-trades a slow deployment for no deployment. A failure logs `could not create the
-agent_messages index …; the package still works, its queries are just
-unindexed` — if that is in your logs, create the three by hand. It is exported
-(`import { ensureIndexes } from 'meteor/10thfloor:agent'`) so a host app can
-also run it itself, under a different connection.
+indexes its Transcript, Activation, Lifecycle, Channel, Attachment, and Memory
+queries need, listed in [the README's Operations section](../app/packages/agent/README.md#operations).
+The set is idempotent, so it runs on every boot. Most creation failures warn and
+continue: the query remains correct but scans more history. A failed unique
+Memory-key index is called out separately because keyed saves are not race-safe
+until duplicate rows are repaired and that index exists. `ensureIndexes` is
+exported so a host can run the same definitions under a different connection:
+
+```ts
+import { ensureIndexes } from 'meteor/10thfloor:agent';
+await ensureIndexes();
+```
 
 ### A worked failure drill
 
@@ -2212,12 +2245,11 @@ one `sweepMs` tick (15s). Then `db.agent_messages.find().sort({ seq: 1 })` shows
 the user row and exactly one assistant row with the complete text — never two,
 and never a half.
 
-### Mongo must be a replica set
+### Mongo must support transactions
 
-On a standalone server there is no oplog and no change streams, so Meteor's
-observers fall back to ~10s polling. Recovery still works — the sweep carries it
-and needs no observer at all — but the watcher's fast path, token streaming, and
-`status()`/`usage()` reactivity all degrade to that cadence. Streaming chat on
-standalone Mongo feels like a teleprinter: ten seconds of nothing, then a
-paragraph. Atlas, or a single-node `--replSet`, is enough. This is Meteor's
-constraint, not this package's.
+Transcript commits transactionally pair every dependent Message/reservation
+insert with its Session Lifecycle guard. That is what makes erasure final even
+when another server had a database write in flight. Use a replica set or sharded
+cluster; Atlas qualifies, and a single-node `--replSet` is enough for
+self-hosting. A standalone production `mongod` is unsupported (and would also
+degrade Meteor observers to slow polling).

@@ -55,6 +55,69 @@ describe('attachment downloads', () => {
       'a ref is a capability only inside its own conversation');
   });
 
+  it('rolls token insertion back with its Session operation guard', async function () {
+    this.timeout(20000);
+    await clean();
+    await seed();
+    const { AttachmentDownloadTokens, issueAttachmentToken } = await import('../server/downloads');
+    let holder = Object.getPrototypeOf(AttachmentDownloadTokens.rawCollection());
+    while (holder && !Object.prototype.hasOwnProperty.call(holder, 'insertOne')) {
+      holder = Object.getPrototypeOf(holder);
+    }
+    if (!holder) throw new Error('Mongo raw Collection has no insertOne implementation');
+    const descriptor = Object.getOwnPropertyDescriptor(holder, 'insertOne')!;
+    const original = descriptor.value;
+    Object.defineProperty(holder, 'insertOne', {
+      ...descriptor,
+      value: async function failAfterInsert(doc: any, ...rest: any[]) {
+        const result = await original.call(this, doc, ...rest);
+        if (doc.sessionId === 'dl1' && doc.attachmentId === 'attD1') {
+          throw new Error('injected download-token transaction failure');
+        }
+        return result;
+      },
+    });
+    try {
+      let failure: unknown;
+      try {
+        await issueAttachmentToken('dl1', 'attD1');
+      } catch (error) {
+        failure = error;
+      }
+      assert.match(String((failure as Error)?.message), /injected download-token/);
+      assert.isUndefined(
+        await AttachmentDownloadTokens.findOneAsync({ sessionId: 'dl1' }),
+        'a failed guarded transaction leaves no capability behind',
+      );
+    } finally {
+      Object.defineProperty(holder, 'insertOne', descriptor);
+    }
+  });
+
+  it('does not mint for a child after its lifecycle root is fenced', async function () {
+    this.timeout(20000);
+    await clean();
+    await seed();
+    const { AgentSessions } = await import('../common/collections');
+    const { AgentAttachments } = await import('../server/attachments');
+    const { issueAttachmentToken } = await import('../server/downloads');
+    const now = new Date();
+    await AgentSessions.insertAsync({
+      _id: 'dl-child', agent: 'dl-agent', userId: 'owner-1', phase: 'idle', model: 'mock',
+      nextSeq: 0, usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      parent: { sessionId: 'dl1', toolCallId: 'dl-child-call' },
+      createdAt: now, updatedAt: now,
+    });
+    await AgentAttachments.insertAsync({
+      _id: 'att-child', sessionId: 'dl-child', name: 'child.txt', contentType: 'text/plain',
+      size: 7, content: b64('private'), origin: 'tool', createdAt: now,
+    });
+    await AgentSessions.updateAsync('dl1', { $set: { erasingAt: new Date() } });
+
+    assert.isNull(await issueAttachmentToken('dl-child', 'att-child'));
+  });
+
   it('the method authorizes like the publication: owner, roster member, nobody else', async function () {
     this.timeout(20000);
     await clean();
@@ -129,5 +192,32 @@ describe('attachment downloads', () => {
     const token = (await issueAttachmentToken('dl1', 'attD1'))!;
     await AgentAttachments.removeAsync({ _id: 'attD1' });
     assert.equal((await handleDownload(token)).status, 404);
+  });
+
+  it('releases the Session operation when attachment decoding throws', async function () {
+    this.timeout(20000);
+    await clean();
+    await seed();
+    const { AgentSessions } = await import('../common/collections');
+    const { AgentAttachments } = await import('../server/attachments');
+    const { issueAttachmentToken, redeemAttachmentToken } = await import('../server/downloads');
+    const token = (await issueAttachmentToken('dl1', 'attD1'))!;
+
+    // Simulate a corrupted legacy row. Buffer.from(null, 'base64') throws only
+    // after redemption has acquired its Session operation.
+    await (AgentAttachments as any).updateAsync('attD1', { $set: { content: null } });
+    let threw = false;
+    try {
+      await redeemAttachmentToken(token);
+    } catch {
+      threw = true;
+    }
+
+    assert.isTrue(threw, 'the malformed stored bytes exercise the failure path');
+    assert.deepEqual(
+      (await AgentSessions.findOneAsync('dl1'))?.operations ?? [],
+      [],
+      'a failed download must not leave an operation that blocks erasure',
+    );
   });
 });

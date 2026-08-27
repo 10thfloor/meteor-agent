@@ -254,9 +254,13 @@ describe('agent-channel-telegram', () => {
       const { telegramTransport } = await import('meteor/10thfloor:agent-channel-telegram');
       const { calls, fetchImpl } = fakeFetch({ ok: true, result: { message_id: 77 } });
       const transport = telegramTransport({ botToken: '123:ABC', fetchImpl });
-      const posted = await transport.post({ chatId: 4242 }, { text: 'hi' }, { idempotencyKey: 'k' });
+      const abort = new AbortController();
+      const posted = await transport.post(
+        { chatId: 4242 }, { text: 'hi' }, { idempotencyKey: 'k', signal: abort.signal },
+      );
       assert.deepEqual(posted, { providerMessageId: '77' });
       assert.include(calls[0].url, '/bot123:ABC/sendMessage');
+      assert.strictEqual(calls[0].init.signal, abort.signal);
       const body = JSON.parse(calls[0].init.body);
       assert.equal(body.chat_id, 4242);
       assert.equal(body.text, 'hi');

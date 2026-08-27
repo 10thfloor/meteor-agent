@@ -235,14 +235,16 @@ describe('agent-channel-email', () => {
         return { ok: true, json: async () => ({ ErrorCode: 0, MessageID: 'pm-out-1' }) };
       }) as unknown as typeof fetch;
       const transport = emailTransport({ serverToken: 'tok', from: 'Agent <agent@example.com>', inboundAddress: 'agent@inbound.test', fetchImpl });
+      const abort = new AbortController();
       const posted = await transport.post(
         { to: 'ada@example.com', subject: 'Re: Order', rootMessageId: 'm1@example.com', replyKey: 'abc' },
         { Subject: 'Re: Order', TextBody: 'On its way.', To: 'attacker@evil.test' },
-        { idempotencyKey: 'deliver:email:abc:m9' },
+        { idempotencyKey: 'deliver:email:abc:m9', signal: abort.signal },
       );
       assert.deepEqual(posted, { providerMessageId: 'pm-out-1' });
       assert.equal(calls[0].url, 'https://api.postmarkapp.com/email');
       assert.equal(calls[0].init.headers['x-postmark-server-token'], 'tok');
+      assert.strictEqual(calls[0].init.signal, abort.signal);
       const body = JSON.parse(calls[0].init.body);
       assert.equal(body.To, 'ada@example.com', 'a payload To cannot redirect the post');
       assert.equal(body.ReplyTo, 'agent+abc@inbound.test');
@@ -291,10 +293,22 @@ describe('agent-channel-email', () => {
     };
 
     beforeEach(async () => {
-      const { DeliveryReceipts, AgentAttachments, ChannelIdentities } = await import('meteor/10thfloor:agent');
+      const {
+        DeliveryReceipts, AgentAttachments, AgentSessions, ChannelIdentities,
+      } = await import('meteor/10thfloor:agent');
       await (DeliveryReceipts as any).removeAsync({});
       await (AgentAttachments as any).removeAsync({});
+      await (AgentSessions as any).removeAsync({ _id: { $in: ['s1', 's2', 's3'] } });
       await (ChannelIdentities as any).removeAsync({});
+      for (const [_id, userId] of [['s1', 'u1'], ['s2', 'u2'], ['s3', null]] as const) {
+        // eslint-disable-next-line no-await-in-loop
+        await (AgentSessions as any).insertAsync({
+          _id, agent: 'email-test', userId, phase: 'idle', model: 'mock', nextSeq: 0,
+          usage: { input: 0, output: 0, cost: 0 },
+          budgetSpent: { turns: 0, toolCalls: 0 },
+          createdAt: new Date(), updatedAt: new Date(),
+        });
+      }
     });
 
     it('requires a recipients policy and gates ask by default', async () => {
@@ -549,6 +563,96 @@ describe('agent-channel-email', () => {
       assert.equal(child.reason, 'session-cannot-continue', "a subagent's private child cannot either");
     });
 
+    it('holds erasure through post-delivery reconciliation and purges recipient PII', async function () {
+      this.timeout(15000);
+      await cleanLoop();
+      const {
+        Agent, mockProvider, ChannelBindings, AgentSessions,
+      } = await import('meteor/10thfloor:agent');
+      const {
+        composeEmailTool, email, threadKey,
+      } = await import('meteor/10thfloor:agent-channel-email');
+      const { fetchImpl } = fakePostmark();
+      new (Agent as any)('email-erase-agent', {
+        model: 'mock', instructions: '', provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      (Agent as any).channel('em-erase', email({
+        agent: 'email-erase-agent', serverToken: 't', from: 'a@ourco.com',
+        inboundAddress: 'inbound@ourco.com', webhookUser: 'hook', webhookPassword: 'pw',
+        fetchImpl,
+      } as any));
+      const tool = composeEmailTool({
+        serverToken: 't', from: 'a@ourco.com', inboundAddress: 'inbound@ourco.com',
+        recipients: ['private-recipient@ourco.com'], onReply: 'continue',
+        kind: 'em-erase', fetchImpl,
+      } as any);
+      await seedComposing('sc-erase-compose', 'email-erase-agent');
+
+      const key = threadKey('compose:sc-erase-compose:private-recipient@ourco.com');
+      const bindingId = `em-erase:${key}`;
+      const originalRawCollection = (ChannelBindings as any).rawCollection;
+      const rawBindings: any = originalRawCollection.call(ChannelBindings);
+      let enteredReconciliation!: () => void;
+      let releaseReconciliation!: () => void;
+      const entered = new Promise<void>((resolve) => { enteredReconciliation = resolve; });
+      const blocked = new Promise<void>((resolve) => { releaseReconciliation = resolve; });
+      let released = false;
+      const interceptedBindings = Object.create(rawBindings);
+      interceptedBindings.updateOne = async function (
+        filter: Record<string, unknown>, update: Record<string, unknown>, options: Record<string, unknown>,
+      ) {
+        if (filter?._id === bindingId && update?.$setOnInsert && options?.session) {
+          enteredReconciliation();
+          await blocked;
+        }
+        return rawBindings.updateOne(filter, update, options);
+      };
+      (ChannelBindings as any).rawCollection = () => interceptedBindings;
+
+      let sending: Promise<any> | undefined;
+      let erasing: Promise<any> | undefined;
+      try {
+        sending = tool.run(
+          { to: 'private-recipient@ourco.com', subject: 'Private', body: 'Private body' },
+          { userId: 'owner-1', sessionId: 'sc-erase-compose', toolCallId: 'tc-erase-compose' } as any,
+        ) as Promise<any>;
+        await entered;
+
+        let erased = false;
+        erasing = new (Agent as any)('email-erase-agent')
+          .erase('sc-erase-compose', { userId: 'owner-1' })
+          .then((result: unknown) => { erased = true; return result; });
+        await new Promise((resolve) => setTimeout(resolve, 40));
+        assert.isFalse(
+          erased,
+          'erase cannot complete while confirmed delivery is reconciling its recipient writes',
+        );
+
+        released = true;
+        releaseReconciliation();
+        const outcome = await sending;
+        assert.isTrue(outcome.sent);
+        assert.equal(await erasing, 'erased');
+        assert.isUndefined(await (AgentSessions as any).findOneAsync('sc-erase-compose'));
+        assert.isUndefined(await (ChannelBindings as any).findOneAsync(bindingId));
+        assert.equal(
+          await (ChannelBindings as any).find({
+            $or: [
+              { externalUserId: 'private-recipient@ourco.com' },
+              { 'destination.to': 'private-recipient@ourco.com' },
+            ],
+          }).countAsync(),
+          0,
+          'neither the recipient identity nor destination survives Session erasure',
+        );
+      } finally {
+        (ChannelBindings as any).rawCollection = originalRawCollection;
+        if (!released) releaseReconciliation();
+        await Promise.allSettled([sending, erasing].filter(Boolean) as Promise<unknown>[]);
+        await cleanLoop();
+      }
+    });
+
     it('mints the key, pre-binds member-shaped, joins the roster — and the reply continues the session', async function () {
       this.timeout(15000);
       await cleanLoop();
@@ -605,6 +709,24 @@ describe('agent-channel-email', () => {
         session.participants.find((p: any) => p.id === 'x:em-loop:dana@ourco.com').addedBy,
         'm:email-loop-agent',
       );
+
+      // Simulate the precise crash window this seam closes: the provider
+      // receipt is already settled, but its derived local reconciliation is
+      // missing. Replaying the same tool call must repair locally, not re-mail.
+      await (ChannelBindings as any).removeAsync(`em-loop:${key}`);
+      await (AgentSessions as any).updateAsync('sc1', {
+        $pull: { participants: { id: 'x:em-loop:dana@ourco.com' } },
+      });
+      const recovered: any = await tool.run(
+        { to: 'Dana@OurCo.com', subject: 'Q3 numbers', body: 'Please review.' },
+        { userId: 'owner-1', sessionId: 'sc1', toolCallId: 'tc-l1' } as any,
+      );
+      assert.isTrue(recovered.sent);
+      assert.equal(sends.length, 1, 'a settled receipt repairs without another provider post');
+      assert.isDefined(await (ChannelBindings as any).findOneAsync(`em-loop:${key}`));
+      assert.isDefined((await (AgentSessions as any).findOneAsync('sc1')).participants.find(
+        (p: any) => p.id === 'x:em-loop:dana@ourco.com',
+      ));
 
       // A SECOND compose to the same recipient adopts — one conversation, one
       // binding, one roster row, two mails.
