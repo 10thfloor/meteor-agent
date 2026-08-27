@@ -71,7 +71,8 @@ export interface CreateAttachmentOptions {
     caps?: AttachmentCaps;
 }
 /** Insert one file and return its ref. Enforces per-file cap always, and
- *  per-message count/total caps when staging. Refusals are `Meteor.Error`s. */
+ *  per-message count/total caps when staging. Refusals are `Meteor.Error`s.
+ *  The Session must exist and not be undergoing erasure. */
 export declare function createAttachment(opts: CreateAttachmentOptions): Promise<AttachmentRef>;
 /** Claim staged refs for the turn-final assistant row. Single-winner per row;
  *  crash-recovery re-stages idempotently via `createAttachment`. */

@@ -220,7 +220,7 @@ export declare function evaluateGate(tool: ResolvedTool | undefined, ctx: GateCo
 export declare function resolveTools(specs: ToolSpec[]): ResolvedTool[];
 /** Discover MCP catalogs (concurrent) and expand whole-server specs.
  *  App-authored names always win over discovered MCP names. */
-export declare function expandMcpTools(tools: ResolvedTool[]): Promise<ResolvedTool[]>;
+export declare function expandMcpTools(tools: ResolvedTool[], reservedNames?: readonly string[]): Promise<ResolvedTool[]>;
 /** On-demand instructions: listed in the prompt, loaded via the `skill` tool. */
 export interface Skill {
     /** Letters, digits and hyphens, 1-64 characters. It is what the model passes

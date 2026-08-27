@@ -1,12 +1,16 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
-import { ACTIVE_PHASES, type AgentSession, type SessionInc } from '../common/types';
+import { ACTIVE_PHASES, type AgentSession } from '../common/types';
 import { modelFrom } from '../common/participants';
 import { buildRunConfig, getAgent } from './registry';
 import { guardedUpdate, SERVER_ID } from './lease';
 import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
 // Type-only: runTurn is passed in by the loop to avoid a cyclic import.
 import type { RunConfig } from './loop';
+import {
+  beginSessionMutationOperation, withSessionOperationTransaction,
+} from './session-operations';
+import { insertInitialTranscript } from './transcript';
 
 /** Fork-bomb bound: each nesting level multiplies model calls. */
 export const MAX_SUBAGENT_DEPTH = 3;
@@ -154,7 +158,9 @@ export async function runSubagent(
     return { result: failure('invalid-args', verdict.reason) };
   }
 
-  const parent = await AgentSessions.findOneAsync(ctx.sessionId);
+  const parent = await AgentSessions.findOneAsync({
+    _id: ctx.sessionId, erasingAt: { $exists: false },
+  });
   if (!parent) return { result: failure('subagent-failed', 'The calling session is gone.') };
 
   // Check depth before any write to bound runaway chains.
@@ -189,8 +195,9 @@ export async function runSubagent(
   }
 
   const childSessionId = Random.id();
-
-  await AgentSessions.insertAsync({
+  const childMessageId = Random.id();
+  const now = new Date();
+  const child: AgentSession = {
     _id: childSessionId,
     agent: name,
     userId,
@@ -208,46 +215,74 @@ export async function runSubagent(
         ...parent.participants.filter((p) => p.kind === 'human'),
         {
           id: `m:${name}`, kind: 'model' as const, role: 'member' as const,
-          agent: name, displayName: name, joinedAt: new Date(),
+          agent: name, displayName: name, joinedAt: now,
         },
       ],
     } : {}),
-    createdAt: new Date(),
-    updatedAt: new Date(),
-  });
+    createdAt: now,
+    updatedAt: now,
+  };
 
-  // Set activeChild before the run so clients can find the streaming child.
-  await guardedUpdate(ctx.sessionId, SERVER_ID, {
-    $set: { activeChild: { sessionId: childSessionId, toolCallId: ctx.toolCallId ?? '' } },
-  });
+  const parentOperation = await beginSessionMutationOperation(ctx.sessionId);
+  if (!parentOperation) {
+    return { result: failure('subagent-failed', 'The calling session is no longer writable.') };
+  }
+  let born = false;
+  try {
+    born = await withSessionOperationTransaction(parentOperation, async (mongoSession) => {
+      // Parent Lease, active-child marker, child Session, and first Message are
+      // one birth transaction. A crash cannot strand an unowned child or an
+      // activeChild pointer to a transcript that never materialized.
+      const activated = await AgentSessions.rawCollection().updateOne(
+        {
+          _id: ctx.sessionId,
+          'lease.serverId': SERVER_ID,
+          erasingAt: { $exists: false },
+          purgingAt: { $exists: false },
+        },
+        {
+          $set: {
+            activeChild: { sessionId: childSessionId, toolCallId: ctx.toolCallId ?? '' },
+            updatedAt: now,
+          },
+        },
+        { session: mongoSession },
+      );
+      if (activated.matchedCount !== 1) return false;
+      await insertInitialTranscript(mongoSession, child, {
+        _id: childMessageId,
+        role: 'user',
+        content: prompt,
+        // Attribute to the parent model, not the owner — it's a delegation.
+        ...(parent.participants?.length ? { from: modelFrom(parent.agent) } : {}),
+        createdAt: now,
+      });
+      return true;
+    });
+  } catch {
+    // A transaction may commit even if its final acknowledgement is lost.
+    // Adopt only the exact atomic birth; otherwise report a generic failure.
+    const [standingChild, standingMessage, standingParent] = await Promise.all([
+      AgentSessions.findOneAsync(childSessionId),
+      AgentMessages.findOneAsync({ sessionId: childSessionId, seq: 0 }),
+      AgentSessions.findOneAsync(ctx.sessionId),
+    ]);
+    born = standingChild?.parent?.sessionId === ctx.sessionId
+      && standingChild.parent.toolCallId === (ctx.toolCallId ?? '')
+      && standingMessage?.content === prompt
+      && standingParent?.activeChild?.sessionId === childSessionId;
+    if (!born) {
+      console.error(`[10thfloor:agent] subagent "${name}" could not be created`);
+    }
+  } finally {
+    await parentOperation.close();
+  }
+  if (!born) {
+    return { result: failure('subagent-failed', 'The calling session is no longer writable.') };
+  }
 
   try { // outer: the finally at the end clears activeChild on every exit
   try {
-    // Atomic seq allocation (same pattern as agent.send).
-    const before = await AgentSessions.rawCollection().findOneAndUpdate(
-      { _id: childSessionId },
-      { $inc: { nextSeq: 1, 'budgetSpent.turns': 1 } satisfies SessionInc, $set: { updatedAt: new Date() } },
-      { returnDocument: 'before' },
-    ) as unknown as AgentSession | null;
-    if (!before) {
-      return {
-        result: failure('subagent-failed', 'The child session vanished before it could start.'),
-        childSessionId,
-      };
-    }
-
-    await AgentMessages.insertAsync({
-      _id: Random.id(),
-      sessionId: childSessionId,
-      seq: before.nextSeq,
-      role: 'user',
-      content: prompt,
-      // Attribute to the parent model, not the owner — it's a delegation.
-      ...(parent.participants?.length
-        ? { from: modelFrom(parent.agent) } : {}),
-      createdAt: new Date(),
-    });
-
     await runTurn(childSessionId, buildRunConfig(config, userId));
   } catch {
     // Harness failure — never expose the raw message in the transcript.

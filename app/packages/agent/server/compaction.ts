@@ -5,15 +5,13 @@ import type { ProviderMessage, ToolSchema } from './providers/types';
 import {
   claimLease, guardedUpdate, heartbeat, releaseLease, HEARTBEAT_MS, SERVER_ID,
 } from './lease';
+import { prepareToolRuntime } from './tool-runtime';
+import { runProviderExchange } from './provider-exchange';
 import {
-  expandMcpTools, resolveTools, toolSchemas, withSkillTool,
-} from './tools';
-import { runBeforeProviderRequest } from './hooks';
-import {
-  accruedCost, allocateSeq, classifyProviderError, running,
+  accruedCost, classifyProviderError, running,
 } from './turn-state';
 import {
-  batchSafeBoundary, toProviderMessages, type TranscriptView,
+  batchSafeBoundary, commitLeasedMessage, toProviderMessages, type TranscriptView,
 } from './transcript';
 import { modelParticipantId } from '../common/participants';
 import { getAgent, resolveProvider } from './registry';
@@ -150,18 +148,14 @@ async function compactNow(
 
   let summary = '';
   let usage = { input: 0, output: 0 } as { input: number; output: number; cost?: number };
-  // Poll for stop and abort the summarization request — no consuming-loop
-  // interrupt check covers this standalone provider call.
-  const abort = new AbortController();
-  const poll = setInterval(() => {
-    void AgentSessions.findOneAsync(sessionId)
-      .then((s) => { if (!s || s.phase === 'stopped') abort.abort(); })
-      .catch(() => { /* best-effort */ });
-  }, interruptCheckMs);
-  try {
-    // Hook seam: apps can replace the summarizer via `purpose === 'compaction'`.
-    // `signal` is re-stamped below; cancellation is the harness's job.
-    const request = await runBeforeProviderRequest({
+  // Hook ordering, signal ownership, and stop observation are shared with an
+  // ordinary Turn through the private Provider Exchange Module.
+  const exchange = await runProviderExchange({
+    sessionId,
+    provider: billing.provider,
+    interruptCheckMs,
+    context: { agent, sessionId, purpose: 'compaction' },
+    request: {
       model: billing.model,
       system:
         'You compact conversation history for an agent. Produce a concise brief '
@@ -182,33 +176,32 @@ async function compactNow(
       ],
       // Anthropic rejects tool_use blocks without a `tools` parameter.
       tools: schemas,
-    }, { agent, sessionId, purpose: 'compaction' });
-    for await (const chunk of billing.provider.stream({ ...request, signal: abort.signal })) {
+    },
+    onChunk(chunk) {
       if (chunk.kind === 'text') summary += chunk.chunk;
       else if (chunk.kind === 'done' && chunk.usage) usage = chunk.usage;
-    }
-  } catch (e) {
+    },
+  });
+  if (exchange.kind === 'interrupted') return false;
+  if (exchange.kind === 'failed') {
     // Abort = user's stop mid-summarization; anything else is degraded, not fatal.
-    if (classifyProviderError(e) !== 'abandon') {
+    if (classifyProviderError(exchange.error) !== 'abandon') {
       console.warn('[10thfloor:agent] compaction failed; proceeding uncompacted');
     }
     return false;
-  } finally {
-    clearInterval(poll);
   }
   if (!summary.trim()) return false;
 
   // Accrue usage/cost atomically with the note's seq allocation.
-  const noteSeq = await allocateSeq(sessionId, {
+  const noteSeq = await commitLeasedMessage(sessionId, {
+    _id: Random.id(), role: 'note', kind: 'compaction',
+    summary, upto, usage, createdAt: new Date(),
+  }, { inc: {
     'usage.input': usage.input,
     'usage.output': usage.output,
     'usage.cost': accruedCost(usage, billing.pricing),
-  });
+  }, unlessStopped: true });
   if (noteSeq === null) return false;
-  await AgentMessages.insertAsync({
-    _id: Random.id(), sessionId, seq: noteSeq, role: 'note', kind: 'compaction',
-    summary, upto, usage, createdAt: new Date(),
-  });
   return true;
 }
 
@@ -255,14 +248,24 @@ export async function compactSession(
       void heartbeat(sessionId).catch(() => { /* the guards catch a lost lease */ });
     }, HEARTBEAT_MS);
     try {
-      // Tool schemas needed because the compacted head carries tool_use blocks.
-      const tools = withSkillTool(
-        await expandMcpTools(resolveTools(config.tools)), config.skills,
-      );
+      // Tool schemas are prepared through the same catalog as an ordinary
+      // Turn because the compacted head may carry any of its tool_use blocks.
+      const selfAgent = config.agentName ?? session.agent;
+      const prepared = await prepareToolRuntime({
+        specs: config.tools,
+        skills: config.skills,
+        memory: config.memory
+          ? {
+            config: config.memory,
+            session,
+            agent: selfAgent,
+          }
+          : undefined,
+      });
       const history = await AgentMessages
         .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
       const did = await compactNow(
-        sessionId, session.agent, config, history, toolSchemas(tools),
+        sessionId, session.agent, config, history, prepared.schemas,
         config.interruptCheckMs ?? 250,
       );
       return did ? 'compacted' : 'nothing';

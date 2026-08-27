@@ -1,9 +1,9 @@
 import { assert } from 'chai';
 import type { Provider } from '../server/providers/types';
 
-/** Deferred work (the turn a watcher wakes, the resume a verdict schedules)
- *  exposes no promise to await, so every wait here is bounded by a deadline and
- *  fails loudly rather than hanging the suite. */
+/** Activation nudges expose no promise for the Turn they may start, so every
+ *  wait here is bounded by a deadline and fails loudly rather than hanging the
+ *  suite. */
 const waitFor = async (cond: () => Promise<boolean>, label: string, ms = 20000) => {
   const deadline = Date.now() + ms;
   for (;;) {
@@ -104,8 +104,8 @@ const noteCount = async (parentId: string): Promise<number> => {
 /**
  * Park a real session on an ask-gated tool, exactly as a run does.
  *
- * Registration is load-bearing: the watcher resumes through the REGISTRY
- * config (`getAgent` + `deferTurn`), so the tools and provider it finds have to
+ * Registration is load-bearing: Activation resolves the Session's Agent from
+ * the registry before starting a Turn, so the tools and provider it finds must
  * be the same objects this fixture parked with. The provider answers the first
  * call with the gated tool call and the second with plain text, so a resumed
  * turn that reaches the think loop leaves a SECOND assistant row — the signal
@@ -142,7 +142,7 @@ const parkFixture = async (
 };
 
 describe('orphan-claim watcher', () => {
-  it('claims an orphan the observer sees enter an active phase', async function () {
+  it('claims an orphan the Activation observer sees enter an active phase', async function () {
     this.timeout(60000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
     const { Agent } = await import('../server/agent');
@@ -154,17 +154,17 @@ describe('orphan-claim watcher', () => {
       model: 'mock', instructions: '', tools: [],
       provider: mockProvider(() => ({ text: 'recovered' })),
     });
-    // Seeded 'idle', so the session is OUTSIDE the observer's selector until the
-    // update below — and the sweep interval is longer than this whole test, so
-    // only the observer can be responsible for what happens next.
+    // Seeded 'idle', so the Session is outside Activation recovery's observer
+    // selector until the update below. The sweep interval is longer than this
+    // whole test, so only the observer can be responsible for what happens next.
     await seedSession('s-obs', 'watch-observer', {
       lease: { serverId: 'dead-server', until: new Date(Date.now() - 60_000) },
     });
 
     const w = startWatcher({ sweepMs: 600_000 });
     try {
-      // Let observeChangesAsync resolve first, so the change below is what the
-      // observer reacts to rather than its initial fetch.
+      // Let Activation's observer resolve first, so the change below is what it
+      // reacts to rather than its initial fetch.
       await settle(250);
       await AgentSessions.updateAsync('s-obs', {
         $set: { phase: 'streaming', updatedAt: new Date() },
@@ -174,15 +174,65 @@ describe('orphan-claim watcher', () => {
       // poll-and-diff, whose default interval is 10s.
       await waitFor(
         () => finished('s-obs', 1),
-        'the observer to claim the orphan and finish its turn',
+        'the Activation observer to claim the orphan and finish its Turn',
         40000,
       );
 
       const msg = await AgentMessages.findOneAsync({ sessionId: 's-obs', role: 'assistant' });
-      assert.equal(msg!.content, 'recovered', 'the recovered turn runs the registry config');
+      assert.equal(msg!.content, 'recovered', 'the recovered Turn runs the Agent config');
       const doc = (await AgentSessions.findOneAsync('s-obs'))!;
       assert.equal(doc.phase, 'idle', 'a recovered turn ends in a normal terminal phase');
       assert.isUndefined(doc.lease, 'and releases the lease it claimed');
+    } finally {
+      await w.stop();
+    }
+  });
+
+  it('honors a heartbeat-only Lease renewal instead of activating at the old expiry', async function () {
+    this.timeout(20000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { startWatcher } = await import('../server/watcher');
+
+    await reset();
+    let providerCalls = 0;
+    new Agent('watch-live-heartbeat', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => {
+        providerCalls += 1;
+        return { text: 'should not run' };
+      }),
+    });
+    await seedSession('s-live-heartbeat', 'watch-live-heartbeat', {
+      phase: 'streaming',
+      lease: { serverId: 'another-server', until: new Date(Date.now() + 1200) },
+    });
+
+    const w = startWatcher({ sweepMs: 40 });
+    try {
+      await settle(200);
+
+      // A live owner changes only its Lease deadline. Recovery must honor the
+      // renewed ownership even after the old deadline has passed.
+      const renewedUntil = new Date(Date.now() + 60_000);
+      await AgentSessions.updateAsync('s-live-heartbeat', {
+        $set: { 'lease.until': renewedUntil },
+      } as any);
+      await settle(1300);
+
+      assert.equal(providerCalls, 0, 'Activation must not start the Agent');
+      assert.equal(
+        await AgentMessages.find({
+          sessionId: 's-live-heartbeat', role: 'assistant',
+        }).countAsync(),
+        0,
+        'a heartbeat-only Lease renewal must not produce a Turn',
+      );
+      const doc = (await AgentSessions.findOneAsync('s-live-heartbeat'))!;
+      assert.equal(doc.phase, 'streaming', 'the owning Turn remains live');
+      assert.equal(doc.lease?.serverId, 'another-server');
+      assert.isAbove(doc.lease!.until.getTime(), Date.now(), 'the renewed Lease remains live');
     } finally {
       await w.stop();
     }
@@ -200,10 +250,9 @@ describe('orphan-claim watcher', () => {
       model: 'mock', instructions: '', tools: [],
       provider: mockProvider(() => ({ text: 'swept up' })),
     });
-    // The belt, not the braces. This session is in an active phase with a LIVE
-    // lease when the watcher starts — the observer's initial pass sees a healthy
-    // run — and the lease then expires with no write of any kind. There is
-    // nothing for an observer to observe, which is exactly why the sweep exists.
+    // The belt, not the braces. This Session is in an active phase with a live
+    // Lease when Activation recovery starts, so its observer leaves the Turn
+    // alone. The Lease then expires with no write; only the sweep can recover it.
     await seedSession('s-sweep', 'watch-sweep', {
       phase: 'streaming',
       lease: { serverId: 'dead-server', until: new Date(Date.now() + 1200) },
@@ -407,9 +456,9 @@ describe('orphan-claim watcher', () => {
     const { startWatcher } = await import('../server/watcher');
 
     await reset();
-    // The sessions collection outlives any deployment's defineAgent calls: a
-    // renamed or retired agent is an ordinary consequence of shipping, and must
-    // not crash the sweep that would have recovered every other session.
+    // The Sessions collection outlives any deployment's Agent registrations: a
+    // renamed or retired Agent is an ordinary consequence of shipping, and must
+    // not stop Activation recovery from considering every other Session.
     await seedSession('s-unregistered', 'watch-agent-that-never-existed', {
       phase: 'streaming',
       lease: { serverId: 'dead-server', until: new Date(Date.now() - 60_000) },
@@ -421,7 +470,7 @@ describe('orphan-claim watcher', () => {
     const w = startWatcher({ sweepMs: 60 });
     try {
       await waitFor(
-        async () => warnings.some((m) => m.includes('unregistered agent')),
+        async () => warnings.some((m) => m.includes('watch-agent-that-never-existed')),
         'a warning about the skipped session',
       );
       await settle(200);
@@ -451,11 +500,10 @@ describe('orphan-claim watcher', () => {
     await reset();
     const state = await parkFixture('s-standing', 'watch-standing');
 
-    // The liveness gap the loop's wake self-check cannot close: a verdict
-    // written exactly as `agent.approve` writes it, with no surviving process
-    // behind the resume it deferred. `updatedAt` backdated past the grace period
-    // is what marks it as DROPPED rather than in flight — the sweep must never
-    // race a legitimate resume that is milliseconds from starting.
+    // The liveness gap an in-process Activation nudge cannot close: a verdict
+    // was committed, then the process died before its local drain claimed the
+    // Lease. Backdating `updatedAt` past the grace period marks the work as
+    // dropped rather than in flight, so recovery does not race a fresh nudge.
     await AgentSessions.updateAsync('s-standing', {
       $set: {
         'pending.verdict': 'approved',

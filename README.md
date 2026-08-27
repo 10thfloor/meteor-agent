@@ -132,10 +132,10 @@ The consequences are the interesting part:
   your existing method through a real `MethodInvocation` — `this.userId`,
   `this.unblock()`, and its own `check()` calls all work untouched. One
   implementation serves your UI and your agent.
-- **Crashes are boring.** Assistant messages commit only at turn boundaries,
-  every write is guarded by a per-session lease, and a watcher on every app
-  server claims orphaned runs. Kill a pod mid-stream and the turn repairs
-  itself and reruns.
+- **Crashes are boring.** Assistant messages commit only at turn boundaries.
+  A watcher on every app server finds durable unfinished work and nudges the
+  private Activation Module; the Turn's exact per-session Lease claim chooses
+  one runner. Kill a pod mid-stream and the Turn repairs itself and reruns.
 - **Humans stay in the loop without holding a process open.** A tool marked
   `gate: 'ask'` *parks* the run — no timer, no waiting promise — and survives
   deploys until someone approves, denies, or a timeout does.
@@ -450,16 +450,18 @@ with a warning — it never kills a turn.
 ## Durability
 
 Kill the server mid-stream. The assistant message was never committed — only
-deltas were, and they are scratch. The lease expires, the watcher claims the
-orphan, and a new server re-runs the turn from the last committed row. One
-assistant row lands, never two, never a half.
+deltas were, and they are scratch. The Lease expires, the watcher finds the
+durable orphan and nudges Activation. A Turn then wins the exact Lease claim and
+re-runs from the last committed row. One assistant row lands, never two, never a
+half.
 
 ```
-provider streaming ──▶ kill -9 ──▶ lease expires (≤30s) ──▶ watcher claims
-  ──▶ new serverId, re-runs turn ──▶ committed, idle
+provider streaming ──▶ kill -9 ──▶ Lease expires (≤30s) ──▶ watcher observes
+  ──▶ Activation nudges ──▶ exact Lease claim ──▶ Turn repairs, commits, idles
 ```
 
-No application code required. The watcher starts at boot on every server.
+No application code or Activation API is required. The watcher starts at boot
+on every server; existing `Agent` calls remain the public entry points.
 
 ## Validation
 
@@ -687,10 +689,9 @@ are authoritative where an older record describes an earlier release.
 ## Requirements
 
 - **Meteor 3.5+** (change streams, async DDP rate limiters, Node 24)
-- **MongoDB as a replica set in production** — on standalone Mongo, Meteor's
-  observers fall back to ~10s polling and streaming feels like a teleprinter.
-  This is Meteor's constraint, not this package's; Atlas or a single-node
-  `--replSet` is fine.
+- **Transaction-capable MongoDB** — a replica set or sharded cluster. Transcript
+  commits pair dependent writes with the Session erasure fence in a transaction;
+  Atlas or a single-node `--replSet` is sufficient.
 - `typebox` for full tool-argument validation.
 - `@earendil-works/pi-ai` as an app dependency unless you bring your own
   provider; `@modelcontextprotocol/sdk` only if you use MCP tools.
@@ -698,11 +699,20 @@ are authoritative where an older record describes an earlier release.
 ## How it holds together
 
 ```
-send() ─▶ method (authorize, atomic seq) ─▶ lease claim ─▶ turn loop
-                                                             │
-   provider stream ──chunks──▶ [capped deltas] ──publication──▶ merged cursor
-                     └──done──▶ [messages]  (committed at boundaries only)
+send() ─▶ authorize ─▶ reserve ─▶ [atomic seq + budget + message + wake]
+                                                                    │
+                 Activation ─▶ exact lease claim ─▶ turn loop       │
+                                                        │           │
+   provider stream ──chunks──▶ [bounded capped deltas] ─┴───────▶ merged cursor
+                     └──done──▶ [atomic Session + message commit]
 ```
+
+The reservation and Activation machinery are private. `Agent.send(sessionId,
+text)` is unchanged: it resolves after the user Message is durable, while a
+compact Session marker remains until the Transcript proves that input was
+answered. A crash at any commit step is reconciled to the same Message and
+sequence without charging the Turn budget twice; the exact Lease claim still
+chooses the single Turn runner.
 
 The design reasoning — the lease model, repair invariants, approval-gate
 semantics, and why the merge walks backward — is preserved in the historical
@@ -721,6 +731,7 @@ app/                                  reference/test host; not an app template
 docs/deployment/                      production-host deployment runbooks
 docs/superpowers/specs/               historical architectural decisions
 scripts/verify-build.sh               proves the loader against a real production bundle
+release.json                          the verified core + channel package set
 deploy/galaxy.settings.example.json   host-app Galaxy settings starting point
 ```
 

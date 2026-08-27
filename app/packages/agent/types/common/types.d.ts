@@ -76,9 +76,9 @@ export interface AgentSession {
         /** Tool's one-line account of the call, from `describe(args, ctx)` at park
          *  time. Absent when no `describe` or it threw. Advisory only. */
         display?: string;
-        /** Identity token for the wake — the deferred callback proceeds only if
-         *  this token still matches, preventing a consumed-then-re-parked verdict
-         *  from waking the wrong resume. */
+        /** Identity token for the wake. Activation and the Turn's first commit
+         *  both require this exact token, so an older verdict cannot consume a
+         *  replacement park. */
         wakeToken?: string;
     };
     lease?: {
@@ -132,8 +132,8 @@ export interface AgentSession {
         agent: string;
         token: string;
     };
-    /** Deferred system turn (one per session). Cleared by the turn's first
-     *  commit, not by the dispatcher. A second park is refused. */
+    /** Durable scheduled System turn (one per session). Cleared by that Turn's
+     *  first commit, not by Activation. A second park is refused. */
     pendingSystem?: {
         prompt: string;
         agent?: string;

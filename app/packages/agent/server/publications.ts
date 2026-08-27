@@ -17,6 +17,7 @@ export function registerPublications(): void {
     const authorized = {
       _id: sessionId,
       agent,
+      erasingAt: { $exists: false },
       $or: [
         { userId: uid },
         ...(uid !== null
@@ -68,12 +69,17 @@ export function registerPublications(): void {
       return []; // publishes nothing and marks the sub ready
     }
     return [
-      // `lease` and `pending.wakeToken` are server-internal bookkeeping —
+      // Leases and wake tokens are server-internal bookkeeping —
       // never needed by any client code.
       AgentSessions.find(
         // Same exclusion rationale as wakeToken above.
         { _id: sessionId },
-        { fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0 } },
+        {
+          fields: {
+            lease: 0, operations: 0, pendingInput: 0, pendingInputs: 0, purgingAt: 0,
+            'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0,
+          },
+        },
       ),
       AgentMessages.find({ sessionId }, { sort: { seq: 1 } }),
       AgentDeltas.find({ sessionId }),
@@ -91,6 +97,7 @@ export function registerPublications(): void {
     return AgentSessions.find(
       {
         agent,
+        erasingAt: { $exists: false },
         $or: [
           { userId: this.userId },
           { participants: { $elemMatch: { kind: 'human', userId: this.userId } } },
@@ -98,12 +105,15 @@ export function registerPublications(): void {
         parent: { $exists: false },
         ...(includeArchived ? {} : { archived: { $exists: false } }),
       },
-      // `lease` and `pending.wakeToken` omitted here too — see the matching
+      // Leases and wake tokens omitted here too — see the matching
       // comment on `pubSession`.
       {
         sort: { updatedAt: -1 },
         limit: 100,
-        fields: { lease: 0, 'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0 },
+        fields: {
+          lease: 0, operations: 0, pendingInput: 0, pendingInputs: 0, purgingAt: 0,
+          'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0,
+        },
       },
     );
   });

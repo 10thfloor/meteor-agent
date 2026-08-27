@@ -8,3 +8,6 @@ settings.json
 
 # Deployment credentials — copy the tracked example, never commit the copy.
 deploy/galaxy.settings.json
+
+# Separate local worktree; never include its nested repository in this release.
+website/

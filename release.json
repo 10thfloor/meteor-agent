@@ -1,0 +1,12 @@
+{
+  "packageVersion": "0.2.1-rc.1",
+  "stableTag": "v0.2.0",
+  "packages": [
+    { "name": "10thfloor:agent", "directory": "agent", "role": "core" },
+    { "name": "10thfloor:agent-channel-slack", "directory": "agent-channel-slack", "role": "channel" },
+    { "name": "10thfloor:agent-channel-telegram", "directory": "agent-channel-telegram", "role": "channel" },
+    { "name": "10thfloor:agent-channel-whatsapp", "directory": "agent-channel-whatsapp", "role": "channel" },
+    { "name": "10thfloor:agent-channel-sms", "directory": "agent-channel-sms", "role": "channel" },
+    { "name": "10thfloor:agent-channel-email", "directory": "agent-channel-email", "role": "channel" }
+  ]
+}

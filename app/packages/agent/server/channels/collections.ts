@@ -63,6 +63,8 @@ export interface ChannelBinding {
   deliveredSeq: number;
   /** Delivering worker's per-binding lease (`claimLease`-shaped). */
   claim?: { serverId: string; until: Date } | null;
+  /** @internal Session lifecycle fence; workers refuse a new delivery claim. */
+  erasingAt?: Date;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -81,6 +83,9 @@ export const promptSuffix = (toolCallId: string): string => `prompt:${toolCallId
 export interface DeliveryReceipt {
   _id: string;                    // `deliver:${bindingId}:${suffix}`
   bindingId: string;
+  /** Owning Session. Legacy rows may lack this in storage and are removed via
+   *  the binding fallback during lifecycle erasure. */
+  sessionId: string;
   state: 'sending' | 'sent' | 'abandoned';
   providerMessageId?: string;
   /** Reply grammar registered by a prompt delivery. Ingress checks it for

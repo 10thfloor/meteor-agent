@@ -1,6 +1,9 @@
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
 import { AgentSessions } from '../../common/collections';
+import {
+  beginSessionMutationOperation, withSessionOperationTransaction,
+} from '../session-operations';
 import { recordVerdict } from '../methods';
 import {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
@@ -88,16 +91,17 @@ export async function linkIdentity(
   // Member bindings excluded — they belong to the composing session's owner.
   const orphaned = await ChannelBindings.find({
     kind, externalUserId, userId: null, member: { $ne: true },
+    erasingAt: { $exists: false },
   }).fetchAsync();
   for (const binding of orphaned) {
     // eslint-disable-next-line no-await-in-loop
     await ChannelBindings.updateAsync(
-      { _id: binding._id, userId: null },
+      { _id: binding._id, userId: null, erasingAt: { $exists: false } },
       { $set: { userId, updatedAt: new Date() } },
     );
     // eslint-disable-next-line no-await-in-loop
     await AgentSessions.updateAsync(
-      { _id: binding.sessionId, userId: null },
+      { _id: binding.sessionId, userId: null, erasingAt: { $exists: false } },
       {
         $set: {
           userId,
@@ -112,6 +116,7 @@ export async function linkIdentity(
   // an account gains DDP standing without changing session ownership.
   await AgentSessions.rawCollection().updateMany(
     {
+      erasingAt: { $exists: false },
       participants: {
         $elemMatch: {
           kind: 'human', 'identity.kind': kind, 'identity.externalUserId': externalUserId,
@@ -146,13 +151,32 @@ export async function issueVerdictToken(
   agent: string, sessionId: string, toolCallId: string,
   verdict: 'approved' | 'denied', opts: { ttlMs?: number } = {},
 ): Promise<string> {
-  const _id = Random.secret();
-  await ChannelVerdictTokens.insertAsync({
-    _id, agent, sessionId, toolCallId, verdict,
-    expiresAt: new Date(Date.now() + (opts.ttlMs ?? DEFAULT_VERDICT_TTL_MS)),
-    createdAt: new Date(),
-  });
-  return _id;
+  const operation = await beginSessionMutationOperation(sessionId);
+  if (!operation) throw new Meteor.Error('no-session', 'Session not found');
+  try {
+    const _id = Random.secret();
+    let issued = false;
+    await withSessionOperationTransaction(operation, async (mongoSession) => {
+      const session = await AgentSessions.rawCollection().findOne(
+        {
+          _id: sessionId, agent,
+          erasingAt: { $exists: false }, purgingAt: { $exists: false },
+        },
+        { projection: { _id: 1 }, session: mongoSession },
+      );
+      if (!session) return;
+      await ChannelVerdictTokens.rawCollection().insertOne({
+        _id, agent, sessionId, toolCallId, verdict,
+        expiresAt: new Date(Date.now() + (opts.ttlMs ?? DEFAULT_VERDICT_TTL_MS)),
+        createdAt: new Date(),
+      }, { session: mongoSession });
+      issued = true;
+    });
+    if (!issued) throw new Meteor.Error('no-session', 'Session not found');
+    return _id;
+  } finally {
+    await operation.close();
+  }
 }
 
 /** Burn a verdict token and record the verdict. Token must name the
@@ -164,7 +188,9 @@ export async function redeemVerdictToken(token: string): Promise<boolean> {
   ) as unknown as ChannelVerdictToken | null;
   if (!doc || doc.expiresAt.getTime() < Date.now()) return false;
 
-  const session = await AgentSessions.findOneAsync(doc.sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: doc.sessionId, erasingAt: { $exists: false },
+  });
   if (!session) return false;
   if (session.pending?.toolCallId !== doc.toolCallId || session.pending.verdict) {
     return false;   // stale — different ask is parked now

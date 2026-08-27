@@ -1,8 +1,6 @@
 import { Random } from 'meteor/random';
-import { AgentMessages, AgentSessions } from '../common/collections';
-import type { AgentSession, SessionInc } from '../common/types';
-import type { SessionSet } from '../common/db';
 import { guardedUpdate, SERVER_ID } from './lease';
+import { commitLeasedMessage } from './transcript';
 
 /**
  * Leaf module for turn primitives shared by compaction, dispatch, and loop.
@@ -36,40 +34,6 @@ export function classifyProviderError(e: any): 'retryable' | 'fatal' | 'abandon'
   return 'retryable';
 }
 
-/** Atomically allocate the next `seq` under the lease guard. Returns null
- *  when the lease is gone or the optional Stop guard loses — caller must
- *  abandon that write. */
-export async function allocateSeq(
-  sessionId: string,
-  // Typed to SessionInc so a mistyped counter path is a compile error.
-  inc: SessionInc = {},
-  // Extra `$set` that must ride the same atomic write (e.g. pendingRelay).
-  set?: SessionSet,
-  // Markers to clear atomically — the turn's first commit consumes the relay
-  // or system intent so a crash before commit leaves the wake standing.
-  unset?: { pendingRelay?: 1; pendingSystem?: 1 },
-  // Turn-output commits use this to make Stop the winner. Tool-result and
-  // repair allocations deliberately do not: an already-committed tool_use
-  // still needs its matching result when a descendant is interrupted.
-  opts: { unlessStopped?: boolean } = {},
-): Promise<number | null> {
-  // Double cast: driver returns the document (not ModifyResult) with v5+ defaults.
-  const before = await AgentSessions.rawCollection().findOneAndUpdate(
-    {
-      _id: sessionId,
-      'lease.serverId': SERVER_ID,
-      ...(opts.unlessStopped ? { phase: { $ne: 'stopped' as const } } : {}),
-    },
-    {
-      $inc: { nextSeq: 1, ...inc } satisfies SessionInc,
-      $set: { updatedAt: new Date(), ...(set ?? {}) },
-      ...(unset && Object.keys(unset).length > 0 ? { $unset: unset } : {}),
-    },
-    { returnDocument: 'before' },
-  ) as unknown as AgentSession | null;
-  return before ? before.nextSeq : null;
-}
-
 /** Which limit tripped, and the sentence a UI shows for it. */
 const BUDGET_REASONS = {
   turns: 'Turn budget reached.',
@@ -82,13 +46,12 @@ const BUDGET_REASONS = {
 export async function commitBudgetNote(
   sessionId: string, budget: keyof typeof BUDGET_REASONS,
 ): Promise<void> {
-  const seq = await allocateSeq(sessionId);
-  if (seq === null) return;
-  await AgentMessages.insertAsync({
-    _id: Random.id(), sessionId, seq, role: 'note', kind: 'budget', budget,
+  const seq = await commitLeasedMessage(sessionId, {
+    _id: Random.id(), role: 'note', kind: 'budget', budget,
     error: { error: 'budget-exhausted', reason: BUDGET_REASONS[budget] },
     createdAt: new Date(),
   });
+  if (seq === null) return;
   await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'stopped' } });
 }
 
@@ -96,7 +59,7 @@ export async function commitBudgetNote(
  *  The lease protects against a second server; this Set against a second call. */
 export const running = new Set<string>();
 
-/** Optimization: lets the sweep skip wake-ups it knows will be no-ops. */
+/** Local duplicate-work hint. The Lease remains the cross-process authority. */
 export function isRunning(sessionId: string): boolean {
   return running.has(sessionId);
 }

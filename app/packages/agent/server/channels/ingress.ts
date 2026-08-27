@@ -137,7 +137,14 @@ async function ensureSession(kind: string, binding: ChannelBinding): Promise<boo
     return false;
   }
   const existing = await AgentSessions.findOneAsync(binding.sessionId);
+  if (existing?.erasingAt) return false;
   if (!existing) {
+    // A binding deleted/fenced by Session erasure must never repair its old
+    // capability id back into a live Session.
+    const liveBinding = await ChannelBindings.findOneAsync({
+      _id: binding._id, erasingAt: { $exists: false },
+    });
+    if (!liveBinding || liveBinding.sessionId !== binding.sessionId) return false;
     // A lost insert is another server's repair winning — fine either way.
     await insertOrLose(AgentSessions, {
       _id: binding.sessionId,
@@ -316,9 +323,16 @@ async function route(
   if (def.adoptDestination) {
     const merged = def.adoptDestination(binding.destination, reading.destination);
     if (merged !== undefined) {
-      await ChannelBindings.updateAsync(binding._id, {
+      const adopted = await ChannelBindings.updateAsync({
+        _id: binding._id,
+        sessionId: binding.sessionId,
+        erasingAt: { $exists: false },
+      }, {
         $set: { destination: merged, updatedAt: new Date() },
       });
+      // A stale webhook must not mutate a replacement binding that reused the
+      // provider's deterministic conversation id after Session erasure.
+      if (adopted !== 1) return { status: 200 };
       binding.destination = merged;
     }
   }

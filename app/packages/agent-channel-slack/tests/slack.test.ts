@@ -404,12 +404,15 @@ describe('agent-channel-slack', () => {
       const { slackTransport } = await import('meteor/10thfloor:agent-channel-slack');
       const { calls, fetchImpl } = fakeFetch({ ok: true, ts: '1700.42' });
       const transport = slackTransport({ botToken: 'xoxb-test', fetchImpl });
+      const abort = new AbortController();
       const posted = await transport.post(
-        { channel: 'D42', threadTs: '1700.1' }, { text: 'hi' }, { idempotencyKey: 'deliver:x:y' },
+        { channel: 'D42', threadTs: '1700.1' }, { text: 'hi' },
+        { idempotencyKey: 'deliver:x:y', signal: abort.signal },
       );
       assert.deepEqual(posted, { providerMessageId: '1700.42' });
       assert.equal(calls[0].url, 'https://slack.com/api/chat.postMessage');
       assert.equal(calls[0].init.headers.authorization, 'Bearer xoxb-test');
+      assert.strictEqual(calls[0].init.signal, abort.signal);
       const body = JSON.parse(calls[0].init.body);
       assert.equal(body.channel, 'D42');
       assert.equal(body.thread_ts, '1700.1');

@@ -24,6 +24,10 @@ export declare class DeltaWriter {
     private toolArgBytes;
     /** One warn per turn, not one per dropped chunk. */
     private warnedClamp;
+    /** Root+target lifecycle authority held from first flush through stop. */
+    private operationPromise;
+    /** Once authority/reconciliation is ambiguous, the durable Message wins. */
+    private suppressed;
     constructor(sessionId: string, messageId: string, msgSeq: number, flushMs: number, 
     /** Per-turn ceiling on `tool_args` delta bytes. Past this, `tool_args`
      *  deltas stop; `text`/`thinking` and committed `toolCalls` are unaffected. */

@@ -86,12 +86,33 @@ export interface AgentSession {
     /** Tool's one-line account of the call, from `describe(args, ctx)` at park
      *  time. Absent when no `describe` or it threw. Advisory only. */
     display?: string;
-    /** Identity token for the wake — the deferred callback proceeds only if
-     *  this token still matches, preventing a consumed-then-re-parked verdict
-     *  from waking the wrong resume. */
+    /** Identity token for the wake. Activation and the Turn's first commit
+     *  both require this exact token, so an older verdict cannot consume a
+     *  replacement park. */
     wakeToken?: string;
   };
   lease?: { serverId: string; until: Date };
+  /** @internal Short durable leases for Session-scoped writes and external
+   *  delivery. Erasure fences new entries, then waits for live entries. */
+  operations?: Array<{ id: string; until: Date }>;
+  /** @internal Compatibility marker written by pre-Transcript-Commit builds.
+   * New sends use `pendingInputs`; recovery reads this for one release. */
+  pendingInput?: {
+    token: string;
+    at: Date;
+    messageId?: string;
+    /** Operation that owns the Message reservation. Optional on older rows. */
+    operationId?: string;
+  };
+  /** @internal Compact, level-triggered wake links for user Messages. The
+   * reconstructable draft lives in a private reservation collection until its
+   * deterministic Message row exists. Links remain until the Transcript proves
+   * the input was answered, closing materialize→activate crash windows. */
+  pendingInputs?: Array<{
+    messageId: string;
+    seq: number;
+    at: Date;
+  }>;
   /** `systemTurns` is optional (legacy docs lack it) — read as `?? 0`. */
   budgetSpent: { turns: number; toolCalls: number; systemTurns?: number };
   /** Subagent sessions: which parent session's tool call opened this one.
@@ -112,6 +133,12 @@ export interface AgentSession {
   /** Throwaway (`Agent.ask`): deleted after one turn. Tools that create
    *  standing state pointing back at the session must refuse. */
   ephemeral?: true;
+  /** @internal Durable lifecycle fence. Once present, no new turn, delivery,
+   *  or user mutation may begin; the server removes package-owned session
+   *  data after every lease in the recursive child tree is quiet. */
+  erasingAt?: Date;
+  /** @internal Final cleanup gate. Operation heartbeats cannot cross it. */
+  purgingAt?: Date;
   /** Roster (§4.1) — absent on 1:1, complete when present. Capped at `MAX_PARTICIPANTS`. */
   participants?: SessionParticipant[];
   /** Model-relay hops since the last human message. At `budget.relay` the
@@ -120,8 +147,8 @@ export interface AgentSession {
   /** Durable relay wake — written atomically with the relay's seq, consumed by
    *  the addressee's turn. `token` is identity, same as `wakeToken`. */
   pendingRelay?: { agent: string; token: string };
-  /** Deferred system turn (one per session). Cleared by the turn's first
-   *  commit, not by the dispatcher. A second park is refused. */
+  /** Durable scheduled System turn (one per session). Cleared by that Turn's
+   *  first commit, not by Activation. A second park is refused. */
   pendingSystem?: {
     prompt: string;
     agent?: string;

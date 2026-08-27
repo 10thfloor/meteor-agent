@@ -8,16 +8,27 @@
 - `docs/superpowers/specs/` — historical design records. The source and tests
   are authoritative where a record describes an earlier release.
 - `scripts/verify-build.sh` — production-bundle verification (see README).
+- `release.json` — the six-package Release set, candidate version, and current
+  public documentation tag.
+- `CONTEXT.md` — current domain language and Module ownership.
 
 From `app/`, install dependencies with `meteor npm ci` and run the static gates:
 
 ```bash
 npm run typecheck
+npm run release:check
 npm run types:check
 ```
 
 `types:check` regenerates the declarations shipped by the core and all five
-channel packages and fails if the committed output has drifted.
+channel packages and fails if the committed output has drifted, including when
+generation creates a new untracked declaration.
+
+For a stable promotion, update `packageVersion`, `stableTag`, package pins, and
+the documented stable links together in the PR. `release:check` permits that
+future stable tag to be absent while the PR is under CI. Create the tag only
+after the promotion has merged; tag CI then requires the tag to match
+`packageVersion` and verifies that `stableTag` resolves.
 
 ## Running the suite
 
@@ -25,17 +36,13 @@ From `app/` (port 3200 — 3000 is often taken; a blocked port hangs silently),
 `npm test` runs the same command as CI:
 
 ```bash
-TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 \
-  --driver-package meteortesting:mocha \
-  ./packages/agent \
-  ./packages/agent-channel-slack ./packages/agent-channel-telegram \
-  ./packages/agent-channel-whatsapp ./packages/agent-channel-sms \
-  ./packages/agent-channel-email
+npm test
 ```
 
-Every package, and the same list CI runs — keep the two in step. Running the
-core alone passes while a surface package is broken, which is how five lens
-suites came to run only on developers' machines.
+The package set in `release.json` is checked against the literal Meteor
+descriptors, core dependency pins, MCP runtime identity, shipped declaration
+entries, and this test command. Running the core alone can pass while a surface
+package is broken, so CI calls this same `npm test` entry point.
 
 Budget 3–5 minutes. The client half needs Playwright's Chromium
 (`npx playwright install chromium`). Live smoke tests remain pending unless

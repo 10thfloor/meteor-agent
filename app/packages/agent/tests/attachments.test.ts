@@ -21,6 +21,32 @@ async function refusalOf(p: Promise<unknown>): Promise<string | null> {
 
 const b64 = (s: string) => Buffer.from(s, 'utf8').toString('base64');
 
+const rawAttachmentInsertPrototype = async (): Promise<object> => {
+  const { AgentAttachments } = await import('../server/attachments');
+  let holder = Object.getPrototypeOf(AgentAttachments.rawCollection());
+  while (holder && !Object.prototype.hasOwnProperty.call(holder, 'insertOne')) {
+    holder = Object.getPrototypeOf(holder);
+  }
+  if (!holder) throw new Error('Mongo raw Collection has no insertOne implementation');
+  return holder;
+};
+
+async function seedAttachmentSessions(...ids: string[]): Promise<void> {
+  const { AgentSessions } = await import('../common/collections');
+  for (const _id of ids) {
+    // eslint-disable-next-line no-await-in-loop
+    if (await AgentSessions.findOneAsync(_id)) continue;
+    // eslint-disable-next-line no-await-in-loop
+    await AgentSessions.insertAsync({
+      _id, agent: 'attachment-test', userId: null,
+      phase: 'idle', model: 'mock', nextSeq: 0,
+      usage: { input: 0, output: 0, cost: 0 },
+      budgetSpent: { turns: 0, toolCalls: 0 },
+      createdAt: new Date(), updatedAt: new Date(),
+    });
+  }
+}
+
 describe('attachments', () => {
   // ---- The law's naming clause (§10) ---------------------------------------
 
@@ -103,6 +129,7 @@ describe('attachments', () => {
     it('encodes UTF-8 content, computes the decoded size, and returns a ref', async () => {
       const { createAttachment, AgentAttachments } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       const ref = await createAttachment({
         sessionId, name: 'summary.csv', contentType: 'text/csv', content: 'id,total\n1,200\n',
       });
@@ -114,9 +141,62 @@ describe('attachments', () => {
       assert.isUndefined(row.staged);
     });
 
+    it('rolls byte insertion back when the guarded transaction fails', async function () {
+      this.timeout(20000);
+      const { createAttachment, AgentAttachments } = await import('../server/attachments');
+      const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
+      const rawPrototype = await rawAttachmentInsertPrototype() as any;
+      const descriptor = Object.getOwnPropertyDescriptor(rawPrototype, 'insertOne')!;
+      const original = descriptor.value;
+      Object.defineProperty(rawPrototype, 'insertOne', {
+        ...descriptor,
+        value: async function failAfterInsert(doc: any, ...rest: any[]) {
+          const result = await original.call(this, doc, ...rest);
+          if (doc.sessionId === sessionId) throw new Error('injected attachment transaction failure');
+          return result;
+        },
+      });
+      try {
+        let failure: unknown;
+        try {
+          await createAttachment({
+            sessionId, name: 'private.txt', contentType: 'text/plain', content: 'private',
+          });
+        } catch (error) {
+          failure = error;
+        }
+        assert.match(String((failure as Error)?.message), /injected attachment/);
+        assert.isUndefined(
+          await AgentAttachments.findOneAsync({ sessionId }),
+          'the bytes and operation-guard renewal roll back together',
+        );
+      } finally {
+        Object.defineProperty(rawPrototype, 'insertOne', descriptor);
+      }
+    });
+
+    it('refuses a child attachment when its lifecycle root is fenced', async () => {
+      const { createAttachment, AgentAttachments } = await import('../server/attachments');
+      const { AgentSessions } = await import('../common/collections');
+      const rootId = Random.id();
+      const childId = Random.id();
+      await seedAttachmentSessions(rootId, childId);
+      await AgentSessions.updateAsync(childId, {
+        $set: { parent: { sessionId: rootId, toolCallId: 'attachment-root-fence' } },
+      });
+      await AgentSessions.updateAsync(rootId, { $set: { erasingAt: new Date() } });
+
+      assert.equal(await refusalOf(createAttachment({
+        sessionId: childId, name: 'private.txt', contentType: 'text/plain', content: 'private',
+      })), 'no-session');
+      assert.isUndefined(await AgentAttachments.findOneAsync({ sessionId: childId }));
+    });
+
     it('refuses invalid base64 and oversize files, with codes a tool result can carry', async () => {
       const { createAttachment } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       assert.equal(await refusalOf(createAttachment({
         sessionId, name: 'x.bin', contentType: 'application/octet-stream',
         content: { base64: 'not*base64!' },
@@ -130,6 +210,8 @@ describe('attachments', () => {
     it('enforces the staged-set caps: count, then total bytes', async () => {
       const { createAttachment } = await import('../server/attachments');
       const sessionId = Random.id();
+      const sessionB = Random.id();
+      await seedAttachmentSessions(sessionId, sessionB);
       const caps = { maxFiles: 2, maxTotalBytes: 10 };
       await createAttachment({ sessionId, name: 'a', contentType: 'text/plain', content: 'aaaa', attach: true, caps });
       await createAttachment({ sessionId, name: 'b', contentType: 'text/plain', content: 'bbbb', attach: true, caps });
@@ -137,7 +219,6 @@ describe('attachments', () => {
         sessionId, name: 'c', contentType: 'text/plain', content: 'c', attach: true, caps,
       })), 'attachment-limit');
       const total = { maxFiles: 5, maxTotalBytes: 10 };
-      const sessionB = Random.id();
       await createAttachment({ sessionId: sessionB, name: 'a', contentType: 'text/plain', content: 'aaaaaaaa', attach: true, caps: total });
       assert.equal(await refusalOf(createAttachment({
         sessionId: sessionB, name: 'b', contentType: 'text/plain', content: 'bbbb', attach: true, caps: total,
@@ -151,6 +232,8 @@ describe('attachments', () => {
     it('derives the id from session + toolCallId + name: a re-run adopts, and re-stages after a claim', async () => {
       const { createAttachment, claimStagedRefs, AgentAttachments } = await import('../server/attachments');
       const sessionId = Random.id();
+      const otherSessionId = Random.id();
+      await seedAttachmentSessions(sessionId, otherSessionId);
       const make = () => createAttachment({
         sessionId, name: 'report.csv', contentType: 'text/csv',
         content: 'x,y\n1,2\n', attach: true, toolCallId: 'tc1',
@@ -172,7 +255,7 @@ describe('attachments', () => {
       // A DIFFERENT session with the same toolCallId and name (the mock
       // provider reuses `t1` every turn) must not collide.
       const other = await createAttachment({
-        sessionId: Random.id(), name: 'report.csv', contentType: 'text/csv',
+        sessionId: otherSessionId, name: 'report.csv', contentType: 'text/csv',
         content: 'x,y\n1,2\n', toolCallId: 'tc1',
       });
       assert.notEqual(other.id, first.id);
@@ -191,6 +274,7 @@ describe('attachments', () => {
     it('claims each staged row exactly once — the single-winner shape', async () => {
       const { createAttachment, claimStagedRefs } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       await createAttachment({ sessionId, name: 'a.txt', contentType: 'text/plain', content: 'a', attach: true });
       await createAttachment({ sessionId, name: 'b.txt', contentType: 'text/plain', content: 'b', attach: true });
       await createAttachment({ sessionId, name: 'loose.txt', contentType: 'text/plain', content: 'c' });
@@ -205,6 +289,7 @@ describe('attachments', () => {
     it('hydrates session-scoped and reports what no longer exists', async () => {
       const { createAttachment, hydrateRefs } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       const ref = await createAttachment({
         sessionId, name: 'data.json', contentType: 'application/json', content: '{"a":1}',
       });
@@ -226,25 +311,38 @@ describe('attachments', () => {
 
   describe('admitInboundAttachments', () => {
     it('applies the caps in order — count, per-file, total — and says what it dropped', async () => {
-      const { admitInboundAttachments } = await import('../server/attachments');
+      const { admitInboundAttachments, AgentAttachments } = await import('../server/attachments');
+      const { AgentSessions } = await import('../common/collections');
       const sessionId = Random.id();
+      await AgentSessions.insertAsync({
+        _id: sessionId, agent: 'attachment-test', userId: null,
+        phase: 'idle', model: 'mock', nextSeq: 0,
+        usage: { input: 0, output: 0, cost: 0 },
+        budgetSpent: { turns: 0, toolCalls: 0 },
+        createdAt: new Date(), updatedAt: new Date(),
+      });
       const file = (name: string, text: string) => ({
         name, contentType: 'text/plain', size: text.length, content: b64(text),
       });
-      const out = await admitInboundAttachments(sessionId, [
-        file('keep-1.txt', 'aaaa'),
-        { name: 'garbage.bin', contentType: 'application/octet-stream', size: 4, content: '!!invalid!!' },
-        file('too-big.txt', 'x'.repeat(20)),
-        file('over-total.txt', 'ccccc'),   // 4 kept + 5 = 9 > the 8-byte total
-        file('keep-2.txt', 'bb'),          // 4 + 2 = 6 still fits
-        file('over-count.txt', 'd'),       // two already kept — the count cap
-      ], { maxFiles: 2, maxFileBytes: 10, maxTotalBytes: 8 });
-      assert.deepEqual(out.refs.map((r) => r.name), ['keep-1.txt', 'keep-2.txt'], 'kept exactly what passed');
-      assert.equal(out.notes.length, 4, 'one note per rejected file');
-      assert.match(out.notes[0], /"garbage\.bin".*did not decode/);
-      assert.match(out.notes[1], /"too-big\.txt" \(20 bytes\) exceeded the 10 bytes limit/);
-      assert.match(out.notes[2], /"over-total\.txt".*total limit/);
-      assert.match(out.notes[3], /"over-count\.txt".*already carries 2 files/);
+      try {
+        const out = await admitInboundAttachments(sessionId, [
+          file('keep-1.txt', 'aaaa'),
+          { name: 'garbage.bin', contentType: 'application/octet-stream', size: 4, content: '!!invalid!!' },
+          file('too-big.txt', 'x'.repeat(20)),
+          file('over-total.txt', 'ccccc'),   // 4 kept + 5 = 9 > the 8-byte total
+          file('keep-2.txt', 'bb'),          // 4 + 2 = 6 still fits
+          file('over-count.txt', 'd'),       // two already kept — the count cap
+        ], { maxFiles: 2, maxFileBytes: 10, maxTotalBytes: 8 });
+        assert.deepEqual(out.refs.map((r) => r.name), ['keep-1.txt', 'keep-2.txt'], 'kept exactly what passed');
+        assert.equal(out.notes.length, 4, 'one note per rejected file');
+        assert.match(out.notes[0], /"garbage\.bin".*did not decode/);
+        assert.match(out.notes[1], /"too-big\.txt" \(20 bytes\) exceeded the 10 bytes limit/);
+        assert.match(out.notes[2], /"over-total\.txt".*total limit/);
+        assert.match(out.notes[3], /"over-count\.txt".*already carries 2 files/);
+      } finally {
+        await AgentAttachments.removeAsync({ sessionId });
+        await AgentSessions.removeAsync(sessionId);
+      }
     });
   });
 
@@ -273,6 +371,7 @@ describe('attachments', () => {
     it('returns text for text-like content, session-scoped', async () => {
       const { createAttachment, readTool } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       const ref = await createAttachment({
         sessionId, name: 'notes.md', contentType: 'text/markdown', content: '# hello',
       });
@@ -286,6 +385,7 @@ describe('attachments', () => {
     it('refuses binary with a structured result the model can route around', async () => {
       const { createAttachment, readTool } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       const ref = await createAttachment({
         sessionId, name: 'photo.jpg', contentType: 'image/jpeg', content: { base64: b64('notreallyajpeg') },
       });
@@ -299,6 +399,7 @@ describe('attachments', () => {
     it('truncates past the cap and names the full size', async () => {
       const { createAttachment, readTool, READ_TEXT_CAP } = await import('../server/attachments');
       const sessionId = Random.id();
+      await seedAttachmentSessions(sessionId);
       const ref = await createAttachment({
         sessionId, name: 'big.txt', contentType: 'text/plain', content: 'x'.repeat(READ_TEXT_CAP + 100),
       });

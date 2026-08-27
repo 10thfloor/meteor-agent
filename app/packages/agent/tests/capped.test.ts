@@ -121,6 +121,7 @@ describe('publications', () => {
     await AgentSessions.insertAsync({
       ...base, _id: 'mine', userId: 'u1',
       lease: { serverId: 's1', until: new Date() },
+      pendingInputs: [{ messageId: 'private-wake-link', seq: 0, at: new Date() }],
     } as any);
     await AgentSessions.insertAsync({ ...base, _id: 'theirs', userId: 'u2' } as any);
 
@@ -132,6 +133,10 @@ describe('publications', () => {
     // Wire hygiene: `lease` is server-internal (server/lease.ts) and must
     // never reach the client, even though the doc above was seeded with one.
     assert.isUndefined(docs[0].lease, 'agent.sessions must not publish `lease`');
+    assert.isUndefined(
+      docs[0].pendingInputs,
+      'agent.sessions must not publish `pendingInputs`',
+    );
   });
 
   it('shelves an archived session from agent.sessions, and hands it back on request', async () => {
@@ -247,6 +252,7 @@ describe('publications', () => {
       // Set deliberately, so the assertion below proves the field is
       // stripped by the publication rather than merely absent from the doc.
       lease: { serverId: 's1', until: new Date() },
+      pendingInputs: [{ messageId: 'private-wake-link', seq: 0, at: new Date() }],
       createdAt: new Date(), updatedAt: new Date(),
     } as any);
     await AgentMessages.insertAsync({
@@ -266,6 +272,10 @@ describe('publications', () => {
     const sessionDocs = await result[0].fetchAsync();
     assert.equal(sessionDocs.length, 1);
     assert.isUndefined(sessionDocs[0].lease, 'agent.session must not publish `lease`');
+    assert.isUndefined(
+      sessionDocs[0].pendingInputs,
+      'agent.session must not publish `pendingInputs`',
+    );
   });
 
   it('stops a live agent.session publication when a participant is removed', async () => {

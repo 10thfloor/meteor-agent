@@ -1,6 +1,7 @@
 import {
   attachmentNotice, channelKnobs, LINK_GESTURE, encodeVerdictPostback, decodeVerdictPostback, headerValue, promptDisplay, safeEqual,
-  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type ChannelDef, type ChannelKnobs, type ChannelPostOptions, type ChannelProfile,
+  type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
@@ -257,13 +258,14 @@ export interface TelegramTransportOptions {
 export function telegramTransport(options: TelegramTransportOptions): ChannelTransport {
   const doFetch = options.fetchImpl ?? fetch;
   return {
-    async post(destination: unknown, payload: unknown) {
+    async post(destination: unknown, payload: unknown, opts: ChannelPostOptions) {
       const dest = (destination ?? {}) as { chatId?: number | string };
       const res = await doFetch(`https://api.telegram.org/bot${options.botToken}/sendMessage`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
         // Payload first, addressing last: a payload can never redirect a post.
         body: JSON.stringify({ ...(payload as Record<string, unknown>), chat_id: dest.chatId }),
+        signal: opts.signal,
       });
       const json: any = await res.json();
       if (!json?.ok) {

@@ -1,19 +1,21 @@
 import { Random } from 'meteor/random';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import {
-  DECIDED_PHASES, type AgentSession, type Phase, type SessionInc,
+  DECIDED_PHASES, type AgentSession, type Phase,
 } from '../common/types';
+import type { SessionQuery } from '../common/db';
 import { systemFrom } from '../common/participants';
 import { getAgent, resolveBudget, memoryOpt, type AgentConfig } from './registry';
 import { SERVER_ID } from './lease';
+import { beginSessionTreeOperation } from './session-operations';
 import { isRunning } from './turn-state';
-import { isDuplicateKey } from './channels/collections';
+import { commitOperationMessage } from './transcript';
 
 /** Phases that block parking. Named once so the three sites cannot drift. */
 const HALTED_PHASES: Phase[] = ['stopped', 'error'];
 
-/** System turns — turns nobody typed. Takes dispatcher as arg to avoid
- *  a cycle with loop.ts. */
+/** System turns — durable prompts nobody typed. Activation is the normal
+ * coordinator; the dispatcher Adapter remains for compatibility. */
 
 /** Stale intent ceiling — without it a halted session blocks all future firings. */
 export const SYSTEM_INTENT_TTL_MS = 24 * 60 * 60 * 1000;
@@ -27,7 +29,7 @@ export type SystemTurnResult =
       | 'budget-exhausted' | 'no-session' | 'no-agent';
   };
 
-/** Shape of the dispatcher injected by the caller (deferTurn or runTurn). */
+/** Legacy dispatcher Adapter used by the durable System-intent primitives. */
 export type SystemDispatch = (
   sessionId: string,
   config: AgentConfig,
@@ -54,7 +56,7 @@ export function systemBudgetClause(limit?: number): object[] {
 }
 
 /** Nobody else holds a live lease. Spread into an `$and`, never bare. */
-function consumableByUs(now: Date): object {
+function consumableByUs(now: Date): SessionQuery {
   return {
     $or: [
       { lease: { $exists: false } },
@@ -65,12 +67,14 @@ function consumableByUs(now: Date): object {
   };
 }
 
-/** Materialize a standing intent and dispatch its turn. The marker and budget
- *  are consumed by the turn's first commit, not here (decision 14). */
+/** Materialize a standing intent and hand it to a Turn dispatcher. The marker
+ *  and budget are consumed by the Turn's first commit, not here. */
 export async function consumeSystemIntent(
   sessionId: string, dispatch: SystemDispatch,
 ): Promise<boolean> {
-  const session = await AgentSessions.findOneAsync(sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   const intent = session?.pendingSystem;
   if (!session || !intent) return false;
   // Early-out; the claim re-asserts all of these atomically.
@@ -81,54 +85,51 @@ export async function consumeSystemIntent(
 
   const target = getAgent(intent.agent ?? session.agent);
   if (!target) return false;
-
-  const rowId = systemRowId(sessionId, intent.key ?? intent.token);
-  const existing = await AgentMessages.findOneAsync(rowId);
-  if (!existing) {
-    const now = new Date();
-    // Atomic claim — token makes it single-winner across servers.
-    const before = await AgentSessions.rawCollection().findOneAndUpdate(
-      {
-        _id: sessionId,
-        'pendingSystem.token': intent.token,
-        phase: { $nin: DECIDED_PHASES },
-        $and: [consumableByUs(now)],
-      },
-      { $inc: { nextSeq: 1 } satisfies SessionInc, $set: { updatedAt: now } },
-      { returnDocument: 'before' },
-    ) as unknown as AgentSession | null;
-    if (!before) return false;
-
-    try {
-      await AgentMessages.insertAsync({
-        _id: rowId,
+  const operation = await beginSessionTreeOperation(sessionId);
+  if (!operation) return false;
+  try {
+    const rowId = systemRowId(sessionId, intent.key ?? intent.token);
+    const existing = await AgentMessages.findOneAsync(rowId);
+    if (!existing) {
+      const now = new Date();
+      await operation.assertActive();
+      // Token claim, sequence, and System row are one lifecycle transaction.
+      const seq = await commitOperationMessage(
+        operation,
         sessionId,
-        seq: before.nextSeq,
-        role: 'system',
-        content: intent.prompt,
-        // Unconditional (decision 3) — roster-gating would drop attribution in 1:1.
-        from: systemFrom(intent.source),
-        createdAt: now,
-      });
-    } catch (e) {
-      // Another consumer won; the allocated seq becomes a harmless gap.
-      if (!isDuplicateKey(e)) throw e;
-      return false;
+        rowId,
+        {
+          'pendingSystem.token': intent.token,
+          phase: { $nin: DECIDED_PHASES },
+          $and: [consumableByUs(now)],
+        },
+        {},
+        () => ({
+          role: 'system',
+          content: intent.prompt,
+          // Unconditional (decision 3) — roster-gating would drop attribution in 1:1.
+          from: systemFrom(intent.source),
+          createdAt: now,
+        }),
+      );
+      if (seq === null) return false;
     }
-  }
 
-  // Name the target explicitly — recovery-time resolution can't honour intent.agent.
-  const primary = getAgent(session.agent);
-  if (intent.agent && primary && target !== primary) {
-    dispatch(sessionId, target, session.userId, {
-      agentName: intent.agent,
-      budget: resolveBudget(primary.budget),
-      ...memoryOpt(primary),
-    });
-  } else {
-    dispatch(sessionId, target, session.userId);
+    // Name the target explicitly — recovery-time resolution can't honour intent.agent.
+    const primary = getAgent(session.agent);
+    if (intent.agent && primary && target !== primary) {
+      dispatch(sessionId, target, session.userId, {
+        agentName: intent.agent,
+        budget: resolveBudget(primary.budget),
+        ...memoryOpt(primary),
+      });
+    } else {
+      dispatch(sessionId, target, session.userId);
+    }
+    return true;
+  } finally {
+    await operation.close();
   }
-  return true;
 }
 
 /** Park a system turn, and run it now if the session is free.
@@ -139,7 +140,9 @@ export async function startSystemTurnWith(
   prompt: string,
   opts?: { key?: string; agent?: string; source?: string },
 ): Promise<SystemTurnResult> {
-  const session = await AgentSessions.findOneAsync(sessionId);
+  const session = await AgentSessions.findOneAsync({
+    _id: sessionId, erasingAt: { $exists: false },
+  });
   if (!session) return { ok: false, reason: 'no-session' };
 
   const primary = getAgent(session.agent);
@@ -157,6 +160,7 @@ export async function startSystemTurnWith(
   const claimed = await AgentSessions.rawCollection().findOneAndUpdate(
     {
       _id: sessionId,
+      erasingAt: { $exists: false },
       phase: { $nin: HALTED_PHASES },
       ephemeral: { $ne: true },  // throwaway sessions are deleted after the call
       ...(opts?.key ? { lastSystemKey: { $ne: opts.key } } : {}),

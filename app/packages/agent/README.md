@@ -292,45 +292,65 @@ is the only method whose every accepted call buys a provider round trip, and no
 turn budget applies to it, so an unlimited one is a cheaper `send` with
 `budget.spend` as its only backstop.
 
-**Recovery runs itself.** Every server starts a watcher at boot: it observes
-sessions stuck in a live phase with a dead lease (a deploy, an OOM, a SIGKILL
-mid-turn) and re-runs the turn, which repairs its own transcript on entry. A
-15s sweep backs the observer up, because a lease can expire without any document
-change to observe, and the same sweep enforces `budget.approval`, picks up a
-verdict whose resume died before consuming it, and **re-links orphaned
-children**: a subagent dispatch that died between creating the child session and
-committing its result leaves a real child that no published document points at,
-so the sweep writes a `role: 'note', kind: 'orphan-child'` row into the *parent*
-transcript carrying `childSessionId` and `childAgent` — the handle a client
-needs to find it again. One note per child, and never for a child the parent is
-actively dispatching. It writes a pointer and nothing else: a sweep never
-deletes session data, so a child whose parent document is gone entirely is
-warned about once per process and left standing. Two servers racing on one
-session resolve through the lease, the verdict's conditional write, and the
-note's derived `_id` — one winner, no new coordination. Turn it off with
+`Agent.send(sessionId, text)` remains the whole application Interface. After
+authorization, the private Transcript Commit machinery records a reconstructable
+reservation, then atomically allocates its sequence and Turn-budget charge,
+materializes the Message, records compact wake evidence, and removes the
+reservation in one transaction. Recovery retries that transaction without
+spending twice; Activation's exact Lease claim still chooses the one Turn runner.
+
+The commit Interface refuses text above 256 KiB of UTF-8 and a 65th unanswered
+input before allocating a sequence or charging the Turn budget. The full input
+stays outside the hot Session document and only compact wake evidence lives
+there. Those are safety ceilings, not traffic policy: use `budget.turns` to
+bound accepted sends per Session, `rateLimit.sends` to bound the DDP path, and
+an app/channel ingress limit appropriate to untrusted payloads.
+
+**Recovery runs itself.** Every server starts a watcher at boot. Its observer and
+15s sweep find durable activation evidence: a live phase with no live Lease, or
+a standing verdict, Relay, System intent, or committed input. They nudge the
+private Activation Module, which re-reads the Session and Transcript, resolves
+the eligible Agent, and queues a Turn. The Turn's exact Lease claim chooses one
+runner; repair still happens on Turn entry.
+
+The watcher also enforces `budget.approval` and **re-links orphaned children**.
+A subagent dispatch that died between creating the child Session and committing
+its result leaves a real child that no published document points at, so the
+sweep writes a `role: 'note', kind: 'orphan-child'` row into the *parent*
+Transcript with `childSessionId` and `childAgent`. It writes one pointer and
+nothing else; a child whose parent is gone is warned about once per process and
+left standing. Racing servers resolve through the exact Lease claim, the
+verdict's conditional write, and the note's derived `_id`.
+
+Activation is not an application API, and this coordination requires no app
+migration. Existing `Agent` calls and `WatcherOptions` remain the public
+Interface. Turn recovery off with
 `{ "packages": { "10thfloor:agent": { "watcher": false } } }`, or call
 `startWatcher({ sweepMs })` yourself.
 
 ### Operations
 
-**Standalone MongoDB.** On a standalone server (no replica set — no oplog, no
-change streams) Meteor's observers fall back to ~10s polling. Recovery still
-works — the sweep is what carries it — but the watcher's observer path, token
-streaming, and `usage()`/`status()` reactivity all degrade to that polling
-cadence. Streaming chat on standalone Mongo will feel like a teleprinter.
-Run a replica set (Atlas, or a single-node `--replSet`) for production; this is
-Meteor's constraint, not this package's.
+**MongoDB must support transactions.** Transcript commits transactionally pair
+each dependent Message/reservation write with its Session Lifecycle fence, so a
+completed erasure cannot be followed by a delayed write recreating private
+data. Use a replica set or sharded cluster (Atlas qualifies; a single-node
+`--replSet` is enough for self-hosting). Meteor's managed local Mongo supports
+this during development. A standalone production `mongod` is unsupported.
 
 **Indexes are created at startup.** Mongo creates exactly one index for you —
-`_id` — so the package creates the ones its own queries need, on every boot,
-idempotently: these three for the transcript and the watcher, and seven more
-for channels (listed under **Channels**):
+`_id` — so the package idempotently creates the indexes its own Transcript,
+Activation, lifecycle, and Channel queries need on every boot. Core indexes
+include:
 
 | Collection | Key | Why |
 | --- | --- | --- |
 | `agent_messages` | `{ sessionId: 1, seq: 1 }` | every transcript read: the session publication, the history each turn re-reads, the compaction cut |
 | `agent_sessions` | `{ 'parent.sessionId': 1, createdAt: 1 }` (sparse) | the watcher's orphan-child sweep, which scans every child ever created, every 15s |
 | `agent_sessions` | `{ phase: 1, 'lease.until': 1 }` | the sweep's orphan-claim, standing-verdict and unanswered-park queries |
+| `agent_sessions` | `{ 'pendingSystem.at': 1 }` (partial) | scheduled System Turn recovery |
+| `agent_sessions` | `{ 'pendingInput.at': 1 }` (partial) | compatibility recovery for pre-Transcript-Commit Sessions |
+| `agent_sessions` | `{ 'pendingInputs.at': 1 }` (partial) | committed-input Activation recovery |
+| private reservation store | `{ sessionId: 1, createdAt: 1 }` | reconstruct an interrupted user-Message commit in order |
 
 A failure to create them **warns and continues**: a locked-down Atlas user may
 not hold the `createIndex` action, and a package that refused to boot over a
@@ -957,6 +977,30 @@ The separation is deliberate. "Archive this chat" means *stop showing it to me*;
 a package that read it as *stop the work* would silently drop a scheduled turn
 nobody cancelled.
 
+### Erasing a Session (server only)
+
+Archiving is display state; erasure is permanent data lifecycle. Call it from
+trusted server code with the owner identity made explicit:
+
+```ts
+const outcome = await Support.erase(sessionId, { userId: this.userId });
+// 'erased' | 'absent'
+```
+
+Only the exact owner can erase a root Session. A roster member cannot erase the
+owner's conversation, and missing, wrong-owner, wrong-agent, and child Session
+ids all return the same `absent` result. `userId: null` is required explicitly
+for an anonymous owner.
+
+Erasure fences new Turns and deliveries, stops the root and its recursive
+subagent descendants, waits for their Leases, then removes Messages, Deltas,
+Attachments, download/verdict tokens, Channel Bindings, and their delivery
+receipts. Forks are independent roots and survive. User/app Memory and
+account-wide Channel Identity also survive: deleting a conversation is not an
+account-wide “forget me” operation. If storage or a live Turn prevents prompt
+completion, the call throws `erase-incomplete`; the Session remains inaccessible
+and the recovery watcher retries the idempotent cleanup.
+
 ### Auto-start, and remembering the session
 
 With no `session-id`, the element calls `start()` when it connects and then
@@ -1259,8 +1303,8 @@ claims somebody typed it.
 
 **It waits behind live work instead of being dropped.** A busy session — most
 importantly one sitting in `awaiting` on an approval — parks a durable intent
-and runs it when the session next goes idle. The intent survives a deploy, and
-the watcher recovers one whose process died.
+and runs it when the session next goes idle. The intent survives a deploy as
+durable evidence; recovery observes it and nudges Activation.
 
 **It spends its own purse.** `budget.systemTurns` is separate from `turns`, and
 is spent when the turn commits, not when it is requested — so a turn that never
@@ -1493,7 +1537,7 @@ Agent.channel('sms', {
 | Field | Meaning |
 | --- | --- |
 | `agent` | **Required.** The registered agent this surface drives. |
-| `transport` | **Required.** `{ post(destination, payload, { idempotencyKey }), reconcile?(destination, idempotencyKey) }` — the provider call itself, supplied by the package so the core never depends on a provider SDK. `post` receives whatever `lens.out` produced and may return `{ providerMessageId }`; `reconcile` answers "did a post under this key already land?" and its presence is what makes `onUncertainDelivery: 'reconcile'` legal. |
+| `transport` | **Required.** `{ post(destination, payload, { idempotencyKey, signal? }), reconcile?(destination, idempotencyKey) }` — the provider call itself, supplied by the package so the core never depends on a provider SDK. `post` receives whatever `lens.out` produced, may forward the optional `AbortSignal` to its provider request, and may return `{ providerMessageId }`; `reconcile` answers "did a post under this key already land?" and its presence is what makes `onUncertainDelivery: 'reconcile'` legal. |
 | `lens` | **Required.** `{ out(item, destination), in(event) }` — see **The lens**. |
 | `profile` | **Required.** `{ interact: 'native' \| 'menu' \| 'link', limit? }` — see **The lens**. |
 | `verify(raw)` | **Required.** The trust boundary: does this request really come from the provider? `false` is answered 401 before anything else runs. `raw` is `{ headers, rawBody, url? }` — headers lower-cased, the body **unparsed** (signature schemes sign raw bytes; a re-serialized body never verifies), `url` the path+query as Node saw it. |
@@ -1701,7 +1745,9 @@ tools: [{
 ```
 
 ```ts
-deliverOnce(binding, item | () => Promise<item>, suffix, { expects? })
+deliverOnce(binding, item | () => Promise<item>, suffix, {
+  expects?, afterDelivered?, def?,
+})
   : Promise<'delivered' | 'abandoned' | 'deferred'>
 ```
 
@@ -1717,6 +1763,17 @@ still inside its backoff window and nothing was posted — a one-shot caller
 treats that as not sent. A thunk `item` runs only when a post actually
 happens, so a rendering's side effects (minting verdict tokens) never run on a
 re-sweep that finds the receipt settled.
+
+`def` is the channel-author form for a side action that already holds its
+Transport, Lens, and uncertain-delivery policy instead of looking them up by
+`binding.kind`. `afterDelivered` is narrower still: it reconciles
+Session-owned Mongo state after confirmation while the delivery's Lifecycle
+operation remains held. It runs for a newly confirmed post **and** for replay
+of an already-settled receipt, may be retried by Mongo, and therefore must be
+idempotent transactional database work only—no network calls or other side
+effects. Use the supplied `ClientSession` on every raw Mongo write. Ordinary
+tool bodies need neither option; they should use a registered binding as in the
+example above.
 
 ### Linking
 
@@ -1830,11 +1887,11 @@ open question) and tears down the member's channel bindings with them.
 with `extras.to`) runs that model's config — its prompt, tools and provider —
 under the *primary's* budget: one purse per conversation. A model whose reply
 leads with `@colleague` schedules that colleague's turn — a **relay**,
-durable (`pendingRelay` rides the same atomic write as the commit, the
-watcher sweeps it) and budgeted (`budget.relay`, default 4 hops, reset by any
-human message; the capped reply still delivers, with a note saying why
-nothing answered). Model-addressed replies are internal deliberation: the web
-transcript shows them, channels skip them.
+durable (`pendingRelay` rides the same atomic write as the commit, and Activation
+recovery observes and sweeps it) and budgeted (`budget.relay`, default 4 hops,
+reset by any human message; the capped reply still delivers, with a note saying
+why nothing answered). Model-addressed replies are internal deliberation: the
+web transcript shows them, channels skip them.
 
 **Channels admit members by policy.** A binding's `admits` — `'opener'` (the
 default, v1's guard verbatim), `'members'` (roster-matched senders, account
@@ -2013,11 +2070,10 @@ Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
 
 ## Scope and stability
 
-Version `0.2.0` is the current public package surface: durable transcripts,
-streaming, tools and gates, budgets, recovery, compaction, subagents, forking,
-MCP, skills, hooks, the optional chat element, five channel adapters,
-participants, attachments, system turns, and memory. The sections above define
-those supported entry points and their operational caveats.
+The latest `v*` tag is the stable public package surface. This README follows
+the current source tree, including candidate Interfaces such as `Agent#erase`;
+consult the tagged README when targeting a stable release. The sections above
+describe the candidate's supported entry points and their operational caveats.
 
 The extension surface is deliberately small. Use `beforeProviderRequest` and
 `afterToolResult` hooks to change provider requests or tool results; use a

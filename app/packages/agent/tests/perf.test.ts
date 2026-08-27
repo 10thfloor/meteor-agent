@@ -315,8 +315,10 @@ describe('tool_args delta pressure', () => {
       this.timeout(30000);
       const { DeltaWriter } = await import('../server/loop');
       const { AgentDeltas } = await import('../common/collections');
+      const { claimLease } = await import('../server/lease');
       const sessionId = 's-toolargs-clamp';
-      await AgentDeltas.removeAsync({ sessionId } as any);
+      await seed(sessionId);
+      assert.isTrue(await claimLease(sessionId));
 
       const warnings: string[] = [];
       const originalWarn = console.warn;
@@ -367,8 +369,10 @@ describe('tool_args delta pressure', () => {
     this.timeout(30000);
     const { DeltaWriter, DEFAULT_MAX_TOOL_ARG_BYTES } = await import('../server/loop');
     const { AgentDeltas } = await import('../common/collections');
+    const { claimLease } = await import('../server/lease');
     const sessionId = 's-toolargs-default';
-    await AgentDeltas.removeAsync({ sessionId } as any);
+    await seed(sessionId);
+    assert.isTrue(await claimLease(sessionId));
 
     assert.equal(DEFAULT_MAX_TOOL_ARG_BYTES, 256 * 1024);
     const writer = new DeltaWriter(sessionId, 'm-default', 0, 10_000, DEFAULT_MAX_TOOL_ARG_BYTES);

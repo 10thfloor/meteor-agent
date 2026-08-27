@@ -1,6 +1,7 @@
 import { Meteor } from 'meteor/meteor';
 import { Mongo } from 'meteor/mongo';
 import { Tracker } from 'meteor/tracker';
+import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import { AgentSessions, AgentMessages, AgentDeltas } from '../common/collections';
 import { mergeView } from '../common/merge';
@@ -105,7 +106,9 @@ export class Agent {
   }
 
   send(sessionId: string, text: string): Promise<string> {
-    return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text);
+    // Stable across Meteor's transparent method retry: the server's private
+    // Transcript Commit Module uses this only as an idempotency identity.
+    return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text, Random.id());
   }
 
   interrupt(sessionId: string): Promise<void> {

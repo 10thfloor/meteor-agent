@@ -1,4 +1,4 @@
-import { type AgentSession, type SessionParticipant } from '../common/types';
+import { type AgentMessage, type AgentSession, type SessionParticipant } from '../common/types';
 export interface AddParticipantOptions {
     /** The participant id performing the add, recorded as `addedBy`. */
     by?: string;
@@ -16,8 +16,14 @@ export declare function addParticipant(sessionId: string, participant: Omit<Sess
 export declare function removeParticipant(sessionId: string, participantId: string): Promise<boolean>;
 /** Read the roster fresh; empty array when absent. */
 export declare function listParticipants(sessionId: string): Promise<SessionParticipant[]>;
-/** The addressee of the newest user row, if that addressee hasn't answered.
- *  Addressee-aware: only a reply FROM the addressee counts as an answer. */
+/** The addressee of one exact user row, if that addressee has not answered it.
+ * Addressee-aware: only a later reply FROM that model counts. */
+export declare function unansweredMessageAddressee(session: AgentSession, user: AgentMessage): Promise<{
+    id: string;
+    agent: string;
+} | null>;
+/** Compatibility query for callers that intentionally ask about the newest
+ * user row rather than a durable Transcript Commit link. */
 export declare function unansweredAddressee(session: AgentSession): Promise<{
     id: string;
     agent: string;

@@ -8,13 +8,11 @@ import { type SaveArgs } from './memory';
 import { type ChannelDef } from './channels/registry';
 import { createAttachment } from './attachments';
 import { addParticipant, listParticipants, removeParticipant } from './participants';
+import { type SessionErasure } from './session-lifecycle';
 export declare class Agent {
     readonly name: string;
     constructor(name: string, config?: AgentConfig);
     define(config: AgentConfig): this;
-    /** One question, one answer — throwaway session, inline turn, no trace.
-     *  Rejects with `ask-parked` or `ask-failed` since headless callers
-     *  cannot notice a stall. */
     /** Start a turn no person asked for (schedule, webhook, job).
      *  Idempotent via `key`; a busy session parks until idle. */
     systemTurn(sessionId: string, prompt: string, opts?: {
@@ -22,6 +20,9 @@ export declare class Agent {
         agent?: string;
         source?: string;
     }): Promise<SystemTurnResult>;
+    /** One question, one answer — throwaway session, inline turn, no trace.
+     *  Rejects with `ask-parked` or `ask-failed` since headless callers
+     *  cannot notice a stall. */
     ask(text: string, opts?: {
         userId?: string | null;
     }): Promise<string>;
@@ -30,6 +31,12 @@ export declare class Agent {
     send(sessionId: string, text: string, opts?: {
         userId?: string | null;
     }): Promise<string>;
+    /** Permanently erase one owned root Session and its subagent descendants.
+     *  Server-only. `userId` is required; explicit null means anonymous owner.
+     *  Memory and account-wide channel identities are preserved. */
+    erase(sessionId: string, opts: {
+        userId: string | null;
+    }): Promise<SessionErasure>;
     /** Server-side approve — same core as DDP method; racing answerers
      *  produce exactly one verdict. */
     approve(sessionId: string, opts?: {
@@ -103,5 +110,5 @@ export declare class Agent {
     /** Clear all hooks (global + per-agent) — test seam. */
     static clearHooks(): void;
 }
-export type { AgentConfig };
+export type { AgentConfig, SessionErasure };
 //# sourceMappingURL=agent.d.ts.map

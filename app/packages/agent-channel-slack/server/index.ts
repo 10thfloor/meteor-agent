@@ -2,7 +2,8 @@ import { createHmac } from 'crypto';
 import {
   attachmentNotice, channelKnobs, decodeVerdictPostback, encodeVerdictPostback,
   headerValue, isLinkGesture, promptDisplay, safeEqual,
-  type ChannelDef, type ChannelKnobs, type ChannelProfile, type ChannelTransport,
+  type ChannelDef, type ChannelKnobs, type ChannelPostOptions, type ChannelProfile,
+  type ChannelTransport,
   type DeliveryItem, type InboundReading, type Lens, type RawInbound,
 } from 'meteor/10thfloor:agent';
 
@@ -363,7 +364,7 @@ export interface SlackTransportOptions {
 export function slackTransport(options: SlackTransportOptions): ChannelTransport {
   const doFetch = options.fetchImpl ?? fetch;
   return {
-    async post(destination: unknown, payload: unknown, opts: { idempotencyKey: string }) {
+    async post(destination: unknown, payload: unknown, opts: ChannelPostOptions) {
       const dest = (destination ?? {}) as { channel?: string; threadTs?: string };
       // Payload FIRST, addressing and policy LAST: a lens payload (ours, or an
       // app's override) can never redirect a post to another channel or
@@ -389,6 +390,7 @@ export function slackTransport(options: SlackTransportOptions): ChannelTransport
           'content-type': 'application/json; charset=utf-8',
         },
         body: JSON.stringify(body),
+        signal: opts.signal,
       });
       const json: any = await res.json();
       if (!json?.ok) {

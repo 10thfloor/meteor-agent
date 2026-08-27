@@ -8,8 +8,8 @@ import {
 } from './tools';
 import { runSubagent, type SubagentDispatch } from './subagent';
 import { runAfterToolResult, type ToolResultHookContext } from './hooks';
-import { allocateSeq, commitBudgetNote } from './turn-state';
-import { discardTurn, locateBatch } from './transcript';
+import { commitBudgetNote } from './turn-state';
+import { commitLeasedMessage, discardTurn, locateBatch } from './transcript';
 import type { RunConfig } from './loop';
 
 /** Tool-call dispatch. `runTurn` is injected (not imported) to break the
@@ -128,18 +128,16 @@ export async function dispatchCalls(
     call: { id: string; name: string; args: unknown }, refusal: ToolResult,
   ): Promise<boolean> => {
     const result = await runAfterToolResult(refusal, call, hookCtx);
-    const seq = await allocateSeq(sessionId);
-    if (seq === null) return false;
     const row = toolResultContent(result, limits.maxResultChars);
-    await AgentMessages.insertAsync({
-      _id: Random.id(), sessionId, seq, role: 'tool',
+    const seq = await commitLeasedMessage(sessionId, {
+      _id: Random.id(), role: 'tool',
       toolCallId: call.id,
       content: row.content,
       error: row.error,
       ...(turn.from ? { from: turn.from } : {}),
       createdAt: new Date(),
     });
-    return true;
+    return seq !== null;
   };
 
   for (const call of calls) {
@@ -229,6 +227,11 @@ export async function dispatchCalls(
       return 'parked';
     }
 
+    // Gate/canUse/describe are application callbacks and may await arbitrary
+    // work. Re-prove ownership at the last boundary before a real tool side
+    // effect; a preflight performed only at the top of the loop can go stale.
+    if (!(await holdsLease(sessionId))) return abandon();
+
     // Collect attachment refs the tool stamps onto its result.
     const resultRefs: import('../common/types').AttachmentRef[] = [];
     const dispatched = tool
@@ -252,13 +255,9 @@ export async function dispatchCalls(
     });
 
     // Atomic seq + budget $inc — a subagent costs one toolCall to the parent.
-    const toolSeq = await allocateSeq(sessionId, { 'budgetSpent.toolCalls': 1 });
-    // Null seq = turn gone; abandon to avoid stranding a tool_use.
-    if (toolSeq === null) return abandon();
-
     const row = toolResultContent(result, limits.maxResultChars);
-    await AgentMessages.insertAsync({
-      _id: Random.id(), sessionId, seq: toolSeq, role: 'tool',
+    const toolSeq = await commitLeasedMessage(sessionId, {
+      _id: Random.id(), role: 'tool',
       toolCallId: call.id,
       content: row.content,
       error: row.error,
@@ -268,7 +267,9 @@ export async function dispatchCalls(
       // Attachments that survived the hook chain.
       ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
-    });
+    }, { inc: { 'budgetSpent.toolCalls': 1 } });
+    // Null seq = turn gone; abandon to avoid stranding a tool_use.
+    if (toolSeq === null) return abandon();
   }
 
   return 'completed';
@@ -379,22 +380,20 @@ export async function resumeParkedTurn(
     });
 
     // Denied/refused calls cost no tool budget — nothing was dispatched.
-    const seq = await allocateSeq(
-      sessionId,
-      (pending.verdict === 'denied' || refusedByCanUse) ? {} : { 'budgetSpent.toolCalls': 1 },
-    );
-    if (seq === null) return abandon();
-
     const row = toolResultContent(result, limits.maxResultChars);
-    await AgentMessages.insertAsync({
-      _id: Random.id(), sessionId, seq, role: 'tool', toolCallId: call.id,
+    const seq = await commitLeasedMessage(sessionId, {
+      _id: Random.id(), role: 'tool', toolCallId: call.id,
       content: row.content,
       error: row.error,
       childSessionId,
       ...(from ? { from } : {}),
       ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
+    }, {
+      inc: (pending.verdict === 'denied' || refusedByCanUse)
+        ? {} : { 'budgetSpent.toolCalls': 1 },
     });
+    if (seq === null) return abandon();
   }
 
   // Clear pending BEFORE re-dispatching the remainder — a second park would
