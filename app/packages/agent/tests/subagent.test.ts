@@ -989,13 +989,14 @@ describe('subagents: budgets and the live handle', () => {
     await AgentSessions.updateAsync('s-interrupt-parked', {
       $set: { activeChild: { sessionId: childId, toolCallId: 'g1' } },
     } as any);
+    const parentPhase = (await AgentSessions.findOneAsync('s-interrupt-parked'))!.phase;
 
     const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
     await interrupt.call({ userId: 'u1' }, 'park-parent', 's-interrupt-parked');
 
     assert.equal(
-      (await AgentSessions.findOneAsync('s-interrupt-parked'))!.phase, 'stopped',
-      'the named session is stopped as always',
+      (await AgentSessions.findOneAsync('s-interrupt-parked'))!.phase, parentPhase,
+      'a stale interrupt cannot stop a parent that is no longer running',
     );
     const child = (await AgentSessions.findOneAsync(childId))!;
     assert.equal(

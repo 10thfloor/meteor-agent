@@ -71,6 +71,11 @@ export interface PiAiModels {
     getModel(provider: string, id: string): unknown;
     streamSimple(model: unknown, context: PiAiContext, options?: unknown): AsyncIterable<any>;
 }
+type PiAiStreamOptions = Record<string, unknown>;
+type PiAiStreamOptionsForModel = (model: Readonly<{
+    provider: string;
+    modelId: string;
+}>) => PiAiStreamOptions;
 /** Pure mapping from ProviderRequest to pi-ai's request format. Identity trio
  *  and thinking are stamped at stream time by `createPiAiProvider` instead. */
 export declare function toPiAiRequest(req: ProviderRequest, now?: number): PiAiRequest;
@@ -78,12 +83,14 @@ export declare function toPiAiRequest(req: ProviderRequest, now?: number): PiAiR
 export declare function translateEvent(ev: any): ProviderChunk[];
 /** Provider over a pi-ai Models collection. Exported so tests can inject a
  *  fauxProvider without a network call. */
-export declare function createPiAiProvider(resolveModels: () => Promise<PiAiModels>, options?: Record<string, unknown>): Provider;
-/** Options for the default adapter. An explicit key wins over pi-ai's
- * provider-specific environment lookup; an absent key leaves that lookup
- * untouched. Exported for deterministic configuration tests, not re-exported
- * from the package's public server barrel. */
+export declare function createPiAiProvider(resolveModels: () => Promise<PiAiModels>, options?: PiAiStreamOptions | PiAiStreamOptionsForModel): Provider;
+/** Legacy explicit-key adapter option. `piAiProvider()` scopes it to Anthropic;
+ * an absent key leaves pi-ai's provider-specific lookup untouched. Exported
+ * for deterministic configuration tests, not from the public server barrel. */
 export declare function piAiOptionsFromEnv(env?: Readonly<Record<string, string | undefined>>): Record<string, unknown>;
+/** The legacy generic key is an Anthropic convention in the demo app. Never
+ * forward that opaque key to a differently configured provider. */
+export declare function piAiOptionsForProvider(provider: string, env?: Readonly<Record<string, string | undefined>>): Record<string, unknown>;
 /** Lazy singleton. Credentials come from the environment. */
 export declare function piAiProvider(): Provider;
 export {};

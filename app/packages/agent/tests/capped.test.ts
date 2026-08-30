@@ -122,6 +122,14 @@ describe('publications', () => {
       ...base, _id: 'mine', userId: 'u1',
       lease: { serverId: 's1', until: new Date() },
       pendingInputs: [{ messageId: 'private-wake-link', seq: 0, at: new Date() }],
+      participants: [
+        { id: 'h:u1', kind: 'human', role: 'owner', userId: 'u1', displayName: 'Alex', joinedAt: new Date() },
+        {
+          id: 'x:email:private@example.test', kind: 'human', role: 'member',
+          identity: { kind: 'email', externalUserId: 'private@example.test' },
+          displayName: 'Dana', joinedAt: new Date(),
+        },
+      ],
     } as any);
     await AgentSessions.insertAsync({ ...base, _id: 'theirs', userId: 'u2' } as any);
 
@@ -136,6 +144,11 @@ describe('publications', () => {
     assert.isUndefined(
       docs[0].pendingInputs,
       'agent.sessions must not publish `pendingInputs`',
+    );
+    assert.equal(docs[0].participants[1].identity.kind, 'email');
+    assert.isUndefined(
+      docs[0].participants[1].identity.externalUserId,
+      'agent.sessions exposes the surface kind but not the private provider identity',
     );
   });
 
@@ -253,6 +266,14 @@ describe('publications', () => {
       // stripped by the publication rather than merely absent from the doc.
       lease: { serverId: 's1', until: new Date() },
       pendingInputs: [{ messageId: 'private-wake-link', seq: 0, at: new Date() }],
+      participants: [
+        { id: 'h:u1', kind: 'human', role: 'owner', userId: 'u1', displayName: 'Alex', joinedAt: new Date() },
+        {
+          id: 'x:sms:+15555550100', kind: 'human', role: 'member',
+          identity: { kind: 'sms', externalUserId: '+15555550100' },
+          displayName: 'Dana', joinedAt: new Date(),
+        },
+      ],
       createdAt: new Date(), updatedAt: new Date(),
     } as any);
     await AgentMessages.insertAsync({
@@ -275,6 +296,11 @@ describe('publications', () => {
     assert.isUndefined(
       sessionDocs[0].pendingInputs,
       'agent.session must not publish `pendingInputs`',
+    );
+    assert.equal(sessionDocs[0].participants[1].identity.kind, 'sms');
+    assert.isUndefined(
+      sessionDocs[0].participants[1].identity.externalUserId,
+      'agent.session omits the private identity field used for server authorization',
     );
   });
 
@@ -377,8 +403,8 @@ describe('applyRateLimits', () => {
     assert.equal(applyRateLimits({ packages: {} }), 0);
   });
 
-  it('adds a per-connection-pair rule AND a per-user rule per configured entry', async () => {
-    // Two rules per entry is the design, not an accident: the (userId,
+  it('applies the sends entry to both waking sends and non-waking contributions', async () => {
+    // Two rules per METHOD is the design, not an accident: the (userId,
     // connectionId) pair rule isolates anonymous floods per connection, and
     // the authenticated-only per-user rule caps the multiply-your-limit-by-
     // opening-N-connections bypass the pair rule alone would allow.
@@ -386,11 +412,12 @@ describe('applyRateLimits', () => {
     const added = applyRateLimits({
       rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } },
     });
-    assert.equal(added, 2);
+    assert.equal(added, 4, 'two rules each for agent.send and agent.contribute');
   });
 
-  it('adds six rules when both sends and starts are configured', async () => {
-    // Two per method, and `starts` governs TWO methods: `agent.start` and
+  it('adds eight rules when both sends and starts are configured', async () => {
+    // Two per method; `sends` governs send+contribute, and `starts` governs
+    // TWO methods: `agent.start` and
     // `agent.fork`. A fork creates a session exactly as a start does (and
     // copies a transcript on top), so it shares the session-creation budget
     // rather than getting a cheaper knob of its own.
@@ -401,7 +428,7 @@ describe('applyRateLimits', () => {
         starts: { count: HEADROOM, intervalMs: 30000 },
       },
     });
-    assert.equal(added, 6);
+    assert.equal(added, 8);
   });
 
   it('a starts entry registers rules for agent.fork as well as agent.start', async () => {
@@ -423,7 +450,7 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds eight rules when interrupts is configured alongside sends and starts', async () => {
+  it('adds ten rules when interrupts is configured alongside sends and starts', async () => {
     // `interrupts` gets the identical two-rule treatment, not a cheaper one:
     // it is an unauthenticated-reachable write, so the anonymous-isolation
     // pair rule and the per-user cap on multi-connection multiplication both
@@ -436,7 +463,7 @@ describe('applyRateLimits', () => {
         interrupts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 8);
+    assert.equal(added, 10);
   });
 
   it('registers a rule that actually matches an agent.interrupt invocation', async () => {
@@ -467,11 +494,11 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds twelve rules when approvals joins sends, starts and interrupts', async () => {
+  it('adds fourteen rules when approvals joins sends, starts and interrupts', async () => {
     // `approvals` is the second entry governing TWO methods: `agent.approve`
     // and `agent.deny` are the same decision made two ways, and separate knobs
     // would make `deny` the cheap way to hammer the path `approve` limits.
-    // Two rules per method, so the entry adds four — 8 + 4.
+    // Two rules per method, so the entry adds four — 10 + 4.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
@@ -481,7 +508,7 @@ describe('applyRateLimits', () => {
         approvals: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 12);
+    assert.equal(added, 14);
   });
 
   it('an approvals entry registers rules for BOTH agent.approve and agent.deny', async () => {
@@ -509,8 +536,8 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds fourteen rules when compacts joins the other four entries', async () => {
-    // `compacts` governs ONE method, so it adds the plain two — 12 + 2. It gets
+  it('adds sixteen rules when compacts joins the other four entries', async () => {
+    // `compacts` governs ONE method, so it adds the plain two — 14 + 2. It gets
     // an entry of its own rather than sharing `sends` because both buy a
     // provider round trip but an operator tunes them apart: a compaction is
     // bookkeeping a UI fires rarely, a send is the product.
@@ -524,7 +551,7 @@ describe('applyRateLimits', () => {
         compacts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 14);
+    assert.equal(added, 16);
   });
 
   it('a compacts entry registers rules scoped to agent.compact', async () => {
@@ -650,5 +677,18 @@ describe('applyRateLimits', () => {
       unrelatedAfter.length, unrelatedBefore.length,
       'the rule must be scoped to agent.send, not every method',
     );
+  });
+
+  it('the sends entry also matches agent.contribute, closing the note-mode bypass', async () => {
+    const { applyRateLimits } = await import('../server/rate-limits');
+    const { DDPRateLimiter } = await import('meteor/ddp-rate-limiter');
+    const input = {
+      type: 'method', name: NAMES.mContribute,
+      userId: 'rl-user-note', connectionId: 'rl-conn-note', clientAddress: '127.0.0.1',
+    };
+    const before = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    applyRateLimits({ rateLimit: { sends: { count: HEADROOM, intervalMs: 60000 } } });
+    const after = await (DDPRateLimiter as any).findAllMatchingRulesAsync(input);
+    assert.isAbove(after.length, before.length);
   });
 });

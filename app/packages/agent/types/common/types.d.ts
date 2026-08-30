@@ -155,6 +155,20 @@ export interface AgentToolCall {
     name: string;
     args: unknown;
 }
+/** Trusted ingress surface for a human-authored transcript row. DDP methods
+ * stamp `desktop`; verified channel ingress stamps the registered channel
+ * kind. Clients can read this field but cannot supply it to a write method. */
+export type MessageSource = {
+    kind: 'desktop';
+} | {
+    kind: 'channel';
+    channel: string;
+    /** Opaque binding token. It lets egress suppress only the surface that
+     * originated the row while fanning out to the Session's other bindings.
+     * Random and transport-independent: this is never a conversation id or
+     * destination, and browser clients cannot choose it. */
+    origin?: string;
+};
 /** File metadata on a message row — bytes live in `AgentAttachments`, never in
  *  the row itself (rows are read constantly). `size` is decoded byte count. */
 export interface AttachmentRef {
@@ -182,7 +196,7 @@ export interface AgentMessage {
         reason?: string;
     };
     /** `orphan-child`: watcher recovered a child whose result row never landed. */
-    kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child' | 'unrouted-mention';
+    kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child' | 'unrouted-mention' | 'crew-note';
     /** `kind: 'unrouted-mention'` notes only: the agent the text named but did
      *  not address. */
     mentioned?: string;
@@ -220,6 +234,9 @@ export interface AgentMessage {
         participant: string;
         name: string;
     };
+    /** Where a human row entered the transcript. Trusted server attribution,
+     * never accepted from browser input or inferred from message text. */
+    source?: MessageSource;
     /** Addressee participant id — selects which model answers. Assistant rows
      *  addressing a model are internal deliberation (channel delivery skips them). */
     to?: string;

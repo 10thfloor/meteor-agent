@@ -47,6 +47,10 @@ export interface ChannelBinding {
     /** The roster participant a `member: true` binding reaches — teardown's
      *  key: removing the participant deletes their bindings. */
     participant?: string;
+    /** Random, transport-independent origin token stamped on inbound Messages.
+     *  It is safe to publish with source attribution: unlike `_id` and
+     *  `conversationRef`, it contains no provider address or conversation key. */
+    sourceKey?: string;
     /** Egress high-water mark for this surface. Advanced only by the guarded
      *  write in `advanceCursor`; deferred rows leave it unchanged. */
     deliveredSeq: number;
@@ -107,6 +111,12 @@ export interface ChannelVerdictToken {
     verdict: 'approved' | 'denied';
     expiresAt: Date;
     createdAt: Date;
+    /** Short redemption lease. A transient failure releases it; a crashed
+     * redeemer can be superseded after `until`. */
+    claim?: {
+        id: string;
+        until: Date;
+    };
 }
 export type IdentityQuery = Fields<ChannelIdentity> & {
     $or?: IdentityQuery[];

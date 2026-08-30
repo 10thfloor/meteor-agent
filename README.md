@@ -13,6 +13,23 @@ Meteor 3.5+ · [MIT](LICENSE)
 [Tools](#tools--five-kinds) · [Durability](#durability) ·
 [Channels](#channels) · [API reference](app/packages/agent/README.md)
 
+## Constellation desktop showcase
+
+This repository includes **Constellation**, a local-first Electron operations
+room built to exercise the `v0.2.1-rc.1` agent runtime: durable missions,
+specialist delegation, inspectable child sessions, approval-gated tools,
+memory, configurable scheduled pulses, reusable per-agent skills, attachments,
+and securely configured channel adapters.
+
+```bash
+npm install
+npm run desktop:offline
+```
+
+The offline mode is deterministic and needs no API key. Use `npm run desktop`
+to let the showcase select a configured live provider when one is available.
+See [the desktop guide](desktop/README.md) for the architecture and controls.
+
 | Agent concern | Meteor primitive |
 | --- | --- |
 | Durable transcript | Mongo collection |
@@ -600,6 +617,8 @@ agent-chat::part(phase awaiting) { text-transform: uppercase; }
 ```
 
 Session persistence, error recovery, and the approval prompt are built in.
+Clean assistant replies render safe, semantic Markdown; raw HTML, remote images,
+user messages, and debug traces stay literal.
 Drop to `Agent` directly for layouts it does not have or two sessions side by
 side.
 

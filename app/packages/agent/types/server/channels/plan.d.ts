@@ -6,6 +6,9 @@ export interface PlanOptions {
     profile: ChannelProfile;
     /** Session web URL for overflow links (§8.5). Absent = no link. */
     overflowUrl?: string;
+    /** Opaque source token of the binding being planned. Channel human rows
+     *  skip only a matching origin; every other binding may receive them. */
+    origin?: string;
 }
 /** One planned row: the message and its delivery item, or null (advance past). */
 export interface PlannedRow {

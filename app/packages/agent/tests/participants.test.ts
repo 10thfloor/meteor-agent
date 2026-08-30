@@ -256,6 +256,96 @@ describe('participants', () => {
       );
     });
 
+    it('keeps participant chat access but reserves DDP session controls for the owner', async function () {
+      this.timeout(30000);
+      const { Meteor } = await import('meteor/meteor');
+      const { NAMES } = await import('../common/names');
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { AgentMessages, AgentSessions } = await import('../common/collections');
+      await clean();
+
+      const controller = new Agent('pp-controls', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => ({ text: 'ok' })),
+      });
+      await seedRostered('pm-controls', 'pp-controls', 'u1', [human('u2', 'Dana')]);
+      const handlers = (Meteor.server as any).method_handlers;
+      const asMember = { userId: 'u2', unblock() {} };
+
+      // Transcript participation remains a member capability.
+      await handlers[NAMES.mContribute].call(
+        asMember,
+        'pp-controls',
+        'pm-controls',
+        'Context from Dana',
+        'participant-control-note',
+      );
+      const note = await AgentMessages.findOneAsync({
+        sessionId: 'pm-controls', kind: 'crew-note',
+      });
+      assert.deepInclude(note?.from, { participant: 'h:u2', name: 'Dana' });
+
+      // Browser control-plane methods are not implied by transcript membership.
+      for (const name of [
+        NAMES.mInterrupt,
+        NAMES.mFork,
+        NAMES.mCompact,
+        NAMES.mArchive,
+        NAMES.mUnarchive,
+      ]) {
+        const error = await rejectsWith(
+          () => handlers[name].call(asMember, 'pp-controls', 'pm-controls'),
+          'not-allowed',
+        );
+        assert.include(error.reason, 'session owner');
+      }
+      assert.equal(
+        await AgentSessions.find({ agent: 'pp-controls' }).countAsync(),
+        1,
+        'denied controls create no fork or other Session',
+      );
+      assert.isUndefined(
+        (await AgentSessions.findOneAsync('pm-controls'))?.archived,
+        'denied archive/unarchive leaves display state unchanged',
+      );
+
+      // Existing owner behavior remains unchanged.
+      const asOwner = { userId: 'u1', unblock() {} };
+      await handlers[NAMES.mArchive].call(asOwner, 'pp-controls', 'pm-controls');
+      assert.instanceOf((await AgentSessions.findOneAsync('pm-controls'))?.archived, Date);
+      await handlers[NAMES.mUnarchive].call(asOwner, 'pp-controls', 'pm-controls');
+      assert.isUndefined((await AgentSessions.findOneAsync('pm-controls'))?.archived);
+
+      // The restriction is the public DDP boundary. App code keeps its
+      // existing server-side authority and may deliberately fork for a member.
+      const forkId = await controller.fork('pm-controls', { userId: 'u2' });
+      assert.equal((await AgentSessions.findOneAsync(forkId))?.forkedFrom?.sessionId, 'pm-controls');
+    });
+
+    it('preserves anonymous capability owners for DDP session controls', async function () {
+      this.timeout(30000);
+      const { Meteor } = await import('meteor/meteor');
+      const { NAMES } = await import('../common/names');
+      const { AgentSessions } = await import('../common/collections');
+      await clean();
+      await seedRostered('pm-anon-controls', 'pp-anon-controls', null);
+      const handlers = (Meteor.server as any).method_handlers;
+      const anonymous = { userId: null, unblock() {} };
+
+      await handlers[NAMES.mArchive].call(
+        anonymous, 'pp-anon-controls', 'pm-anon-controls',
+      );
+      assert.instanceOf(
+        (await AgentSessions.findOneAsync('pm-anon-controls'))?.archived,
+        Date,
+      );
+      await handlers[NAMES.mUnarchive].call(
+        anonymous, 'pp-anon-controls', 'pm-anon-controls',
+      );
+      assert.isUndefined((await AgentSessions.findOneAsync('pm-anon-controls'))?.archived);
+    });
+
     it('stamps from off the authenticated sender, never the text', async function () {
       this.timeout(30000);
       const { Agent } = await import('../server/agent');
@@ -288,6 +378,69 @@ describe('participants', () => {
       assert.equal(rows[0].from?.name, 'Dana');
       assert.equal(rows[1].from?.participant, 'x:email:dana@x.co');
       assert.equal(rows[1].from?.name, 'dana@x.co');
+    });
+
+    it('commits retry-safe crew notes without a wake, turn charge, or @ routing', async function () {
+      this.timeout(30000);
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { contributeToSession } = await import('../server/methods');
+      const { unansweredMessageAddressee } = await import('../server/participants');
+      const { AgentMessages, AgentSessions } = await import('../common/collections');
+      await clean();
+
+      // eslint-disable-next-line no-new
+      new Agent('pp-contribute', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => ({ text: 'must not run' })),
+      });
+      await seedRostered('pc1', 'pp-contribute', 'u1', [
+        human('u2', 'Dana'), model('pp-colleague'),
+      ]);
+      const key = 'crew-note-retry-key';
+      await contributeToSession(
+        'pp-contribute', 'pc1', '@pp-colleague review this later', 'u2',
+        { commitKey: key, source: { kind: 'desktop' } },
+      );
+      await contributeToSession(
+        'pp-contribute', 'pc1', '@pp-colleague review this later', 'u2',
+        { commitKey: key, source: { kind: 'desktop' } },
+      );
+
+      const rows = await AgentMessages.find({ sessionId: 'pc1' }).fetchAsync();
+      assert.lengthOf(rows, 1, 'a transparent retry adopts the one durable row');
+      const [note] = rows;
+      assert.equal(note.role, 'user', 'a later model turn receives this context');
+      assert.equal(note.kind, 'crew-note', 'routing/recovery can identify a non-waking row');
+      assert.deepEqual(note.from, { participant: 'h:u2', name: 'Dana' });
+      assert.deepEqual(note.source, { kind: 'desktop' });
+      assert.isUndefined(note.to, 'even a leading @ token is not resolved by contribute');
+
+      const session = (await AgentSessions.findOneAsync('pc1'))!;
+      assert.equal(session.nextSeq, 1);
+      assert.equal(session.budgetSpent.turns, 0, 'a note buys no model turn');
+      assert.isUndefined(session.pendingInputs, 'there is no durable Activation evidence');
+      assert.equal(session.phase, 'idle');
+      assert.isNull(
+        await unansweredMessageAddressee(session, note),
+        'an unrelated future wake cannot rediscover the note as owed work',
+      );
+
+      await rejectsWith(
+        () => contributeToSession(
+          'pp-contribute', 'pc1', 'different input', 'u2',
+          { commitKey: key, source: { kind: 'desktop' } },
+        ),
+        'commit-conflict',
+      );
+      await rejectsWith(
+        () => contributeToSession(
+          'pp-contribute', 'pc1', 'intrusion', 'stranger',
+          { commitKey: 'unauthorized-note-key', source: { kind: 'desktop' } },
+        ),
+        'no-session',
+      );
+      assert.equal(await AgentMessages.find({ sessionId: 'pc1' }).countAsync(), 1);
     });
   });
 

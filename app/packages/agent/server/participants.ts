@@ -142,6 +142,10 @@ export async function listParticipants(sessionId: string): Promise<SessionPartic
 export async function unansweredMessageAddressee(
   session: AgentSession, user: AgentMessage,
 ): Promise<{ id: string; agent: string } | null> {
+  // Crew notes are context for a later turn, not work somebody owes. In
+  // particular a leading @name inside one must not be rediscovered as routing
+  // when an unrelated System turn or recovery wake arrives later.
+  if (user.kind === 'crew-note') return null;
   if (!session.participants?.length) return null;
   const hit = resolveAddressee(user.content, user.to, session);
   if (hit) {

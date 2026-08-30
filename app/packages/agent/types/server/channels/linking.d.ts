@@ -9,6 +9,14 @@ export declare function resolveIdentity(kind: string, externalUserId: string): P
 export declare function issueLinkToken(kind: string, externalUserId: string, opts?: {
     ttlMs?: number;
 }): Promise<string>;
+export interface LinkTokenPreview {
+    state: 'ready' | 'expired' | 'unavailable';
+    channel?: string;
+    expiresAt?: Date;
+}
+/** Inspect an account-link capability without spending it. External identity
+ * ids remain private; the page only needs the Channel label and expiry. */
+export declare function previewLinkToken(token: string): Promise<LinkTokenPreview>;
 /** Burn token, link identity. findOneAndDelete is single-winner;
  *  indistinguishable null on any failure. */
 export declare function redeemLinkToken(token: string, userId: string): Promise<ChannelIdentity | null>;
@@ -16,6 +24,22 @@ export declare function redeemLinkToken(token: string, userId: string): Promise<
  *  only null-owned rows matching this external identity are touched, so
  *  crash-recovery is idempotent. OIDC callers use this directly. */
 export declare function linkIdentity(kind: string, externalUserId: string, userId: string, assurance: 'link' | 'oidc'): Promise<ChannelIdentity>;
+export interface VerdictTokenPreview {
+    state: 'ready' | 'expired' | 'unavailable';
+    verdict?: 'approved' | 'denied';
+    missionTitle?: string;
+    toolName?: string;
+    requestingAgent?: string;
+    runContext?: 'owner' | 'anonymous' | 'elevated';
+    source?: string;
+    scope?: 'one-call';
+    expiresAt?: Date;
+}
+/** Inspect a verdict capability without spending it. The token itself is the
+ * authority to see this deliberately small summary; tool args, user ids, and
+ * transcript content never leave the server. A stale/missing request is kept
+ * indistinguishable from a token that was already used. */
+export declare function previewVerdictToken(token: string): Promise<VerdictTokenPreview>;
 /** Mint a verdict-approval token for one choice of one delivered prompt.
  *  24h default TTL; the real staleness guard is toolCallId at redemption. */
 export declare function issueVerdictToken(agent: string, sessionId: string, toolCallId: string, verdict: 'approved' | 'denied', opts?: {

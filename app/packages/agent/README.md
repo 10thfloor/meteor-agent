@@ -278,7 +278,9 @@ session — see *Recovery runs itself*; it carries `childSessionId` and
 Each entry registers two DDP rules per method it governs: per-(user,
 connection) so an anonymous flood only burns its own connection's quota, and
 per-user for authenticated callers so opening more connections does not
-multiply the allowance. Two entries govern two methods each: `starts` covers
+multiply the allowance. `sends` covers both `agent.send` and the non-waking
+`agent.contribute`, so note mode cannot bypass a deployment's transcript-write
+ceiling. Two other entries govern two methods each: `starts` covers
 `agent.start` and `agent.fork` (see **Forking**), both of which create a
 session, and `approvals` covers `agent.approve` and `agent.deny` — the same
 decision made two ways, and the one unauthenticated-reachable method that
@@ -292,7 +294,8 @@ is the only method whose every accepted call buys a provider round trip, and no
 turn budget applies to it, so an unlimited one is a cheaper `send` with
 `budget.spend` as its only backstop.
 
-`Agent.send(sessionId, text)` remains the whole application Interface. After
+`Agent.send(sessionId, text)` is the waking input Interface; `Agent.contribute`
+is its non-waking collaboration counterpart. After a send's
 authorization, the private Transcript Commit machinery records a reconstructable
 reservation, then atomically allocates its sequence and Turn-budget charge,
 materializes the Message, records compact wake evidence, and removes the
@@ -489,8 +492,27 @@ meteor npm install --save @modelcontextprotocol/sdk
 
 **Connections are lazy and per server.** Nothing spawns at registration. The
 first turn that needs a server connects over stdio, runs `tools/list` once and
-caches both for the life of the process — never one connection per tool. Call
-`stopMcp()` to close them all; a `process.exit` closes them best-effort.
+caches both until it is disconnected — never one connection per tool. Server
+code can manage that lifecycle explicitly:
+
+```ts
+import {
+  discoverMcpTools, disconnectMcpServer, unregisterMcpServer,
+  getMcpServerStatus, stopMcp,
+} from 'meteor/10thfloor:agent';
+
+await discoverMcpTools('docs');       // connect and return the current catalog
+getMcpServerStatus('docs');           // disconnected | connecting | connected | cooldown
+await disconnectMcpServer('docs');    // close now; keep the registration
+await unregisterMcpServer('docs');    // close now; remove the registration
+await stopMcp();                      // disconnect every server; keep registrations
+```
+
+Replacing a registration, disconnecting, unregistering, and stopping all fence
+off in-flight opens: a late subprocess is closed and can never repopulate the
+cache. Status is deliberately coarse and never includes command arguments,
+environment values, or failure text. A `process.exit` closes clients
+best-effort.
 
 **A server that is down never fails a turn.** A named tool stays listed (with a
 placeholder description) and answers `mcp-unavailable`, which the model reads
@@ -767,10 +789,22 @@ your redaction. `Agent.clearHooks()` clears **both** scopes;
 const sessionId = await Support.start();
 Support.subscribe(sessionId);
 await Support.send(sessionId, 'where is my order?');
+await Support.contribute(sessionId, 'Dana confirmed the deadline.'); // no model wake
 
 Support.messages(sessionId).fetch();   // reactive, includes in-flight tokens
 Support.status(sessionId);             // 'idle' | 'streaming' | 'calling' | …
 ```
+
+`contribute(sessionId, text)` is human-to-crew context. It commits a
+`role:'user', kind:'crew-note'` row so the next model turn can read it, but it
+does **not** resolve a leading `@agent`, create Activation evidence, increment
+`budget.turns`, or start a provider call. Browser retries are idempotent just
+like `send`. Both browser methods stamp `message.source = { kind:'desktop' }`;
+verified channel ingress stamps `{ kind:'channel', channel:<registered kind>,
+origin:<opaque binding token> }`. `origin` is random — never a provider
+conversation id or destination — and exists only to suppress an echo to the
+exact binding that received the row. Source metadata is written only by trusted
+server paths; neither browser method accepts it.
 
 An in-flight row also carries `toolArgs` when the model is streaming tool
 calls: a `Record<number, string>` of the partial arguments JSON, **keyed by the
@@ -787,10 +821,14 @@ make, so you can render it and let a human decide.
 
 ```ts
 const ask = Support.pending(sessionId);   // { toolCallId, name, args, … } | undefined
-if (ask) await Support.approve(sessionId);
+if (ask) await Support.approve(sessionId, ask.toolCallId);
 // …or refuse, with a reason the model gets to see:
-await Support.deny(sessionId, 'too large');
+if (ask) await Support.deny(sessionId, 'too large', ask.toolCallId);
 ```
+
+Pass the displayed `toolCallId`: the verdict write then matches that exact
+pending call atomically, so a late click for ask A cannot approve a newly
+parked ask B. The argument is optional only for compatibility with older UIs.
 
 `pending` also carries **`runAs`** when the parked tool has one (`null` = the
 anonymous service context), because an approver is authorizing an identity as
@@ -841,9 +879,10 @@ defineAgentChat();          // registers <agent-chat>
 </agent-chat>
 ```
 
-That is a full chat: streaming assistant bubbles with a cursor, tool rows,
-compaction and budget notes, the phase badge, the approval bar wired to
-`approve`/`deny`, and a composer with Send and Stop.
+That is a full chat: streaming assistant bubbles with a cursor, concise tool
+receipts, compaction and budget notes, the phase badge, the approval bar wired
+to `approve`/`deny`, and a composer with Send and Stop. Exact machine records
+are available only in explicit debug mode.
 
 **It is never registered for you.** A package that called
 `customElements.define('agent-chat', …)` at import time would squat that name
@@ -867,7 +906,21 @@ framework never re-renders it.
 | `agent` | **Required.** The name a server-side `new Agent(name, …)` registered. |
 | `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
 | `placeholder` | Composer hint. |
-| `verbosity` | `full` (default) shows everything. `quiet` renders the conversation without the machine's working — no tool results, no `→ name({…})` traces, and no empty bubble where a tool-only assistant turn was. Errors, budget stops and approval notes always show. It only changes what is drawn, so toggling it re-paints without touching the session. |
+| `composer-mode` | `ask` (default) calls `send` and wakes the addressed/default agent. `note` calls `contribute`, changes the default hint/button/ARIA label, and records shared context without a wake. The `composerMode` property mirrors the attribute. |
+| `verbosity` | `clean` is the default: tool calls/results become concise operational receipts, approvals use bounded human-readable argument summaries, embedded JSON-string escapes are decoded, and raw object/array payloads are hidden. `debug` restores exact assistant bytes, tool arguments, tool-result payloads, structured assistant content, and approval records. Legacy `quiet` aliases `clean`; legacy `full` aliases `debug`. It only changes what is drawn, so toggling it re-paints without touching the session. |
+
+In clean mode, assistant prose renders as semantic GFM/CommonMark-style
+Markdown (headings, lists, emphasis, code, fenced code, blockquotes, tables,
+and links). The lexer output is walked into an allowlisted DOM; it is never
+inserted as HTML. Raw HTML and image syntax remain inert text, and only absolute
+HTTPS or `mailto:` links become hardened external anchors. User messages, Crew
+notes, tools, notes, and debug-mode assistant bytes remain literal text.
+
+Each submit enters a single in-flight state immediately: input and send button
+disable, the label becomes `Sending…` or `Adding note…`, and duplicate submits
+are ignored until the method settles. A rejection restores the draft and the
+controls. A successful submit emits **`agent-chat:submitted`** with
+`detail: { sessionId, mode }`.
 
 Re-pointing the element usually takes two attribute writes
 (`removeAttribute('session-id')`, then `setAttribute('agent', …)`), and
@@ -1026,7 +1079,9 @@ knows to forget a stale saved id. Branch on the **code** when you do that:
 on `detail.error.error === 'no-session'` — forgetting it on every rejection
 throws away a live conversation the moment somebody clicks Send twice too
 quickly. Text that failed to send is put back in the composer rather than
-swallowed.
+swallowed. Transcript repainting also leaves a reader's scroll position and
+composer focus alone when they have moved above the tail; a **New messages**
+button returns to the bottom. A reader already at the tail keeps following it.
 
 ### Theming
 
@@ -1050,13 +1105,18 @@ element you never theme still follows the OS light/dark setting.
 | --- | --- |
 | `root`, `header`, `messages`, `composer` | Layout containers |
 | `phase` | The badge; also carries the phase itself (`::part(phase awaiting)`) |
-| `message` | Every transcript row; also carries `user` / `assistant` / `tool` / `note`, plus `streaming` on an in-flight row and the note's `kind` (`::part(note error)`) |
-| `tool-name`, `tool-content` | The two halves of a tool row — the content is line-clamped, `::part(tool-content) { -webkit-line-clamp: none }` unclamps it |
-| `tool-calls` | The ` → name(args)` line under an assistant bubble |
+| `message` | Every transcript row; also carries `user` / `assistant` / `note`, plus `operation` on a clean tool receipt, `streaming` on an in-flight row, and the note's `kind` (`::part(note error)`) |
+| `markdown` | Clean assistant content boundary. Descendants expose `markdown-heading`, `markdown-paragraph`, `markdown-list`, `markdown-list-item`, `markdown-strong`, `markdown-emphasis`, `markdown-strikethrough`, `markdown-code`, `markdown-inline-code`, `markdown-code-block`, `markdown-language`, `markdown-blockquote`, `markdown-rule`, `markdown-table`, and `markdown-link`. |
+| `crew-note-badge` | Visible `Crew note` label on a non-waking human contribution. Its leading `@agent` chips deliberately never carry `addressed`. |
+| `new-messages` | The transcript-tail affordance; also carries `pending` while newer rows are waiting below the reader. |
+| `operation`, `operations` | Clean-mode tool/delegation status, without arguments or result payloads |
+| `structured-hidden` | Clean-mode replacement for a whole JSON or JSON-fenced assistant message |
+| `tool-name`, `tool-content` | Debug-only halves of an exact tool row — the content is line-clamped, `::part(tool-content) { -webkit-line-clamp: none }` unclamps it |
+| `tool-calls` | Debug-only ` → name(args)` line under an assistant bubble |
 | `mention` | A resolved `@handle`; also carries its kind (`agent`, or whatever the app set) |
 | `approval`, `approval-text` | The bar and its sentence |
 | `typeahead`, `suggestion` | The mention autocomplete and its rows (`suggestion-handle`, `suggestion-detail`) |
-| `button` | Every button; also carries `send` / `stop` / `approve` / `deny` |
+| `button` | Every button; also carries `send` / `stop` / `approve` / `deny`; an in-flight send also carries `loading` |
 | `input` | The composer field |
 
 ```css
@@ -1083,7 +1143,10 @@ For anything the element does not do (`fork`, `usage`, a denial with a reason
 you collected from the user), reach through it:
 
 ```js
-chat.agentInstance.deny(chat.sessionId, 'the amount is too large');
+const ask = chat.agentInstance.pending(chat.sessionId);
+if (ask) chat.agentInstance.deny(
+  chat.sessionId, 'the amount is too large', ask.toolCallId,
+);
 ```
 
 ## Subagents
@@ -1503,8 +1566,9 @@ Five surface packages ship — `10thfloor:agent-channel-slack`, `-telegram`,
 `-whatsapp`, `-sms`, and `-email` — each exactly one lens, one transport and one
 profile default, zero npm dependencies; each README carries provider setup.
 Server-side `agent.send(sessionId, text, { userId })`,
-`agent.approve(sessionId, { userId })` and `agent.deny(sessionId, reason,
-{ userId })` landed with channels: the same core the DDP methods call, always
+`agent.approve(sessionId, { userId, expectedToolCallId })` and
+`agent.deny(sessionId, reason, { userId, expectedToolCallId })` landed with
+channels: the same core the DDP methods call, always
 scoped to `{ agent, session, userId }` — `userId: null` is the anonymous owner,
 never "all sessions". The DDP rate limiter does not see this path (its rules
 match method names); the session budget does, and the webhook brings its own
@@ -1704,10 +1768,13 @@ a log line; a provider retry would meet the identical refusal forever.
 ### Delivery
 
 The worker is `startWatcher` with the collection swapped: one observer over
-committed assistant and note rows (insert-only, so `added` is the whole story)
-plus a 15s sweep for everything no write signals — an expired claim, a parked
-prompt (a park writes the session document, which the observer deliberately
-does not watch). One worker, query-sliced, never an observer per conversation:
+committed assistant/note rows and trusted Desktop/Channel human rows
+(insert-only, so `added` is the whole story), plus a 15s sweep for everything
+no write signals — an expired claim, a parked prompt (a park writes the session
+document, which the observer deliberately does not watch). The observer looks
+up every binding for a fresh row even when that binding is older than the
+sweep's lookback, so an inactive surface does not lose a live fan-out. One
+worker, query-sliced, never an observer per conversation:
 a Slack thread never disconnects, so per-conversation observers would
 accumulate forever. Each binding carries its own cursor (`deliveredSeq`) and
 its own claim, so a downed gateway delays only itself. The worker never calls
@@ -1837,7 +1904,7 @@ one delivery collide on the insert, and one wins.
 | Collection | `_id` | Holds |
 | --- | --- | --- |
 | `agent_channel_identities` | `<kind>:<externalUserId>` | Who an external sender is: `{ kind, externalUserId, userId, assurance, linkedAt }`. One app user, many rows; no row means unlinked. |
-| `agent_channel_bindings` | `<kind>:<conversationRef>` | Which conversation maps to which session: `destination`, `audience`, `agent`, `sessionId`, `userId`, the opener's `externalUserId` and `assurance`, `deliveredSeq` (this surface's cursor), `claim` (the delivering worker's lease). One session, many bindings. Inserted **before** the session, so a lost race creates nothing. |
+| `agent_channel_bindings` | `<kind>:<conversationRef>` | Which conversation maps to which session: `destination`, `audience`, `agent`, `sessionId`, `userId`, the opener's `externalUserId` and `assurance`, random `sourceKey` (origin-only echo suppression), `deliveredSeq` (this surface's cursor), `claim` (the delivering worker's lease). One session, many bindings. Inserted **before** the session, so a lost race creates nothing. |
 | `agent_delivery_receipts` | `deliver:<bindingId>:<suffix>` | The three-phase intent log: `state` (`sending` \| `sent` \| `abandoned`), `providerMessageId`, `expects` (the reply grammar a prompt delivery registered), `attempts`, `at`. |
 | `agent_inbound_submissions` | `<kind>:<eventId>` | Deduplicated admission: one row per admitted provider event. TTL-reaped after a week, which defines the deduplication window. |
 | `agent_channel_link_tokens` | `Random.secret()` | Single-use linking tokens, bound to one external identity. |
@@ -1882,6 +1949,10 @@ gains a harness-stamped `from` — written from the authenticated source, never
 parsed from text, so a model can never impersonate a colleague.
 `Agent.participants.remove` refuses the owner (ownership transfer is a named
 open question) and tears down the member's channel bindings with them.
+Session publications preserve `participant.identity.kind` for surface UI but
+strip `participant.identity.externalUserId`; raw provider ids remain a
+server-side authorization detail. Render the sanitized `displayName`, not an
+external address.
 
 **Addressing is mechanical.** A message that starts `@analyst` (or a send
 with `extras.to`) runs that model's config — its prompt, tools and provider —
@@ -1901,6 +1972,15 @@ group-thread path) — gates ingress; the roster gates DDP. Member bindings
 never prompts, statuses, or capability URLs, and the claim-history sweep
 skips them. The composed-email loop closes on exactly this machinery — see
 the email package's `onReply: 'continue'`.
+
+Desktop-authored human rows (`send` and `contribute`) fan out to attached
+Channel bindings as attributed replies (`Name: …` / `Name · crew note: …`).
+Channel-originated human rows carry their binding's random `sourceKey` as an
+opaque `source.origin`: they advance that exact origin silently and fan out,
+once per receipt, to every other binding on the Session — including another
+binding of the same Channel kind. Legacy channel rows without an origin and
+source-less user rows remain silent because their origin cannot be identified
+safely. Assistant egress is unchanged.
 
 **Files round out the surface.** Attachment refs on published rows render as
 chips in `<agent-chat>`; a click mints a single-use ~60-second token

@@ -78,6 +78,10 @@ export function registerPublications(): void {
           fields: {
             lease: 0, operations: 0, pendingInput: 0, pendingInputs: 0, purgingAt: 0,
             'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0,
+            // External ids (email addresses, phone numbers, provider user ids)
+            // authorize on the server but are not client display data. The
+            // roster's sanitized displayName + identity kind are sufficient.
+            'participants.identity.externalUserId': 0,
           },
         },
       ),
@@ -113,6 +117,7 @@ export function registerPublications(): void {
         fields: {
           lease: 0, operations: 0, pendingInput: 0, pendingInputs: 0, purgingAt: 0,
           'pending.wakeToken': 0, 'pendingRelay.token': 0, 'pendingSystem.token': 0,
+          'participants.identity.externalUserId': 0,
         },
       },
     );

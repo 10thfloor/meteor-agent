@@ -5,7 +5,7 @@ import { createHash } from 'crypto';
 import type { ClientSession } from 'mongodb';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import type {
-  AgentMessage, AgentSession, AttachmentRef, SessionInc, SessionParticipant,
+  AgentMessage, AgentSession, AttachmentRef, MessageSource, SessionInc, SessionParticipant,
 } from '../common/types';
 import type { SessionQuery, SessionSet } from '../common/db';
 import { needsAttribution } from '../common/participants';
@@ -28,6 +28,7 @@ export interface UserMessageDraft {
   attachments?: AttachmentRef[];
   from?: { participant: string; name: string };
   to?: string;
+  source?: MessageSource;
 }
 
 /** @internal */
@@ -254,13 +255,20 @@ function sameAttachments(a?: AttachmentRef[], b?: AttachmentRef[]): boolean {
   });
 }
 
+function sameSource(a?: MessageSource, b?: MessageSource): boolean {
+  if (a?.kind !== b?.kind) return false;
+  if (a?.kind === 'channel' && b?.kind === 'channel') return a.channel === b.channel;
+  return a === undefined ? b === undefined : true;
+}
+
 function sameDraft(a: UserMessageDraft, b: UserMessageDraft): boolean {
   return a.content === b.content
     && sameAttachments(a.attachments, b.attachments)
     && a.to === b.to
     && a.from?.participant === b.from?.participant
     && a.from?.name === b.from?.name
-    && (a.from === undefined) === (b.from === undefined);
+    && (a.from === undefined) === (b.from === undefined)
+    && sameSource(a.source, b.source);
 }
 
 function sameMessage(
@@ -274,7 +282,8 @@ function sameMessage(
     && message.to === draft.to
     && message.from?.participant === draft.from?.participant
     && message.from?.name === draft.from?.name
-    && (message.from === undefined) === (draft.from === undefined);
+    && (message.from === undefined) === (draft.from === undefined)
+    && sameSource(message.source, draft.source);
 }
 
 function conflict(): never {

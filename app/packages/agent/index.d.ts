@@ -5,7 +5,13 @@
 export * from './types/server/index';
 
 // The `<agent-chat>` element. Client-only.
-export { defineAgentChat } from './types/client/element';
+export {
+  defineAgentChat,
+  type ComposerMode,
+  type Mentionable,
+  type MentionSource,
+  type MentionCollection,
+} from './types/client/element';
 
 // Browser-side `Agent` under an unambiguous type name. At client runtime this
 // alias and `Agent` reference the same browser implementation.

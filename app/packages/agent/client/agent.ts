@@ -111,6 +111,14 @@ export class Agent {
     return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text, Random.id());
   }
 
+  /** Commit human-to-crew context without waking an agent. The stable retry
+   * key makes Meteor's transparent reconnect retry exactly-once. */
+  contribute(sessionId: string, text: string): Promise<string> {
+    return Meteor.callAsync(
+      NAMES.mContribute, this.name, sessionId, text, Random.id(),
+    );
+  }
+
   interrupt(sessionId: string): Promise<void> {
     return Meteor.callAsync(NAMES.mInterrupt, this.name, sessionId);
   }
@@ -142,14 +150,18 @@ export class Agent {
     return `/agent/attachments/${token}`;
   }
 
-  approve(sessionId: string): Promise<void> {
-    return Meteor.callAsync(NAMES.mApprove, this.name, sessionId);
+  /** Bind the click to the ask that was rendered when possible. Omitting the
+   * id remains supported for older callers. */
+  approve(sessionId: string, expectedToolCallId?: string): Promise<void> {
+    return Meteor.callAsync(NAMES.mApprove, this.name, sessionId, expectedToolCallId);
   }
 
   /** `reason` reaches the model as the denied tool result, so it is the model's
    *  only account of why — worth writing for it, not just for the log. */
-  deny(sessionId: string, reason?: string): Promise<void> {
-    return Meteor.callAsync(NAMES.mDeny, this.name, sessionId, reason);
+  deny(sessionId: string, reason?: string, expectedToolCallId?: string): Promise<void> {
+    return Meteor.callAsync(
+      NAMES.mDeny, this.name, sessionId, reason, expectedToolCallId,
+    );
   }
 
   /** Shelve a session: it drops out of `sessions()` and keeps everything else,

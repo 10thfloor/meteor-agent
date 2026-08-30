@@ -1,9 +1,9 @@
-10thfloor:agent@0.1.0
-10thfloor:agent-channel-email@0.1.0
-10thfloor:agent-channel-slack@0.1.0
-10thfloor:agent-channel-sms@0.1.0
-10thfloor:agent-channel-telegram@0.1.0
-10thfloor:agent-channel-whatsapp@0.1.0
+10thfloor:agent@0.2.1-rc.1
+10thfloor:agent-channel-email@0.2.1-rc.1
+10thfloor:agent-channel-slack@0.2.1-rc.1
+10thfloor:agent-channel-sms@0.2.1-rc.1
+10thfloor:agent-channel-telegram@0.2.1-rc.1
+10thfloor:agent-channel-whatsapp@0.2.1-rc.1
 accounts-base@3.3.0
 accounts-password@3.3.0
 allow-deny@2.1.0

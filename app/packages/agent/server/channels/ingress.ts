@@ -111,6 +111,9 @@ async function findOrCreateBinding(
       // The channel's declared admission posture for NEW conversations
       // (participants spec decision 11); absent reads 'opener', v1 verbatim.
       ...(def.admits !== undefined ? { admits: def.admits } : {}),
+      // A public Message may carry this random token for origin-only echo
+      // suppression. Never stamp `_id`: it embeds provider conversation keys.
+      sourceKey: Random.secret(),
       deliveredSeq: 0,
       createdAt: new Date(),
       updatedAt: new Date(),
@@ -121,6 +124,26 @@ async function findOrCreateBinding(
     // Activity bump for the egress sweep's lookback window. Destination
     // adoption deliberately happens AFTER admission in `route`.
     await ChannelBindings.updateAsync(bindingId, { $set: { updatedAt: new Date() } });
+  }
+
+  // Compatibility for bindings created by an older release or inserted by a
+  // compose integration. The conditional write makes concurrent repairs
+  // converge; the reread adopts the winner's token.
+  if (!binding.sourceKey) {
+    await ChannelBindings.updateAsync({
+      _id: binding._id,
+      sessionId: binding.sessionId,
+      sourceKey: { $exists: false },
+      erasingAt: { $exists: false },
+    }, {
+      $set: { sourceKey: Random.secret() },
+    });
+    const repaired = await ChannelBindings.findOneAsync({
+      _id: binding._id,
+      sessionId: binding.sessionId,
+      erasingAt: { $exists: false },
+    });
+    if (repaired) binding = repaired;
   }
   return binding;
 }
@@ -171,7 +194,7 @@ async function ensureSession(kind: string, binding: ChannelBinding): Promise<boo
  *  staleness guard; the single-winner verdict write is the final authority. */
 async function verdictFromExpects(
   binding: ChannelBinding, text: string,
-): Promise<'approved' | 'denied' | null> {
+): Promise<{ verdict: 'approved' | 'denied'; toolCallId: string } | null> {
   const session = await AgentSessions.findOneAsync(binding.sessionId);
   const pending = session?.pending;
   if (!session || session.phase !== 'awaiting' || !pending || pending.verdict) return null;
@@ -182,7 +205,7 @@ async function verdictFromExpects(
   const match = matchExpectation(text, receipt.expects);
   if (!match) return null;
   if (match.toolCallId !== pending.toolCallId) return null;   // invariant: expects built for this ask
-  return match.verdict;
+  return match;
 }
 
 // ---- The pipeline ----------------------------------------------------------
@@ -341,11 +364,12 @@ async function route(
     if (intent.kind === 'message') {
       // Free text answers an outstanding prompt first (§8.3), else it is a
       // send. The verdict write's single-winner selector remains the backstop.
-      const verdict = await verdictFromExpects(binding, intent.text);
-      if (verdict) {
+      const matched = await verdictFromExpects(binding, intent.text);
+      if (matched) {
         await recordVerdict(
-          { userId }, binding.agent, binding.sessionId, verdict,
-          verdict === 'denied' ? intent.text : undefined,
+          { userId }, binding.agent, binding.sessionId, matched.verdict,
+          matched.verdict === 'denied' ? intent.text : undefined,
+          matched.toolCallId,
         );
         return { status: 200 };
       }
@@ -372,11 +396,20 @@ async function route(
       if (text === '' && !refs) return { status: 200 };
       await sendToSession(
         binding.agent, binding.sessionId, text, userId,
-        (refs || via) ? {
+        {
           ...(refs ? { attachments: refs } : {}),
           // Trusted principal for channel-identified members (decision 12).
           ...(via ? { via } : {}),
-        } : undefined,
+          // Surface attribution is stamped after webhook verification and
+          // lens interpretation. Provider/user text cannot choose this value.
+          source: {
+            kind: 'channel', channel: kind,
+            // `findOrCreateBinding` repairs legacy rows before this point.
+            // Keep the optional spread fail-closed if lifecycle fencing won
+            // the race and no live token survived the reread.
+            ...(binding.sourceKey ? { origin: binding.sourceKey } : {}),
+          },
+        },
       );
       return { status: 200 };
     }
@@ -390,6 +423,7 @@ async function route(
       }
       await recordVerdict(
         { userId }, binding.agent, binding.sessionId, intent.verdict, intent.reason,
+        intent.toolCallId,
       );
       return { status: 200 };
     }

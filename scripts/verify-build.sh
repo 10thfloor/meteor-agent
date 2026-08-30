@@ -215,12 +215,17 @@ if (!prodLayout) {
 
 const rootEntry = resolvePiAiEntry();
 const allEntry = resolvePiAiEntry('providers/all');
+const openAICompletionsEntry = resolvePiAiEntry('api/openai-completions.lazy');
 if (!path.isAbsolute(rootEntry)) die(`root entry is not absolute: ${rootEntry}`);
 if (!fs.existsSync(rootEntry)) die(`root entry does not exist: ${rootEntry}`);
 if (!fs.existsSync(allEntry)) die(`providers/all entry does not exist: ${allEntry}`);
+if (!fs.existsSync(openAICompletionsEntry)) {
+  die(`api/openai-completions.lazy entry does not exist: ${openAICompletionsEntry}`);
+}
 const rel = (p) => path.relative(base, p);
 console.log(`exports "."           : ${rel(rootEntry)}`);
 console.log(`exports providers/*   : ${rel(allEntry)}`);
+console.log(`exports api/*         : ${rel(openAICompletionsEntry)}`);
 
 const outcomes = [];
 async function attempt(label, fn) {
@@ -240,6 +245,10 @@ await attempt('1 bare import', () => import(PKG));
 await attempt('2 URL import', () => import(rootUrl));
 await attempt('3 temp shim', () => shimLoad(rootUrl));
 const nsAll = await attempt('  providers/all (URL)', () => import(pathToFileURL(allEntry).href));
+const nsOpenAICompletions = await attempt(
+  '  openai-completions.lazy',
+  () => import(pathToFileURL(openAICompletionsEntry).href),
+);
 
 for (const o of outcomes) {
   console.log(`branch ${o.label.padEnd(22)} ${o.ok ? 'ok' : `fail  (${o.why})`}`);
@@ -262,6 +271,16 @@ if (!nsAll || typeof nsAll.builtinModels !== 'function') die('providers/all did 
 const model = nsAll.builtinModels().getModel('anthropic', 'claude-sonnet-5');
 if (!model) die('builtinModels() has no anthropic/claude-sonnet-5');
 console.log(`builtinModels()       : anthropic/claude-sonnet-5 -> api=${model.api}`);
+
+if (!nsOpenAICompletions || typeof nsOpenAICompletions.openAICompletionsApi !== 'function') {
+  die('api/openai-completions.lazy did not expose openAICompletionsApi()');
+}
+const openAICompletionsApi = nsOpenAICompletions.openAICompletionsApi();
+if (typeof openAICompletionsApi?.stream !== 'function'
+    || typeof openAICompletionsApi?.streamSimple !== 'function') {
+  die('openAICompletionsApi() did not produce usable ProviderStreams');
+}
+console.log('openAICompletionsApi(): usable lazy ProviderStreams');
 
 /*
  * M4: the same chain against typebox's `./value` export, which is what
