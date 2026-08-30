@@ -11,6 +11,9 @@ export interface PlanOptions {
   profile: ChannelProfile;
   /** Session web URL for overflow links (§8.5). Absent = no link. */
   overflowUrl?: string;
+  /** Opaque source token of the binding being planned. Channel human rows
+   *  skip only a matching origin; every other binding may receive them. */
+  origin?: string;
 }
 
 /** One planned row: the message and its delivery item, or null (advance past). */
@@ -31,6 +34,34 @@ function overflow(text: string, limit: number, url?: string): DeliveryItem {
 }
 
 function itemFor(message: AgentMessage, opts: PlanOptions): DeliveryItem | null {
+  const source = message.source;
+  // Trusted Desktop input fans out everywhere. New Channel input carries a
+  // random binding token and fans out everywhere EXCEPT its exact origin.
+  // Legacy source-less / channel-without-origin rows stay local: guessing an
+  // origin would create an echo on the surface the person just used.
+  const outwardHuman = message.role === 'user'
+    && (source?.kind === 'desktop'
+      || (source?.kind === 'channel' && !!source.origin && source.origin !== opts.origin));
+  if (outwardHuman) {
+    const rawName = message.from?.name
+      ?? (source?.kind === 'channel' ? 'Channel participant' : 'Desktop');
+    // Attribution should remain one bounded line even for hand-inserted legacy
+    // roster data that predates display-name sanitization.
+    // eslint-disable-next-line no-control-regex
+    const name = rawName.replace(/[\x00-\x1f\x7f]/g, '').trim().slice(0, 80) || 'Desktop';
+    const surface = source?.kind === 'channel'
+      ? ` · ${source.channel.replace(/[^\w .-]/g, '').trim().slice(0, 40) || 'Channel'}`
+      : '';
+    const label = message.kind === 'crew-note'
+      ? `${name}${surface} · crew note`
+      : `${name}${surface}`;
+    const text = `${label}: ${message.content ?? ''}`;
+    const limit = opts.profile.limit;
+    if (limit !== undefined && text.length > limit) {
+      return overflow(text, limit, opts.overflowUrl);
+    }
+    return { item: 'reply', text };
+  }
   if (message.role === 'assistant') {
     // Model-to-model deliberation: channels advance past it.
     if (message.to?.startsWith('m:')) return null;
@@ -85,4 +116,3 @@ export function promptItem(
     ],
   };
 }
-

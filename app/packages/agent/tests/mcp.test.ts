@@ -60,6 +60,12 @@ function fakeServer(script: Script): Fake {
   return fake;
 }
 
+function deferred<T>(): { promise: Promise<T>; resolve: (value: T) => void } {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+
 const SEARCH: McpToolInfo = {
   name: 'search',
   description: 'Search the documentation',
@@ -622,6 +628,201 @@ describe('MCP tool specs', () => {
       console.warn = realWarn;
       restore();
     }
+  });
+});
+
+describe('MCP server lifecycle', () => {
+  it('exports discovery and lifecycle controls from the public server entry', async () => {
+    const api = await import('../server/index');
+    assert.isFunction(api.discoverMcpTools);
+    assert.isFunction(api.disconnectMcpServer);
+    assert.isFunction(api.unregisterMcpServer);
+    assert.isFunction(api.getMcpServerStatus);
+  });
+
+  it('reports coarse state, disconnects for reconnect, and unregisters idempotently', async () => {
+    const {
+      _setMcpClientFactory, discoverMcpTools, disconnectMcpServer,
+      unregisterMcpServer, getMcpServerStatus,
+    } = await import('../server/mcp/client');
+    const fake = fakeServer({ tools: [SEARCH] });
+    const restore = _setMcpClientFactory(fake.factory);
+    const name = 't-lifecycle';
+    try {
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: false, state: 'disconnected',
+      });
+      Agent.mcpServer(name, { command: 'never-spawned' });
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'disconnected',
+      });
+
+      const found = await discoverMcpTools(name);
+      assert.isTrue(found.ok, (found as any).reason);
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'connected', toolCount: 1,
+      });
+
+      assert.isTrue(await disconnectMcpServer(name));
+      assert.equal(fake.closed, 1);
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'disconnected',
+      });
+
+      assert.isTrue((await discoverMcpTools(name)).ok);
+      assert.equal(fake.connects.length, 2, 'disconnect keeps registration but forces a reconnect');
+      assert.isTrue(await unregisterMcpServer(name));
+      assert.equal(fake.closed, 2);
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: false, state: 'disconnected',
+      });
+      assert.isFalse(await unregisterMcpServer(name), 'a repeat unregister is an idempotent miss');
+      assert.isFalse((await discoverMcpTools(name)).ok);
+      assert.equal(fake.connects.length, 2, 'an unregistered server never reaches the factory');
+    } finally { restore(); }
+  });
+
+  it('exposes cooldown timing without exposing configuration or failure detail', async () => {
+    const {
+      _setMcpClientFactory, discoverMcpTools, disconnectMcpServer,
+      getMcpServerStatus,
+    } = await import('../server/mcp/client');
+    const fake = fakeServer({ tools: [SEARCH], onList: () => { throw new Error('secret detail'); } });
+    const restore = _setMcpClientFactory(fake.factory);
+    const name = 't-status-cooldown';
+    try {
+      Agent.mcpServer(name, { command: 'private-command', env: { TOKEN: 'hidden' }, cooldownMs: 1000 });
+      assert.isFalse((await discoverMcpTools(name)).ok);
+      const status = getMcpServerStatus(name);
+      assert.equal(status.registered, true);
+      assert.equal(status.state, 'cooldown');
+      assert.instanceOf(status.cooldownUntil, Date);
+      assert.notProperty(status, 'reason');
+      assert.notProperty(status, 'command');
+      assert.notProperty(status, 'env');
+      await disconnectMcpServer(name);
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'disconnected',
+      });
+    } finally { restore(); }
+  });
+
+  it('closes late opens and never recaches them after every invalidation path', async () => {
+    const {
+      _setMcpClientFactory, discoverMcpTools, disconnectMcpServer,
+      unregisterMcpServer, getMcpServerStatus, stopMcp,
+    } = await import('../server/mcp/client');
+    for (const action of ['replace', 'disconnect', 'unregister', 'stop'] as const) {
+      const name = `t-stale-${action}`;
+      const opened = deferred<McpClient>();
+      let closed = 0;
+      let listed = 0;
+      const client: McpClient = {
+        async listTools() { listed += 1; return { tools: [SEARCH] }; },
+        async callTool() { return { content: [] }; },
+        async close() { closed += 1; },
+      };
+      const restore = _setMcpClientFactory(async () => opened.promise);
+      try {
+        Agent.mcpServer(name, { command: 'old' });
+        const discovery = discoverMcpTools(name);
+        assert.equal(getMcpServerStatus(name).state, 'connecting', action);
+
+        if (action === 'replace') Agent.mcpServer(name, { command: 'new' });
+        else if (action === 'disconnect') await disconnectMcpServer(name);
+        else if (action === 'unregister') await unregisterMcpServer(name);
+        else await stopMcp();
+
+        opened.resolve(client);
+        const stale = await discovery;
+        assert.isFalse(stale.ok, `${action}: invalidated discovery must not succeed`);
+        assert.equal(closed, 1, `${action}: the late client must close exactly once`);
+        assert.equal(listed, 0, `${action}: stale clients must not even run discovery`);
+        assert.deepEqual(getMcpServerStatus(name), {
+          registered: action !== 'unregister', state: 'disconnected',
+        });
+      } finally { restore(); }
+    }
+  });
+
+  it('closes a client invalidated while tools/list is pending and never caches its answer', async () => {
+    const {
+      _setMcpClientFactory, discoverMcpTools, disconnectMcpServer, getMcpServerStatus,
+    } = await import('../server/mcp/client');
+    const listed = deferred<{ tools: McpToolInfo[] }>();
+    let listStarted = false;
+    let closed = 0;
+    const client: McpClient = {
+      listTools() { listStarted = true; return listed.promise; },
+      async callTool() { return { content: [] }; },
+      async close() { closed += 1; },
+    };
+    const restore = _setMcpClientFactory(async () => client);
+    const name = 't-stale-list';
+    try {
+      Agent.mcpServer(name, { command: 'never-spawned' });
+      const discovery = discoverMcpTools(name);
+      for (let i = 0; i < 5 && !listStarted; i += 1) {
+        // eslint-disable-next-line no-await-in-loop
+        await Promise.resolve();
+      }
+      assert.isTrue(listStarted, 'the test must invalidate during tools/list');
+      assert.isTrue(await disconnectMcpServer(name));
+      assert.equal(closed, 1, 'disconnect closes a known pending client immediately');
+      listed.resolve({ tools: [SEARCH] });
+      assert.isFalse((await discovery).ok);
+      assert.equal(closed, 1, 'late completion does not double-close the same client');
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'disconnected',
+      });
+    } finally { restore(); }
+  });
+
+  it('an old completion cannot delete or replace a newer generation', async () => {
+    const {
+      _setMcpClientFactory, discoverMcpTools, getMcpServerStatus,
+    } = await import('../server/mcp/client');
+    const oldOpened = deferred<McpClient>();
+    const newOpened = deferred<McpClient>();
+    let oldClosed = 0;
+    let oldListed = 0;
+    let newClosed = 0;
+    const oldClient: McpClient = {
+      async listTools() { oldListed += 1; return { tools: [SEARCH] }; },
+      async callTool() { return { content: [] }; },
+      async close() { oldClosed += 1; },
+    };
+    const newClient: McpClient = {
+      async listTools() { return { tools: [FETCH] }; },
+      async callTool() { return { content: [] }; },
+      async close() { newClosed += 1; },
+    };
+    const restore = _setMcpClientFactory(async (_name, def) => (
+      def.command === 'old' ? oldOpened.promise : newOpened.promise
+    ));
+    const name = 't-stale-versus-new';
+    try {
+      Agent.mcpServer(name, { command: 'old' });
+      const oldDiscovery = discoverMcpTools(name);
+      Agent.mcpServer(name, { command: 'new' });
+      const newDiscovery = discoverMcpTools(name);
+
+      newOpened.resolve(newClient);
+      const fresh = await newDiscovery;
+      assert.isTrue(fresh.ok, (fresh as any).reason);
+      assert.deepEqual((fresh as any).tools.map((tool: McpToolInfo) => tool.name), ['fetch']);
+
+      oldOpened.resolve(oldClient);
+      assert.isFalse((await oldDiscovery).ok);
+      assert.equal(oldListed, 0, 'the invalidated factory result never runs tools/list');
+      assert.equal(oldClosed, 1);
+      assert.equal(newClosed, 0, 'the old completion cannot close the new connection');
+      assert.deepEqual(getMcpServerStatus(name), {
+        registered: true, state: 'connected', toolCount: 1,
+      });
+      const stillFresh = await discoverMcpTools(name);
+      assert.deepEqual((stillFresh as any).tools.map((tool: McpToolInfo) => tool.name), ['fetch']);
+    } finally { restore(); }
   });
 });
 

@@ -34,6 +34,9 @@ export declare class Agent {
         title?: string;
     }): Promise<string>;
     send(sessionId: string, text: string): Promise<string>;
+    /** Commit human-to-crew context without waking an agent. The stable retry
+     * key makes Meteor's transparent reconnect retry exactly-once. */
+    contribute(sessionId: string, text: string): Promise<string>;
     interrupt(sessionId: string): Promise<void>;
     /** Branch at atSeq (clamped to batch-safe cut). Returns new session id. */
     fork(sessionId: string, opts?: {
@@ -60,10 +63,12 @@ export declare class Agent {
     } | undefined;
     /** Mint a single-use download URL (burned on GET, ~60s TTL). */
     attachmentUrl(sessionId: string, attachmentId: string): Promise<string>;
-    approve(sessionId: string): Promise<void>;
+    /** Bind the click to the ask that was rendered when possible. Omitting the
+     * id remains supported for older callers. */
+    approve(sessionId: string, expectedToolCallId?: string): Promise<void>;
     /** `reason` reaches the model as the denied tool result, so it is the model's
      *  only account of why — worth writing for it, not just for the log. */
-    deny(sessionId: string, reason?: string): Promise<void>;
+    deny(sessionId: string, reason?: string, expectedToolCallId?: string): Promise<void>;
     /** Shelve a session: it drops out of `sessions()` and keeps everything else,
      *  including the ability to take a turn. */
     archive(sessionId: string): Promise<void>;

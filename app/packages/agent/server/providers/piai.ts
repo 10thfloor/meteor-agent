@@ -53,6 +53,11 @@ export interface PiAiModels {
   streamSimple(model: unknown, context: PiAiContext, options?: unknown): AsyncIterable<any>;
 }
 
+type PiAiStreamOptions = Record<string, unknown>;
+type PiAiStreamOptionsForModel = (
+  model: Readonly<{ provider: string; modelId: string }>,
+) => PiAiStreamOptions;
+
 /** Pure mapping from ProviderRequest to pi-ai's request format. Identity trio
  *  and thinking are stamped at stream time by `createPiAiProvider` instead. */
 export function toPiAiRequest(req: ProviderRequest, now: number = Date.now()): PiAiRequest {
@@ -185,7 +190,7 @@ export function translateEvent(ev: any): ProviderChunk[] {
  *  fauxProvider without a network call. */
 export function createPiAiProvider(
   resolveModels: () => Promise<PiAiModels>,
-  options?: Record<string, unknown>,
+  options: PiAiStreamOptions | PiAiStreamOptionsForModel = {},
 ): Provider {
   return {
     capabilities: {
@@ -204,6 +209,9 @@ export function createPiAiProvider(
     },
     async *stream(req: ProviderRequest): AsyncIterable<ProviderChunk> {
       const { provider, modelId, context } = toPiAiRequest(req);
+      const streamOptions = typeof options === 'function'
+        ? options({ provider, modelId })
+        : options;
       const models = await resolveModels();
       const model = models.getModel(provider, modelId);
       if (!model) {
@@ -222,7 +230,9 @@ export function createPiAiProvider(
         }
       }
       // signal written last so the loop's controller can't be displaced.
-      for await (const ev of models.streamSimple(model, context, { ...options, signal: req.signal })) {
+      for await (const ev of models.streamSimple(
+        model, context, { ...streamOptions, signal: req.signal },
+      )) {
         if (ev?.type === 'error') {
           // pi-ai signals failure as an event; re-throw so the loop handles it.
           const err: any = new Error(
@@ -252,15 +262,23 @@ export function createPiAiProvider(
 let singleton: Provider | null = null;
 let builtins: Promise<PiAiModels> | null = null;
 
-/** Options for the default adapter. An explicit key wins over pi-ai's
- * provider-specific environment lookup; an absent key leaves that lookup
- * untouched. Exported for deterministic configuration tests, not re-exported
- * from the package's public server barrel. */
+/** Legacy explicit-key adapter option. `piAiProvider()` scopes it to Anthropic;
+ * an absent key leaves pi-ai's provider-specific lookup untouched. Exported
+ * for deterministic configuration tests, not from the public server barrel. */
 export function piAiOptionsFromEnv(
   env: Readonly<Record<string, string | undefined>> = process.env,
 ): Record<string, unknown> {
   const apiKey = env.PROVIDER_API_KEY;
-  return apiKey === undefined || apiKey === '' ? {} : { apiKey };
+  return apiKey === undefined || apiKey.trim() === '' ? {} : { apiKey };
+}
+
+/** The legacy generic key is an Anthropic convention in the demo app. Never
+ * forward that opaque key to a differently configured provider. */
+export function piAiOptionsForProvider(
+  provider: string,
+  env: Readonly<Record<string, string | undefined>> = process.env,
+): Record<string, unknown> {
+  return provider === 'anthropic' ? piAiOptionsFromEnv(env) : {};
 }
 
 /** Lazy singleton. Credentials come from the environment. */
@@ -276,6 +294,6 @@ export function piAiProvider(): Provider {
       builtins.catch(() => { builtins = null; });
     }
     return builtins;
-  }, piAiOptionsFromEnv());
+  }, ({ provider }) => piAiOptionsForProvider(provider));
   return singleton;
 }

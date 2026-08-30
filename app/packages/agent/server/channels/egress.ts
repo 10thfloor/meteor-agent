@@ -289,6 +289,7 @@ export async function deliverBinding(
     statuses: binding.member ? undefined : def.statuses,
     profile: def.profile,
     overflowUrl: overflowUrlFor(def, binding, session),
+    origin: binding.sourceKey,
   });
 
   let cursor = binding.deliveredSeq;
@@ -408,21 +409,45 @@ export function startEgress(kind: string, opts: EgressOptions = {}): EgressWorke
    *  the full backlog on boot (receipts prevent re-delivery). INSERT-ONLY
    *  collection, so `changed` is unnecessary. */
   let handle: { stop(): void } | null = null;
+  let replaying = true;
+  const observingSince = Date.now();
   const observing = AgentMessages.find(
-    { role: { $in: ['assistant', 'note'] } },
-    { fields: { sessionId: 1 } },
+    {
+      $or: [
+        { role: { $in: ['assistant', 'note'] } },
+        // Human fan-out is limited to server-stamped sources. Source-less
+        // legacy rows are deliberately not awakened by this observer.
+        { role: 'user', 'source.kind': { $in: ['desktop', 'channel'] } },
+      ],
+    },
+    { fields: { sessionId: 1, createdAt: 1 } },
   ).observeChangesAsync({
-    added(_id: string, fields: { sessionId?: string }) {
+    added(_id: string, fields: { sessionId?: string; createdAt?: Date }) {
       if (stopped || !fields.sessionId) return;
+      // A newly committed row is activity for every attached surface. Bump
+      // before posting so a stale binding whose immediate attempt fails (or
+      // defers behind a sending receipt) stays inside the retry sweep. Initial
+      // observer replay does not resurrect old bindings merely by booting;
+      // createdAt covers a row that committed during that replay window.
+      const live = !replaying || (fields.createdAt?.getTime() ?? 0) >= observingSince;
       void ChannelBindings.find(
         { kind, sessionId: fields.sessionId }, { fields: { _id: 1 } },
-      ).fetchAsync().then((bindings) => {
+      ).fetchAsync().then(async (bindings) => {
+        if (live) {
+          await Promise.all(bindings.map((binding) => ChannelBindings.updateAsync({
+            _id: binding._id,
+            erasingAt: { $exists: false },
+          }, {
+            $set: { updatedAt: new Date() },
+          })));
+        }
         for (const b of bindings) notice(b._id);
       }).catch(() => {
         console.error(`[10thfloor:agent] egress(${kind}): binding lookup failed`);
       });
     },
   }).then((h: any) => {
+    replaying = false;
     // stop() can win the race against a still-resolving observe — stop the
     // handle the moment it exists (the worker's own guard).
     handle = h;

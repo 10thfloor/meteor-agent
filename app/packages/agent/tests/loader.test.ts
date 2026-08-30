@@ -76,6 +76,18 @@ describe('pi-ai loader v2 (no node_modules writes)', () => {
     assert.include(entry, '@earendil-works');
   });
 
+  it('loads the OpenAI-compatible lazy API subpath used by local providers', async function () {
+    this.timeout(20000);
+    const { loadPiAi, resolvePiAiEntry } = await import('../server/providers/loader');
+    const entry = resolvePiAiEntry('api/openai-completions.lazy');
+    assert.isTrue(entry.startsWith('/'), `expected absolute path, got ${entry}`);
+    const ns: any = await loadPiAi('api/openai-completions.lazy');
+    assert.isFunction(ns.openAICompletionsApi);
+    const streams = ns.openAICompletionsApi();
+    assert.isFunction(streams.stream);
+    assert.isFunction(streams.streamSimple);
+  });
+
   it('shimLoad imports a resolved file URL and yields a usable namespace', async function () {
     this.timeout(20000);
     const { resolvePiAiEntry, shimLoad } = await import('../server/providers/loader');

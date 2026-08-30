@@ -43,11 +43,32 @@ export async function issueLinkToken(
   return _id;
 }
 
+export interface LinkTokenPreview {
+  state: 'ready' | 'expired' | 'unavailable';
+  channel?: string;
+  expiresAt?: Date;
+}
+
+/** Inspect an account-link capability without spending it. External identity
+ * ids remain private; the page only needs the Channel label and expiry. */
+export async function previewLinkToken(token: string): Promise<LinkTokenPreview> {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) return { state: 'unavailable' };
+  const doc = await ChannelLinkTokens.findOneAsync(token);
+  if (!doc) return { state: 'unavailable' };
+  if (doc.expiresAt.getTime() < Date.now()) return { state: 'expired' };
+  return {
+    state: 'ready',
+    channel: cleanPreviewText(doc.kind, 'Channel', 32),
+    expiresAt: doc.expiresAt,
+  };
+}
+
 /** Burn token, link identity. findOneAndDelete is single-winner;
  *  indistinguishable null on any failure. */
 export async function redeemLinkToken(
   token: string, userId: string,
 ): Promise<ChannelIdentity | null> {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) return null;
   const doc = await ChannelLinkTokens.rawCollection().findOneAndDelete(
     { _id: token },
   ) as unknown as ChannelLinkToken | null;
@@ -145,6 +166,66 @@ export async function linkIdentity(
 
 const DEFAULT_VERDICT_TTL_MS = 24 * 60 * 60_000;
 
+export interface VerdictTokenPreview {
+  state: 'ready' | 'expired' | 'unavailable';
+  verdict?: 'approved' | 'denied';
+  missionTitle?: string;
+  toolName?: string;
+  requestingAgent?: string;
+  runContext?: 'owner' | 'anonymous' | 'elevated';
+  source?: string;
+  scope?: 'one-call';
+  expiresAt?: Date;
+}
+
+function cleanPreviewText(value: unknown, fallback: string, max = 96): string {
+  if (typeof value !== 'string') return fallback;
+  const clean = value
+    .replace(/[\u0000-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+  return clean.slice(0, max) || fallback;
+}
+
+/** Inspect a verdict capability without spending it. The token itself is the
+ * authority to see this deliberately small summary; tool args, user ids, and
+ * transcript content never leave the server. A stale/missing request is kept
+ * indistinguishable from a token that was already used. */
+export async function previewVerdictToken(token: string): Promise<VerdictTokenPreview> {
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) return { state: 'unavailable' };
+  const doc = await ChannelVerdictTokens.findOneAsync(token);
+  if (!doc) return { state: 'unavailable' };
+  if (doc.expiresAt.getTime() < Date.now()) return { state: 'expired' };
+
+  const session = await AgentSessions.findOneAsync({
+    _id: doc.sessionId,
+    agent: doc.agent,
+    phase: 'awaiting',
+    erasingAt: { $exists: false },
+    purgingAt: { $exists: false },
+    'pending.toolCallId': doc.toolCallId,
+    'pending.verdict': { $exists: false },
+  });
+  const pending = session?.pending;
+  if (!session || !pending) return { state: 'unavailable' };
+
+  return {
+    state: 'ready',
+    verdict: doc.verdict,
+    missionTitle: cleanPreviewText(session.title, 'Untitled mission'),
+    toolName: cleanPreviewText(pending.name, 'Tool call'),
+    requestingAgent: cleanPreviewText(pending.agent ?? session.agent, 'Agent'),
+    runContext: !('runAs' in pending)
+      ? 'owner'
+      : (pending.runAs === null ? 'anonymous' : 'elevated'),
+    source: pending.mcpServer
+      ? `MCP server · ${cleanPreviewText(pending.mcpServer, 'Unknown')}`
+      : 'App tool',
+    scope: 'one-call',
+    expiresAt: doc.expiresAt,
+  };
+}
+
 /** Mint a verdict-approval token for one choice of one delivered prompt.
  *  24h default TTL; the real staleness guard is toolCallId at redemption. */
 export async function issueVerdictToken(
@@ -183,28 +264,62 @@ export async function issueVerdictToken(
  *  currently parked toolCallId (staleness guard). Returns true when this
  *  redemption decided the ask; indistinguishable false otherwise. */
 export async function redeemVerdictToken(token: string): Promise<boolean> {
-  const doc = await ChannelVerdictTokens.rawCollection().findOneAndDelete(
-    { _id: token },
-  ) as unknown as ChannelVerdictToken | null;
-  if (!doc || doc.expiresAt.getTime() < Date.now()) return false;
+  if (!/^[A-Za-z0-9_-]{8,128}$/.test(token)) return false;
+  const now = new Date();
+  const claimId = Random.secret();
+  const claimed = await ChannelVerdictTokens.rawCollection().findOneAndUpdate(
+    {
+      _id: token,
+      expiresAt: { $gt: now },
+      $or: [
+        { claim: { $exists: false } },
+        { 'claim.until': { $lte: now } },
+      ],
+    },
+    { $set: { claim: { id: claimId, until: new Date(now.getTime() + 30_000) } } },
+    { returnDocument: 'after' },
+  ) as unknown as ChannelVerdictToken | { value?: ChannelVerdictToken } | null;
+  const doc: ChannelVerdictToken | null = claimed && 'value' in claimed
+    ? (claimed.value ?? null)
+    : claimed as ChannelVerdictToken | null;
+  if (!doc) return false;
+
+  const spend = () => ChannelVerdictTokens.rawCollection().deleteOne({
+    _id: token, 'claim.id': claimId,
+  });
+  const release = () => ChannelVerdictTokens.rawCollection().updateOne(
+    { _id: token, 'claim.id': claimId }, { $unset: { claim: '' } },
+  );
 
   const session = await AgentSessions.findOneAsync({
     _id: doc.sessionId, erasingAt: { $exists: false },
   });
-  if (!session) return false;
-  if (session.pending?.toolCallId !== doc.toolCallId || session.pending.verdict) {
+  const pending = session?.pending;
+  if (!session || !pending) {
+    await spend();
+    return false;
+  }
+  if (pending.toolCallId !== doc.toolCallId || pending.verdict) {
+    await spend();
     return false;   // stale — different ask is parked now
   }
   try {
     await recordVerdict(
       { userId: session.userId }, doc.agent, doc.sessionId, doc.verdict,
       doc.verdict === 'denied' ? 'denied via approval link' : undefined,
+      doc.toolCallId,
     );
+    await spend();
     return true;
   } catch (e) {
-    // Meteor.Error = settled refusal (raced, not-allowed, etc.) → false.
-    // Anything else propagates.
-    if (e instanceof Meteor.Error) return false;
+    // Meteor.Error = settled refusal (raced, not-allowed, etc.) → spend it.
+    // Infrastructure failures release the short claim so the same link can be
+    // retried instead of silently losing a still-pending human decision.
+    if (e instanceof Meteor.Error) {
+      await spend();
+      return false;
+    }
+    await release();
     throw e;
   }
 }

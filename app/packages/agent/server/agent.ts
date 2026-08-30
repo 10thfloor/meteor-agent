@@ -1,4 +1,4 @@
-import type { AgentSession, ResolvedMemory } from '../common/types';
+import type { AgentSession, MessageSource, ResolvedMemory } from '../common/types';
 import type { SessionQuery } from '../common/db';
 import { Meteor } from 'meteor/meteor';
 import { Random } from 'meteor/random';
@@ -18,7 +18,9 @@ import {
   clearAgentHooks, clearHooks, registerAgentHook, registerHook,
   type HookMap, type HookName,
 } from './hooks';
-import { recordVerdict, sendToSession, startSystemTurn } from './methods';
+import {
+  contributeToSession, recordVerdict, sendToSession, startSystemTurn,
+} from './methods';
 import type { SystemTurnResult } from './system-turn';
 import {
   forgetMemory, readSelector, saveMemory, type SaveArgs,
@@ -147,6 +149,19 @@ export class Agent {
     return sendToSession(this.name, sessionId, text, opts?.userId ?? null);
   }
 
+  /** Add human conversation context without waking a model. The row remains
+   * visible to a later turn, but does not consume the Turn budget or resolve
+   * a leading @mention. Server callers may stamp another trusted surface;
+   * app/browser contributions default to Desktop. */
+  contribute(
+    sessionId: string, text: string,
+    opts?: { userId?: string | null; source?: MessageSource },
+  ): Promise<string> {
+    return contributeToSession(this.name, sessionId, text, opts?.userId ?? null, {
+      source: opts?.source ?? { kind: 'desktop' },
+    });
+  }
+
   /** Permanently erase one owned root Session and its subagent descendants.
    *  Server-only. `userId` is required; explicit null means anonymous owner.
    *  Memory and account-wide channel identities are preserved. */
@@ -158,16 +173,26 @@ export class Agent {
 
   /** Server-side approve — same core as DDP method; racing answerers
    *  produce exactly one verdict. */
-  async approve(sessionId: string, opts?: { userId?: string | null }): Promise<void> {
-    await recordVerdict({ userId: opts?.userId ?? null }, this.name, sessionId, 'approved');
+  async approve(
+    sessionId: string,
+    opts?: { userId?: string | null; expectedToolCallId?: string },
+  ): Promise<void> {
+    await recordVerdict(
+      { userId: opts?.userId ?? null }, this.name, sessionId, 'approved',
+      undefined, opts?.expectedToolCallId,
+    );
   }
 
   /** The deny half of `approve` — same core, same guarantees; `reason`
    *  reaches the model as the denied tool result. */
   async deny(
-    sessionId: string, reason?: string, opts?: { userId?: string | null },
+    sessionId: string, reason?: string,
+    opts?: { userId?: string | null; expectedToolCallId?: string },
   ): Promise<void> {
-    await recordVerdict({ userId: opts?.userId ?? null }, this.name, sessionId, 'denied', reason);
+    await recordVerdict(
+      { userId: opts?.userId ?? null }, this.name, sessionId, 'denied',
+      reason, opts?.expectedToolCallId,
+    );
   }
 
   /** Branch a session at `atSeq` (clamped to batch-safe cut). Returns

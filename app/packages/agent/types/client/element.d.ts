@@ -1,3 +1,4 @@
+export type ComposerMode = 'ask' | 'note';
 /** Something a message can name with `@`. Model participants are resolved
  *  automatically; app-specific subjects (via `mentionables`) autocomplete
  *  and render but schedule nothing. */
@@ -49,6 +50,15 @@ export type MentionSource = (MentionShape & {
      *  and `search(handle)` is used, which is correct but does more work. */
     lookup?(handle: string): Mentionable | null | undefined;
 };
+/** True only when the whole assistant message is a machine-shaped payload.
+ * Prose that happens to contain braces remains prose. An explicit JSON/JSONC
+ * fence is machine-shaped even if the provider emitted malformed JSON inside. */
+export declare function isStructuredAssistantContent(value: string): boolean;
+/** Clean-mode assistant prose transform. It decodes embedded JSON string
+ * serialization (including a truncated final string), removes embedded raw
+ * object/array records, and deliberately leaves ordinary quotes/placeholders
+ * alone. Debug rendering never calls this helper. */
+export declare function sanitizeCleanAssistantContent(value: string, streaming?: boolean): string;
 /** Register `<agent-chat>` (or a custom tag) and return its constructor.
  *  Idempotent per tag; a different name registers a fresh class. */
 export declare function defineAgentChat(tagName?: string): CustomElementConstructor;

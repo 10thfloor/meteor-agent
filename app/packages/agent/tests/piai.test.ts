@@ -1,7 +1,8 @@
 import { assert } from 'chai';
 import { loadPiAi } from '../server/providers/loader';
 import {
-  createPiAiProvider, piAiOptionsFromEnv, piAiProvider, toPiAiRequest, translateEvent,
+  createPiAiProvider, piAiOptionsForProvider, piAiOptionsFromEnv, piAiProvider,
+  toPiAiRequest, translateEvent,
 } from '../server/providers/piai';
 import type { ProviderChunk, ProviderRequest } from '../server/providers/types';
 
@@ -497,6 +498,14 @@ describe('piAiProvider()', () => {
     );
     assert.deepEqual(piAiOptionsFromEnv({}), {});
     assert.deepEqual(piAiOptionsFromEnv({ PROVIDER_API_KEY: '' }), {});
+    assert.deepEqual(piAiOptionsFromEnv({ PROVIDER_API_KEY: '   ' }), {});
+  });
+
+  it('scopes the legacy generic key to Anthropic', () => {
+    const env = { PROVIDER_API_KEY: 'one-provider-key' };
+    assert.deepEqual(piAiOptionsForProvider('anthropic', env), { apiKey: 'one-provider-key' });
+    assert.deepEqual(piAiOptionsForProvider('openai', env), {});
+    assert.deepEqual(piAiOptionsForProvider('ollama', env), {});
   });
 
   it('is a lazy singleton exposing the Provider seam', () => {

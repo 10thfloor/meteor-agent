@@ -12,6 +12,17 @@ export interface McpServerDef {
     /** How long a failed open suppresses the next attempt. Default: `MCP_FAILURE_COOLDOWN_MS`; 0 to disable. */
     cooldownMs?: number;
 }
+/** Coarse runtime state for operator UIs. Deliberately excludes the command,
+ * environment and last failure reason: those may contain deployment secrets. */
+export type McpServerState = 'disconnected' | 'connecting' | 'connected' | 'cooldown';
+export interface McpServerStatus {
+    registered: boolean;
+    state: McpServerState;
+    /** Present only while connected. */
+    toolCount?: number;
+    /** Present only during an active cooldown. */
+    cooldownUntil?: Date;
+}
 /** 15s deadline for connect + discovery (the SDK's 60s default is too long
  *  for something that blocks the turn). */
 export declare const MCP_DISCOVERY_TIMEOUT_MS = 15000;
@@ -74,12 +85,25 @@ export type DiscoveryResult = {
 /** The server's tool catalog, connecting if necessary. Cached with the
  *  connection; a failure is remembered only as a bounded cooldown. */
 export declare function discoverMcpTools(server: string): Promise<DiscoveryResult>;
+/** Close this server's current and in-flight clients while retaining its
+ * registration. Returns false only when neither registration nor runtime state
+ * exists for `name`. A later discovery reconnects from the stored definition. */
+export declare function disconnectMcpServer(name: string): Promise<boolean>;
+/** Remove this server's registration and close every current/in-flight client.
+ * The registry deletion is synchronous from callers' perspective, before any
+ * asynchronous close is awaited. */
+export declare function unregisterMcpServer(name: string): Promise<boolean>;
+/** Read a coarse, secret-safe snapshot for an operator UI. Configuration and
+ * failure detail intentionally remain available only to the code that owns the
+ * registration. */
+export declare function getMcpServerStatus(name: string): McpServerStatus;
 export declare function warnMcp(message: string): void;
 /** Map an MCP call result to ToolResult. Errors are sanitized. */
 export declare function mapMcpResult(raw: McpCallResult | undefined | null): ToolResult;
 /** Call one tool on one server. Failures are structured, never throws. */
 export declare function callMcpTool(server: string, tool: string, args: unknown): Promise<ToolResult>;
-/** Close every connection. For shutdown and test cleanup. */
+/** Close every current and in-flight client. Registrations remain available so
+ * a long-lived process can reconnect after a coordinated runtime stop. */
 export declare function stopMcp(): Promise<void>;
 /** Test seam: replace the client factory. null restores the default.
  *  Snapshots and restores server definitions so test registrations don't leak. */

@@ -19,6 +19,19 @@ export interface McpServerDef {
   cooldownMs?: number;
 }
 
+/** Coarse runtime state for operator UIs. Deliberately excludes the command,
+ * environment and last failure reason: those may contain deployment secrets. */
+export type McpServerState = 'disconnected' | 'connecting' | 'connected' | 'cooldown';
+
+export interface McpServerStatus {
+  registered: boolean;
+  state: McpServerState;
+  /** Present only while connected. */
+  toolCount?: number;
+  /** Present only during an active cooldown. */
+  cooldownUntil?: Date;
+}
+
 /** 15s deadline for connect + discovery (the SDK's 60s default is too long
  *  for something that blocks the turn). */
 export const MCP_DISCOVERY_TIMEOUT_MS = 15_000;
@@ -107,9 +120,12 @@ export function registerMcpServer(name: string, def: McpServerDef): void {
       );
     }
   }
-  if (servers.has(name)) dropConnection(name);
-  // A redefinition clears the cooldown too.
-  cooldowns.delete(name);
+  // Replacing a definition invalidates every open/pending operation before the
+  // new definition becomes visible. Closing is best-effort because this API is
+  // intentionally synchronous; generation fencing prevents a late close from
+  // ever caching the old connection under the new definition.
+  const invalidated = invalidateServerRuntime(name);
+  void Promise.all(invalidated.closing);
   servers.set(name, {
     command: def.command,
     args: def.args ? [...def.args] : undefined,
@@ -180,6 +196,15 @@ interface Connection {
   client: McpClient;
   tools: McpToolInfo[];
   byName: Map<string, McpToolInfo>;
+  generation: number;
+}
+
+interface PendingAttempt {
+  generation: number;
+  invalidated: boolean;
+  /** Set as soon as the factory resolves, including while `tools/list` waits. */
+  client?: McpClient;
+  promise: Promise<ConnectResult>;
 }
 
 /** The default factory. env merges over the SDK's `getDefaultEnvironment()`
@@ -213,25 +238,95 @@ const defaultFactory: McpClientFactory = async (_name, def) => {
 let factory: McpClientFactory = defaultFactory;
 
 const connections = new Map<string, Connection>();
-const pending = new Map<string, Promise<Connection>>();
+const pending = new Map<string, PendingAttempt>();
 /** Per-server failure cooldowns: the wall-clock instant the next spawn attempt
  *  is allowed, and the reason to answer with until then. See
  *  `MCP_FAILURE_COOLDOWN_MS` for why this is a cooldown and not a cache. */
 const cooldowns = new Map<string, { until: number; reason: string }>();
 
-function closeQuietly(client: McpClient): void {
+/** A monotonic token makes an old open distinguishable even if a server is
+ * removed and immediately registered again under the same name. */
+const generations = new Map<string, number>();
+let nextGeneration = 1;
+
+/** Closing is idempotent per client. Invalidation can race the factory/list
+ * continuation, and both paths are responsible for cleanup. */
+const closingClients = new WeakMap<McpClient, Promise<void>>();
+
+function closeClient(client: McpClient): Promise<void> {
+  const known = closingClients.get(client);
+  if (known) return known;
+  let finish!: () => void;
+  const closing = new Promise<void>((resolve) => { finish = resolve; });
+  // Publish before invoking third-party code so even a re-entrant close event
+  // cannot call the same client's close method twice.
+  closingClients.set(client, closing);
   try {
-    void Promise.resolve(client.close()).catch(() => { /* best effort */ });
-  } catch { /* best effort */ }
+    void Promise.resolve(client.close()).then(finish, finish);
+  } catch {
+    finish();
+  }
+  return closing;
+}
+
+function closeQuietly(client: McpClient): void {
+  void closeClient(client);
+}
+
+function advanceGeneration(name: string): number {
+  const generation = nextGeneration;
+  nextGeneration += 1;
+  generations.set(name, generation);
+  return generation;
+}
+
+function generationFor(name: string): number {
+  return generations.get(name) ?? advanceGeneration(name);
+}
+
+/** Atomically forget one runtime generation, then close every client already
+ * known to it. An unresolved factory is fenced by `invalidated`; its eventual
+ * client is closed by `openConnection` and can never enter `connections`. */
+function invalidateServerRuntime(
+  name: string,
+): { closing: Promise<void>[] } {
+  const conn = connections.get(name);
+  const attempt = pending.get(name);
+
+  advanceGeneration(name);
+  connections.delete(name);
+  pending.delete(name);
+  cooldowns.delete(name);
+  if (attempt) attempt.invalidated = true;
+
+  const clients = new Set<McpClient>();
+  if (conn) clients.add(conn.client);
+  if (attempt?.client) clients.add(attempt.client);
+  return {
+    closing: [...clients].map((client) => closeClient(client)),
+  };
+}
+
+function invalidateAllRuntime(): Promise<void>[] {
+  const names = new Set<string>([
+    ...servers.keys(), ...connections.keys(), ...pending.keys(), ...cooldowns.keys(),
+  ]);
+  const closing: Promise<void>[] = [];
+  for (const name of names) closing.push(...invalidateServerRuntime(name).closing);
+  return closing;
 }
 
 /** Forget a server's connection (and close it, best effort). Called when the
  *  definition changes, when a call fails at the transport, and by `stopMcp`. */
-function dropConnection(name: string): void {
-  const conn = connections.get(name);
-  connections.delete(name);
-  pending.delete(name);
-  if (conn) closeQuietly(conn.client);
+function dropConnection(name: string, expected?: Connection): void {
+  // A call on an old client may fail after a replacement has already connected.
+  // It must close its own client without invalidating that newer generation.
+  if (expected && connections.get(name) !== expected) {
+    closeQuietly(expected.client);
+    return;
+  }
+  const invalidated = invalidateServerRuntime(name);
+  void Promise.all(invalidated.closing);
 }
 
 /** Best-effort child cleanup on exit; registered lazily. */
@@ -240,10 +335,7 @@ function hookExit(): void {
   if (exitHooked) return;
   exitHooked = true;
   process.on('exit', () => {
-    for (const conn of connections.values()) {
-      try { void conn.client.close(); } catch { /* best effort */ }
-    }
-    connections.clear();
+    void Promise.all(invalidateAllRuntime());
   });
 }
 
@@ -266,13 +358,28 @@ function budgetFor(def: McpServerDef): number {
   return def.timeoutMs ?? MCP_DISCOVERY_TIMEOUT_MS;
 }
 
-async function openConnection(name: string, def: McpServerDef): Promise<Connection> {
+function attemptIsCurrent(name: string, attempt: PendingAttempt): boolean {
+  return !attempt.invalidated
+    && pending.get(name) === attempt
+    && generations.get(name) === attempt.generation
+    && servers.has(name);
+}
+
+function invalidatedReason(name: string): string {
+  return `The MCP server "${name}" changed while connecting. Retry with its current configuration.`;
+}
+
+async function openConnection(
+  name: string, def: McpServerDef, attempt: PendingAttempt,
+): Promise<Connection> {
   const budget = budgetFor(def);
   const started = factory(name, def);
   let abandoned = false;
-  // Close a late-arriving subprocess rather than leaking it.
+  // Close a late-arriving or superseded subprocess rather than leaking it.
   void started.then(
-    (late) => { if (abandoned) closeQuietly(late); },
+    (late) => {
+      if (abandoned || !attemptIsCurrent(name, attempt)) closeQuietly(late);
+    },
     () => { /* reported by the await below */ },
   );
 
@@ -282,6 +389,11 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
   } catch (e) {
     abandoned = true;
     throw e;
+  }
+  attempt.client = client;
+  if (!attemptIsCurrent(name, attempt)) {
+    await closeClient(client);
+    throw new Error(invalidatedReason(name));
   }
 
   try {
@@ -293,10 +405,19 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
       budget,
       `the MCP server "${name}" did not list its tools`,
     );
+    if (!attemptIsCurrent(name, attempt)) {
+      await closeClient(client);
+      throw new Error(invalidatedReason(name));
+    }
     const tools = (listed?.tools ?? []).filter(
       (t): t is McpToolInfo => !!t && typeof t.name === 'string' && t.name !== '',
     );
-    const conn: Connection = { client, tools, byName: new Map(tools.map((t) => [t.name, t])) };
+    const conn: Connection = {
+      client,
+      tools,
+      byName: new Map(tools.map((t) => [t.name, t])),
+      generation: attempt.generation,
+    };
     hookExit();
     return conn;
   } catch (e) {
@@ -305,11 +426,52 @@ async function openConnection(name: string, def: McpServerDef): Promise<Connecti
   }
 }
 
+async function runConnectAttempt(
+  name: string, def: McpServerDef, attempt: PendingAttempt,
+): Promise<ConnectResult> {
+  try {
+    const conn = await openConnection(name, def, attempt);
+    if (!attemptIsCurrent(name, attempt)) {
+      await closeClient(conn.client);
+      return { ok: false, reason: invalidatedReason(name) };
+    }
+    connections.set(name, conn);
+    cooldowns.delete(name);
+    return { ok: true, conn };
+  } catch (e) {
+    // Teardown/replacement is not an outage and must not poison the new
+    // generation with the old definition's failure cooldown.
+    if (!attemptIsCurrent(name, attempt)) {
+      return { ok: false, reason: invalidatedReason(name) };
+    }
+    const reason = unavailable(name, e);
+    const cooldownMs = def.cooldownMs ?? MCP_FAILURE_COOLDOWN_MS;
+    if (cooldownMs > 0) cooldowns.set(name, { until: Date.now() + cooldownMs, reason });
+    return { ok: false, reason };
+  } finally {
+    if (pending.get(name) === attempt) pending.delete(name);
+  }
+}
+
+function startConnectAttempt(name: string, def: McpServerDef): PendingAttempt {
+  const attempt: PendingAttempt = {
+    generation: generationFor(name),
+    invalidated: false,
+    promise: undefined as unknown as Promise<ConnectResult>,
+  };
+  // Publish the identity before executing any asynchronous continuation: the
+  // current-generation predicate is also used by a synchronously resolving
+  // fake factory in tests.
+  pending.set(name, attempt);
+  attempt.promise = runConnectAttempt(name, def, attempt);
+  return attempt;
+}
+
 /** Connect (or return cached connection). Concurrent callers share one attempt;
  *  failures start a bounded cooldown. */
 async function connect(name: string): Promise<ConnectResult> {
   const hit = connections.get(name);
-  if (hit) return { ok: true, conn: hit };
+  if (hit && hit.generation === generations.get(name)) return { ok: true, conn: hit };
   const def = servers.get(name);
   if (!def) return { ok: false, reason: `No MCP server named "${name}" is registered.` };
 
@@ -321,29 +483,8 @@ async function connect(name: string): Promise<ConnectResult> {
     cooldowns.delete(name);
   }
 
-  let attempt = pending.get(name);
-  if (!attempt) {
-    attempt = openConnection(name, def);
-    pending.set(name, attempt);
-  }
-  try {
-    const conn = await attempt;
-    connections.set(name, conn);
-    // A success clears the cooldown outright — including one another concurrent
-    // attempt may have written while this one was in flight.
-    cooldowns.delete(name);
-    return { ok: true, conn };
-  } catch (e) {
-    const reason = unavailable(name, e);
-    const cooldownMs = def.cooldownMs ?? MCP_FAILURE_COOLDOWN_MS;
-    if (cooldownMs > 0) cooldowns.set(name, { until: Date.now() + cooldownMs, reason });
-    return { ok: false, reason };
-  } finally {
-    // The in-flight marker goes either way — a failed attempt must leave no
-    // trace, and a successful one is remembered in `connections` instead.
-    // Guarded so a slow loser cannot delete a NEWER attempt.
-    if (pending.get(name) === attempt) pending.delete(name);
-  }
+  const attempt = pending.get(name) ?? startConnectAttempt(name, def);
+  return attempt.promise;
 }
 
 /* ------------------------------ the API ------------------------------ */
@@ -357,6 +498,54 @@ export type DiscoveryResult =
 export async function discoverMcpTools(server: string): Promise<DiscoveryResult> {
   const c = await connect(server);
   return c.ok ? { ok: true, tools: c.conn.tools } : { ok: false, reason: c.reason };
+}
+
+/** Close this server's current and in-flight clients while retaining its
+ * registration. Returns false only when neither registration nor runtime state
+ * exists for `name`. A later discovery reconnects from the stored definition. */
+export async function disconnectMcpServer(name: string): Promise<boolean> {
+  const existed = servers.has(name)
+    || connections.has(name) || pending.has(name) || cooldowns.has(name);
+  if (!existed) return false;
+  const invalidated = invalidateServerRuntime(name);
+  await Promise.all(invalidated.closing);
+  return true;
+}
+
+/** Remove this server's registration and close every current/in-flight client.
+ * The registry deletion is synchronous from callers' perspective, before any
+ * asynchronous close is awaited. */
+export async function unregisterMcpServer(name: string): Promise<boolean> {
+  const existed = servers.has(name)
+    || connections.has(name) || pending.has(name) || cooldowns.has(name);
+  if (!existed) return false;
+  servers.delete(name);
+  const invalidated = invalidateServerRuntime(name);
+  // `attempt.invalidated` plus the global monotonic token keep late work safe;
+  // the per-name tombstone itself need not grow forever under CRUD churn.
+  generations.delete(name);
+  await Promise.all(invalidated.closing);
+  return true;
+}
+
+/** Read a coarse, secret-safe snapshot for an operator UI. Configuration and
+ * failure detail intentionally remain available only to the code that owns the
+ * registration. */
+export function getMcpServerStatus(name: string): McpServerStatus {
+  const registered = servers.has(name);
+  const conn = connections.get(name);
+  if (conn && conn.generation === generations.get(name)) {
+    return { registered, state: 'connected', toolCount: conn.tools.length };
+  }
+  if (pending.has(name)) return { registered, state: 'connecting' };
+  const cool = cooldowns.get(name);
+  if (cool) {
+    if (Date.now() < cool.until) {
+      return { registered, state: 'cooldown', cooldownUntil: new Date(cool.until) };
+    }
+    cooldowns.delete(name);
+  }
+  return { registered, state: 'disconnected' };
 }
 
 /** One warn per distinct message kind (separate from tools.ts's own latch). */
@@ -426,20 +615,15 @@ export async function callMcpTool(
     return mapMcpResult(await c.conn.client.callTool(params));
   } catch (e) {
     // Transport failure — drop the connection so the next call reconnects.
-    dropConnection(server);
+    dropConnection(server, c.conn);
     return { ok: false, error: { error: 'mcp-unavailable', reason: unavailable(server, e) } };
   }
 }
 
-/** Close every connection. For shutdown and test cleanup. */
+/** Close every current and in-flight client. Registrations remain available so
+ * a long-lived process can reconnect after a coordinated runtime stop. */
 export async function stopMcp(): Promise<void> {
-  const open = [...connections.values()];
-  connections.clear();
-  pending.clear();
-  cooldowns.clear();
-  await Promise.all(open.map(async (conn) => {
-    try { await conn.client.close(); } catch { /* best effort */ }
-  }));
+  await Promise.all(invalidateAllRuntime());
 }
 
 /** Test seam: replace the client factory. null restores the default.
@@ -447,18 +631,10 @@ export async function stopMcp(): Promise<void> {
 export function _setMcpClientFactory(next: McpClientFactory | null): () => void {
   const previous = factory;
   const previousServers = new Map(servers);
-  const open = [...connections.values()];
-  connections.clear();
-  pending.clear();
-  cooldowns.clear();
-  for (const conn of open) closeQuietly(conn.client);
+  void Promise.all(invalidateAllRuntime());
   factory = next ?? defaultFactory;
   return () => {
-    const live = [...connections.values()];
-    connections.clear();
-    pending.clear();
-    cooldowns.clear();
-    for (const conn of live) closeQuietly(conn.client);
+    void Promise.all(invalidateAllRuntime());
     servers.clear();
     for (const [name, def] of previousServers) servers.set(name, def);
     factory = previous;

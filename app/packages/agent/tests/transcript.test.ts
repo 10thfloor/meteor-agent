@@ -366,7 +366,7 @@ describe('Transcript Commit Module Interface', () => {
     });
   });
 
-  it('keeps the legacy three-argument send and makes the optional fourth key idempotent', async () => {
+  it('keeps legacy send, and makes send/contribute retry keys idempotent', async () => {
     const sessionId = 'transcript-method-idempotency';
     const agentName = 'transcript-method-idempotency-agent';
     // eslint-disable-next-line no-new
@@ -391,15 +391,28 @@ describe('Transcript Commit Module Interface', () => {
       { userId: 'transcript-owner' }, agentName, sessionId, 'retry-safe method input', commitKey,
     );
 
+    const contribute = (Meteor.server as any).method_handlers[NAMES.mContribute];
+    const contributionKey = 'transcript-crew-note-key';
+    await contribute.call(
+      { userId: 'transcript-owner' }, agentName, sessionId, 'human-only context', contributionKey,
+    );
+    await contribute.call(
+      { userId: 'transcript-owner' }, agentName, sessionId, 'human-only context', contributionKey,
+    );
+
     const rows = await AgentMessages.find(
       { sessionId, role: 'user' }, { sort: { seq: 1 } },
     ).fetchAsync();
     assert.deepEqual(rows.map((row) => row.content), [
-      'legacy three arguments', 'retry-safe method input',
+      'legacy three arguments', 'retry-safe method input', 'human-only context',
     ]);
     assert.notEqual(rows[1]._id, commitKey, 'the public retry key must not become a document id');
+    assert.equal(rows[2].kind, 'crew-note');
+    assert.deepEqual(rows.map((row) => row.source), [
+      { kind: 'desktop' }, { kind: 'desktop' }, { kind: 'desktop' },
+    ], 'browser write methods stamp their trusted surface server-side');
     const session = (await AgentSessions.findOneAsync(sessionId))!;
-    assert.equal(session.nextSeq, 2);
+    assert.equal(session.nextSeq, 3);
     assert.equal(session.budgetSpent.turns, 2);
     assert.lengthOf((session as any).pendingInputs, 2);
   });

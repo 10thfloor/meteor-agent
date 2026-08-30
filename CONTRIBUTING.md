@@ -51,8 +51,11 @@ uses `MCP_LIVE_TEST=1`.
 
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
-The package has three app-level npm dependencies — `@earendil-works/pi-ai`,
-`@modelcontextprotocol/sdk`, and `typebox` — and none is ever an `Npm.depends`.
+The package has four app-level npm dependencies — `@earendil-works/pi-ai`,
+`@modelcontextprotocol/sdk`, `typebox`, and `marked` — and none is ever an
+`Npm.depends`. The first three are server-side and subject to every rule
+below; `marked` is client-only and covered by its own paragraph after the
+pins.
 pi-ai is **pre-1.0 and its API has moved during this project** (0.73 → 0.84
 renamed the scope and reshaped the streaming surface); the MCP SDK is post-1.0
 but ships weekly; typebox is post-1.0 and its `Compile`/`Value` surface is
@@ -107,11 +110,24 @@ package survives all three because of three rules — keep them:
      `MCP_LIVE_TEST=1` (it spawns `npx -y @modelcontextprotocol/server-everything`
      and is the only test that proves the real protocol round trip).
 
-The app pins `^0.84.2` (pi-ai), `^1.30.0` (MCP SDK), and `^1.3.7` (typebox). Do
-not widen any range in a commit that changes anything else. A typebox bump is a
-verification event too: run the suite (the tools suite pins the full ladder and
-`format` enforcement) and re-read the `Compile`/`Value` probe notes at the top
-of `server/tools.ts`.
+The app pins `^0.84.2` (pi-ai), `^1.30.0` (MCP SDK), `^1.3.7` (typebox), and
+`18.0.11` (marked, exact). Do not widen any range in a commit that changes
+anything else. A typebox bump is a verification event too: run the suite (the
+tools suite pins the full ladder and `format` enforcement) and re-read the
+`Compile`/`Value` probe notes at the top of `server/tools.ts`.
+
+**marked is the one client-side dependency, and it follows the same spirit
+with different mechanics.** It is imported by exactly one file —
+`client/markdown.ts` — and used only as a lexer: its HTML renderer is never
+called, the token tree is walked into an allowlisted DOM, and every content
+leaf lands as a Text node. There is no loader seam because the seam exists for
+Meteor's SERVER resolver; the client bundler follows the `exports` map at
+build time, and a missing install fails the build loudly instead of failing an
+agent at runtime. It is required (not an optional peer) for any app that loads
+the client element. The pin is exact because the token shapes are the entire
+contract. A marked bump is a verification event: run the client suite — the
+`element.client.ts` Markdown block pins rendering, sanitization (raw HTML
+inert, active URL schemes rejected), and the streaming-fence upgrade.
 
 **Both peers are genuinely optional, and that is a property to preserve.** An
 app that installs neither still runs agents: the MCP SDK is reached only by a

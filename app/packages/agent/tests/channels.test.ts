@@ -196,6 +196,40 @@ describe('channels', () => {
       );
     });
 
+    it('fans trusted human rows out with attribution and skips only their Channel origin', async () => {
+      const { planItems } = await import('../server/channels/plan');
+      const rows = [
+        msg({
+          sessionId: 's', seq: 1, role: 'user', content: 'Can everyone review?',
+          from: { participant: 'h:u1', name: 'Alex' }, source: { kind: 'desktop' },
+        }),
+        msg({
+          sessionId: 's', seq: 2, role: 'user', kind: 'crew-note', content: 'Decision is due Friday.',
+          from: { participant: 'h:u2', name: 'Dana' }, source: { kind: 'desktop' },
+        }),
+        msg({
+          sessionId: 's', seq: 3, role: 'user', content: 'This came from Slack',
+          from: { participant: 'h:u3', name: 'Lee' },
+          source: { kind: 'channel', channel: 'slack', origin: 'slack-origin' },
+        }),
+        msg({
+          sessionId: 's', seq: 4, role: 'user', content: 'Do not echo this one',
+          source: { kind: 'channel', channel: 'slack', origin: 'target-origin' },
+        }),
+        msg({ sessionId: 's', seq: 5, role: 'user', content: 'legacy source-less input' }),
+      ];
+      const planned = planItems(rows, {
+        profile: { interact: 'menu' }, origin: 'target-origin',
+      });
+      assert.deepEqual(planned.map((row) => row.item), [
+        { item: 'reply', text: 'Alex: Can everyone review?' },
+        { item: 'reply', text: 'Dana · crew note: Decision is due Friday.' },
+        { item: 'reply', text: 'Lee · slack: This came from Slack' },
+        null,
+        null,
+      ]);
+    });
+
     it('advances silently past an empty answer and passes status fields through', async () => {
       const { planItems } = await import('../server/channels/plan');
       const rows = [
@@ -468,6 +502,15 @@ describe('channels', () => {
       assert.deepEqual(session.channel, { origin: 'test', assurance: 'none' });
       const users = await AgentMessages.find({ sessionId: binding.sessionId, role: 'user' }).fetchAsync();
       assert.deepEqual(users.map((u) => u.content), ['hello']);
+      assert.deepEqual(
+        users[0].source, { kind: 'channel', channel: 'test', origin: binding.sourceKey },
+        'verified ingress, not provider text, stamps the source surface',
+      );
+      assert.isString(binding.sourceKey, 'the binding owns an opaque echo-suppression token');
+      assert.notEqual(
+        binding.sourceKey, binding._id,
+        'the public source token must not expose a provider conversation key',
+      );
     });
 
     it('admits inbound files under the channel caps: refs ride the user row, rejections become notes', async () => {
@@ -1236,6 +1279,133 @@ describe('channels', () => {
         await worker.stop();
       }
     });
+
+    it('promptly fans Desktop asks and crew notes to a stale binding exactly once', async function () {
+      this.timeout(10_000);
+      const { transport } = await registerTestChannel();
+      const { startEgress, deliverBinding } = await import('../server/channels/egress');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'desktop-fanout', nextSeq: 2,
+      } as any);
+      await seedBinding('test:desktop-fanout', {
+        sessionId: 'desktop-fanout', destination: { to: 'desktop-target' },
+        sourceKey: 'desktop-target-key', createdAt: stale, updatedAt: stale,
+      });
+
+      const worker = startEgress('test', {
+        sweepMs: 3_600_000, sweepLookbackMs: 1,
+      });
+      try {
+        await AgentMessages.insertAsync(msg({
+          sessionId: 'desktop-fanout', seq: 1, role: 'user', content: 'Please review.',
+          from: { participant: 'h:alex', name: 'Alex' }, source: { kind: 'desktop' },
+        }) as any);
+        await until(async () => transport.posts.some(
+          (post) => post.payload.text === 'Alex: Please review.',
+        ));
+        await AgentMessages.insertAsync(msg({
+          sessionId: 'desktop-fanout', seq: 2, role: 'user', kind: 'crew-note',
+          content: 'Decision is due Friday.',
+          from: { participant: 'h:dana', name: 'Dana' }, source: { kind: 'desktop' },
+        }) as any);
+        await until(async () => transport.posts.some(
+          (post) => post.payload.text === 'Dana · crew note: Decision is due Friday.',
+        ));
+
+        assert.deepEqual(transport.posts.map((post) => post.payload.text), [
+          'Alex: Please review.', 'Dana · crew note: Decision is due Friday.',
+        ]);
+        await deliverBinding('test', 'test:desktop-fanout');
+        await deliverBinding('test', 'test:desktop-fanout');
+        assert.lengthOf(transport.posts, 2, 'receipts/cursor make observer + retry exactly once');
+        assert.equal(
+          (await ChannelBindings.findOneAsync('test:desktop-fanout'))!.deliveredSeq, 2,
+        );
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('keeps a stale binding sweep-eligible when its immediate delivery attempt fails', async function () {
+      this.timeout(10_000);
+      const { transport } = await registerTestChannel();
+      const { startEgress } = await import('../server/channels/egress');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { ChannelBindings, DeliveryReceipts } = await import('../server/channels/collections');
+      const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'desktop-retry', nextSeq: 1,
+      } as any);
+      await seedBinding('test:desktop-retry', {
+        sessionId: 'desktop-retry', sourceKey: 'desktop-retry-key',
+        createdAt: stale, updatedAt: stale,
+      });
+      transport.fail(1);
+      const worker = startEgress('test', {
+        sweepMs: 3_600_000, sweepLookbackMs: 1,
+      });
+      try {
+        await AgentMessages.insertAsync(msg({
+          sessionId: 'desktop-retry', seq: 1, role: 'user', content: 'Retry me',
+          source: { kind: 'desktop' },
+        }) as any);
+        await until(async () => !!(await DeliveryReceipts.findOneAsync(
+          'deliver:test:desktop-retry:m-desktop-retry-1',
+        )));
+        await until(async () => (
+          (await ChannelBindings.findOneAsync('test:desktop-retry'))!.updatedAt.getTime()
+            > stale.getTime()
+        ));
+        assert.lengthOf(transport.posts, 0, 'the first transport attempt failed');
+      } finally {
+        await worker.stop();
+      }
+    });
+
+    it('fans a Channel human row to another binding once without echoing to its origin', async function () {
+      this.timeout(10_000);
+      const { transport } = await registerTestChannel();
+      const { startEgress, deliverBinding } = await import('../server/channels/egress');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { ChannelBindings } = await import('../server/channels/collections');
+      const stale = new Date(Date.now() - 2 * 24 * 60 * 60_000);
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'channel-fanout', nextSeq: 1,
+      } as any);
+      await seedBinding('test:origin', {
+        sessionId: 'channel-fanout', destination: { to: 'origin' },
+        sourceKey: 'origin-key', createdAt: stale, updatedAt: stale,
+      });
+      await seedBinding('test:other', {
+        sessionId: 'channel-fanout', destination: { to: 'other' },
+        sourceKey: 'other-key', createdAt: stale, updatedAt: stale,
+      });
+
+      const worker = startEgress('test', {
+        sweepMs: 3_600_000, sweepLookbackMs: 1,
+      });
+      try {
+        await AgentMessages.insertAsync(msg({
+          sessionId: 'channel-fanout', seq: 1, role: 'user', content: 'Shared update',
+          from: { participant: 'h:alex', name: 'Alex' },
+          source: { kind: 'channel', channel: 'test', origin: 'origin-key' },
+        }) as any);
+        await until(async () => transport.posts.length === 1);
+        assert.deepEqual(transport.posts[0].destination, { to: 'other' });
+        assert.equal(transport.posts[0].payload.text, 'Alex · test: Shared update');
+        assert.equal((await ChannelBindings.findOneAsync('test:origin'))!.deliveredSeq, 1);
+        assert.equal((await ChannelBindings.findOneAsync('test:other'))!.deliveredSeq, 1);
+
+        await deliverBinding('test', 'test:origin');
+        await deliverBinding('test', 'test:other');
+        assert.lengthOf(transport.posts, 1, 'origin skip and target receipt survive retries');
+      } finally {
+        await worker.stop();
+      }
+    });
   });
 
   // ---- Linking (§12) -------------------------------------------------------
@@ -1266,6 +1436,34 @@ describe('channels', () => {
       await linkIdentity('test', 'ext-1', 'meteor-user', 'oidc');
       await linkIdentity('test', 'ext-1', 'meteor-user', 'link');
       assert.equal((await resolveIdentity('test', 'ext-1'))!.assurance, 'oidc', 'stronger proof survives');
+    });
+
+    it('previews an account-link token without spending it or exposing the external identity', async () => {
+      await registerTestChannel();
+      const {
+        issueLinkToken, previewLinkToken, redeemLinkToken,
+      } = await import('../server/channels/linking');
+      const token = await issueLinkToken('test', 'private-external-user');
+
+      const first = await previewLinkToken(token);
+      const second = await previewLinkToken(token);
+      assert.deepEqual(first, second, 'preview is non-consuming');
+      assert.deepInclude(first, { state: 'ready', channel: 'test' });
+      assert.notInclude(JSON.stringify(first), 'private-external-user');
+      assert.notInclude(JSON.stringify(first), token, 'the bearer is never reflected');
+
+      assert.isDefined(await redeemLinkToken(token, 'preview-owner'));
+      assert.deepEqual(
+        await previewLinkToken(token), { state: 'unavailable' },
+        'a used token is no longer previewable',
+      );
+      assert.deepEqual(
+        await previewLinkToken('not valid'), { state: 'unavailable' },
+        'malformed values are rejected without a lookup',
+      );
+
+      const expired = await issueLinkToken('test', 'expired-preview-user', { ttlMs: -1 });
+      assert.deepEqual(await previewLinkToken(expired), { state: 'expired' });
     });
 
     it('an unlinked sender can never act as the conversation\'s linked owner', async () => {
@@ -1344,6 +1542,135 @@ describe('channels', () => {
       assert.isDefined(note, 'the redemption left its audit row');
       assert.isTrue(note!.approved);
       assert.isFalse(await redeemVerdictToken(token), 'single-use');
+    });
+
+    it('previews a verdict link without spending it or exposing tool arguments', async () => {
+      await registerTestChannel();
+      const { AgentSessions } = await import('../common/collections');
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'sv-preview',
+        title: 'Publish launch brief',
+        phase: 'awaiting',
+        pending: {
+          toolCallId: 'tc-preview',
+          name: 'publish_brief',
+          args: { token: 'must-not-leak' },
+          agent: 'critic',
+          runAs: 'service-user',
+          mcpServer: 'workspace-runtime',
+        },
+      } as any);
+      const {
+        issueVerdictToken, previewVerdictToken, redeemVerdictToken,
+      } = await import('../server/channels/linking');
+      const token = await issueVerdictToken(
+        'channel-agent', 'sv-preview', 'tc-preview', 'denied',
+      );
+
+      const first = await previewVerdictToken(token);
+      const second = await previewVerdictToken(token);
+      assert.deepEqual(first, second, 'preview is non-consuming');
+      assert.deepInclude(first, {
+        state: 'ready',
+        verdict: 'denied',
+        missionTitle: 'Publish launch brief',
+        toolName: 'publish_brief',
+        requestingAgent: 'critic',
+        runContext: 'elevated',
+        source: 'MCP server · workspace-runtime',
+        scope: 'one-call',
+      });
+      assert.notInclude(JSON.stringify(first), 'must-not-leak');
+      assert.notInclude(JSON.stringify(first), 'service-user', 'opaque user ids stay private');
+      assert.isTrue(await redeemVerdictToken(token));
+      assert.deepEqual(
+        await previewVerdictToken(token), { state: 'unavailable' },
+        'a used token is no longer previewable',
+      );
+    });
+
+    it('releases a verdict-token claim after a transient authorization failure', async () => {
+      await registerTestChannel();
+      const { Agent, mockProvider } = await import('../server/index');
+      const { AgentSessions } = await import('../common/collections');
+      const { ChannelVerdictTokens } = await import('../server/channels/collections');
+      const { issueVerdictToken, redeemVerdictToken } = await import('../server/channels/linking');
+      let attempts = 0;
+      new Agent('channel-agent').define({
+        model: 'mock',
+        instructions: 'test',
+        provider: mockProvider(() => ({ text: 'unused' })),
+        approve: async () => {
+          attempts += 1;
+          if (attempts === 1) throw new Error('temporary authorization dependency failure');
+          return true;
+        },
+      });
+      await AgentSessions.insertAsync({
+        ...sessionBase,
+        _id: 'sv-preview-retry',
+        phase: 'awaiting',
+        pending: { toolCallId: 'tc-preview-retry', name: 'publish_brief', args: {} },
+      } as any);
+      const token = await issueVerdictToken(
+        'channel-agent', 'sv-preview-retry', 'tc-preview-retry', 'approved',
+      );
+
+      let failed = false;
+      try { await redeemVerdictToken(token); } catch { failed = true; }
+      assert.isTrue(failed, 'the transient failure propagates to the caller');
+      const retryable = await ChannelVerdictTokens.findOneAsync(token);
+      assert.isDefined(retryable, 'the token is retained');
+      assert.isUndefined(retryable?.claim, 'its short claim is released');
+      assert.isTrue(await redeemVerdictToken(token), 'the same link can be retried');
+      assert.isUndefined(await ChannelVerdictTokens.findOneAsync(token), 'success spends it');
+    });
+
+    it('atomically binds a delayed verdict-token callback to its original ask', async () => {
+      await registerTestChannel();
+      const { Agent, mockProvider } = await import('../server/index');
+      const { AgentSessions, AgentMessages } = await import('../common/collections');
+      const { issueVerdictToken, redeemVerdictToken } = await import('../server/channels/linking');
+      let entered!: () => void;
+      let release!: () => void;
+      const authorizationEntered = new Promise<void>((resolve) => { entered = resolve; });
+      const authorizationRelease = new Promise<void>((resolve) => { release = resolve; });
+      new Agent('channel-agent').define({
+        model: 'mock', instructions: 'test',
+        provider: mockProvider(() => ({ text: 'unused' })),
+        approve: async () => {
+          entered();
+          await authorizationRelease;
+          return true;
+        },
+      });
+      await AgentSessions.insertAsync({
+        ...sessionBase, _id: 'sv-atomic', phase: 'awaiting',
+        pending: { toolCallId: 'token-a', name: 'first', args: {} },
+      } as any);
+      const token = await issueVerdictToken(
+        'channel-agent', 'sv-atomic', 'token-a', 'approved',
+      );
+
+      const redemption = redeemVerdictToken(token);
+      await authorizationEntered;
+      await AgentSessions.updateAsync('sv-atomic', {
+        $set: {
+          phase: 'awaiting',
+          pending: { toolCallId: 'token-b', name: 'second', args: {}, requestedAt: new Date() },
+        },
+      });
+      release();
+
+      assert.isFalse(await redemption, 'the callback for A cannot decide replacement ask B');
+      const session = (await AgentSessions.findOneAsync('sv-atomic'))!;
+      assert.equal(session.pending?.toolCallId, 'token-b');
+      assert.isUndefined(session.pending?.verdict);
+      assert.isUndefined(
+        await AgentMessages.findOneAsync({ sessionId: 'sv-atomic', kind: 'approval' }),
+        'a stale callback leaves no audit row',
+      );
     });
 
     it('does not mint a verdict token for a child under a fenced root', async () => {

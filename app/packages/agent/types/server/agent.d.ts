@@ -1,3 +1,4 @@
+import type { MessageSource } from '../common/types';
 import { type AgentConfig } from './registry';
 import type { Provider } from './providers/types';
 import { type AdoptedTool, type AgentMethodOptions } from './tools';
@@ -31,6 +32,14 @@ export declare class Agent {
     send(sessionId: string, text: string, opts?: {
         userId?: string | null;
     }): Promise<string>;
+    /** Add human conversation context without waking a model. The row remains
+     * visible to a later turn, but does not consume the Turn budget or resolve
+     * a leading @mention. Server callers may stamp another trusted surface;
+     * app/browser contributions default to Desktop. */
+    contribute(sessionId: string, text: string, opts?: {
+        userId?: string | null;
+        source?: MessageSource;
+    }): Promise<string>;
     /** Permanently erase one owned root Session and its subagent descendants.
      *  Server-only. `userId` is required; explicit null means anonymous owner.
      *  Memory and account-wide channel identities are preserved. */
@@ -41,11 +50,13 @@ export declare class Agent {
      *  produce exactly one verdict. */
     approve(sessionId: string, opts?: {
         userId?: string | null;
+        expectedToolCallId?: string;
     }): Promise<void>;
     /** The deny half of `approve` — same core, same guarantees; `reason`
      *  reaches the model as the denied tool result. */
     deny(sessionId: string, reason?: string, opts?: {
         userId?: string | null;
+        expectedToolCallId?: string;
     }): Promise<void>;
     /** Branch a session at `atSeq` (clamped to batch-safe cut). Returns
      *  the new session's id; the fork is a new root with zeroed usage. */

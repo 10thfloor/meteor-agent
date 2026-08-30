@@ -73,7 +73,13 @@ export function applyRateLimits(settings: unknown): number {
   if (!rateLimit) return 0;
 
   let added = 0;
-  if (rateLimit.sends) added += addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
+  if (rateLimit.sends) {
+    added += addRuleFor(NAMES.mSend, rateLimit.sends, 'sends');
+    // A crew note buys no provider call, but is still a transcript write. It
+    // shares the input budget so `contribute` cannot bypass a deployment's
+    // anti-flood ceiling by selecting the non-waking composer mode.
+    added += addRuleFor(NAMES.mContribute, rateLimit.sends, 'sends');
+  }
   if (rateLimit.starts) {
     added += addRuleFor(NAMES.mStart, rateLimit.starts, 'starts');
     // Fork shares the `starts` budget — it creates a session too, and a

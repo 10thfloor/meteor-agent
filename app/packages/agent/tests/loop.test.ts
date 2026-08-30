@@ -1880,6 +1880,130 @@ describe('approval gates', () => {
     assert.equal(notes, 1, 'one verdict, one note');
   });
 
+  it('atomically binds a delayed UI verdict to the tool call that was displayed', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    let entered!: () => void;
+    let release!: () => void;
+    const authorizationEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const authorizationRelease = new Promise<void>((resolve) => { release = resolve; });
+    new Agent('gate-bound-verdict', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => ({ text: 'unused' })),
+      approve: async () => {
+        entered();
+        await authorizationRelease;
+        return true;
+      },
+    });
+    await seed('s-bound-verdict', 'hello', 'gate-bound-verdict');
+    await AgentSessions.updateAsync('s-bound-verdict', {
+      $set: {
+        phase: 'awaiting',
+        pending: { toolCallId: 'call-a', name: 'first', args: {}, requestedAt: new Date() },
+      },
+    });
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    const staleClick = approve.call(
+      { userId: 'u1' }, 'gate-bound-verdict', 's-bound-verdict', 'call-a',
+    );
+    await authorizationEntered;
+
+    // Model the old click arriving while authorization waits and a new ask B
+    // replacing A. Only the atomic verdict selector can close this TOCTOU gap.
+    await AgentSessions.updateAsync('s-bound-verdict', {
+      $set: {
+        phase: 'awaiting',
+        pending: { toolCallId: 'call-b', name: 'second', args: {}, requestedAt: new Date() },
+      },
+    });
+    release();
+
+    try {
+      await staleClick;
+      assert.fail('a click rendered for call A must not approve replacement call B');
+    } catch (e: any) {
+      assert.equal(e.error, 'no-pending');
+    }
+    const session = (await AgentSessions.findOneAsync('s-bound-verdict'))!;
+    assert.equal(session.phase, 'awaiting');
+    assert.equal(session.pending?.toolCallId, 'call-b');
+    assert.isUndefined(session.pending?.verdict, 'replacement ask B remains undecided');
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-bound-verdict', kind: 'approval' } as any)
+        .countAsync(),
+      0,
+      'a stale click leaves no approval audit row',
+    );
+  });
+
+  it('snapshots the observed tool call for compatibility approval callers', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    let entered!: () => void;
+    let release!: () => void;
+    const authorizationEntered = new Promise<void>((resolve) => { entered = resolve; });
+    const authorizationRelease = new Promise<void>((resolve) => { release = resolve; });
+    new Agent('gate-compat-bound-verdict', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => ({ text: 'unused' })),
+      approve: async () => {
+        entered();
+        await authorizationRelease;
+        return true;
+      },
+    });
+    await seed('s-compat-bound-verdict', 'hello', 'gate-compat-bound-verdict');
+    await AgentSessions.updateAsync('s-compat-bound-verdict', {
+      $set: {
+        phase: 'awaiting',
+        pending: { toolCallId: 'compat-a', name: 'first', args: {}, requestedAt: new Date() },
+      },
+    });
+
+    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
+    // Older callers do not send an explicit id. The server must still bind the
+    // authorization to the pending call it read before the async predicate.
+    const staleApproval = approve.call(
+      { userId: 'u1' }, 'gate-compat-bound-verdict', 's-compat-bound-verdict',
+    );
+    await authorizationEntered;
+    await AgentSessions.updateAsync('s-compat-bound-verdict', {
+      $set: {
+        phase: 'awaiting',
+        pending: { toolCallId: 'compat-b', name: 'second', args: {}, requestedAt: new Date() },
+      },
+    });
+    release();
+
+    try {
+      await staleApproval;
+      assert.fail('a compatibility approval for call A must not approve replacement call B');
+    } catch (e: any) {
+      assert.equal(e.error, 'no-pending');
+    }
+    const session = (await AgentSessions.findOneAsync('s-compat-bound-verdict'))!;
+    assert.equal(session.phase, 'awaiting');
+    assert.equal(session.pending?.toolCallId, 'compat-b');
+    assert.isUndefined(session.pending?.verdict);
+    assert.equal(
+      await AgentMessages.find({ sessionId: 's-compat-bound-verdict', kind: 'approval' } as any)
+        .countAsync(),
+      0,
+    );
+  });
+
   it('refuses a caller that config.approve rejects', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -1949,7 +2073,7 @@ describe('approval gates', () => {
     assert.isUndefined((await AgentSessions.findOneAsync('s-gone'))!.pending);
   });
 
-  it('an interrupt cancels the park, and the next send is answered not wedged', async function () {
+  it('an interrupt cannot cancel a parked approval', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
     const { NAMES } = await import('../common/names');
@@ -1962,40 +2086,29 @@ describe('approval gates', () => {
     const interrupt = (Meteor.server as any).method_handlers[NAMES.mInterrupt];
     await interrupt.call({ userId: 'u1' }, 'gate-stop', 's-park-stop');
 
-    // The stop cancels the WAIT, not the record of what was asked.
-    const stopped = (await AgentSessions.findOneAsync('s-park-stop'))!;
-    assert.equal(stopped.phase, 'stopped');
-    assert.deepInclude(stopped.pending as any, { toolCallId: 'g1' });
+    const stillParked = (await AgentSessions.findOneAsync('s-park-stop'))!;
+    assert.equal(stillParked.phase, 'awaiting');
+    assert.deepInclude(stillParked.pending as any, { toolCallId: 'g1' });
 
-    // And a verdict is no longer answerable: approve/deny require 'awaiting'.
-    const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
-    try {
-      await approve.call({ userId: 'u1' }, 'gate-stop', 's-park-stop');
-      assert.fail('an interrupted park must not accept a verdict');
-    } catch (e: any) {
-      assert.equal(e.error, 'no-pending');
-    }
-
-    // The send clears the stop. The dead request must go with it — otherwise
-    // its unanswered tool_use 400s every provider call from here on, and the
-    // message the user just sent is never answered at all.
-    const send = (Meteor.server as any).method_handlers[NAMES.mSend];
-    await send.call({ userId: 'u1' }, 'gate-stop', 's-park-stop', 'never mind');
+    // A parked request has its own explicit decision controls. A stale Stop
+    // must not make that durable question unanswerable.
+    const deny = (Meteor.server as any).method_handlers[NAMES.mDeny];
+    await deny.call({ userId: 'u1' }, 'gate-stop', 's-park-stop', 'not this time');
 
     await waitFor(
       async () => !!(await AgentMessages.findOneAsync({
         sessionId: 's-park-stop', role: 'assistant', content: 'all done',
       } as any)),
-      'the send after an interrupted park to be answered',
+      'the denied parked turn to finish',
     );
 
-    assert.deepEqual(state.ran, [], 'a cancelled gate never runs its tool');
+    assert.deepEqual(state.ran, [], 'a denied gate never runs its tool');
     const msgs = await AgentMessages
       .find({ sessionId: 's-park-stop' }, { sort: { seq: 1 } }).fetchAsync();
-    assert.deepEqual(unansweredToolUses(msgs), [], 'the cancelled request must not strand a call');
-    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 1, 'the dead turn was discarded');
+    assert.deepEqual(unansweredToolUses(msgs), [], 'the denied request must not strand a call');
+    assert.lengthOf(msgs.filter((m) => m.role === 'assistant'), 2, 'the parked turn resumed normally');
     const doc = (await AgentSessions.findOneAsync('s-park-stop'))!;
-    assert.isUndefined(doc.pending, 'the dead marker must not outlive the turn');
+    assert.isUndefined(doc.pending, 'the decided marker must not outlive the turn');
     assert.equal(doc.phase, 'idle');
   });
 

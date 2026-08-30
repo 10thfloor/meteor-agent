@@ -84,9 +84,10 @@ export interface SessionModifier {
 
 // ---- AgentMessages ---------------------------------------------------------
 
-/** Message selector: flat fields only (no nested paths). */
+/** Message selector: own fields plus trusted ingress-source paths. */
 export type MessageQuery =
   & Fields<AgentMessage>
+  & { [k: `source.${string}`]: unknown }
   & {
     $or?: MessageQuery[];
     $and?: MessageQuery[];

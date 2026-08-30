@@ -15,6 +15,7 @@ export declare const NAMES: {
     readonly pubSessions: 'agent.sessions';
     readonly mStart: 'agent.start';
     readonly mSend: 'agent.send';
+    readonly mContribute: 'agent.contribute';
     readonly mInterrupt: 'agent.interrupt';
     readonly mFork: 'agent.fork';
     readonly mApprove: 'agent.approve';

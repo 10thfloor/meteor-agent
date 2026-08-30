@@ -19,6 +19,7 @@ export const NAMES = {
   pubSessions: 'agent.sessions',
   mStart: 'agent.start',
   mSend: 'agent.send',
+  mContribute: 'agent.contribute',
   mInterrupt: 'agent.interrupt',
   mFork: 'agent.fork',
   mApprove: 'agent.approve',

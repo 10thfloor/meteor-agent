@@ -60,12 +60,15 @@ export type {
 } from './hooks';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
 export {
-  stopMcp,
+  discoverMcpTools, disconnectMcpServer, unregisterMcpServer,
+  getMcpServerStatus, stopMcp,
+  type DiscoveryResult, type McpServerState, type McpServerStatus,
   type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
 } from './mcp/client';
 export { mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
-export { piAiProvider } from './providers/piai';
+export { createPiAiProvider, piAiProvider, type PiAiModels } from './providers/piai';
+export { loadPiAi } from './providers/loader';
 export type {
   Provider, ProviderChunk, ProviderRequest, ProviderMessage,
 } from './providers/types';
@@ -96,8 +99,10 @@ export {
 } from './channels/egress';
 export { handleInbound, mountChannelRoutes } from './channels/ingress';
 export {
-  issueLinkToken, redeemLinkToken, linkIdentity, resolveIdentity,
-  issueVerdictToken, redeemVerdictToken,
+  issueLinkToken, previewLinkToken, redeemLinkToken, linkIdentity, resolveIdentity,
+  type LinkTokenPreview,
+  issueVerdictToken, previewVerdictToken, redeemVerdictToken,
+  type VerdictTokenPreview,
 } from './channels/linking';
 export {
   ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens,
