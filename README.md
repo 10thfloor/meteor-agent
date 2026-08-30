@@ -9,26 +9,37 @@ your Meteor app already uses—without a second realtime stack.
 [CI](https://github.com/10thfloor/meteor-agent/actions/workflows/ci.yml) ·
 Meteor 3.5+ · [MIT](LICENSE)
 
+[Constellation](#constellation) ·
 [Quick start](#quick-start) · [Why Meteor?](#why-this-exists) ·
 [Tools](#tools--five-kinds) · [Durability](#durability) ·
 [Channels](#channels) · [API reference](app/packages/agent/README.md)
 
-## Constellation desktop showcase
+## Constellation
 
-This repository includes **Constellation**, a local-first Electron operations
-room built to exercise the `v0.2.1-rc.1` agent runtime: durable missions,
-specialist delegation, inspectable child sessions, approval-gated tools,
-memory, configurable scheduled pulses, reusable per-agent skills, attachments,
-and securely configured channel adapters.
+![A Constellation mission awaiting approval — the orchestrator has delegated to a researcher and a critic, and publishing the brief now needs a human](docs/images/constellation.png)
+
+**An agent operations room that runs on your laptop, no API key required.**
+Constellation is the Electron showcase for the `v0.2.1-rc.1` runtime, and
+everything in that window is the framework doing its job. The mission is a
+durable session in Mongo. Atlas, the orchestrator, delegates to a specialist
+crew through child sessions you can open and read. The amber bar is a parked
+approval — the mission survives a restart while it waits for you. The meters
+are enforced budgets, not decoration. And the Pulse screen schedules system
+turns: agent work that starts with nobody at the keyboard.
 
 ```bash
 npm install
 npm run desktop:offline
 ```
 
-The offline mode is deterministic and needs no API key. Use `npm run desktop`
-to let the showcase select a configured live provider when one is available.
-See [the desktop guide](desktop/README.md) for the architecture and controls.
+Offline mode is deterministic end to end — subagents, approvals, attachments,
+memory, forks, and system turns all run against the scripted provider. Plain
+`npm run desktop` picks up a live provider when one is configured: an
+Anthropic key, or a local Ollama. The [desktop guide](desktop/README.md)
+covers the architecture, the security posture, and the other screens —
+Missions, Pulse, Memory, Skills, and Channels.
+
+Every piece of it maps to a Meteor primitive:
 
 | Agent concern | Meteor primitive |
 | --- | --- |
