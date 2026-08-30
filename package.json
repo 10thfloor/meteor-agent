@@ -1,0 +1,17 @@
+{
+  "name": "meteor-agent-constellation",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Constellation — an Electron showcase for meteor-agent rc1",
+  "main": "desktop/main.cjs",
+  "scripts": {
+    "desktop": "electron desktop/main.cjs",
+    "desktop:offline": "CONSTELLATION_OFFLINE=1 electron desktop/main.cjs",
+    "desktop:inspect": "METEOR_DESKTOP_DEVTOOLS=1 electron desktop/main.cjs",
+    "meteor": "npm --prefix app start",
+    "check:desktop": "node --check desktop/main.cjs && node --check desktop/preload.cjs"
+  },
+  "devDependencies": {
+    "electron": "^44.0.0"
+  }
+}

@@ -1,27 +1,935 @@
 <head>
-  <title>10thfloor:agent demo</title>
+  <title>Constellation — meteor-agent</title>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <meta name="theme-color" content="#101211">
 </head>
 
 <body>
-  <div class="demo-shell">
-    <aside class="demo-side">
-      <section id="account-box" aria-label="Account"></section>
-      <section id="link-box" hidden aria-label="Link a channel"></section>
-      <section id="sessions-box" aria-label="Conversations">
-        <header class="sessions-header">
-          <h2>Conversations</h2>
-          <button id="new-chat" type="button" title="Start a new conversation">New</button>
-        </header>
-        <p id="sessions-empty">Sign in to see your conversations across surfaces.</p>
-        <ul id="sessions-list"></ul>
-      </section>
-    </aside>
-    <main class="demo-main">
-      <agent-chat agent="demo"
-                  placeholder='Try "what time is it?" or "refund my order"'>
-        <h1 slot="header">10thfloor:agent</h1>
-      </agent-chat>
-    </main>
+  <div class="app-frame" id="app-frame" data-startup-state="loading" aria-busy="true">
+    <header class="window-bar">
+      <div class="window-drag-zone"></div>
+      <div class="window-brand" aria-label="Constellation">
+        <span class="brand-mark" aria-hidden="true">
+          <span></span><span></span><span></span>
+        </span>
+        <strong>Constellation</strong>
+        <span class="rc-badge">RC1 LAB</span>
+      </div>
+      <button class="command-trigger" id="command-trigger" type="button" aria-label="Open command menu">
+        <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m14.5 14.5 3 3M9 16A7 7 0 1 1 9 2a7 7 0 0 1 0 14Z"/></svg>
+        <span>Search / commands</span><kbd>⌘ K</kbd>
+      </button>
+      <div class="window-status" aria-label="Runtime status">
+        <span class="status-light"></span>
+        <span id="runtime-label">Local runtime</span>
+      </div>
+    </header>
+
+    <div class="workspace-shell" id="workspace-shell" data-current-view="missions">
+      <nav class="primary-rail" aria-label="Primary navigation">
+        <div class="rail-top">
+          <button class="rail-button active" type="button" data-view="missions" aria-label="Missions" aria-current="page">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3.25a8.75 8.75 0 1 0 8.75 8.75A8.75 8.75 0 0 0 12 3.25Z"/><path d="m9.1 12.3 1.8 1.8 4.2-4.4"/></svg>
+            <span>Missions</span>
+          </button>
+          <button class="rail-button" type="button" data-view="automations" aria-label="Pulses">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M12 3v3M12 18v3M4.22 4.22l2.12 2.12M17.66 17.66l2.12 2.12M3 12h3M18 12h3M4.22 19.78l2.12-2.12M17.66 6.34l2.12-2.12"/><circle cx="12" cy="12" r="4"/></svg>
+            <span>Pulses</span>
+          </button>
+          <button class="rail-button" type="button" data-view="memory" aria-label="Memory">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M7.5 6.5a4 4 0 0 1 7.4-2.1A3.5 3.5 0 0 1 19 7.8a3.5 3.5 0 0 1-.7 2.1A4 4 0 0 1 17 17.5a4.1 4.1 0 0 1-5 2.7 4.1 4.1 0 0 1-5-2.7 4 4 0 0 1-1.3-7.6A3.5 3.5 0 0 1 5 7.8a3.5 3.5 0 0 1 2.5-3.4"/><path d="M12 5.5v13M8.5 9.5A3.5 3.5 0 0 0 12 13M15.5 9.5A3.5 3.5 0 0 1 12 13"/></svg>
+            <span>Memory</span>
+          </button>
+          <button class="rail-button" type="button" data-view="capabilities" aria-label="Capabilities">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M8 3.5h8l4 4v9l-4 4H8l-4-4v-9l4-4Z"/><path d="M9 9h6v6H9z"/></svg>
+            <span>Capabilities</span>
+          </button>
+          <button class="rail-button" type="button" data-view="channels" aria-label="Channels">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v10H8l-4 3v-13Z"/><path d="M8 9h8M8 12h5"/></svg>
+            <span>Channels</span>
+          </button>
+        </div>
+        <div class="rail-bottom">
+          <button class="avatar-button" id="profile-button" type="button" aria-label="Local workspace account" title="Local workspace account">
+            <span class="account-avatar" aria-hidden="true">
+              <svg viewBox="0 0 20 20"><circle cx="10" cy="7" r="3"/><path d="M4.75 16c.5-3 2.25-4.5 5.25-4.5s4.75 1.5 5.25 4.5"/></svg>
+            </span>
+            <span class="account-label" aria-hidden="true">Local</span>
+          </button>
+        </div>
+      </nav>
+
+      <aside class="mission-sidebar" id="mission-sidebar">
+        <div class="sidebar-heading">
+          <div>
+            <p class="eyebrow">Workspace</p>
+            <h1>Mission control</h1>
+          </div>
+          <button class="icon-button primary" id="new-mission" type="button" aria-label="New mission" title="New mission" data-loading="false">
+            <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M10 4v12M4 10h12"/></svg>
+          </button>
+        </div>
+        <label class="sidebar-search">
+          <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 3.5 3.5"/></svg>
+          <input id="mission-search" type="search" placeholder="Search missions" autocomplete="off">
+          <kbd>/</kbd>
+        </label>
+        <div class="sidebar-section-label">
+          <span>Missions</span><span id="mission-count">0</span>
+        </div>
+        <div class="mission-list" id="mission-list" aria-label="Missions"></div>
+        <div class="sidebar-foot">
+          <div class="continuity-card">
+            <div class="continuity-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
+            <div><strong>Session continuity</strong><span id="continuity-state">Enabled</span></div>
+            <button type="button" id="configure-continuity" aria-label="Configure session continuity" data-loading="false">→</button>
+          </div>
+        </div>
+      </aside>
+
+      <main class="content-stage">
+        <section class="view-panel active" id="view-missions" data-view-panel="missions" data-agent-state="loading" aria-busy="true">
+          <div class="mission-topbar">
+            <div class="mission-title-block">
+              <div class="mission-breadcrumb"><span>MISSIONS</span><b>/</b><span id="mission-slug">NEW MISSION</span></div>
+              <div class="mission-title-row">
+                <h2 id="mission-title">New mission</h2>
+                <span class="live-pill loading" id="phase-pill" data-agent-state="loading" data-runtime-phase="idle"><i></i><span>LOADING</span></span>
+              </div>
+            </div>
+            <div class="mission-actions">
+              <button class="toolbar-button" id="configure-mission" type="button" title="Configure mission" aria-haspopup="dialog" aria-controls="mission-dialog" data-loading="false" data-loading-label="Loading">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h8M15 5h2M3 10h2M9 10h8M3 15h6M13 15h4"/><circle cx="13" cy="5" r="2"/><circle cx="7" cy="10" r="2"/><circle cx="11" cy="15" r="2"/></svg>
+                Configure
+              </button>
+              <button class="toolbar-button" id="fork-mission" type="button" title="Branch this mission" data-loading="false" data-loading-label="Forking">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="14" cy="5" r="2"/><circle cx="10" cy="15" r="2"/><path d="M6 7v1.5c0 2 4 2 4 4.5M14 7v1.5c0 2-4 2-4 4.5"/></svg>
+                Fork
+              </button>
+              <button class="toolbar-button" id="compact-mission" type="button" title="Compact the session context" data-loading="false" data-loading-label="Compacting">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3v5H2M15 3v5h3M5 17v-5H2M15 17v-5h3"/><path d="m2 8 5-5M18 8l-5-5M2 12l5 5M18 12l-5 5"/></svg>
+                Compact
+              </button>
+              <button class="toolbar-button icon-only active" id="toggle-inspector" type="button" aria-label="Toggle inspector" title="Toggle inspector">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M12.5 3v14"/></svg>
+              </button>
+            </div>
+          </div>
+
+          <div class="mission-workspace">
+            <section class="conversation-pane">
+              <div class="conversation-context">
+                <div class="context-copy">
+                  <span class="agent-avatar avatar-orbit" id="primary-avatar">A<i></i></span>
+                  <div><strong id="primary-name">Atlas</strong><span id="primary-role">Orchestrator</span></div>
+                </div>
+                <div class="mission-participant-control">
+                  <div class="participant-stack" id="mission-participant-stack" data-state="loading" role="group" aria-label="Mission crew" aria-busy="true">
+                    <span class="participant-stack-loading" aria-hidden="true"></span>
+                  </div>
+                  <button class="manage-crew-button" id="manage-mission-crew" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button>
+                </div>
+                <div class="context-metrics">
+                  <div class="agent-work-state" id="mission-runtime-state" data-agent-state="loading" data-runtime-phase="idle" role="status" aria-live="polite" aria-atomic="true">
+                    <span class="work-state-visual" aria-hidden="true"><i></i><i></i><i></i></span>
+                    <span id="mission-runtime-label">Loading</span>
+                  </div>
+                  <span><i class="dot-green"></i> Local</span><span id="turn-counter">0 turns</span>
+                </div>
+              </div>
+              <div class="chat-stage">
+                <agent-chat id="mission-chat" agent="orchestrator" placeholder="Give Atlas an outcome, or type @ to address a specialist…">
+                  <span slot="header" class="chat-header-label">LIVE TRANSCRIPT</span>
+                </agent-chat>
+                <div class="chat-mode-control" id="chat-mode-control" data-mode="ask" role="group" aria-label="Message mode">
+                  <button class="active" id="chat-mode-ask" type="button" aria-pressed="true" title="Send to Atlas">Ask Atlas</button>
+                  <button id="chat-mode-note" type="button" aria-pressed="false" title="Post without starting an agent turn">Crew note</button>
+                  <span id="chat-mode-hint">Starts an agent turn</span>
+                </div>
+                <div class="mission-empty" id="mission-empty">
+                  <div class="empty-signal" aria-hidden="true">
+                    <span class="signal-core"></span><span class="signal-ring one"></span><span class="signal-ring two"></span>
+                  </div>
+                  <h3>New mission</h3>
+                  <p>Enter an objective or choose a workflow.</p>
+                  <div class="starter-grid">
+                    <button class="starter-card" type="button" data-prompt="Build a launch plan for a privacy-first team knowledge product. Research the market, pressure-test the positioning, and prepare a brief for my approval." data-loading="false" data-loading-label="Starting">
+                      <span class="starter-icon amber"><svg viewBox="0 0 20 20"><path d="m10 2 2.2 5.8L18 10l-5.8 2.2L10 18l-2.2-5.8L2 10l5.8-2.2L10 2Z"/></svg></span>
+                      <span><strong>Launch plan</strong><small>Research · critique · approval</small></span>
+                      <b>↗</b>
+                    </button>
+                    <button class="starter-card" type="button" data-prompt="Research the strongest open-source agent orchestration patterns and give me a concise evidence-backed recommendation." data-loading="false" data-loading-label="Starting">
+                      <span class="starter-icon blue"><svg viewBox="0 0 20 20"><circle cx="8" cy="8" r="5"/><path d="m12 12 5 5M8 5v6M5 8h6"/></svg></span>
+                      <span><strong>Research</strong><small>Evidence synthesis</small></span>
+                      <b>↗</b>
+                    </button>
+                    <button class="starter-card" type="button" data-prompt="Review this mission as a skeptical operator. Surface hidden risks, weak assumptions, and the three decisions that matter most." data-loading="false" data-loading-label="Starting">
+                      <span class="starter-icon red"><svg viewBox="0 0 20 20"><path d="M10 2.5 17 5v5c0 4.1-2.8 6.6-7 7.8C5.8 16.6 3 14.1 3 10V5l7-2.5Z"/><path d="M10 6v5M10 14h.01"/></svg></span>
+                      <span><strong>Decision review</strong><small>Risks · assumptions · priorities</small></span>
+                      <b>↗</b>
+                    </button>
+                    <button class="starter-card" type="button" data-prompt="Remember that I prefer direct, decision-oriented updates with assumptions stated explicitly." data-loading="false" data-loading-label="Starting">
+                      <span class="starter-icon green"><svg viewBox="0 0 20 20"><path d="M5.5 4.5h9v11h-9z"/><path d="M8 7h4M8 10h4M8 13h2"/></svg></span>
+                      <span><strong>Save preference</strong><small>Personal memory</small></span>
+                      <b>↗</b>
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </section>
+
+            <aside class="inspector-pane" id="inspector-pane">
+              <div class="inspector-tabs" role="tablist" aria-label="Mission inspector">
+                <button class="active" id="inspector-tab-crew" type="button" data-inspector-tab="crew" role="tab" aria-selected="true" aria-controls="inspector-panel-crew">Crew</button>
+                <button id="inspector-tab-activity" type="button" data-inspector-tab="activity" role="tab" aria-selected="false" aria-controls="inspector-panel-activity" tabindex="-1">Activity</button>
+              </div>
+              <div class="inspector-scroll">
+                <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
+                  <section class="inspector-section">
+                    <div class="section-heading"><span>MISSION CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button></span></div>
+                    <div class="crew-subsection">
+                      <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
+                      <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
+                      <p class="compact-empty" id="mission-crew-people-empty">No people added</p>
+                    </div>
+                    <div class="crew-subsection">
+                      <div class="crew-subsection-heading"><span>Agents</span><span id="crew-count">0</span></div>
+                      <div class="crew-list" id="crew-list" role="group" aria-label="Agents in this mission"></div>
+                    </div>
+                    <button class="workspace-crew-link" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Edit workspace crew</button>
+                  </section>
+                  <section class="inspector-section mission-health">
+                    <div class="section-heading"><span>MISSION HEALTH</span><span id="health-label">Nominal</span></div>
+                    <div class="health-grid">
+                      <div><strong id="usage-tokens">0</strong><span>tokens</span></div>
+                      <div><strong id="usage-tools">0</strong><span>tool calls</span></div>
+                      <div><strong id="usage-cost">$0.00</strong><span>model cost</span></div>
+                    </div>
+                    <div class="budget-bar"><span id="budget-fill"></span></div>
+                    <p id="budget-copy">0 / 40 tool calls</p>
+                  </section>
+                  <section class="inspector-section">
+                    <div class="section-heading"><span>CHANNEL CONVERSATIONS</span><button type="button" data-view-link="channels">Channel settings</button></div>
+                    <div class="surface-list compact" id="mission-surface-list" role="list" aria-label="Channel conversations on this Mission"></div>
+                    <p class="compact-empty" id="mission-surface-empty">None · Missions started from a Channel appear here</p>
+                  </section>
+                </div>
+                <div class="inspector-tab-panel" id="inspector-panel-activity" data-inspector-panel="activity" role="tabpanel" aria-labelledby="inspector-tab-activity" hidden>
+                  <section class="inspector-section">
+                    <div class="section-heading"><span>EXECUTION TRACE</span><span class="trace-live"><i></i> LIVE</span></div>
+                    <div class="activity-feed" id="activity-feed"></div>
+                  </section>
+                </div>
+              </div>
+            </aside>
+          </div>
+        </section>
+
+        <section class="view-panel page-view" id="view-automations" data-view-panel="automations">
+          <header class="page-header">
+            <div><p class="eyebrow page-scope">Workspace</p><h2>Pulses</h2></div>
+            <div class="page-header-actions">
+              <button class="primary-action" id="add-pulse" type="button">+ New pulse</button>
+            </div>
+          </header>
+          <div class="control-summary" aria-label="Pulse status">
+            <div class="control-stat"><span>Total</span><strong id="pulse-total-count">0</strong></div>
+            <div class="control-stat"><span>Enabled</span><strong id="pulse-active-count">0</strong></div>
+            <div class="control-stat"><span>Next</span><strong id="pulse-next-run">—</strong></div>
+          </div>
+          <div class="resource-toolbar">
+            <span>Pulses</span>
+            <div class="segmented" role="group" aria-label="Filter pulses">
+              <button class="active" type="button" data-pulse-filter="all">All</button>
+              <button type="button" data-pulse-filter="active">Active</button>
+              <button type="button" data-pulse-filter="paused">Paused</button>
+            </div>
+          </div>
+          <div class="automation-grid" id="pulse-grid" aria-live="polite"></div>
+        </section>
+
+        <section class="view-panel page-view" id="view-memory" data-view-panel="memory">
+          <header class="page-header">
+            <div><p class="eyebrow page-scope">Workspace</p><h2>Memory</h2></div>
+          </header>
+          <div class="memory-layout">
+            <aside class="memory-summary">
+              <span class="green-label">SAVED MEMORIES</span>
+              <div class="memory-scope-stat"><span>Personal</span><strong id="personal-memory-count">0</strong></div>
+              <div class="memory-scope-stat"><span>Shared work</span><strong id="work-memory-count">0</strong></div>
+            </aside>
+            <div class="memory-main">
+              <form class="memory-compose" id="memory-form" aria-busy="false">
+                <span class="memory-compose-scope">Personal</span>
+                <input id="memory-input" type="text" maxlength="2000" placeholder="Add personal memory" required>
+                <label title="Include this in every agent turn"><input id="memory-pinned" type="checkbox"><span>Always include</span></label>
+                <button type="submit" data-loading="false" data-loading-label="Saving">Save</button>
+              </form>
+              <p class="memory-scope-note" id="memory-scope-note" hidden>Shared work is managed by agents and may require approval to forget.</p>
+              <div class="memory-toolbar"><div class="segmented"><button class="active" type="button" data-memory-filter="all">All</button><button type="button" data-memory-filter="user">Personal</button><button type="button" data-memory-filter="app">Shared work</button></div><label class="memory-search-field"><span class="sr-only">Search memories</span><input id="memory-search" type="search" placeholder="Search memories"><kbd>⌘ F</kbd></label></div>
+              <div class="memory-list" id="memory-list"></div>
+            </div>
+          </div>
+        </section>
+
+        <section class="view-panel page-view capabilities-view" id="view-capabilities" data-view-panel="capabilities">
+          <header class="page-header capability-page-header">
+            <div><p class="eyebrow page-scope">Workspace</p><h2>Capabilities</h2></div>
+            <div class="capability-action-stack">
+              <div class="page-header-actions" data-capability-actions="tools">
+                <span class="catalog-lock"><svg viewBox="0 0 20 20" aria-hidden="true"><rect x="4" y="8" width="12" height="9" rx="2"/><path d="M7 8V6a3 3 0 0 1 6 0v2"/></svg> Read-only catalog</span>
+              </div>
+              <div class="page-header-actions" data-capability-actions="skills" hidden>
+                <button class="secondary-action" id="skill-demo" type="button" data-loading="false" data-loading-label="Starting">Try skills in current mission</button>
+                <button class="primary-action" id="add-skill" type="button">+ New skill</button>
+              </div>
+              <div class="page-header-actions" data-capability-actions="mcp" hidden>
+                <button class="secondary-action" id="refresh-mcp-servers" type="button" data-loading="false" data-loading-label="Checking">Check all servers</button>
+                <button class="primary-action" id="add-mcp-server" type="button">+ Add server</button>
+              </div>
+            </div>
+          </header>
+
+          <div class="capability-nav-row">
+            <div class="capability-tabs" role="tablist" aria-label="Capability type">
+              <button class="active" id="capability-tab-tools" type="button" role="tab" aria-selected="true" aria-controls="capability-panel-tools" data-capability-tab="tools"><span>Tools</span><b id="tool-tab-count">0</b></button>
+              <button id="capability-tab-skills" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-skills" data-capability-tab="skills" tabindex="-1"><span>Skills</span><b id="skill-tab-count">0</b></button>
+              <button id="capability-tab-mcp" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-mcp" data-capability-tab="mcp" tabindex="-1"><span>MCP servers</span><b id="mcp-tab-count">0</b></button>
+            </div>
+            <label class="capability-search-field">
+              <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 3.5 3.5"/></svg>
+              <input id="capability-search" type="search" placeholder="Search current tab" autocomplete="off" aria-label="Search current capability tab">
+            </label>
+          </div>
+
+          <div class="control-summary capability-summary" data-capability-summary="tools" aria-label="Tool status">
+            <div class="control-stat"><span>Available</span><strong id="tool-count">0</strong></div>
+            <div class="control-stat"><span>Catalog</span><strong id="tool-catalog-count">0</strong></div>
+            <div class="control-stat"><span>Built-in</span><strong id="tool-builtin-count">0</strong></div>
+            <div class="control-stat"><span>Added MCP</span><strong id="tool-added-mcp-count">0</strong></div>
+          </div>
+          <div class="control-summary capability-summary" data-capability-summary="skills" aria-label="Skill status" hidden>
+            <div class="control-stat"><span>Enabled</span><strong id="skill-enabled-count">0</strong></div>
+            <div class="control-stat"><span>Skill assignments</span><strong id="skill-assignment-count">0</strong></div>
+            <div class="control-stat"><span>Assigned agents</span><strong id="skill-agent-count">0</strong></div>
+          </div>
+          <div class="control-summary capability-summary" data-capability-summary="mcp" aria-label="MCP server status" hidden>
+            <div class="control-stat"><span>Servers</span><strong id="mcp-server-count">0</strong></div>
+            <div class="control-stat"><span>Ready</span><strong id="mcp-ready-count">0</strong></div>
+            <div class="control-stat"><span>Needs attention</span><strong id="mcp-attention-count">0</strong></div>
+          </div>
+
+          <div class="capability-panels">
+            <section class="capability-panel active" id="capability-panel-tools" role="tabpanel" aria-labelledby="capability-tab-tools" data-capability-panel="tools">
+              <div class="capability-panel-toolbar">
+                <div><strong>Tool catalog</strong><span id="tool-source-summary">0 framework · 0 app · 0 MCP</span></div>
+                <div class="tool-catalog-filters">
+                  <div class="segmented tool-view-switch" role="group" aria-label="Group tools"><button class="active" type="button" data-tool-view="tools" aria-pressed="true">By tool</button><button type="button" data-tool-view="agents" aria-pressed="false">By agent</button></div>
+                  <label class="compact-select"><span>Source</span><select id="tool-source-filter"><option value="all">All</option><option value="builtin">Built-in</option><option value="added-mcp">Added MCP</option></select></label>
+                  <label class="compact-select"><span>Agent</span><select id="tool-agent-filter"><option value="all">All agents</option></select></label>
+                  <button class="clear-filter-button" id="clear-tool-filters" type="button">Clear filters</button>
+                </div>
+              </div>
+              <div class="capability-master-detail tool-catalog-layout" id="tool-catalog-by-tool">
+                <div class="capability-master-panel">
+                  <div class="capability-table tool-catalog-table" role="grid" aria-label="Tool catalog" aria-colcount="5">
+                    <div class="capability-table-header" role="row" aria-rowindex="1"><span role="columnheader">Tool</span><span role="columnheader">Source</span><span role="columnheader">Access</span><span role="columnheader">Approval</span><span role="columnheader">Status</span></div>
+                    <div class="capability-table-body" id="tool-catalog-list" role="rowgroup" aria-live="polite"></div>
+                  </div>
+                </div>
+                <aside class="capability-detail-panel" id="tool-detail" aria-label="Tool detail">
+                  <div class="capability-detail-empty" id="tool-detail-empty"><span class="detail-glyph" aria-hidden="true">⌘</span><strong>Select a tool</strong><span>Inspect access, policy, and schema.</span></div>
+                  <div class="capability-detail-content" id="tool-detail-content" hidden>
+                    <header class="capability-detail-header"><span class="cap-icon steel" id="tool-detail-icon">⌘</span><div><span class="source-badge" id="tool-detail-source">APP</span><h3 id="tool-detail-name">Tool</h3><code id="tool-detail-id">tool_name</code></div><span class="capability-state ready" id="tool-detail-status" data-state="ready">Available</span></header>
+                    <p class="capability-detail-description" id="tool-detail-description"></p>
+                    <dl class="detail-metrics"><div><dt>Agent access</dt><dd id="tool-detail-agents">—</dd></div><div><dt>Approval</dt><dd id="tool-detail-approval">—</dd></div></dl>
+                    <section class="detail-section tool-availability-section">
+                      <div class="detail-section-heading"><strong>Availability</strong><button id="open-tool-source" type="button">Manage access</button></div>
+                      <dl class="tool-provenance"><div><dt>Provided by</dt><dd id="tool-detail-provider">—</dd></div><div><dt>Assigned through</dt><dd id="tool-detail-assignment">—</dd></div><div><dt>Why available</dt><dd id="tool-detail-why">—</dd></div></dl>
+                      <div class="tool-agent-list" id="tool-detail-agent-list" aria-label="Agents with access"></div>
+                    </section>
+                    <section class="detail-section"><div class="detail-section-heading"><strong>Input schema</strong><button id="copy-tool-schema" type="button" data-loading="false" data-loading-label="Copying">Copy</button></div><pre id="tool-detail-schema">{}</pre></section>
+                  </div>
+                </aside>
+              </div>
+              <div class="tool-agent-groups" id="tool-catalog-by-agent" aria-live="polite" hidden></div>
+            </section>
+
+            <section class="capability-panel" id="capability-panel-skills" role="tabpanel" aria-labelledby="capability-tab-skills" data-capability-panel="skills" hidden>
+              <div class="capability-panel-toolbar"><div><strong>Instruction packs</strong><span>Enabled skills load for assigned agents with Skill access.</span></div><span class="panel-count" id="skill-panel-count">0 skills</span></div>
+              <div class="capability-grid" id="capability-grid" aria-live="polite"></div>
+            </section>
+
+            <section class="capability-panel" id="capability-panel-mcp" role="tabpanel" aria-labelledby="capability-tab-mcp" data-capability-panel="mcp" hidden>
+              <div class="capability-panel-toolbar"><div><strong>External tool providers</strong><span>Local stdio processes.</span></div><span class="mcp-health-summary" id="mcp-health-summary" data-mcp-state="not-tested"><i aria-hidden="true"></i><span>Not tested</span></span></div>
+              <div class="capability-master-detail mcp-server-layout">
+                <div class="capability-master-panel mcp-master-panel">
+                  <div class="mcp-server-list-header" aria-hidden="true"><span>Server</span><span>Tools</span><span>Health</span></div>
+                  <div class="mcp-server-list" id="mcp-server-list" aria-label="MCP servers" aria-live="polite"></div>
+                </div>
+                <aside class="capability-detail-panel mcp-detail-panel" id="mcp-server-detail" aria-label="MCP server detail">
+                  <div class="capability-detail-empty" id="mcp-detail-empty"><span class="detail-glyph mcp" aria-hidden="true">M</span><strong>Select a server</strong><span>View tools, access, and diagnostics.</span></div>
+                  <div class="mcp-detail-content" id="mcp-detail-content" hidden>
+                    <header class="mcp-detail-header"><div><span class="source-badge">WORKSPACE MCP</span><h3 id="mcp-detail-name">Server</h3><code id="mcp-detail-id">server-id</code></div><span class="mcp-status" id="mcp-detail-status" data-mcp-state="not-tested" role="status"><i aria-hidden="true"></i><span>Not tested</span></span></header>
+                    <div class="mcp-detail-actions"><button id="test-mcp-server" type="button" data-loading="false" data-loading-label="Testing">Test &amp; refresh tools</button><button id="edit-mcp-server" type="button">Configure</button></div>
+                    <div class="mcp-detail-tabs" role="tablist" aria-label="Server detail">
+                      <button class="active" id="mcp-detail-tab-overview" type="button" role="tab" aria-selected="true" aria-controls="mcp-detail-panel-overview" data-mcp-detail-tab="overview">Overview</button><button id="mcp-detail-tab-tools" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-tools" data-mcp-detail-tab="tools" tabindex="-1">Tools <b id="mcp-detail-tool-count">0</b></button><button id="mcp-detail-tab-access" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-access" data-mcp-detail-tab="access" tabindex="-1">Access</button><button id="mcp-detail-tab-diagnostics" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-diagnostics" data-mcp-detail-tab="diagnostics" tabindex="-1">Diagnostics</button>
+                    </div>
+                    <div class="mcp-detail-panels">
+                      <section class="mcp-detail-tab-panel active" id="mcp-detail-panel-overview" role="tabpanel" aria-labelledby="mcp-detail-tab-overview" data-mcp-detail-panel="overview"><dl class="detail-metrics"><div><dt>Transport</dt><dd id="mcp-detail-transport">Local command</dd></div><div><dt>Agents</dt><dd id="mcp-detail-agent-count">0</dd></div><div><dt>Last checked</dt><dd id="mcp-detail-last-checked">Never</dd></div></dl><div class="detail-section"><div class="detail-section-heading"><strong>Executable</strong></div><code class="command-preview" id="mcp-detail-command">—</code></div></section>
+                      <section class="mcp-detail-tab-panel" id="mcp-detail-panel-tools" role="tabpanel" aria-labelledby="mcp-detail-tab-tools" data-mcp-detail-panel="tools" hidden><div class="derived-tool-list" id="mcp-detail-tool-list" aria-live="polite"></div></section>
+                      <section class="mcp-detail-tab-panel" id="mcp-detail-panel-access" role="tabpanel" aria-labelledby="mcp-detail-tab-access" data-mcp-detail-panel="access" hidden><div class="detail-section"><div class="detail-section-heading"><strong>Assigned agents</strong></div><div class="assignment-chips" id="mcp-detail-agent-list"></div></div><div class="detail-section"><div class="detail-section-heading"><strong>Default approval</strong></div><p id="mcp-detail-approval">Ask each call</p></div></section>
+                      <section class="mcp-detail-tab-panel" id="mcp-detail-panel-diagnostics" role="tabpanel" aria-labelledby="mcp-detail-tab-diagnostics" data-mcp-detail-panel="diagnostics" hidden><pre class="diagnostic-output" id="mcp-detail-diagnostics">No diagnostics.</pre></section>
+                    </div>
+                  </div>
+                </aside>
+              </div>
+            </section>
+          </div>
+        </section>
+
+        <section class="view-panel page-view" id="view-channels" data-view-panel="channels">
+          <header class="page-header">
+            <div><p class="eyebrow page-scope">Workspace</p><h2>Channels</h2></div>
+            <button class="secondary-action" id="copy-link-command" type="button" data-loading="false" data-loading-label="Copying">Copy /link command</button>
+          </header>
+          <div class="control-summary" aria-label="Channel status">
+            <div class="control-stat"><span>Active</span><strong id="channel-active-count">1</strong></div>
+            <div class="control-stat"><span>Needs setup</span><strong id="channel-incomplete-count">0</strong></div>
+            <div class="control-stat"><span>Disabled</span><strong id="channel-disabled-count">0</strong></div>
+          </div>
+          <div class="resource-toolbar"><span>Connections</span></div>
+          <div class="channel-list">
+            <div class="channel-list-header" aria-hidden="true"><span>Channel</span><span>Source</span><span>Status</span><span>Action</span></div>
+            <div class="channel-list-body" id="channel-list" aria-live="polite"></div>
+          </div>
+        </section>
+      </main>
+    </div>
   </div>
+
+  <dialog class="command-palette" id="command-palette">
+    <div class="command-input-wrap"><svg viewBox="0 0 20 20"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 3.5 3.5"/></svg><input id="command-input" type="text" placeholder="Search commands" autocomplete="off"><kbd>ESC</kbd></div>
+    <div class="command-group"><span>Navigate</span>
+      <button type="button" data-command="view:missions"><i>◎</i><span><strong>Missions</strong></span></button>
+      <button type="button" data-command="view:automations"><i>⌁</i><span><strong>Pulses</strong></span></button>
+      <button type="button" data-command="view:memory"><i>◇</i><span><strong>Memory</strong></span></button>
+      <button type="button" data-command="view:capabilities"><i>◈</i><span><strong>Capabilities</strong></span></button>
+      <button type="button" data-command="view:channels"><i>∷</i><span><strong>Channels</strong></span></button>
+    </div>
+    <div class="command-group"><span>Actions</span>
+      <button type="button" data-command="new"><i>＋</i><span><strong>New mission</strong></span><kbd>⌘ N</kbd></button>
+    </div>
+  </dialog>
+
+  <dialog class="run-dialog" id="run-dialog">
+    <header>
+      <div><p class="eyebrow">DELEGATED RUN</p><h2 id="run-dialog-title">Specialist trace</h2></div>
+      <div class="run-dialog-controls">
+        <div class="agent-work-state run-runtime-state" id="run-runtime-state" data-agent-state="loading" data-runtime-phase="idle" role="status" aria-live="polite" aria-atomic="true">
+          <span class="work-state-visual" aria-hidden="true"><i></i><i></i><i></i></span>
+          <span id="run-runtime-label">Loading</span>
+        </div>
+        <button id="close-run-dialog" type="button" aria-label="Close">×</button>
+      </div>
+    </header>
+    <div id="child-chat-mount" class="child-chat-mount" data-agent-state="loading" aria-busy="true"></div>
+  </dialog>
+
+  <dialog class="settings-dialog settings-dialog-wide" id="mission-dialog" aria-labelledby="mission-dialog-title">
+    <header>
+      <div><h2 id="mission-dialog-title">Mission settings</h2><span class="settings-record-id" id="mission-dialog-id"></span></div>
+      <button id="close-mission-dialog" type="button" aria-label="Close mission settings">×</button>
+    </header>
+    <form class="settings-form" id="mission-form" aria-busy="false">
+      <div class="settings-form-scroll">
+        <div class="settings-form-heading">
+          <div><strong>Mission configuration</strong><span>Applies to this mission</span></div>
+          <span class="mission-config-state" id="mission-config-runtime-state" data-state="ready"><i aria-hidden="true"></i><span>Ready</span></span>
+        </div>
+        <div class="form-grid two">
+          <label><span>Title</span><input id="mission-config-title" name="title" type="text" maxlength="96" autocomplete="off" required></label>
+          <label><span>State</span><select id="mission-config-status" name="status" aria-describedby="mission-status-hint"><option value="active">Active</option><option value="paused">Paused</option></select><small id="mission-status-hint">Agents and linked Pulses can run.</small></label>
+        </div>
+        <label class="form-field"><span>Objective</span><textarea id="mission-config-objective" name="objective" class="compact-textarea" rows="4" maxlength="2000" aria-describedby="mission-objective-hint"></textarea><small id="mission-objective-hint">Included in every agent turn</small></label>
+        <fieldset class="form-section">
+          <legend>Health thresholds</legend>
+          <div class="form-grid three">
+            <label><span>Turn alert</span><input id="mission-config-turns" name="turns" type="number" min="1" max="1000" step="1" required></label>
+            <label><span>Tool-call alert</span><input id="mission-config-tool-calls" name="toolCalls" type="number" min="0" max="1000" step="1" required></label>
+            <label><span>Spend alert</span><div class="money-input"><span>$</span><input id="mission-config-spend" name="spend" type="number" min="0" max="10000" step="0.25" required></div></label>
+          </div>
+        </fieldset>
+        <fieldset class="form-section mission-controls">
+          <legend>Behavior</legend>
+          <div class="mission-control-options">
+            <label class="mission-control-option"><input id="mission-config-auto-title" name="autoTitle" type="checkbox"><span><strong>Auto title</strong><small>Use the first operator message</small></span></label>
+            <label class="mission-control-option"><input id="mission-config-continuity" name="continuity" type="checkbox"><span><strong>Restore after restart</strong><small>Reopen if this was your last mission</small></span></label>
+            <label class="mission-control-option"><input id="mission-config-approvals" name="approvals" type="checkbox"><span><strong>Require approval before publishing briefs</strong><small id="mission-config-approvals-hint">Atlas asks before each Publish brief call</small></span></label>
+            <label class="mission-control-option"><input id="mission-config-debug-traces" name="debugTraces" type="checkbox"><span><strong>Show debug traces</strong><small>Include raw tool payloads in transcripts</small></span></label>
+          </div>
+        </fieldset>
+      </div>
+      <footer class="settings-form-actions">
+        <button id="archive-mission" class="danger-button" type="button" data-loading="false" data-loading-label="Saving">Complete mission</button>
+        <span id="mission-complete-effect" class="mission-destructive-hint">Stops work, pauses linked Pulses, and disables resume.</span>
+        <button id="cancel-mission-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save mission</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="crew-dialog" id="crew-dialog" aria-labelledby="crew-dialog-title">
+    <header>
+      <div><p class="eyebrow">WORKSPACE</p><h2 id="crew-dialog-title">Crew directory</h2></div>
+      <div class="crew-dialog-actions">
+        <button class="header-primary-action" id="crew-new-person" type="button" aria-haspopup="dialog" aria-controls="crew-person-dialog">+ New person</button>
+        <button id="close-crew-dialog" type="button" aria-label="Close crew directory">×</button>
+      </div>
+    </header>
+    <div class="crew-directory-tabs" role="tablist" aria-label="Crew type">
+      <button id="crew-directory-tab-people" type="button" data-crew-directory-tab="people" role="tab" aria-selected="false" aria-controls="crew-directory-panel-people" tabindex="-1">People <span id="crew-people-count">0</span></button>
+      <button class="active" id="crew-directory-tab-agents" type="button" data-crew-directory-tab="agents" role="tab" aria-selected="true" aria-controls="crew-directory-panel-agents">Agents <span id="crew-settings-tab-count">0</span></button>
+    </div>
+    <section class="crew-directory-panel people-directory-panel" id="crew-directory-panel-people" data-crew-directory-panel="people" role="tabpanel" aria-labelledby="crew-directory-tab-people" hidden>
+      <div class="people-directory-layout">
+        <aside class="crew-settings-sidebar people-directory-sidebar">
+          <div class="crew-settings-label"><span id="crew-people-label">People</span><span id="crew-people-list-count">0</span></div>
+          <div id="crew-person-list" class="crew-settings-list person-directory-list" role="listbox" aria-labelledby="crew-people-label" aria-busy="false"></div>
+          <div class="directory-list-empty" id="crew-person-list-empty"><strong>No people yet</strong><span>Use New person to add one.</span></div>
+        </aside>
+        <section class="person-directory-detail" aria-live="polite">
+          <div class="directory-detail-empty" id="crew-person-detail-empty">
+            <span class="directory-empty-icon" aria-hidden="true">○</span>
+            <strong id="crew-person-detail-empty-title">No people in this workspace</strong>
+            <span id="crew-person-detail-empty-hint">Add a person to include them in Missions.</span>
+          </div>
+          <article class="person-detail-card" id="crew-person-detail" hidden>
+            <header class="person-detail-header">
+              <span class="person-avatar large" id="crew-person-detail-avatar" aria-hidden="true">P</span>
+              <div><h3 id="crew-person-detail-name">Person</h3><p id="crew-person-detail-role">Participant</p></div>
+              <button id="crew-edit-person" type="button" aria-haspopup="dialog" aria-controls="crew-person-dialog">Edit</button>
+            </header>
+            <dl class="person-detail-facts">
+              <div><dt>Workspace access</dt><dd id="crew-person-detail-access">Participant</dd></div>
+              <div><dt>Connection</dt><dd id="crew-person-detail-status">Unlinked</dd></div>
+            </dl>
+            <section class="person-detail-surfaces">
+              <h4>Message access</h4>
+              <div id="crew-person-detail-surfaces" class="surface-list" role="list"></div>
+              <p class="compact-empty" id="crew-person-detail-surfaces-empty">Not connected to a Channel</p>
+            </section>
+          </article>
+        </section>
+      </div>
+    </section>
+    <section class="crew-directory-panel active" id="crew-directory-panel-agents" data-crew-directory-panel="agents" role="tabpanel" aria-labelledby="crew-directory-tab-agents">
+      <div class="crew-settings-layout">
+        <aside class="crew-settings-sidebar">
+          <div class="crew-settings-label"><span id="crew-settings-label">Agents</span><span id="crew-settings-count">0</span></div>
+          <div id="crew-settings-list" class="crew-settings-list" role="group" aria-labelledby="crew-settings-label"></div>
+          <button id="add-crew-agent" class="add-agent-button" type="button" data-loading="false" data-loading-label="Adding">+ Add agent</button>
+        </aside>
+        <form id="crew-form" class="crew-form" aria-busy="false">
+          <div class="crew-form-scroll">
+            <div class="crew-form-heading">
+              <span id="crew-form-avatar" class="crew-form-avatar">A</span>
+              <div><strong id="crew-form-title">Agent</strong><span id="crew-form-id">Workspace agent</span></div>
+              <label class="crew-enabled"><input id="crew-enabled" type="checkbox"><span>Active</span></label>
+            </div>
+            <p class="crew-edit-state" id="crew-edit-state" role="status" aria-live="polite">Saved</p>
+            <div class="form-grid two">
+              <label><span>Name</span><input id="crew-name" name="displayName" type="text" maxlength="40" required></label>
+              <label><span>Role</span><input id="crew-role" name="role" type="text" maxlength="60" required></label>
+              <label><span>Avatar</span><input id="crew-avatar" name="avatar" type="text" maxlength="2" required></label>
+              <label><span>Color</span><select id="crew-color" name="color"><option value="amber">Amber</option><option value="blue">Blue</option><option value="green">Green</option><option value="red">Red</option><option value="violet">Violet</option><option value="steel">Steel</option></select></label>
+            </div>
+            <label class="form-field"><span>Instructions</span><textarea id="crew-instructions" name="instructions" rows="7" maxlength="4000" required></textarea></label>
+            <label class="form-field model-field" id="crew-model-field"><span>Model</span><select id="crew-model" name="model" aria-describedby="crew-model-hint" required><option value="default">Use workspace default</option></select><small id="crew-model-hint" class="model-field-hint" data-model-state="loading" aria-live="polite">Loading available models…</small></label>
+            <fieldset class="form-section">
+              <legend>Budget</legend>
+              <div class="form-grid three">
+                <label><span>Turns</span><input id="crew-turns" type="number" min="1" max="200" required></label>
+                <label><span>Tool calls</span><input id="crew-tool-calls" type="number" min="0" max="100" required></label>
+                <label><span>Spend cap</span><div class="money-input"><span>$</span><input id="crew-spend" type="number" min="0" max="100" step="0.25" required></div></label>
+              </div>
+            </fieldset>
+            <fieldset class="form-section">
+              <legend>Capabilities</legend>
+              <div class="capability-checks">
+                <label><input id="crew-cap-inspect" type="checkbox"><span><strong>Workspace state</strong><small>inspect_workspace</small></span></label>
+                <label><input id="crew-cap-memory" type="checkbox"><span><strong>Memory</strong><small>Personal + shared</small></span></label>
+                <label><input id="crew-cap-publish" type="checkbox"><span><strong>Publish brief</strong><small>Approval gated</small></span></label>
+              </div>
+            </fieldset>
+          </div>
+          <footer class="crew-form-actions">
+            <div class="crew-leading-action">
+              <button id="remove-crew-agent" class="danger-button" type="button" data-loading="false" data-loading-label="Removing">Remove</button>
+              <span id="crew-primary-label" class="crew-primary-label" hidden>Primary agent · always active</span>
+            </div>
+            <span></span>
+            <button id="cancel-crew-edit" class="secondary-action" type="button">Cancel</button>
+            <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save changes</button>
+          </footer>
+        </form>
+      </div>
+    </section>
+  </dialog>
+
+  <dialog class="settings-dialog crew-person-dialog" id="crew-person-dialog" aria-labelledby="crew-person-dialog-title">
+    <header>
+      <div><h2 id="crew-person-dialog-title">New person</h2><span class="settings-record-id" id="crew-person-dialog-id"></span></div>
+      <button id="close-crew-person-dialog" type="button" aria-label="Close person editor">×</button>
+    </header>
+    <form class="settings-form" id="crew-person-form" aria-busy="false">
+      <div class="settings-form-scroll">
+        <span class="sr-only" id="crew-person-edit-state" role="status" aria-live="polite">Not saved</span>
+        <div class="form-grid two">
+          <label><span>Name <i class="field-required">Required</i></span><input id="crew-person-name" name="displayName" type="text" maxlength="80" autocomplete="off" required></label>
+          <label><span>Title</span><input id="crew-person-title" name="title" type="text" maxlength="80" autocomplete="off" placeholder="Optional"></label>
+        </div>
+        <fieldset class="form-section person-surface-fields">
+          <legend>Connection</legend>
+          <div class="form-grid two">
+            <label><span>How they join</span><select id="crew-person-connection" name="connection"><option value="unlinked">Not connected</option><option value="channel">Via a Channel</option></select></label>
+            <label id="crew-person-surface-field"><span>Channel <i class="field-required">Required</i></span><select id="crew-person-surface" name="surface"><option value="">Choose a Channel</option></select></label>
+          </div>
+          <label class="form-field advanced-identity-field" id="crew-person-address-field"><span><b id="crew-person-address-label">Member ID</b> <i class="field-required" id="crew-person-address-required">Required</i></span><input id="crew-person-address" name="address" type="text" maxlength="240" autocomplete="off"><small id="crew-person-address-hint">Use the exact member ID from the selected Channel.</small></label>
+          <div id="crew-person-identities-extra" class="person-identities-extra"></div>
+        </fieldset>
+      </div>
+      <footer class="settings-form-actions">
+        <button id="remove-crew-person" class="danger-button" type="button" data-loading="false" data-loading-label="Removing" hidden>Remove</button>
+        <span></span>
+        <button id="cancel-crew-person-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save person</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings-dialog settings-dialog-wide mission-crew-dialog" id="mission-crew-dialog" aria-labelledby="mission-crew-dialog-title">
+    <header>
+      <div><h2 id="mission-crew-dialog-title">Mission crew</h2><span class="settings-record-id" id="mission-crew-dialog-id"></span><span class="settings-record-id" id="mission-crew-capacity">0 / 16 participants</span><span class="settings-record-id" id="mission-crew-availability" hidden>Available when the current turn finishes</span></div>
+      <button id="close-mission-crew-dialog" type="button" aria-label="Close mission crew">×</button>
+    </header>
+    <form class="mission-crew-form" id="mission-crew-form" aria-busy="false">
+      <div class="mission-crew-scroll">
+        <section class="mission-crew-section">
+          <header><div><h3>People</h3><span id="mission-crew-dialog-people-count">1 selected</span></div><button id="mission-crew-open-people" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Manage people</button></header>
+          <div class="mission-roster-list" id="mission-crew-people-list" role="group" aria-label="Available people"></div>
+          <div class="mission-roster-empty" id="mission-crew-people-list-empty"><strong>No people available</strong><span>Add people to the workspace directory.</span></div>
+        </section>
+        <section class="mission-crew-section">
+          <header><div><h3>Agents</h3><span id="mission-crew-dialog-agents-count">0 selected</span></div><button id="mission-crew-open-agents" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Manage agents</button></header>
+          <label class="mission-agent-mode"><input id="mission-crew-agent-mode" type="checkbox" checked><span><strong>Follow workspace agents</strong><small>New active agents join this Mission automatically</small></span></label>
+          <div class="mission-roster-list" id="mission-crew-agents-list" role="group" aria-label="Available agents"></div>
+          <div class="mission-roster-empty" id="mission-crew-agents-list-empty"><strong>No agents available</strong><span>Add an agent to the workspace directory.</span></div>
+        </section>
+        <section class="mission-crew-section mission-surfaces-section">
+          <header><div><h3>Channel conversations</h3><span id="mission-crew-dialog-surfaces-count">0 connected</span></div><button id="mission-crew-open-channels" type="button">Channel settings</button></header>
+          <div class="mission-surface-list" id="mission-crew-surfaces-list" role="list" aria-label="Channel conversations on this Mission"></div>
+          <div class="mission-roster-empty" id="mission-crew-surfaces-list-empty"><strong>No Channel conversations</strong><span>Missions started from a Channel appear here.</span></div>
+        </section>
+      </div>
+      <footer class="settings-form-actions">
+        <span></span><span></span>
+        <button id="cancel-mission-crew" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" id="save-mission-crew" type="submit" data-loading="false" data-loading-label="Saving">Save crew</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings-dialog crew-remove-dialog person-remove-dialog" id="person-remove-dialog" aria-labelledby="person-remove-title">
+    <header>
+      <div><h2 id="person-remove-title">Remove person?</h2><span>Workspace-wide change</span></div>
+      <button id="close-person-remove" type="button" aria-label="Close person removal">×</button>
+    </header>
+    <div class="crew-remove-content">
+      <p id="person-remove-summary"></p>
+      <div id="person-remove-impact" class="crew-remove-impact"></div>
+      <p class="crew-remove-warning">They will lose access to every Mission listed here. This cannot be undone.</p>
+    </div>
+    <footer class="settings-form-actions">
+      <span></span><span></span>
+      <button id="cancel-person-remove" class="secondary-action" type="button">Keep person</button>
+      <button id="confirm-person-remove" class="danger-button" type="button" data-loading="false" data-loading-label="Removing">Remove from workspace</button>
+    </footer>
+  </dialog>
+
+  <dialog class="settings-dialog crew-remove-dialog" id="crew-remove-dialog" aria-labelledby="crew-remove-title">
+    <header>
+      <div><h2 id="crew-remove-title">Remove agent?</h2><span>Workspace-wide change</span></div>
+      <button id="close-crew-remove" type="button" aria-label="Close removal impact">×</button>
+    </header>
+    <div class="crew-remove-content">
+      <p id="crew-remove-summary"></p>
+      <div id="crew-remove-impact" class="crew-remove-impact"></div>
+      <p class="crew-remove-warning">This cannot be undone. Pulses using this agent will be disabled and reassigned to the primary agent.</p>
+    </div>
+    <footer class="settings-form-actions">
+      <span></span><span></span>
+      <button id="cancel-crew-remove" class="secondary-action" type="button">Keep agent</button>
+      <button id="confirm-crew-remove" class="danger-button" type="button" data-loading="false" data-loading-label="Removing">Remove from workspace</button>
+    </footer>
+  </dialog>
+
+  <dialog class="settings-dialog" id="pulse-dialog" aria-labelledby="pulse-dialog-title">
+    <header>
+      <div><h2 id="pulse-dialog-title">New pulse</h2><span class="settings-record-id" id="pulse-dialog-id"></span></div>
+      <button id="close-pulse-dialog" type="button" aria-label="Close pulse editor">×</button>
+    </header>
+    <form class="settings-form" id="pulse-form" aria-busy="false">
+      <div class="settings-form-scroll">
+        <div class="settings-form-heading">
+          <div><strong>Configuration</strong><span>Scheduled system turn</span></div>
+          <label class="settings-enabled"><input id="pulse-enabled" type="checkbox" checked><span>Active</span></label>
+        </div>
+        <div class="form-grid two">
+          <label><span>Name</span><input id="pulse-name" type="text" maxlength="80" autocomplete="off" required></label>
+          <label><span>Agent</span><select id="pulse-agent" required></select></label>
+          <label><span>Mission</span><select id="pulse-session" required></select></label>
+          <label><span>Schedule</span><select id="pulse-schedule-kind"><option value="interval">Interval</option><option value="cron">Cron</option></select></label>
+        </div>
+        <div class="form-grid two schedule-fields" id="pulse-interval-fields">
+          <label><span>Every</span><input id="pulse-interval-value" type="number" min="1" max="10080" step="1" value="4" required></label>
+          <label><span>Unit</span><select id="pulse-interval-unit"><option value="minutes">Minutes</option><option value="hours" selected>Hours</option><option value="days">Days</option></select></label>
+        </div>
+        <label class="form-field schedule-fields" id="pulse-cron-field" hidden><span>Cron expression</span><input id="pulse-cron" type="text" maxlength="120" placeholder="0 9 * * 1" autocomplete="off"><small>5 fields · local time</small></label>
+        <label class="form-field"><span>Instructions</span><textarea id="pulse-prompt" rows="8" maxlength="8000" required></textarea></label>
+      </div>
+      <footer class="settings-form-actions">
+        <button id="delete-pulse" class="danger-button" type="button" data-loading="false" data-loading-label="Deleting">Delete</button>
+        <span></span>
+        <button id="cancel-pulse-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save pulse</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings-dialog settings-dialog-wide" id="skill-dialog" aria-labelledby="skill-dialog-title">
+    <header>
+      <div><h2 id="skill-dialog-title">New skill</h2><span class="settings-record-id" id="skill-dialog-id"></span></div>
+      <button id="close-skill-dialog" type="button" aria-label="Close skill editor">×</button>
+    </header>
+    <form class="settings-form" id="skill-form" aria-busy="false">
+      <div class="settings-form-scroll">
+        <div class="settings-form-heading">
+          <div><strong>Skill definition</strong><span>Loaded on demand</span></div>
+          <label class="skill-editor-toggle" id="skill-editor-toggle" data-skill-state="enabled">
+            <span class="skill-editor-state-copy"><strong id="skill-enabled-label">Enabled</strong><small id="skill-enabled-hint">Available to assigned agents</small></span>
+            <span class="switch"><input id="skill-enabled" type="checkbox" aria-describedby="skill-enabled-hint" checked><span aria-hidden="true"></span></span>
+          </label>
+        </div>
+        <label class="form-field form-field-first"><span>Name</span><input id="skill-name" type="text" maxlength="80" autocomplete="off" required></label>
+        <label class="form-field"><span>Description</span><textarea id="skill-description" class="compact-textarea" rows="3" maxlength="280" required></textarea></label>
+        <label class="form-field"><span>Instructions</span><textarea id="skill-instructions" class="code-editor" rows="14" maxlength="16000" spellcheck="false" required></textarea></label>
+        <fieldset class="form-section">
+          <legend>Assigned agents</legend>
+          <div class="assignment-options" id="skill-agent-options"></div>
+        </fieldset>
+      </div>
+      <footer class="settings-form-actions">
+        <button id="delete-skill" class="danger-button" type="button" data-loading="false" data-loading-label="Deleting">Delete</button>
+        <span class="form-save-status" id="skill-form-status" role="status" aria-live="polite"></span>
+        <button id="cancel-skill-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save skill</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings-dialog mcp-dialog" id="mcp-dialog" aria-labelledby="mcp-dialog-title">
+    <header>
+      <div><h2 id="mcp-dialog-title">Add MCP server</h2><span class="settings-record-id" id="mcp-dialog-id"></span></div>
+      <button id="close-mcp-dialog" type="button" aria-label="Close MCP server editor">×</button>
+    </header>
+    <form class="settings-form mcp-form" id="mcp-form" aria-busy="false">
+      <div class="settings-form-scroll mcp-form-scroll">
+        <div class="mcp-form-main">
+          <div class="settings-form-heading">
+            <div><strong>Server configuration</strong><span>Local stdio process</span></div>
+            <label class="settings-enabled"><input id="mcp-enabled" name="enabled" type="checkbox"><span>Enabled</span></label>
+          </div>
+
+          <section class="mcp-form-section" aria-labelledby="mcp-connection-heading">
+            <div class="mcp-form-section-heading"><div><strong id="mcp-connection-heading">Connection</strong><span>Name and executable</span></div></div>
+            <div class="form-grid two">
+              <label><span>Display name</span><input id="mcp-name" name="displayName" type="text" maxlength="80" autocomplete="off" required></label>
+              <label><span>Transport</span><select id="mcp-transport" name="transport"><option value="stdio">Local command (stdio)</option></select></label>
+              <label class="full"><span>Executable</span><input id="mcp-command" name="command" type="text" maxlength="1000" placeholder="npx" autocomplete="off" spellcheck="false" required></label>
+            </div>
+          </section>
+
+          <details class="mcp-advanced">
+            <summary><span><strong>Advanced connection settings</strong><small>Arguments, environment, timeouts, and diagnostics ID</small></span><i aria-hidden="true">›</i></summary>
+            <div class="mcp-advanced-content">
+              <div class="form-grid two">
+                <label><span>Connect timeout</span><div class="unit-input"><input id="mcp-timeout-ms" name="timeoutMs" type="number" min="250" max="60000" step="250" placeholder="15000"><span>ms</span></div></label>
+                <label><span>Retry cooldown</span><div class="unit-input"><input id="mcp-cooldown-ms" name="cooldownMs" type="number" min="0" max="300000" step="250" placeholder="30000"><span>ms</span></div></label>
+              </div>
+              <div class="mcp-advanced-section" aria-labelledby="mcp-args-heading">
+                <div class="mcp-form-section-heading"><div><strong id="mcp-args-heading">Arguments</strong><span>One argument per row</span></div><button class="inline-add-button" id="add-mcp-arg" type="button">+ Add</button></div>
+                <div class="mcp-repeat-list mcp-args-list" id="mcp-args-rows"></div>
+              </div>
+              <div class="mcp-advanced-section" aria-labelledby="mcp-env-heading">
+                <div class="mcp-form-section-heading"><div><strong id="mcp-env-heading">Environment</strong><span>Values are write-only</span></div><button class="inline-add-button" id="add-mcp-env" type="button">+ Add</button></div>
+                <div class="mcp-repeat-list mcp-env-list" id="mcp-env-rows"></div>
+              </div>
+              <label class="mcp-connection-id"><span>Connection ID</span><input id="mcp-server-id" type="text" maxlength="64" placeholder="Assigned when saved" readonly aria-readonly="true"></label>
+            </div>
+          </details>
+
+          <section class="mcp-form-section" aria-labelledby="mcp-access-heading">
+            <div class="mcp-form-section-heading"><div><strong id="mcp-access-heading">Access</strong><span>Agent and tool policy</span></div></div>
+            <div class="form-grid two mcp-policy-grid">
+              <label><span>Tool access</span><select id="mcp-tool-access" name="toolMode" aria-describedby="mcp-tool-access-hint"><option value="selected">Selected tools</option><option value="all">All current and future tools · High trust</option></select><small id="mcp-tool-access-hint">All grants tools added after refresh.</small></label>
+              <label><span>Approval</span><select id="mcp-approval" name="approval"><option value="ask">Ask each call</option><option value="blocked">Block</option></select><small>Applied before dispatch.</small></label>
+            </div>
+            <fieldset class="form-section mcp-agent-section">
+              <legend>Assigned agents</legend>
+              <div class="assignment-options" id="mcp-agent-options"></div>
+            </fieldset>
+          </section>
+
+          <section class="mcp-trust-panel" aria-labelledby="mcp-trust-heading">
+            <label><input id="mcp-trust-local" name="trustLocal" type="checkbox" required><span><strong id="mcp-trust-heading">Allow local execution</strong><small>Run this executable with the configured arguments and environment.</small></span></label>
+          </section>
+        </div>
+
+        <aside class="mcp-form-aside" aria-label="Discovery and diagnostics">
+          <section class="mcp-aside-card mcp-runtime-card">
+            <div class="mcp-aside-heading"><strong>Runtime</strong><span class="mcp-status" id="mcp-dialog-runtime-status" data-mcp-state="not-tested" role="status" aria-live="polite" aria-atomic="true"><i aria-hidden="true"></i><span>Not tested</span></span></div>
+            <dl class="mcp-runtime-metrics"><div><dt>Last checked</dt><dd id="mcp-last-checked">Never</dd></div><div><dt>Last error</dt><dd id="mcp-last-error">None</dd></div></dl>
+            <button class="secondary-action mcp-test-button" id="mcp-test-discover" type="button" data-loading="false" data-loading-label="Testing">Test &amp; refresh tools</button>
+          </section>
+
+          <section class="mcp-aside-card mcp-discovery-card">
+            <div class="mcp-aside-heading"><div><strong>Discovered tools</strong><span id="mcp-discovery-count">0</span></div><span class="mcp-discovery-status" id="mcp-discovery-status" data-mcp-state="not-tested">Not tested</span></div>
+            <div class="mcp-tool-list-header" aria-hidden="true"><span>Use</span><span>Tool</span><span>State</span></div>
+            <div class="mcp-tool-options" id="mcp-tool-options" aria-live="polite"></div>
+          </section>
+
+          <section class="mcp-aside-card mcp-diagnostics-card">
+            <div class="mcp-aside-heading"><strong>Diagnostics</strong><span>Sanitized</span></div>
+            <pre class="diagnostic-output" id="mcp-diagnostic-log">No diagnostics.</pre>
+          </section>
+        </aside>
+      </div>
+      <footer class="settings-form-actions mcp-form-actions">
+        <button id="delete-mcp-server" class="danger-button" type="button" data-loading="false" data-loading-label="Deleting">Delete</button>
+        <span></span>
+        <button id="cancel-mcp-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save server</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <template id="mcp-arg-row-template">
+    <div class="mcp-repeat-row" data-mcp-arg-row>
+      <span class="mcp-row-handle" aria-hidden="true">↳</span>
+      <input name="mcpArg" type="text" maxlength="2000" autocomplete="off" spellcheck="false" aria-label="Command argument" placeholder="Argument">
+      <button type="button" data-remove-mcp-arg aria-label="Remove argument">×</button>
+    </div>
+  </template>
+
+  <template id="mcp-env-row-template">
+    <div class="mcp-repeat-row mcp-env-row" data-mcp-env-row>
+      <input name="mcpEnvKey" type="text" maxlength="64" pattern="[A-Z_][A-Z0-9_]{0,63}" autocomplete="off" spellcheck="false" aria-label="Environment key" placeholder="KEY">
+      <input name="mcpEnvValue" type="password" maxlength="8000" autocomplete="new-password" spellcheck="false" aria-label="Environment secret value" placeholder="Secret value">
+      <button type="button" data-remove-mcp-env aria-label="Remove environment variable">×</button>
+    </div>
+  </template>
+
+  <template id="mcp-tool-row-template">
+    <label class="mcp-tool-option" data-mcp-tool-row>
+      <input name="mcpTool" type="checkbox">
+      <span><strong data-mcp-tool-name>tool_name</strong><small data-mcp-tool-description></small></span>
+      <span class="mcp-tool-state" data-mcp-tool-status data-state="available">Available</span>
+    </label>
+  </template>
+
+  <dialog class="settings-dialog" id="channel-dialog" aria-labelledby="channel-dialog-title">
+    <header>
+      <div><h2 id="channel-dialog-title">Configure channel</h2><span class="settings-record-id" id="channel-dialog-kind">Connection</span></div>
+      <button id="close-channel-dialog" type="button" aria-label="Close channel configuration">×</button>
+    </header>
+    <form class="settings-form" id="channel-form" aria-busy="false">
+      <div class="settings-form-scroll">
+        <div class="settings-form-heading">
+          <div><strong id="channel-dialog-status">Incomplete</strong><span id="channel-dialog-detail">Credentials required</span></div>
+          <label class="settings-enabled"><input id="channel-enabled" type="checkbox"><span>Enabled</span></label>
+        </div>
+        <div class="channel-field-mount" id="channel-field-mount"></div>
+        <div class="form-field" id="channel-webhook-field" hidden>
+          <span>Webhook URL</span>
+          <div class="copy-field"><input id="channel-webhook-url" type="text" readonly><button id="copy-channel-webhook" type="button" data-loading="false" data-loading-label="Copying">Copy</button></div>
+        </div>
+        <p class="form-hint" id="channel-secret-hint">Secrets are write-only. Blank fields keep stored values.</p>
+        <p class="form-status-message" id="channel-test-status" role="status" aria-live="polite" hidden></p>
+      </div>
+      <footer class="settings-form-actions">
+        <button id="channel-clear" class="danger-button" type="button" data-loading="false" data-loading-label="Clearing">Clear credentials</button>
+        <button id="channel-test" class="secondary-action" type="button" data-loading="false" data-loading-label="Testing">Test saved connection</button>
+        <button id="cancel-channel-edit" class="secondary-action" type="button">Cancel</button>
+        <button class="primary-action" id="channel-save" type="submit" data-loading="false" data-loading-label="Saving">Save connection</button>
+      </footer>
+    </form>
+  </dialog>
+
+  <dialog class="settings-dialog verdict-link-dialog" id="channel-link-dialog"
+          aria-labelledby="channel-link-dialog-title" aria-describedby="channel-link-status"
+          aria-busy="false" tabindex="-1">
+    <header>
+      <div>
+        <p class="eyebrow" id="channel-link-dialog-kicker">CHECKING LINK</p>
+        <h2 id="channel-link-dialog-title">Loading Channel details</h2>
+      </div>
+    </header>
+    <div class="verdict-link-content">
+      <div class="verdict-link-details" id="channel-link-details" hidden>
+        <div><span>Channel</span><strong id="channel-link-kind"></strong></div>
+        <div><span>Expires</span><strong id="channel-link-expiry"></strong></div>
+      </div>
+      <p class="form-status-message" id="channel-link-status" role="status"
+         aria-live="polite">Verifying this one-time link.</p>
+    </div>
+    <footer class="settings-form-actions">
+      <span></span><span></span>
+      <button class="primary-action" id="channel-link-confirm" type="button"
+              data-loading="false" hidden>Link Channel</button>
+    </footer>
+  </dialog>
+
+  <dialog class="settings-dialog verdict-link-dialog" id="verdict-dialog" aria-labelledby="verdict-dialog-title" aria-describedby="verdict-status" aria-busy="false">
+    <header>
+      <div><p class="eyebrow" id="verdict-dialog-kicker">CHECKING LINK</p><h2 id="verdict-dialog-title">Loading decision details</h2></div>
+      <button id="close-verdict-dialog" type="button" aria-label="Close decision">×</button>
+    </header>
+    <div class="verdict-link-content">
+      <div class="verdict-link-details" id="verdict-details" hidden>
+        <div><span>Mission</span><strong id="verdict-mission"></strong></div>
+        <div><span>Action</span><strong id="verdict-tool"></strong></div>
+        <div><span>Requested by</span><strong id="verdict-requester"></strong></div>
+        <div><span>Runs as</span><strong id="verdict-identity"></strong></div>
+        <div><span>Source</span><strong id="verdict-source"></strong></div>
+        <div><span>Scope</span><strong id="verdict-scope"></strong></div>
+        <div><span>Expires</span><strong id="verdict-expiry"></strong></div>
+      </div>
+      <p class="form-status-message" id="verdict-status" role="status" aria-live="polite">Verifying the current request.</p>
+    </div>
+    <footer class="settings-form-actions">
+      <span></span><span></span>
+      <button class="primary-action" id="verdict-confirm" type="button" data-loading="false" hidden>Approve once</button>
+    </footer>
+  </dialog>
+
+  <section class="startup-failure" id="startup-failure" role="alert" aria-labelledby="startup-error-title" hidden>
+    <div class="startup-failure-card">
+      <span class="startup-error-mark" aria-hidden="true">!</span>
+      <div><p class="eyebrow">WORKSPACE UNAVAILABLE</p><h1 id="startup-error-title">Constellation couldn’t start</h1><p id="startup-error-detail"></p></div>
+      <button class="primary-action" id="retry-startup" type="button" data-loading="false">Retry startup</button>
+    </div>
+  </section>
+
+  <div class="toast-region" id="toast-region" aria-live="polite"></div>
 </body>
