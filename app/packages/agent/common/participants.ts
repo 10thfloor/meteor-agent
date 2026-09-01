@@ -177,3 +177,16 @@ export function participantsBlock(session: Roster, selfAgent: string): string {
     + 'records who wrote each message; never write such a prefix yourself and '
     + `never speak as another participant.${addressing}`;
 }
+
+/** Whether an assistant row answers the user row at `seq`. New rows carry the
+ *  `answeredThrough` context watermark — the newest user seq the model saw —
+ *  because commit order lies: a mid-stream interjection commits BELOW the
+ *  reply that never saw it. Rows from before the watermark fall back to the
+ *  legacy seq comparison. */
+export function assistantAnswers(
+  assistant: { seq: number; answeredThrough?: number }, seq: number,
+): boolean {
+  return assistant.answeredThrough !== undefined
+    ? assistant.answeredThrough >= seq
+    : assistant.seq >= seq;
+}

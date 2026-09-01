@@ -29,6 +29,10 @@ const ids = {
   reservation: 'erase-reservation',
   constitution: 'erase-constitution', experience: 'erase-experience',
   practice: 'erase-practice',
+  sessionExperience: 'erase-session-experience',
+  childExperience: 'erase-child-experience',
+  unrelatedExperience: 'erase-unrelated-experience',
+  identityExperience: 'erase-identity-experience',
 };
 
 const frameId = (sessionId: string): string => `erase-frame-${sessionId}`;
@@ -62,7 +66,10 @@ async function clean(): Promise<void> {
     frameId(ids.root), frameId(ids.child), frameId(ids.grandchild), frameId(ids.fork),
   ] } });
   await AgentPractices.removeAsync(ids.practice);
-  await AgentExperiences.removeAsync(ids.experience);
+  await AgentExperiences.removeAsync({ _id: { $in: [
+    ids.experience, ids.sessionExperience, ids.childExperience,
+    ids.unrelatedExperience, ids.identityExperience,
+  ] } });
   await AgentConstitutions.removeAsync(ids.constitution);
   await AgentIdentities.removeAsync('erase-agent');
   await AgentSessions.removeAsync({ _id: { $in: sessionIds } });
@@ -100,7 +107,9 @@ async function insertAgentLearning(): Promise<void> {
     difference: 'The Session lifecycle changed',
     lesson: 'Experience belongs to the Agent, not its source Session.',
     context: 'session-lifecycle', confidence: 1, status: 'active',
-    audience: { scope: 'session', key: ids.root },
+    // Identity audience: only session-audience rows follow their Session
+    // (erasure symmetry); Agent-owned learning survives on provenance alone.
+    audience: { scope: 'identity', key: 'erase-agent' },
     source: {
       kind: 'model', key: 'experience-propose:erase-call',
       sessionId: ids.root, triggerSeq: 0, toolCallId: 'erase-call',
@@ -116,6 +125,25 @@ async function insertAgentLearning(): Promise<void> {
     context: 'session-lifecycle', evidenceIds: [ids.experience],
     source: { kind: 'app', key: 'erase-practice-seed' }, digest: 'practice-digest',
     status: 'candidate', createdAt: now, updatedAt: now,
+  });
+}
+
+async function insertAudienceExperience(
+  _id: string, audience: { scope: 'identity' | 'session'; key: string }, sequence: number,
+): Promise<void> {
+  await AgentExperiences.insertAsync({
+    _id, agentId: 'erase-agent', sequence,
+    expectationBasis: 'explicit',
+    expected: 'The row outlives erasure', observed: 'Erasure follows the audience',
+    difference: 'Only the exposure partition decides',
+    lesson: 'Session-audience Experiences follow their Session.',
+    context: 'session-lifecycle', confidence: 1, status: 'active',
+    audience,
+    source: {
+      kind: 'app', key: `erase-audience-${_id}`,
+      sessionId: 'erase-source-session', triggerSeq: sequence,
+    },
+    digest: `digest-${_id}`, createdAt: new Date(),
   });
 }
 
@@ -228,6 +256,45 @@ describe('Agent.erase — server-side Session lifecycle', () => {
     assert.isDefined(await AgentConstitutions.findOneAsync(ids.constitution));
     assert.isDefined(await AgentExperiences.findOneAsync(ids.experience));
     assert.isDefined(await AgentPractices.findOneAsync(ids.practice));
+  });
+
+  it('erases session-audience Experiences with their Sessions, never other audiences', async () => {
+    await AgentSessions.insertAsync(session(ids.root, 'erase-agent'));
+    await AgentSessions.insertAsync(session(
+      ids.child, 'specialist', { sessionId: ids.root, toolCallId: 'call-1' },
+    ));
+    await insertAudienceExperience(
+      ids.sessionExperience, { scope: 'session', key: ids.root }, 1,
+    );
+    await insertAudienceExperience(
+      ids.childExperience, { scope: 'session', key: ids.child }, 2,
+    );
+    await insertAudienceExperience(
+      ids.unrelatedExperience, { scope: 'session', key: 'erase-unrelated-session' }, 3,
+    );
+    await insertAudienceExperience(
+      ids.identityExperience, { scope: 'identity', key: 'erase-agent' }, 4,
+    );
+
+    const result = await new Agent('erase-agent').erase(ids.root, { userId: 'erase-owner' });
+
+    assert.equal(result, 'erased');
+    assert.isUndefined(
+      await AgentExperiences.findOneAsync(ids.sessionExperience),
+      'a session-audience Experience keyed to the erased root follows it',
+    );
+    assert.isUndefined(
+      await AgentExperiences.findOneAsync(ids.childExperience),
+      'descendant session audiences erase with the tree',
+    );
+    assert.isDefined(
+      await AgentExperiences.findOneAsync(ids.unrelatedExperience),
+      'a session audience keyed to an unrelated Session is untouched',
+    );
+    assert.isDefined(
+      await AgentExperiences.findOneAsync(ids.identityExperience),
+      'Agent-owned identity learning survives Session erasure',
+    );
   });
 
   it('does not disclose or mutate a wrong-owner, wrong-agent, or child Session', async () => {
@@ -541,16 +608,18 @@ describe('Agent.erase — server-side Session lifecycle', () => {
 describe('Agent participant lifecycle — parked turn cancellation', () => {
   const parkedSession = 'archive-parked-session';
   const otherSession = 'archive-other-session';
+  const callingSession = 'archive-calling-session';
+  const sessions = [parkedSession, otherSession, callingSession];
 
   beforeEach(async () => {
-    await AgentDeltas.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
-    await AgentMessages.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
-    await AgentSessions.removeAsync({ _id: { $in: [parkedSession, otherSession] } });
+    await AgentDeltas.removeAsync({ sessionId: { $in: sessions } });
+    await AgentMessages.removeAsync({ sessionId: { $in: sessions } });
+    await AgentSessions.removeAsync({ _id: { $in: sessions } });
   });
   afterEach(async () => {
-    await AgentDeltas.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
-    await AgentMessages.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
-    await AgentSessions.removeAsync({ _id: { $in: [parkedSession, otherSession] } });
+    await AgentDeltas.removeAsync({ sessionId: { $in: sessions } });
+    await AgentMessages.removeAsync({ sessionId: { $in: sessions } });
+    await AgentSessions.removeAsync({ _id: { $in: sessions } });
   });
 
   it('revokes only the archived Agent park and removes its incomplete batch', async () => {
@@ -588,5 +657,71 @@ describe('Agent participant lifecycle — parked turn cancellation', () => {
     assert.isUndefined(await AgentMessages.findOneAsync('archive-assistant'));
     assert.isUndefined(await AgentDeltas.findOneAsync('archive-delta'));
     assert.equal((await AgentSessions.findOneAsync(otherSession))?.phase, 'awaiting');
+  });
+
+  it('waits out a mid-execution approved call, then fences its re-park', async function () {
+    this.timeout(30000);
+    const now = new Date();
+    const executing = {
+      toolCallId: 'calling-call', name: 'dangerous', args: {},
+      agent: 'archived-specialist', requestedAt: now,
+    };
+    await AgentSessions.insertAsync({
+      ...session(callingSession, 'orchestrator'), phase: 'calling', pending: executing,
+      lease: { serverId: 'executing-server', until: new Date(Date.now() + 60_000) },
+    });
+    await AgentMessages.insertAsync({
+      _id: 'calling-assistant', sessionId: callingSession, seq: 0, role: 'assistant',
+      content: '', toolCalls: [{ id: 'calling-call', name: 'dangerous', args: {} }],
+      createdAt: now,
+    });
+
+    const sweeping = abandonPendingAgentTurns('archived-specialist', 'erase-owner');
+    // Phase 'calling' with a LIVE lease is skipped, so however many passes
+    // have run by now, the executing call must remain untouched.
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    const untouched = await AgentSessions.findOneAsync(callingSession);
+    assert.equal(untouched?.phase, 'calling', 'an executing approved call is not fenced');
+    assert.isDefined(untouched?.pending, 'the pending marker survives mid-execution');
+    assert.isDefined(untouched?.lease, 'the executing Lease is not stripped');
+    assert.isDefined(await AgentMessages.findOneAsync('calling-assistant'));
+
+    // The call re-parks (phase leaves 'calling'); the bounded sweep now
+    // fences it within its remaining pass budget.
+    await AgentSessions.updateAsync(callingSession, {
+      $set: { phase: 'awaiting', updatedAt: new Date() },
+    } as any);
+    assert.deepEqual(await sweeping, { sessions: 1, toolCalls: ['calling-call'] });
+    const released = await AgentSessions.findOneAsync(callingSession);
+    assert.equal(released?.phase, 'idle');
+    assert.isUndefined(released?.pending);
+    assert.isUndefined(released?.lease);
+    assert.isUndefined(await AgentMessages.findOneAsync('calling-assistant'));
+  });
+
+  it('fences a dead worker\'s mid-call park without waiting', async function () {
+    this.timeout(30000);
+    const now = new Date();
+    await AgentSessions.insertAsync({
+      ...session(callingSession, 'orchestrator'),
+      phase: 'calling',
+      pending: {
+        toolCallId: 'dead-call', name: 'dangerous', args: {},
+        agent: 'archived-specialist', requestedAt: now,
+      },
+      // An expired lease: the worker died mid-call, its commit is already
+      // impossible, so the sweep must not wait on it.
+      lease: { serverId: 'dead-server', until: new Date(Date.now() - 5_000) },
+    });
+    await AgentMessages.insertAsync({
+      _id: 'dead-call-assistant', sessionId: callingSession, seq: 0, role: 'assistant',
+      content: '', toolCalls: [{ id: 'dead-call', name: 'dangerous', args: {} }],
+      createdAt: now,
+    });
+    assert.deepEqual(
+      await abandonPendingAgentTurns('archived-specialist', 'erase-owner'),
+      { sessions: 1, toolCalls: ['dead-call'] },
+    );
+    assert.isUndefined((await AgentSessions.findOneAsync(callingSession))?.pending);
   });
 });

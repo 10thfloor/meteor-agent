@@ -1,5 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentMemories } from '../common/collections';
+import { isDuplicateKey } from './channels/collections';
 import {
   MEMORY_TEXT_MAX,
   type AgentMemory, type MemoryScope, type ResolvedMemory,
@@ -157,13 +158,6 @@ function isFilterPathError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e ?? '').toLowerCase();
   return msg.includes('filter')
     && (msg.includes('path') || msg.includes('not indexed') || msg.includes('must be indexed'));
-}
-
-/** Mongo's duplicate-key signal, however the driver phrases it. */
-function isDuplicateKey(e: unknown): boolean {
-  const err = e as { code?: unknown; message?: unknown };
-  if (err?.code === 11000 || err?.code === 11001) return true;
-  return String(err?.message ?? '').includes('E11000');
 }
 
 /** Escape regex metacharacters — raw user text would otherwise SyntaxError. */

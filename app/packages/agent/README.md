@@ -2347,8 +2347,12 @@ backfilled when prompt wording changes. Provider retries, Tool
 iterations, approval resume, and recovery adopt the same Frame. Config edits
 and newly admitted Experience or Practice apply on the next trigger, never the
 Turn that created them. Exact Fact Memory
-prompt text stays Turn-local; recovery
-re-renders it and fails closed if it no longer matches the Frame.
+prompt text stays Turn-local; recovery verifies the Frame's frozen evidence
+rows by id and fails closed only when one was edited or erased — facts added
+after the freeze (the Turn's own `memory_save` included) never void a parked
+approval, and a store read failure leaves the park intact for retry. A park
+records its exact Frame id, so an approval resume adopts that Frame even when
+later rows arrive while it waits.
 
 ### Server-only `Agent.learning`
 

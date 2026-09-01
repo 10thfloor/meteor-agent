@@ -47,7 +47,9 @@ export { assembleContext, estimateContext, findCompactionCut } from './compactio
 import { dispatchCalls, resumeParkedTurn, type DispatchLimits } from './dispatch';
 import { activate, installTurnRunner } from './activation';
 import type { SessionQuery } from '../common/db';
-import { prepareTurnLearning, type TurnLearningSnapshot } from './learning-runtime';
+import {
+  LearningIntegrityError, prepareTurnLearning, type TurnLearningSnapshot,
+} from './learning-runtime';
 import { recordProviderRequestDigest } from './learning';
 
 // `runTurn` passes itself to `dispatchCalls`/`resumeParkedTurn` (see the RunTurn
@@ -204,13 +206,27 @@ export async function runTurn(
             practice: config.practice,
             factMemory: memoryForPrompt,
           });
-        } catch {
-          console.error('[10thfloor:agent] the Agent Memory Frame could not be prepared');
-          // A parked Turn may be recovering after mutable Fact Memory changed.
-          // Fail closed without leaving its approval marker immortal: fence
-          // the park and record the actionable restart state atomically, then
-          // discard the incomplete tool batch. The next user message gets a
-          // new trigger and therefore a fresh immutable Frame.
+        } catch (learningError) {
+          console.error(
+            '[10thfloor:agent] the Agent Memory Frame could not be prepared:',
+            (learningError as Error)?.message ?? learningError,
+          );
+          if (entry.pending && !(learningError instanceof LearningIntegrityError)) {
+            // Only a changed-causes verdict may destroy a park. Anything
+            // else — a store read failure, an identity read hiccup — leaves
+            // the park and its recorded verdict as the repairable state.
+            // Activation latches an unchanged cause per drain, so the retry
+            // arrives with the watcher sweep or the next session activity;
+            // the pause bounds spin when a drain does re-attempt.
+            await sleep(1000);
+            return;
+          }
+          // A parked Turn may be recovering after its frozen Fact Memory
+          // EVIDENCE was edited or erased. Fail closed without leaving its
+          // approval marker immortal: fence the park and record the
+          // actionable restart state atomically, then discard the incomplete
+          // tool batch. The next user message gets a new trigger and
+          // therefore a fresh immutable Frame.
           let pendingBatch: ReturnType<typeof locateBatch> = null;
           if (entry.pending) {
             const messages = await AgentMessages.find(
@@ -382,6 +398,12 @@ export async function runTurn(
         // committed seq but the row still supersedes the in-flight one.
         // Retries reuse msgSeq (only messageId changes per attempt).
         const msgSeq = session.nextSeq;
+        // Distinguishes THIS process's attempts from a pre-crash run's: the
+        // attempt counter restarts at zero on recovery, and the rebuilt
+        // request is not guaranteed byte-identical (roster, MCP tool order, a
+        // redeployed prompt), so a durable key reusing the counter would
+        // conflict at the paid-work boundary instead of recording truthfully.
+        const attemptRun = Random.id(8);
 
         let text = '';
         let thinking = '';
@@ -484,11 +506,11 @@ export async function runTurn(
                     {
                       kind: 'system',
                       // The durable assistant commit slot survives process
-                      // restarts and distinguishes an approval continuation
-                      // from the request that originally parked. A volatile
-                      // loop counter restarts at zero on resume and can alias
-                      // two different effective requests against one Frame.
-                      key: `provider:${learning!.memoryFrameId}:${msgSeq}:${attemptIndex}`,
+                      // restarts; the per-run nonce keeps a recovery's
+                      // attempt 0 from aliasing the pre-crash attempt 0 whose
+                      // rebuilt bytes may differ. Every attempt records; the
+                      // audit trail carries them all.
+                      key: `provider:${learning!.memoryFrameId}:${msgSeq}:${attemptRun}:${attemptIndex}`,
                       sessionId,
                       triggerSeq: learning!.triggerSeq,
                     },
@@ -611,6 +633,12 @@ export async function runTurn(
 
         const commitSeq = await commitLeasedMessage(sessionId, {
           _id: messageId, role: 'assistant',
+          // What this reply actually answered: the newest user row the model
+          // SAW. A mid-stream interjection outranks it, so activation starts
+          // a fresh turn instead of classifying the interjection answered.
+          answeredThrough: history.reduce(
+            (max, m) => (m.role === 'user' && m.seq > max ? m.seq : max), 0,
+          ),
           content: text, thinking: thinking || undefined,
           toolCalls, usage,
           ...(staged.length > 0 ? { attachments: staged } : {}),

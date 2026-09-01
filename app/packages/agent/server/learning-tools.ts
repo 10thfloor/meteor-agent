@@ -1,3 +1,4 @@
+import { Meteor } from 'meteor/meteor';
 import type {
   AgentExperience, AgentMemoryFrame, ExperienceAudience, ResolvedExperience, ResolvedPractice,
 } from '../common/learning';
@@ -326,20 +327,31 @@ function practiceProposeTool(
           ? 'Practice proposal already exists in Reviews.'
           : 'Practice proposed for review.';
       }
-      const activated = await validatePracticeAutomatically(
-        opts.agentId,
-        proposed.value._id,
-        opts.frame._id,
-        'Configured automatic Practice policy activated this candidate as a trial.',
-        {
-          kind: 'system',
-          key: `practice-auto-validate:${ctx.assistantMessageId}:${ctx.toolCallId}`,
-          sessionId: opts.frame.sessionId,
-          triggerSeq: opts.frame.triggerSeq,
-          toolCallId: ctx.toolCallId,
-          assistantMessageId: ctx.assistantMessageId,
-        },
-      );
+      let activated: Awaited<ReturnType<typeof validatePracticeAutomatically>>;
+      try {
+        activated = await validatePracticeAutomatically(
+          opts.agentId,
+          proposed.value._id,
+          opts.frame._id,
+          'Configured automatic Practice policy activated this candidate as a trial.',
+          {
+            kind: 'system',
+            key: `practice-auto-validate:${ctx.assistantMessageId}:${ctx.toolCallId}`,
+            sessionId: opts.frame.sessionId,
+            triggerSeq: opts.frame.triggerSeq,
+            toolCallId: ctx.toolCallId,
+            assistantMessageId: ctx.assistantMessageId,
+          },
+        );
+      } catch (error) {
+        // Only a structured GOVERNANCE refusal downgrades to "awaits review"
+        // — the candidate committed and Reviews is its legitimate state per
+        // ADR-0002. An infrastructure failure is not a refusal; rethrow it
+        // rather than fabricate a governed outcome.
+        if (!(error instanceof Meteor.Error)) throw error;
+        const reason = typeof error.reason === 'string' ? ` ${error.reason}` : '';
+        return `Practice proposed; automatic activation was refused, so it awaits human review.${reason}`;
+      }
       return activated.replayed
         ? 'Practice trial was already activated.'
         : 'Practice activated as a trial for future turns.';

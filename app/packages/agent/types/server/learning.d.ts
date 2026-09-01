@@ -40,10 +40,16 @@ export declare function freezeMemoryFrame(input: FreezeMemoryFrameInput): Promis
 /** Render only frozen Constitution/Practice layers. L1 bodies stay behind the Tool seam. */
 export declare function buildProtectedLearningPrompt(frameOrId: AgentMemoryFrame | string): Promise<string>;
 /** Attach the final effective Provider-request digest to a Frame's audit trail.
- * Request bytes never enter Learning persistence. */
+ * Request bytes never enter Learning persistence.
+ *
+ * This runs before EVERY paid provider call, so it is deliberately not a
+ * transaction and never writes the shared identity document — the previous
+ * shape serialized all of an agent's concurrent sessions on one `$inc`. An
+ * append-only audit event with a deterministic id gives the same idempotency:
+ * the unique (agentId, kind, sourceDigest) index arbitrates, a replay adopts,
+ * and a same-key-different-digest insert is the conflict `mutate` detected. */
 export declare function recordProviderRequestDigest(frameId: string, requestDigestInput: string, sourceInput: LearningSource): Promise<LearningMutationResult<AgentMemoryFrame>>;
 export declare function auditLearningState(agentIdInput: string): Promise<LearningAudit>;
-/** Correctness indexes throw: Learning may not run with ambiguous identity/revision state. */
 export declare function ensureLearningIndexes(): Promise<void>;
 export {};
 //# sourceMappingURL=learning.d.ts.map

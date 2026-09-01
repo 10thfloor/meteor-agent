@@ -204,10 +204,16 @@ export const ChannelVerdictTokens =
   new Mongo.Collection<ChannelVerdictToken>(NAMES.channelVerdictTokens) as unknown as
     TypedCollection<ChannelVerdictToken, string | VerdictTokenQuery, never>;
 
-/** True when the error is a duplicate-key (11000 or message match). */
+/** True when the error is a duplicate-key, however the driver phrases it:
+ *  code 11000/11001, codeName, or either message form. Load-bearing wherever
+ *  a derived-`_id` insert treats "lost the race" as adoption — a phrasing
+ *  this misses turns an idempotent replay into a thrown error. */
 export function isDuplicateKey(e: unknown): boolean {
-  const err = e as { code?: number; message?: string } | null;
-  return err?.code === 11000 || /duplicate key/i.test(String(err?.message ?? ''));
+  const err = e as { code?: number; codeName?: string; message?: string } | null;
+  if (err?.code === 11000 || err?.code === 11001) return true;
+  if (err?.codeName === 'DuplicateKey') return true;
+  const msg = String(err?.message ?? '');
+  return msg.includes('E11000') || /duplicate key/i.test(msg);
 }
 
 /** Insert a derived-`_id` row: `true` = inserted (won), `false` = duplicate

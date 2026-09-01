@@ -563,6 +563,383 @@ describe('Agent Learning — Turn and Memory Frame integration', () => {
       assert.include(note?.error?.reason ?? '', 'restart with current memory');
     });
 
+  it('a turn that saves a fact and then parks still resumes after approval',
+    async function () {
+      this.timeout(30_000);
+      const { Agent } = await import('../server/agent');
+      const { AgentMemories, AgentMessages, AgentSessions } = await import('../common/collections');
+      const { buildRunConfig, getAgent } = await import('../server/registry');
+      const { runTurn } = await import('../server/loop');
+      let providerCall = 0;
+      let toolRan = false;
+      const provider: Provider = {
+        async *stream() {
+          providerCall += 1;
+          if (providerCall === 1) {
+            // The deterministic approval-evaporation shape: an auto-gated
+            // save lands, then the ask-gated call parks the same batch.
+            yield {
+              kind: 'done',
+              toolCalls: [
+                {
+                  id: 'sp-save', name: 'memory_save',
+                  args: { text: 'New fact learned mid-turn.', scope: 'user' },
+                },
+                { id: 'sp-publish', name: 'publish_brief', args: {} },
+              ],
+              usage: { input: 1, output: 1 },
+            };
+            return;
+          }
+          yield { kind: 'text', chunk: 'Published.' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      };
+      const agent = new Agent('learning-save-park', {
+        model: 'mock',
+        instructions: 'Save then publish.',
+        provider,
+        tools: [{
+          name: 'publish_brief', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { toolRan = true; return 'published'; },
+        }],
+        memory: { hints: false, scopes: ['user'], index: { pinned: 1, recent: 4 } },
+        identity: { id: 'identity-save-park' },
+      });
+      await seedSession('save-park-session', 'learning-save-park', 'Save and publish.');
+      await runTurn('save-park-session', buildRunConfig(getAgent('learning-save-park')!, 'learning-user'));
+
+      const parked = await AgentSessions.findOneAsync('save-park-session');
+      assert.equal(parked?.phase, 'awaiting');
+      assert.equal(parked?.pending?.name, 'publish_brief');
+      assert.equal(parked?.pending?.memoryFrameId, 'save-park-session:identity-save-park:0',
+        'the park carries its causal Frame anchor');
+      assert.isDefined(await AgentMemories.findOneAsync({ text: 'New fact learned mid-turn.' } as any),
+        'the auto-gated save landed before the park');
+
+      await agent.approve('save-park-session', {
+        userId: 'learning-user', expectedToolCallId: 'sp-publish',
+      });
+      await waitFor(
+        async () => toolRan
+          && (await AgentSessions.findOneAsync('save-park-session'))?.phase === 'idle',
+        'the approved tool to run despite the turn\'s own save',
+      );
+      assert.isUndefined((await AgentSessions.findOneAsync('save-park-session'))?.pending);
+      assert.isUndefined(await AgentMessages.findOneAsync({
+        sessionId: 'save-park-session', role: 'note', kind: 'error',
+        'error.error': 'learning-unavailable',
+      } as any), 'the turn\'s own save must not void the human\'s approval');
+    });
+
+  it('a fact saved by another session while parked does not void the approval',
+    async function () {
+      this.timeout(30_000);
+      const { Agent } = await import('../server/agent');
+      const { AgentMemories, AgentMessages, AgentSessions } = await import('../common/collections');
+      const { buildRunConfig, getAgent } = await import('../server/registry');
+      const { runTurn } = await import('../server/loop');
+      let providerCall = 0;
+      let toolRan = false;
+      const provider: Provider = {
+        async *stream() {
+          providerCall += 1;
+          if (providerCall === 1) {
+            yield {
+              kind: 'done',
+              toolCalls: [{ id: 'cs-publish', name: 'publish_brief', args: {} }],
+              usage: { input: 1, output: 1 },
+            };
+            return;
+          }
+          yield { kind: 'text', chunk: 'Published.' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      };
+      const agent = new Agent('learning-concurrent-save', {
+        model: 'mock',
+        instructions: 'Publish.',
+        provider,
+        tools: [{
+          name: 'publish_brief', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { toolRan = true; return 'published'; },
+        }],
+        memory: { hints: false, scopes: ['user'], index: { pinned: 1, recent: 4 } },
+        identity: { id: 'identity-concurrent-save' },
+      });
+      await seedSession('concurrent-save-session', 'learning-concurrent-save', 'Publish it.');
+      await AgentMemories.insertAsync({
+        _id: 'cs-frozen-fact', scope: 'user', userId: 'learning-user',
+        text: 'A fact the frame froze.', by: 'test', at: new Date(),
+      });
+      await runTurn(
+        'concurrent-save-session',
+        buildRunConfig(getAgent('learning-concurrent-save')!, 'learning-user'),
+      );
+      assert.equal((await AgentSessions.findOneAsync('concurrent-save-session'))?.phase, 'awaiting');
+      const { AgentMemoryFrames } = await import('../server/learning-collections');
+      const frozen = await AgentMemoryFrames.findOneAsync(
+        'concurrent-save-session:identity-concurrent-save:0',
+      );
+      assert.isTrue(
+        frozen?.factMemory.evidence.some((item) => item.id === 'cs-frozen-fact'),
+        'the fixture fact must be frozen evidence, or this test discriminates nothing',
+      );
+
+      // Another session of the same user saves while the approval waits. The
+      // frozen row is untouched — only an addition — so recovery must adopt.
+      await AgentMemories.insertAsync({
+        _id: 'cs-new-fact', scope: 'user', userId: 'learning-user',
+        text: 'Saved elsewhere while parked.', by: 'test', at: new Date(),
+      });
+      await agent.approve('concurrent-save-session', {
+        userId: 'learning-user', expectedToolCallId: 'cs-publish',
+      });
+      await waitFor(
+        async () => toolRan
+          && (await AgentSessions.findOneAsync('concurrent-save-session'))?.phase === 'idle',
+        'the approval to survive a concurrent unrelated save',
+      );
+      assert.isUndefined(await AgentMessages.findOneAsync({
+        sessionId: 'concurrent-save-session', role: 'note', kind: 'error',
+        'error.error': 'learning-unavailable',
+      } as any));
+    });
+
+  it('a user message landing while parked does not move the approved call to a new Frame',
+    async function () {
+      this.timeout(30_000);
+      const { Agent } = await import('../server/agent');
+      const { AgentMessages, AgentSessions } = await import('../common/collections');
+      const { AgentMemoryFrames } = await import('../server/learning-collections');
+      const { buildRunConfig, getAgent } = await import('../server/registry');
+      const { runTurn } = await import('../server/loop');
+      let providerCall = 0;
+      let toolRan = false;
+      const provider: Provider = {
+        async *stream() {
+          providerCall += 1;
+          if (providerCall === 1) {
+            yield {
+              kind: 'done',
+              toolCalls: [{ id: 'mv-publish', name: 'publish_brief', args: {} }],
+              usage: { input: 1, output: 1 },
+            };
+            return;
+          }
+          yield { kind: 'text', chunk: 'Published.' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      };
+      const agent = new Agent('learning-anchored-park', {
+        model: 'mock',
+        instructions: 'Publish.',
+        provider,
+        tools: [{
+          name: 'publish_brief', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { toolRan = true; return 'published'; },
+        }],
+        identity: { id: 'identity-anchored-park' },
+        experience: { record: true, recall: false, scope: 'owner' },
+      });
+      await seedSession('anchored-park-session', 'learning-anchored-park', 'Publish it.');
+      await runTurn(
+        'anchored-park-session',
+        buildRunConfig(getAgent('learning-anchored-park')!, 'learning-user'),
+      );
+      const parked = await AgentSessions.findOneAsync('anchored-park-session');
+      assert.equal(parked?.phase, 'awaiting');
+
+      // A user row lands while parked. Without the anchor, resume would
+      // re-derive this newer row as the trigger and freeze a fresh Frame.
+      const interjectSeq = parked!.nextSeq;
+      await AgentMessages.insertAsync({
+        _id: 'anchored-park-interject', sessionId: 'anchored-park-session',
+        seq: interjectSeq, role: 'user', content: 'Also, one more thing.',
+        createdAt: new Date(),
+      } as AgentMessage);
+      await AgentSessions.updateAsync('anchored-park-session', { $inc: { nextSeq: 1 } });
+
+      await agent.approve('anchored-park-session', {
+        userId: 'learning-user', expectedToolCallId: 'mv-publish',
+      });
+      await waitFor(
+        async () => toolRan
+          && (await AgentSessions.findOneAsync('anchored-park-session'))?.phase === 'idle',
+        'the anchored approval to resume',
+      );
+      const frames = await AgentMemoryFrames.find(
+        { sessionId: 'anchored-park-session' },
+      ).fetchAsync();
+      // A revert of the anchor re-derives the interjected row as the trigger
+      // and freezes a SECOND frame during the resume — one frame at
+      // triggerSeq 0 is the whole proof of adoption.
+      assert.lengthOf(frames, 1, 'the approved call resumed under its original Frame');
+      assert.equal(frames[0].triggerSeq, 0);
+    });
+
+  it('a crew note is never a Memory Frame trigger', async function () {
+    this.timeout(30_000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { prepareTurnLearning } = await import('../server/learning-runtime');
+    const sessionId = 'crew-note-trigger-session';
+    await seedSession(sessionId, 'crew-note-agent', 'Real trigger.');
+    const first = await prepareTurnLearning({
+      session: (await AgentSessions.findOneAsync(sessionId))!,
+      agentName: 'crew-note-agent',
+      identity: { id: 'identity-crew-note', name: 'crew-note-agent' },
+    });
+    assert.equal(first?.triggerSeq, 0);
+
+    // Crew notes promise "no model work" — one must not become the trigger.
+    await AgentMessages.insertAsync({
+      _id: 'crew-note-row', sessionId, seq: 1, role: 'user', kind: 'crew-note',
+      content: 'FYI from the crew.', createdAt: new Date(),
+    } as AgentMessage);
+    await AgentSessions.updateAsync(sessionId, { $inc: { nextSeq: 1 } });
+    const second = await prepareTurnLearning({
+      session: (await AgentSessions.findOneAsync(sessionId))!,
+      agentName: 'crew-note-agent',
+      identity: { id: 'identity-crew-note', name: 'crew-note-agent' },
+    });
+    assert.equal(second?.triggerSeq, 0, 'the crew note must not displace the trigger');
+    assert.equal(second?.memoryFrameId, first?.memoryFrameId);
+  });
+
+  it('a store read failure during recovery leaves the park and verdict intact',
+    async function () {
+      this.timeout(40_000);
+      const { Agent } = await import('../server/agent');
+      const { AgentMemories, AgentMessages, AgentSessions } = await import('../common/collections');
+      const { buildRunConfig, getAgent } = await import('../server/registry');
+      const { runTurn } = await import('../server/loop');
+      let providerCall = 0;
+      let toolRan = false;
+      const provider: Provider = {
+        async *stream() {
+          providerCall += 1;
+          if (providerCall === 1) {
+            yield {
+              kind: 'done',
+              toolCalls: [{ id: 'out-publish', name: 'publish_brief', args: {} }],
+              usage: { input: 1, output: 1 },
+            };
+            return;
+          }
+          yield { kind: 'text', chunk: 'Published.' };
+          yield { kind: 'done', usage: { input: 1, output: 1 } };
+        },
+      };
+      const agent = new Agent('learning-outage', {
+        model: 'mock',
+        instructions: 'Publish.',
+        provider,
+        tools: [{
+          name: 'publish_brief', description: 'x', gate: 'ask',
+          args: { type: 'object', properties: {} },
+          run: async () => { toolRan = true; return 'published'; },
+        }],
+        memory: { hints: false, scopes: ['user'], index: { pinned: 1, recent: 4 } },
+        identity: { id: 'identity-outage' },
+      });
+      await seedSession('outage-session', 'learning-outage', 'Publish it.');
+      await AgentMemories.insertAsync({
+        _id: 'outage-frozen-fact', scope: 'user', userId: 'learning-user',
+        text: 'A fact the frame froze.', by: 'test', at: new Date(),
+      });
+      await runTurn(
+        'outage-session', buildRunConfig(getAgent('learning-outage')!, 'learning-user'),
+      );
+      assert.equal((await AgentSessions.findOneAsync('outage-session'))?.phase, 'awaiting');
+
+      // One injected read failure on the frozen-evidence fetch: the first
+      // resume attempt must PRESERVE the park (no discard, no
+      // learning-unavailable note) and the retry must then complete it.
+      const originalFind = AgentMemories.find.bind(AgentMemories);
+      let injected = false;
+      (AgentMemories as { find: unknown }).find = (selector?: unknown, options?: unknown) => {
+        const byIds = (selector as { _id?: { $in?: unknown[] } } | undefined)?._id?.$in;
+        if (!injected && Array.isArray(byIds)) {
+          injected = true;
+          throw new Error('injected store outage');
+        }
+        return originalFind(selector as any, options as any);
+      };
+      try {
+        await agent.approve('outage-session', {
+          userId: 'learning-user', expectedToolCallId: 'out-publish',
+        });
+        // The failed attempt must settle back to the REPAIRABLE state: park
+        // and verdict intact, nothing discarded, no error note.
+        await waitFor(
+          async () => {
+            if (!injected) return false;
+            const settled = await AgentSessions.findOneAsync('outage-session');
+            return settled?.phase === 'idle' && settled.pending?.verdict === 'approved';
+          },
+          'the failed attempt to leave the park and verdict standing',
+          20_000,
+        );
+        assert.isFalse(toolRan, 'the outage attempt must not have run the tool');
+        assert.isUndefined(await AgentMessages.findOneAsync({
+          sessionId: 'outage-session', role: 'note', kind: 'error',
+          'error.error': 'learning-unavailable',
+        } as any), 'a read failure is not changed causes; the park must not be destroyed');
+
+        // Unchanged causes are latched per drain; in production the watcher
+        // sweep (or any later session activity) opens the next drain. Tests
+        // run watcherless, so nudge per poll — a nudge landing inside a
+        // still-winding-down drain is consumed by its latch, exactly like a
+        // single sweep tick; the next one opens a fresh drain.
+        const { activate } = await import('../server/activation');
+        await waitFor(
+          async () => {
+            activate('outage-session');
+            return toolRan
+              && (await AgentSessions.findOneAsync('outage-session'))?.phase === 'idle';
+          },
+          'the retry to complete the approved call',
+          20_000,
+        );
+      } finally {
+        (AgentMemories as { find: unknown }).find = originalFind;
+      }
+      assert.isUndefined(
+        (await AgentSessions.findOneAsync('outage-session'))?.pending,
+        'the retry consumed the verdict normally',
+      );
+    });
+
+  it('clamps an astral-heavy trigger context without bricking the frame',
+    async function () {
+      this.timeout(30_000);
+      const { AgentSessions } = await import('../common/collections');
+      const { AgentMemoryFrames } = await import('../server/learning-collections');
+      const { prepareTurnLearning } = await import('../server/learning-runtime');
+      const sessionId = 'clamp-trigger-session';
+      // 254 ASCII chars put the astral pair straddling the clamp boundary —
+      // the naive slice split it and BSON round-tripped U+FFFD, bricking the
+      // frozen digest on first re-read.
+      const long = `${'x'.repeat(254)}😀😀 and more text beyond the clamp`;
+      await seedSession(sessionId, 'clamp-agent', long);
+      const snapshot = await prepareTurnLearning({
+        session: (await AgentSessions.findOneAsync(sessionId))!,
+        agentName: 'clamp-agent',
+        identity: { id: 'identity-clamp', name: 'clamp-agent' },
+      });
+      assert.exists(snapshot);
+      assert.isAtMost(snapshot!.frame.context.length, 256);
+      assert.notInclude(snapshot!.frame.context, '�');
+      const stored = await AgentMemoryFrames.findOneAsync(snapshot!.memoryFrameId);
+      assert.equal(
+        stored?.context, snapshot!.frame.context,
+        'the BSON round trip must not mutate the clamped context',
+      );
+    });
+
   it('records a model-authored Experience exactly once, and only after approval',
     async function () {
       this.timeout(30_000);

@@ -23,6 +23,15 @@ export interface PrepareTurnLearningOptions {
 /** Resolve a config scope to one immutable Turn audience. Owner scope never
  * persists an empty/anonymous owner key; anonymous owners are Session-local. */
 export declare function resolveTurnExperienceAudience(agentId: string, session: Pick<AgentSession, '_id' | 'userId'>, scope: ExperienceScope): ExperienceAudience;
+/** Fail-closed: the frozen causes themselves were edited or erased. The park
+ *  (if any) is destroyed — resuming would mix causal snapshots. */
+export declare class LearningIntegrityError extends Error {
+}
+/** Retryable: the store could not be read. The park and its recorded verdict
+ *  are the repairable state and MUST survive; activation retries the resume. */
+export declare class LearningUnavailableError extends Error {
+    readonly transient = true;
+}
 /** Freeze or adopt one Agent/Session/trigger Frame before paid Provider work.
  * Existing Frames win over mutable current state. Fact prompt bytes are not
  * duplicated durably for privacy; recovery therefore re-renders and verifies

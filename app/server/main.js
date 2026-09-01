@@ -12,13 +12,22 @@ import {
   Agent,
   AgentSessions,
   abandonPendingAgentTurns,
+  assertLearningReviewTarget,
+  assertPracticeTransitionEvidence,
   ChannelBindings,
   ChannelIdentities,
+  createLearningPublisher,
   createPiAiProvider,
   discoverMcpTools,
   disconnectMcpServer,
   egress,
   getMcpServerStatus,
+  governedConstitutionRevise,
+  governedExperienceRetract,
+  governedLearningReview,
+  governedPracticePropose,
+  governedPracticeTransition,
+  hostLearningSource,
   loadPiAi,
   LEARNING_TOOL_NAMES,
   EXPERIENCE_RECALL_MAX,
@@ -1008,13 +1017,9 @@ async function backfillCrewConfigs(userId) {
   await Promise.all(updates);
 }
 
-function learningSource(action, agentId, command) {
-  // Meteor may transparently replay a method after reconnect. Bind the source
-  // key to the requested command so an identical replay adopts its first
-  // result, while reuse for different content fails in the Learning Module.
-  const digest = createHash('sha256').update(JSON.stringify(command ?? null)).digest('hex');
-  return { kind: 'app', key: `constellation:${action}:${agentId}:${digest}` };
-}
+// Stable idempotency-key namespace for every learning mutation this app
+// issues. Changing it would orphan replay adoption of in-flight commands.
+const LEARNING_SOURCE_NS = 'constellation';
 
 async function syncCrewLearningIdentity(config) {
   await Agent.learning.ensureIdentity({
@@ -1032,7 +1037,9 @@ async function syncCrewLearningIdentity(config) {
       config._id,
       identity.generation,
       lifecycle,
-      learningSource('lifecycle', config._id, { lifecycle, revision: config.revision }),
+      hostLearningSource(LEARNING_SOURCE_NS, 'lifecycle', config._id, {
+        lifecycle, revision: config.revision,
+      }),
     );
   }
 }
@@ -4198,107 +4205,27 @@ Meteor.publish('constellation.learning', async function publishLearning() {
   if (!await WorkspaceState.findOneAsync(
     { _id: 'local', ownerUserId: this.userId }, { fields: { _id: 1 } },
   )) return this.ready();
-  const views = [
-    ['agent_identities', 'identities', {
-      fields: {
-        generation: 1, experienceSeq: 1, currentName: 1, aliases: 1,
-        displayName: 1, lifecycle: 1, constitutionVersionId: 1,
-        flexibility: 1, createdAt: 1, updatedAt: 1,
-      },
-    }],
-    ['agent_constitutions', 'constitutions', {
-      fields: {
-        agentId: 1, revision: 1, content: 1, reason: 1, digest: 1,
-        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1, createdAt: 1,
-      },
-      sort: { revision: -1 },
-      limit: 200,
-    }],
-    ['agent_experiences', 'experiences', {
-      fields: {
-        agentId: 1, sequence: 1, expectationBasis: 1,
-        expected: 1, observed: 1, difference: 1,
-        lesson: 1, context: 1, confidence: 1, status: 1,
-        audience: 1, admission: 1,
-        'review.at': 1, 'review.reason': 1,
-        'review.source.kind': 1, 'review.source.actorId': 1,
-        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1,
-        frameId: 1, createdAt: 1, retractedAt: 1, retractionReason: 1,
-      },
-      sort: { sequence: -1 },
-      limit: 500,
-    }],
-    ['agent_practices', 'practices', {
-      fields: {
-        practiceId: 1, agentId: 1, key: 1, revision: 1, trigger: 1,
-        guidance: 1, context: 1, evidenceIds: 1, status: 1,
-        frameId: 1, validationAdmission: 1,
-        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1,
-        'transitionSource.kind': 1, 'transitionSource.actorId': 1,
-        'review.at': 1, 'review.reason': 1,
-        'review.source.kind': 1, 'review.source.actorId': 1,
-        createdAt: 1, updatedAt: 1, transitionReason: 1, validatedAt: 1,
-        validationWatermark: 1, hardenedAt: 1, hardenedEvidenceId: 1,
-        retiredAt: 1, rejectedAt: 1,
-      },
-      sort: { updatedAt: -1 },
-      limit: 500,
-    }],
-    ['agent_memory_frames', 'frames', {
-      fields: {
-        agentId: 1, sessionId: 1, triggerSeq: 1, digest: 1, createdAt: 1,
-        context: 1, audience: 1, protectedPromptVersion: 1, protectedPromptDigest: 1,
-        learningPolicy: 1,
-        'constitution.id': 1, 'constitution.revision': 1, 'constitution.digest': 1,
-        'practices.id': 1, 'practices.practiceId': 1, 'practices.revision': 1,
-        'practices.status': 1, 'practices.digest': 1,
-        'experiences.id': 1, 'experiences.digest': 1,
-        'factMemory.promptDigest': 1, 'factMemory.evidence.id': 1,
-        'factMemory.evidence.scope': 1, 'factMemory.evidence.digest': 1,
-      },
-      sort: { createdAt: -1 },
-      limit: 100,
-    }],
-  ];
-  let stopped = false;
-  const handles = [];
-  const started = new Map();
-  this.onStop(() => {
-    stopped = true;
-    for (const handle of handles) handle.stop();
-  });
-  const startAgent = (agentId) => {
-    if (started.has(agentId)) return started.get(agentId);
-    const pending = Promise.all(views.map(async ([collectionName, reader, options]) => {
-      const handle = await Agent.learning.read[reader]([agentId], options).observeChangesAsync({
-        added: (id, fields) => { if (!stopped) this.added(collectionName, id, fields); },
-        changed: (id, fields) => { if (!stopped) this.changed(collectionName, id, fields); },
-        removed: (id) => { if (!stopped) this.removed(collectionName, id); },
-      });
-      if (stopped) handle.stop();
-      else handles.push(handle);
-    }));
-    started.set(agentId, pending);
-    return pending;
-  };
+  // The package owns the reviewed field allowlists; this app only decides
+  // which Agent identities the subscriber may see — its own Crew.
+  const publisher = createLearningPublisher(this);
   const initialCrew = await CrewConfigs.find(
     { userId: this.userId }, { fields: { _id: 1 } },
   ).fetchAsync();
-  await Promise.all(initialCrew.map((row) => startAgent(row._id)));
+  await Promise.all(initialCrew.map((row) => publisher.addAgent(row._id)));
   const crewHandle = await CrewConfigs.find(
     { userId: this.userId }, { fields: { _id: 1 } },
   ).observeChangesAsync({
     added: (id) => {
-      void startAgent(id).catch(() => {
-        if (!stopped) this.error(new Meteor.Error(
+      void publisher.addAgent(id).catch(() => {
+        if (!publisher.stopped) this.error(new Meteor.Error(
           'learning-unavailable', 'Agent learning is temporarily unavailable.',
         ));
       });
     },
   });
-  if (stopped) crewHandle.stop();
-  else handles.push(crewHandle);
-  if (!stopped) this.ready();
+  if (publisher.stopped) crewHandle.stop();
+  else this.onStop(() => crewHandle.stop());
+  if (!publisher.stopped) this.ready();
   return undefined;
 });
 
@@ -4530,23 +4457,11 @@ Meteor.methods({
     check(reason, String);
     await claimWorkspace(this.userId);
     await ownedLearningIdentity(this.userId, agentId, { active: true });
-    try {
-      return await Agent.learning.reviseConstitution(
-        agentId,
-        expectedGeneration,
-        body,
-        reason,
-        learningSource('constitution-revise', agentId, { expectedGeneration, body, reason }),
-      );
-    } catch (error) {
-      if (String(error?.message ?? error).includes('identity-generation-conflict')) {
-        throw new Meteor.Error(
-          'identity-generation-conflict',
-          'The Constitution changed after this draft started. Rebase it onto the latest version.',
-        );
-      }
-      throw error;
-    }
+    // The package raises structured codes (e.g. identity-generation-conflict)
+    // that reach DDP callers directly; nothing to translate here.
+    return governedConstitutionRevise(
+      LEARNING_SOURCE_NS, agentId, expectedGeneration, body, reason,
+    );
   },
 
   async 'constellation.experienceRetract'(agentId, experienceId, reason) {
@@ -4555,32 +4470,19 @@ Meteor.methods({
     check(reason, String);
     await claimWorkspace(this.userId);
     await ownedLearningIdentity(this.userId, agentId, { active: true });
-    return Agent.learning.retractExperience(
-      agentId,
-      experienceId,
-      reason,
-      learningSource('experience-retract', agentId, { experienceId, reason }),
-    );
+    return governedExperienceRetract(LEARNING_SOURCE_NS, agentId, experienceId, reason);
   },
 
   async 'constellation.learningReview'(agentId, target, targetId) {
     check(agentId, String);
     check(target, String);
     check(targetId, String);
-    if (!['experience', 'practice'].includes(target)) {
-      throw new Meteor.Error('invalid-learning-review', 'Unknown learning review target.');
-    }
+    // Input contract precedes authorization so a malformed call is refused
+    // as such even for identities outside this workspace.
+    assertLearningReviewTarget(target);
     await claimWorkspace(this.userId);
     await ownedLearningIdentity(this.userId, agentId, { active: true });
-    return Agent.learning.review({
-      agentId,
-      target,
-      id: targetId,
-      source: {
-        ...learningSource('post-admission-review', agentId, { target, targetId }),
-        actorId: this.userId,
-      },
-    });
+    return governedLearningReview(LEARNING_SOURCE_NS, agentId, target, targetId, this.userId);
   },
 
   async 'constellation.practicePropose'(agentId, proposal) {
@@ -4589,24 +4491,7 @@ Meteor.methods({
     if (proposal.commandId !== undefined) check(proposal.commandId, String);
     await claimWorkspace(this.userId);
     await ownedLearningIdentity(this.userId, agentId, { active: true });
-    return Agent.learning.proposePractice({
-      agentId,
-      key: proposal.key,
-      trigger: proposal.trigger,
-      guidance: proposal.guidance,
-      context: proposal.context,
-      evidenceIds: proposal.evidenceIds,
-      source: learningSource('practice-propose', agentId, {
-        // Distinguish a deliberate later proposal with identical content from
-        // transparent DDP replay of the original method invocation.
-        commandId: proposal.commandId,
-        key: proposal.key,
-        trigger: proposal.trigger,
-        guidance: proposal.guidance,
-        context: proposal.context,
-        evidenceIds: proposal.evidenceIds,
-      }),
-    });
+    return governedPracticePropose(LEARNING_SOURCE_NS, agentId, proposal);
   },
 
   async 'constellation.practiceTransition'(
@@ -4617,30 +4502,13 @@ Meteor.methods({
     check(status, String);
     check(reason, String);
     if (hardeningEvidenceId !== undefined) check(hardeningEvidenceId, String);
-    if (status === 'hardened' && !hardeningEvidenceId?.trim()) {
-      throw new Meteor.Error(
-        'invalid-practice-transition',
-        'Select the exact later Experience used to harden this Practice.',
-      );
-    }
-    if (status !== 'hardened' && hardeningEvidenceId !== undefined) {
-      throw new Meteor.Error(
-        'invalid-practice-transition',
-        'Hardening evidence is accepted only when hardening a Practice.',
-      );
-    }
+    // Same ordering rationale as learningReview: evidence contract first.
+    assertPracticeTransitionEvidence(status, hardeningEvidenceId);
     await claimWorkspace(this.userId);
     await ownedLearningIdentity(this.userId, agentId, { active: true });
-    const source = learningSource('practice-transition', agentId, {
-      practiceId, status, reason,
-      ...(status === 'hardened' ? { hardeningEvidenceId } : {}),
-    });
-    if (status === 'hardened') {
-      return Agent.learning.transitionPractice(
-        agentId, practiceId, status, reason, source, hardeningEvidenceId,
-      );
-    }
-    return Agent.learning.transitionPractice(agentId, practiceId, status, reason, source);
+    return governedPracticeTransition(
+      LEARNING_SOURCE_NS, agentId, practiceId, status, reason, hardeningEvidenceId,
+    );
   },
 
   async 'constellation.bootstrap'() {

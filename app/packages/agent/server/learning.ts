@@ -1,4 +1,5 @@
 import { createHash } from 'crypto';
+import { Meteor } from 'meteor/meteor';
 import { MongoInternals } from 'meteor/mongo';
 import type { ClientSession } from 'mongodb';
 import type {
@@ -21,6 +22,7 @@ import {
 } from '../common/learning';
 import { MEMORY_TEXT_MAX } from '../common/types';
 import { AgentMessages, AgentSessions } from '../common/collections';
+import { isDuplicateKey as isDuplicate } from './channels/collections';
 import {
   AgentConstitutions, AgentExperiences, AgentIdentities, AgentLearningEvents,
   AgentMemoryFrames, AgentPractices,
@@ -138,10 +140,6 @@ async function inTransaction<T>(work: (session: ClientSession) => Promise<T>): P
   }
 }
 
-function isDuplicate(error: unknown): boolean {
-  const e = error as { code?: number; message?: string };
-  return e?.code === 11000 || String(e?.message ?? '').includes('E11000');
-}
 
 function commandConflict(): never {
   throw new Error('[10thfloor:agent] learning-command-conflict');
@@ -816,7 +814,13 @@ export async function recordExperience(
         agentId, admission: 'automatic', status: 'active', review: { $exists: false },
       }, { session });
       if (pendingAudit >= EXPERIENCE_AUTOMATIC_REVIEW_MAX) {
-        throw new Error('[10thfloor:agent] automatic Experience review backlog is full');
+        // Meteor.Error: governance backpressure must reach the model as a
+        // structured code, not an opaque `tool-failed` it will blindly retry.
+        throw new Meteor.Error(
+          'learning-review-backlog-full',
+          'Automatic Experience recording is suspended until a human reviews '
+          + 'the pending backlog.',
+        );
       }
     }
     const nextIdentity = await AgentIdentities.rawCollection().findOneAndUpdate(
@@ -895,7 +899,11 @@ export async function listExperiences(
   const agentId = cleanId(agentIdInput, 'agentId');
   const audience = opts.audience === undefined
     ? identityAudience(agentId) : cleanExperienceAudience(opts.audience, agentId);
-  const limit = Math.max(1, Math.min(opts.limit ?? 50, 200));
+  // `limit: 0` is a valid "none" (recall-disabled configs pass it through);
+  // clamping it up to 1 would leak a record into a surface policy said stays
+  // empty. Only negatives clamp up.
+  const limit = Math.max(0, Math.min(opts.limit ?? 50, 200));
+  if (limit === 0) return [];
   return AgentExperiences.find(
     {
       agentId, 'audience.scope': audience.scope, 'audience.key': audience.key,
@@ -983,7 +991,11 @@ export async function proposePractice(
         { agentId, status: 'candidate', 'source.kind': 'model' }, { session },
       );
       if (candidateCount >= PRACTICE_CANDIDATE_MAX) {
-        throw new Error('[10thfloor:agent] model Practice candidate limit reached');
+        throw new Meteor.Error(
+          'practice-candidate-limit',
+          'The model Practice candidate limit is reached; proposals resume '
+          + 'after a human reviews the standing candidates.',
+        );
       }
     }
     const evidence = await AgentExperiences.rawCollection().find({
@@ -1000,7 +1012,13 @@ export async function proposePractice(
     const standing = await AgentPractices.rawCollection().findOne({
       practiceId, status: { $in: ['candidate', 'validated', 'hardened'] },
     }, { session });
-    if (standing) throw new Error('[10thfloor:agent] Practice already has a live revision');
+    if (standing) {
+      throw new Meteor.Error(
+        'practice-live-revision',
+        'A revision of this Practice is already live (candidate, validated, '
+        + 'or hardened). Do not re-propose it; a human resolves the standing one.',
+      );
+    }
     const prior = await AgentPractices.rawCollection().find(
       { practiceId }, { session, sort: { revision: -1 }, limit: 1 },
     ).toArray() as AgentPractice[];
@@ -1172,7 +1190,11 @@ async function transitionPracticeWithAdmission(
           review: { $exists: false },
         }, { session });
         if (pendingAudit >= PRACTICE_AUTOMATIC_REVIEW_MAX) {
-          throw new Error('[10thfloor:agent] automatic Practice review backlog is full');
+          throw new Meteor.Error(
+            'practice-review-backlog-full',
+            'Automatic Practice activation is suspended until a human reviews '
+            + 'the pending backlog; the candidate stays in Reviews.',
+          );
         }
       }
       set.validatedAt = now;
@@ -1582,7 +1604,14 @@ export async function buildProtectedLearningPrompt(
 }
 
 /** Attach the final effective Provider-request digest to a Frame's audit trail.
- * Request bytes never enter Learning persistence. */
+ * Request bytes never enter Learning persistence.
+ *
+ * This runs before EVERY paid provider call, so it is deliberately not a
+ * transaction and never writes the shared identity document — the previous
+ * shape serialized all of an agent's concurrent sessions on one `$inc`. An
+ * append-only audit event with a deterministic id gives the same idempotency:
+ * the unique (agentId, kind, sourceDigest) index arbitrates, a replay adopts,
+ * and a same-key-different-digest insert is the conflict `mutate` detected. */
 export async function recordProviderRequestDigest(
   frameId: string, requestDigestInput: string, sourceInput: LearningSource,
 ): Promise<LearningMutationResult<AgentMemoryFrame>> {
@@ -1597,23 +1626,30 @@ export async function recordProviderRequestDigest(
   if (source.sessionId !== frame.sessionId || source.triggerSeq !== frame.triggerSeq) {
     throw new Error('[10thfloor:agent] Provider request source does not match Memory Frame');
   }
+  const identity = await AgentIdentities.findOneAsync(frame.agentId);
+  if (!identity || identity.lifecycle !== 'active') {
+    // Terminal, not a provider hiccup: retrying cannot resurrect an archived
+    // identity, and burning the retry/backoff schedule hides the real cause.
+    const archived = new Error('[10thfloor:agent] unknown or archived Agent Identity');
+    (archived as Error & { retryable?: boolean }).retryable = false;
+    throw archived;
+  }
   const command = { frameId, requestDigest, source };
   const digest = commandDigest('provider-requested', command);
   const eid = eventId('provider-requested', frame.agentId, source);
-  return mutate(eid, digest, AgentMemoryFrames, async (session) => {
-    await fenceActiveIdentityMutation(session, frame.agentId);
-    const current = await AgentMemoryFrames.rawCollection().findOne(
-      { _id: frameId }, { session },
-    ) as AgentMemoryFrame | null;
-    if (!current) throw new Error('[10thfloor:agent] unknown Memory Frame');
-    verifyFrozenFrame(current);
-    const now = new Date();
-    await insertEvent(session, event(
-      eid, frame.agentId, 'provider-requested', 'memory-frame', frameId,
-      source, digest, now, { details: { requestDigest } },
-    ));
-    return { value: current, changed: true, replayed: false };
-  });
+  const row = event(
+    eid, frame.agentId, 'provider-requested', 'memory-frame', frameId,
+    source, digest, new Date(), { details: { requestDigest } },
+  );
+  try {
+    await AgentLearningEvents.insertAsync(row);
+  } catch (error) {
+    if (!isDuplicate(error)) throw error;
+    const prior = await AgentLearningEvents.findOneAsync(eid);
+    if (!prior || prior.commandDigest !== digest) commandConflict();
+    return { value: frame, changed: false, replayed: true };
+  }
+  return { value: frame, changed: true, replayed: false };
 }
 
 export async function auditLearningState(agentIdInput: string): Promise<LearningAudit> {
@@ -1881,37 +1917,96 @@ export async function auditLearningState(agentIdInput: string): Promise<Learning
 }
 
 /** Correctness indexes throw: Learning may not run with ambiguous identity/revision state. */
+type LearningIndexSpec = {
+  key: Record<string, 1 | -1>;
+  unique?: boolean;
+  partialFilterExpression?: Record<string, unknown>;
+};
+
+/** One batch per collection, retried per-spec on an option/name conflict from
+ *  an earlier build (codes 85/86): drop the stale definition and rebuild. */
+async function buildIndexes(
+  collection: { rawCollection(): any }, specs: LearningIndexSpec[],
+): Promise<void> {
+  const raw = collection.rawCollection();
+  const conflict = (e: unknown): boolean => {
+    const code = (e as { code?: number } | null)?.code;
+    return code === 85 || code === 86;
+  };
+  try {
+    await raw.createIndexes(specs);
+    return;
+  } catch (error) {
+    if (!conflict(error)) throw error;
+  }
+  for (const spec of specs) {
+    try {
+      await raw.createIndexes([spec]);
+    } catch (error) {
+      if (!conflict(error)) throw error;
+      const name = Object.entries(spec.key).map(([k, v]) => `${k}_${v}`).join('_');
+      await raw.dropIndex(name);
+      await raw.createIndexes([spec]);
+    }
+  }
+}
+
 export async function ensureLearningIndexes(): Promise<void> {
-  await AgentIdentities.createIndexAsync({ currentName: 1 }, { unique: true });
-  await AgentIdentities.createIndexAsync({ aliases: 1 }, { unique: true });
-  await AgentConstitutions.createIndexAsync({ agentId: 1, revision: 1 }, { unique: true });
-  await AgentExperiences.createIndexAsync({ agentId: 1, sequence: 1 }, { unique: true });
-  await AgentExperiences.createIndexAsync({
-    agentId: 1, 'audience.scope': 1, 'audience.key': 1,
-    status: 1, sequence: -1, _id: -1,
-  });
-  await AgentExperiences.createIndexAsync({ agentId: 1, status: 1, sequence: -1, _id: -1 });
-  await AgentExperiences.createIndexAsync({
-    agentId: 1, context: 1, status: 1, sequence: 1, createdAt: 1,
-  });
-  await AgentPractices.createIndexAsync({ practiceId: 1, revision: 1 }, { unique: true });
-  await AgentPractices.createIndexAsync(
-    { practiceId: 1 },
-    {
-      unique: true,
-      partialFilterExpression: { status: { $in: ['candidate', 'validated', 'hardened'] } },
-    } as any,
-  );
-  await AgentPractices.createIndexAsync({ agentId: 1, status: 1, updatedAt: -1, _id: 1 });
-  await AgentMemoryFrames.createIndexAsync(
-    { sessionId: 1, agentId: 1, triggerSeq: 1 }, { unique: true },
-  );
-  await AgentMemoryFrames.createIndexAsync({ agentId: 1, createdAt: -1 });
-  await AgentMemoryFrames.createIndexAsync({
-    agentId: 1, 'audience.scope': 1, 'audience.key': 1, createdAt: -1,
-  });
-  await AgentLearningEvents.createIndexAsync(
-    { agentId: 1, kind: 1, sourceDigest: 1 }, { unique: true },
-  );
-  await AgentLearningEvents.createIndexAsync({ agentId: 1, at: -1, _id: -1 });
+  // This runs inside the startup prelude that gates method registration, so
+  // wall clock here is felt by every cold boot: one round trip per collection,
+  // all collections in parallel. Failures still reject — learning correctness
+  // depends on Mongo enforcing the unique keys.
+  await Promise.all([
+    buildIndexes(AgentIdentities, [
+      { key: { currentName: 1 }, unique: true },
+      // Partial: an identity with no aliases indexes nothing here — a unique
+      // multikey index over empty arrays would collide every such pair on the
+      // same null entry.
+      {
+        key: { aliases: 1 },
+        unique: true,
+        partialFilterExpression: { 'aliases.0': { $exists: true } },
+      },
+    ]),
+    buildIndexes(AgentConstitutions, [
+      { key: { agentId: 1, revision: 1 }, unique: true },
+    ]),
+    buildIndexes(AgentExperiences, [
+      { key: { agentId: 1, sequence: 1 }, unique: true },
+      {
+        key: {
+          agentId: 1, 'audience.scope': 1, 'audience.key': 1,
+          status: 1, sequence: -1, _id: -1,
+        },
+      },
+      { key: { agentId: 1, status: 1, sequence: -1, _id: -1 } },
+      { key: { agentId: 1, context: 1, status: 1, sequence: 1, createdAt: 1 } },
+      // The automatic-admission backlog count filters on admission/review;
+      // without this the count scans every active experience the agent owns.
+      { key: { agentId: 1, admission: 1, status: 1, review: 1 } },
+      // Session erasure deletes by audience partition with no agentId — this
+      // keeps every erase from scanning the whole collection.
+      { key: { 'audience.scope': 1, 'audience.key': 1 } },
+    ]),
+    buildIndexes(AgentPractices, [
+      { key: { practiceId: 1, revision: 1 }, unique: true },
+      // `$in` inside a partial filter needs MongoDB >= 6.0 — Meteor 3.5's
+      // bundled server satisfies it; an external MONGO_URL must too.
+      {
+        key: { practiceId: 1 },
+        unique: true,
+        partialFilterExpression: { status: { $in: ['candidate', 'validated', 'hardened'] } },
+      },
+      { key: { agentId: 1, status: 1, updatedAt: -1, _id: 1 } },
+    ]),
+    buildIndexes(AgentMemoryFrames, [
+      { key: { sessionId: 1, agentId: 1, triggerSeq: 1 }, unique: true },
+      { key: { agentId: 1, createdAt: -1 } },
+      { key: { agentId: 1, 'audience.scope': 1, 'audience.key': 1, createdAt: -1 } },
+    ]),
+    buildIndexes(AgentLearningEvents, [
+      { key: { agentId: 1, kind: 1, sourceDigest: 1 }, unique: true },
+      { key: { agentId: 1, at: -1, _id: -1 } },
+    ]),
+  ]);
 }

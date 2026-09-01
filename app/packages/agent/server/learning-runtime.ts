@@ -2,8 +2,9 @@ import type { AgentMessage, AgentSession, ResolvedMemory } from '../common/types
 import type {
   ExperienceAudience, ExperienceScope, IdentityConfig, ResolvedExperience, ResolvedPractice,
 } from '../common/learning';
-import { AgentMessages } from '../common/collections';
+import { AgentMemories, AgentMessages } from '../common/collections';
 import { modelParticipantId, resolveAddressee } from '../common/participants';
+import { promptDisplay } from '../common/channel-contract';
 import { memoryBlockSnapshot, memoryHintSnapshot } from './memory';
 import {
   buildProtectedLearningPrompt, canonicalDigest, ensureAgentIdentity,
@@ -46,6 +47,9 @@ function triggerForAgent(
     return (session.pending?.agent ?? session.pendingSystem?.agent ?? session.agent) === agentName;
   }
   if (message.role !== 'user') return false;
+  // Crew notes promise "no model work" (participants.ts applies the same
+  // rule); one landing mid-park must not become the next trigger.
+  if (message.kind === 'crew-note') return false;
   if (!session.participants?.length) return session.agent === agentName;
   const addressee = resolveAddressee(message.content, message.to, session);
   // An unaddressed user message follows the Session's ordinary routing rule:
@@ -57,7 +61,11 @@ function triggerForAgent(
 function frameContext(message: AgentMessage): string {
   const text = (message.content ?? `${message.role} trigger`)
     .replace(/\s+/g, ' ').trim();
-  return (text || `${message.role} trigger`).slice(0, 256);
+  // Surrogate-safe clamp: a raw slice can split an astral pair, and BSON
+  // round-trips the lone surrogate as U+FFFD — bricking the frozen digest.
+  // 255 + the appended ellipsis stays within LEARNING_CONTEXT_MAX (256),
+  // which `cleanText` enforces by THROWING at frame creation.
+  return promptDisplay(text || `${message.role} trigger`, { limit: 255 });
 }
 
 /** Resolve a config scope to one immutable Turn audience. Owner scope never
@@ -92,10 +100,53 @@ function assertFactSnapshot(
 ): void {
   if (canonicalDigest(text) !== frame.factMemory.promptDigest
     || !sameFactEvidence(frame, rows)) {
-    throw new Error(
+    throw new LearningIntegrityError(
       '[10thfloor:agent] frozen Fact Memory changed before Frame recovery; '
       + 'the Turn is stopped rather than mixing causal snapshots',
     );
+  }
+}
+
+/** Fail-closed: the frozen causes themselves were edited or erased. The park
+ *  (if any) is destroyed — resuming would mix causal snapshots. */
+export class LearningIntegrityError extends Error {}
+
+/** Retryable: the store could not be read. The park and its recorded verdict
+ *  are the repairable state and MUST survive; activation retries the resume. */
+export class LearningUnavailableError extends Error {
+  readonly transient = true;
+}
+
+/** ADR-0001: "recovery re-renders it and fails closed if its evidence or
+ *  digest changed." The frozen EVIDENCE is the contract — rows added since
+ *  the freeze (including the turn's own `memory_save`, or another session's)
+ *  are not this frame's causes and must not void a human's approval. Only an
+ *  edit or erasure of a row the frame actually froze fails closed. */
+async function assertFrozenEvidenceIntact(
+  frame: TurnLearningSnapshot['frame'],
+): Promise<void> {
+  const evidence = frame.factMemory.evidence;
+  if (evidence.length === 0) return;
+  let rows: Array<{ _id: string; scope: string; text: string }>;
+  try {
+    rows = await AgentMemories.find(
+      { _id: { $in: evidence.map((item) => item.id) } },
+      { fields: { scope: 1, text: 1 } },
+    ).fetchAsync() as Array<{ _id: string; scope: string; text: string }>;
+  } catch (error) {
+    throw new LearningUnavailableError(
+      `[10thfloor:agent] frozen Fact Memory could not be read: ${String((error as Error)?.message ?? error)}`,
+    );
+  }
+  const byId = new Map(rows.map((row) => [row._id, row]));
+  for (const item of evidence) {
+    const row = byId.get(item.id);
+    if (!row || canonicalDigest({ id: row._id, scope: row.scope, text: row.text }) !== item.digest) {
+      throw new LearningIntegrityError(
+        '[10thfloor:agent] frozen Fact Memory changed before Frame recovery; '
+        + 'the Turn is stopped rather than mixing causal snapshots',
+      );
+    }
   }
 }
 
@@ -114,20 +165,60 @@ export async function prepareTurnLearning(
   const audience = resolveTurnExperienceAudience(
     agentId, options.session, options.experience?.scope ?? 'identity',
   );
-  const messages = await AgentMessages.find(
-    { sessionId: options.session._id }, { sort: { seq: 1 } },
-  ).fetchAsync();
-  const trigger = [...messages].reverse()
-    .find((message) => triggerForAgent(message, options.session, options.agentName));
-  const latest = await AgentMemoryFrames.findOneAsync(
-    { sessionId: options.session._id, agentId }, { sort: { triggerSeq: -1 } },
-  );
-  const triggerSeq = trigger?.seq ?? latest?.triggerSeq;
-  if (triggerSeq === undefined) {
+
+  // A verdict resume is causally anchored: the park marker names the exact
+  // Frame the batch was proposed under, so the trigger is never re-derived —
+  // rows landing while parked cannot move the approved call to a fresh Frame.
+  const pending = options.session.pending;
+  const anchored = pending?.verdict && pending.agentId === agentId
+    ? pending.memoryFrameId : undefined;
+  let trigger: AgentMessage | undefined;
+  let triggerSeqCandidate: number | undefined;
+  let existing: Awaited<ReturnType<typeof AgentMemoryFrames.findOneAsync>> = undefined;
+  if (anchored !== undefined) {
+    existing = await AgentMemoryFrames.findOneAsync(anchored);
+    if (!existing || existing.agentId !== agentId
+      || existing.sessionId !== options.session._id) {
+      // Missing, or an anchor pointing at another agent's/session's frame —
+      // defense in depth against a corrupted park marker.
+      throw new LearningIntegrityError(
+        '[10thfloor:agent] the parked batch\'s Memory Frame no longer exists',
+      );
+    }
+    triggerSeqCandidate = existing.triggerSeq;
+    trigger = await AgentMessages.findOneAsync({
+      sessionId: options.session._id, seq: existing.triggerSeq,
+    });
+  } else {
+    // The trigger is virtually always among the last few rows; fetch a
+    // bounded recent window first, falling back to the full transcript only
+    // when the window is both full and trigger-free.
+    const recent = await AgentMessages.find(
+      { sessionId: options.session._id }, { sort: { seq: -1 }, limit: 200 },
+    ).fetchAsync();
+    trigger = recent
+      .find((message) => triggerForAgent(message, options.session, options.agentName));
+    if (!trigger && recent.length === 200) {
+      const all = await AgentMessages.find(
+        { sessionId: options.session._id }, { sort: { seq: 1 } },
+      ).fetchAsync();
+      trigger = [...all].reverse()
+        .find((message) => triggerForAgent(message, options.session, options.agentName));
+    }
+    const latest = await AgentMemoryFrames.findOneAsync(
+      { sessionId: options.session._id, agentId }, { sort: { triggerSeq: -1 } },
+    );
+    triggerSeqCandidate = trigger?.seq ?? latest?.triggerSeq;
+    if (triggerSeqCandidate !== undefined) {
+      existing = await AgentMemoryFrames.findOneAsync(
+        memoryFrameId(options.session._id, agentId, triggerSeqCandidate),
+      );
+    }
+  }
+  if (triggerSeqCandidate === undefined) {
     throw new Error('[10thfloor:agent] identity-enabled Turn has no durable trigger');
   }
-  const id = memoryFrameId(options.session._id, agentId, triggerSeq);
-  const existing = await AgentMemoryFrames.findOneAsync(id);
+  const triggerSeq: number = triggerSeqCandidate;
 
   let factMemoryText = '';
   let factRows: Array<{ _id: string; scope: 'user' | 'agent' | 'app'; text: string }> = [];
@@ -156,7 +247,20 @@ export async function prepareTurnLearning(
   }
 
   if (existing) {
-    assertFactSnapshot(existing, factMemoryText, factRows);
+    // Adoption (approval resume, crash recovery, later iterations): verify
+    // the frozen EVIDENCE is intact, not that nothing was added since. The
+    // turn's own auto-gated `memory_save`, or another session's, must not
+    // void a human's approval — only an edit/erasure of a frozen cause does.
+    await assertFrozenEvidenceIntact(existing);
+    if (existing.factMemory.evidence.length > 0 && factMemoryText === ''
+      && options.factMemory && !options.session.parent) {
+      // Evidence rows are intact yet the block re-render came back empty —
+      // memoryBlockSnapshot swallows store failures. Running the resumed
+      // turn with silently missing facts would break the frame's promise.
+      throw new LearningUnavailableError(
+        '[10thfloor:agent] Fact Memory render unavailable during Frame recovery',
+      );
+    }
     return {
       agentId, memoryFrameId: existing._id, triggerSeq,
       frame: existing,

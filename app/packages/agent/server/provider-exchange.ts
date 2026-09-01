@@ -50,6 +50,19 @@ function count(source: string, needle: string): number {
   return source.split(needle).length - 1;
 }
 
+/** Reserved markers are an authority signal only the harness may emit — in
+ * the system string, exactly once. An occurrence arriving inside MESSAGE
+ * content (a tool result, MCP output, user text, a compaction summary) is
+ * untrusted data wearing the governance uniform: break the byte sequence
+ * with a zero-width space so the model cannot mistake it for a reviewed
+ * Frame, while keeping the surrounding text legible. */
+function neutralizeFrameMarkers(text: string): string {
+  const zwsp = String.fromCharCode(0x200b); // zero-width space
+  return text
+    .split(AGENT_MEMORY_FRAME_OPEN).join(`<${zwsp}${AGENT_MEMORY_FRAME_OPEN.slice(1)}`)
+    .split(AGENT_MEMORY_FRAME_CLOSE).join(`<${zwsp}${AGENT_MEMORY_FRAME_CLOSE.slice(1)}`);
+}
+
 /** Hooks may rewrite ordinary prompt material, but cannot forge a second
  * protected layer. Remove complete and dangling reserved markers before the
  * harness appends its validated Frame bytes. */
@@ -150,6 +163,14 @@ export async function runProviderExchange(
     const request = {
       ...hooked,
       system: finalizeProtectedSystem(hooked.system, options.protectedSystem),
+      // The forgery boundary must cover the whole request, not just the
+      // system string — transcript content is the dominant injection surface.
+      ...(options.protectedSystem ? {
+        messages: hooked.messages.map((message) => (
+          typeof message.content === 'string' && message.content
+            ? { ...message, content: neutralizeFrameMarkers(message.content) }
+            : message)),
+      } : {}),
     };
     // A hook may have awaited long enough for the Lease to expire or move.
     // Re-prove authority immediately before starting paid Provider work rather

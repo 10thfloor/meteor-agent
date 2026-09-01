@@ -1,4 +1,5 @@
 import { assert } from 'chai';
+import { Meteor } from 'meteor/meteor';
 import type { AgentExperience, ExperienceSource, LearningSource } from '../common/learning';
 import { AgentMessages } from '../common/collections';
 
@@ -83,8 +84,8 @@ type LifecycleRaceMode = 'archive-first' | 'mutation-first';
 
 async function exerciseLearningLifecycleRaces(mode: LifecycleRaceMode): Promise<void> {
   const {
-    canonicalDigest, ensureAgentIdentity, freezeMemoryFrame, proposePractice,
-    recordExperience, recordProviderRequestDigest, retractExperience,
+    ensureAgentIdentity, freezeMemoryFrame, proposePractice,
+    recordExperience, retractExperience,
     setIdentityLifecycle, setLearningIdentityFenceHookForTests, transitionPractice,
   } = await import('../server/learning');
   const {
@@ -178,24 +179,6 @@ async function exerciseLearningLifecycleRaces(mode: LifecycleRaceMode): Promise<
       };
     }
 
-    if (label === 'provider-request') {
-      const frame = await freezeMemoryFrame({
-        sessionId: `session-${agentId}`, agentId, triggerSeq: 1,
-        context: 'Provider audit lifecycle race', experienceLimit: 0, practiceLimit: 0,
-      });
-      return {
-        agentId, eventKind: 'provider-requested', label, sourceKey,
-        run: () => recordProviderRequestDigest(
-          frame.value._id, canonicalDigest({ agentId, request: true }), {
-            kind: 'system', key: sourceKey,
-            sessionId: frame.value.sessionId, triggerSeq: frame.value.triggerSeq,
-          },
-        ),
-        verify: async () => {
-          assert.exists(await AgentMemoryFrames.findOneAsync(frame.value._id), label);
-        },
-      };
-    }
 
     const { candidate } = await seedCandidate(agentId, label);
     let from: 'candidate' | 'validated' = 'candidate';
@@ -223,9 +206,12 @@ async function exerciseLearningLifecycleRaces(mode: LifecycleRaceMode): Promise<
     };
   };
 
+  // 'provider-request' is deliberately absent: the audit event is append-only
+  // (no transaction, no identity write — ADR-0001 amendment), so it has no
+  // fence checkpoint to race. Its own contract is pinned in a focused test.
   const labels = [
     'retraction', 'proposal', 'candidate-rejected', 'candidate-validated',
-    'validated-retired', 'validated-rejected', 'frame-freeze', 'provider-request',
+    'validated-retired', 'validated-rejected', 'frame-freeze',
   ];
   for (const [index, label] of labels.entries()) {
     const scenario = await buildScenario(label, index);
@@ -621,6 +607,56 @@ describe('Agent Learning — deep Module invariants', () => {
     async function () {
       this.timeout(120_000);
       await exerciseLearningLifecycleRaces('mutation-first');
+    });
+
+  it('audits provider requests append-only: archived refuses, replay adopts, drift conflicts',
+    async function () {
+      this.timeout(30_000);
+      const {
+        canonicalDigest, ensureAgentIdentity, freezeMemoryFrame,
+        recordProviderRequestDigest, setIdentityLifecycle,
+      } = await import('../server/learning');
+      const { AgentIdentities } = await import('../server/learning-collections');
+      const appSource = (key: string): LearningSource => ({ kind: 'app', key });
+      const agentId = 'identity-provider-audit';
+      await ensureAgentIdentity({ id: agentId, name: agentId, flexibility: 3 });
+      const frame = await freezeMemoryFrame({
+        sessionId: `session-${agentId}`, agentId, triggerSeq: 1,
+        context: 'Provider audit contract', experienceLimit: 0, practiceLimit: 0,
+      });
+      const source = {
+        kind: 'system' as const, key: 'audit-slot-1',
+        sessionId: frame.value.sessionId, triggerSeq: frame.value.triggerSeq,
+      };
+      const digest = canonicalDigest({ agentId, request: 1 });
+      const first = await recordProviderRequestDigest(frame.value._id, digest, source);
+      assert.isFalse(first.replayed);
+      const replay = await recordProviderRequestDigest(frame.value._id, digest, source);
+      assert.isTrue(replay.replayed, 'the same key and digest adopts, never duplicates');
+      try {
+        await recordProviderRequestDigest(
+          frame.value._id, canonicalDigest({ agentId, request: 2 }), source,
+        );
+        assert.fail('a reused key with different bytes must conflict');
+      } catch (error) {
+        assert.include(String((error as Error).message), 'learning-command-conflict');
+      }
+      const before = await AgentIdentities.findOneAsync(agentId);
+      await setIdentityLifecycle(
+        agentId, before!.generation, 'archived', appSource('audit-archive'),
+      );
+      try {
+        await recordProviderRequestDigest(
+          frame.value._id, digest, { ...source, key: 'audit-slot-2' },
+        );
+        assert.fail('an archived Identity must refuse a new audit slot');
+      } catch (error) {
+        assert.include(String((error as Error).message), 'archived');
+        assert.isFalse(
+          (error as { retryable?: boolean }).retryable ?? true,
+          'terminal, not a provider hiccup to burn retries on',
+        );
+      }
     });
 
   it('serializes validation with retraction and audits retracted applied evidence',
@@ -1765,4 +1801,112 @@ describe('Agent Learning — deep Module invariants', () => {
       config: { record: true, recall: false, scope: 'identity', approval: 'ask' },
     }), /collide with reserved Learning Tool names/);
     });
+
+  it('honors listExperiences limit: 0 as an exact empty recall', async () => {
+    const {
+      ensureAgentIdentity, listExperiences, recordExperience,
+    } = await import('../server/learning');
+    const agentId = 'limit-zero-agent';
+    await ensureAgentIdentity({ id: agentId, name: agentId });
+    await recordExperience({
+      agentId, expectationBasis: 'explicit',
+      expected: 'Recall would surface this row.', observed: 'Policy said none.',
+      difference: 'A zero limit is a decision, not an accident.',
+      lesson: 'A recall-disabled config must stay empty.', context: 'limit-zero',
+      confidence: 1,
+      source: appExperienceSource('limit-zero-session', 1, 'limit-zero-row'),
+    });
+
+    assert.lengthOf(await listExperiences(agentId), 1, 'the seeded row recalls by default');
+    assert.deepEqual(
+      await listExperiences(agentId, { limit: 0 }), [],
+      'limit: 0 must not clamp up and leak a record into a disabled surface',
+    );
+  });
+
+  it('refuses governance limits with structured Meteor.Error codes', async () => {
+    const { EXPERIENCE_AUTOMATIC_REVIEW_MAX } = await import('../common/learning');
+    const {
+      ensureAgentIdentity, proposePractice, recordExperience,
+    } = await import('../server/learning');
+    const { AgentExperiences } = await import('../server/learning-collections');
+    const agentId = 'governance-refusals';
+    await ensureAgentIdentity({ id: agentId, name: agentId });
+
+    // Fill the unreviewed automatic backlog directly. High sequences keep the
+    // unique (agentId, sequence) index clear of later allocated rows.
+    const now = new Date();
+    await AgentExperiences.rawCollection().insertMany(Array.from(
+      { length: EXPERIENCE_AUTOMATIC_REVIEW_MAX },
+      (_, index) => ({
+        _id: `experience:backlog-${String(index).padStart(3, '0')}`,
+        agentId, sequence: 1000 + index, expectationBasis: 'explicit',
+        expected: 'Expected', observed: 'Observed', difference: 'Different',
+        lesson: 'Learned', context: 'governance-backlog', confidence: 1,
+        status: 'active', admission: 'automatic',
+        audience: { scope: 'identity', key: agentId },
+        source: {
+          kind: 'app', key: `backlog-${index}`,
+          sessionId: 'backlog-session', triggerSeq: index,
+        },
+        digest: `backlog-digest-${index}`, createdAt: now,
+      }),
+    ));
+    let backlogRefusal: any;
+    try {
+      await recordExperience({
+        agentId, expectationBasis: 'explicit',
+        expected: 'The backlog had room.', observed: 'The backlog was full.',
+        difference: 'Governance suspended automatic admission.',
+        lesson: 'Wait for a human review of the pending backlog.',
+        context: 'governance-backlog', confidence: 1, admission: 'automatic',
+        source: appExperienceSource('governance-session', 1, 'backlog-overflow'),
+      });
+    } catch (error) { backlogRefusal = error; }
+    assert.instanceOf(
+      backlogRefusal, Meteor.Error,
+      'backpressure must reach the model structured, not as an opaque throw',
+    );
+    assert.equal(backlogRefusal.error, 'learning-review-backlog-full');
+
+    const evidence = await recordExperience({
+      agentId, expectationBasis: 'explicit',
+      expected: 'One proposal would stand.', observed: 'A second was attempted.',
+      difference: 'The standing revision was still live.',
+      lesson: 'A human resolves the standing revision first.',
+      context: 'governance-practice', confidence: 1,
+      source: appExperienceSource('governance-session', 2, 'live-revision-evidence'),
+    });
+    const standing = await proposePractice({
+      agentId, key: 'governed-practice', context: 'governance-practice',
+      trigger: 'When a Practice is first proposed',
+      guidance: 'Keep exactly one live revision.',
+      evidenceIds: [evidence.value._id], source: appSource('standing-proposal'),
+    });
+    assert.equal(standing.value.status, 'candidate');
+    let liveRefusal: any;
+    try {
+      await proposePractice({
+        agentId, key: 'governed-practice', context: 'governance-practice',
+        trigger: 'When the same key is re-proposed',
+        guidance: 'Replace the live revision.',
+        evidenceIds: [evidence.value._id], source: appSource('second-proposal'),
+      });
+    } catch (error) { liveRefusal = error; }
+    assert.instanceOf(liveRefusal, Meteor.Error);
+    assert.equal(liveRefusal.error, 'practice-live-revision');
+  });
+
+  it('classifies every driver phrasing of a duplicate key, and nothing else', async () => {
+    const { isDuplicateKey } = await import('../server/channels/collections');
+    assert.isTrue(isDuplicateKey({ code: 11000 }));
+    assert.isTrue(isDuplicateKey({ code: 11001 }));
+    assert.isTrue(isDuplicateKey({ codeName: 'DuplicateKey' }));
+    assert.isTrue(isDuplicateKey({ message: 'E11000 duplicate key' }));
+    assert.isTrue(isDuplicateKey({ message: 'duplicate key error' }));
+    assert.isTrue(isDuplicateKey({ message: 'Duplicate Key error' }), 'message match ignores case');
+    assert.isFalse(isDuplicateKey({ code: 121, message: 'validation' }));
+    assert.isFalse(isDuplicateKey(null));
+    assert.isFalse(isDuplicateKey(new Error('network reset')));
+  });
 });

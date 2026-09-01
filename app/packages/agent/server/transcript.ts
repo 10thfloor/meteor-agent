@@ -9,6 +9,7 @@ import type {
 } from '../common/types';
 import type { SessionQuery, SessionSet } from '../common/db';
 import { needsAttribution } from '../common/participants';
+import { isDuplicateKey as duplicateKey } from './channels/collections';
 import {
   beginSessionMutationOperation, type SessionOperation,
   withSessionOperationTransaction,
@@ -293,10 +294,6 @@ function conflict(): never {
   );
 }
 
-function duplicateKey(error: unknown): boolean {
-  const e = error as { code?: number; codeName?: string } | null;
-  return e?.code === 11000 || e?.codeName === 'DuplicateKey';
-}
 
 function messageIdFor(sessionId: string, commitKey: string): string {
   return `u:${createHash('sha256')

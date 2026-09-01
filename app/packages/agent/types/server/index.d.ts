@@ -6,6 +6,7 @@ export { NAMES } from '../common/names';
 export { saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint, memoryBlockSnapshot, memoryHintSnapshot, readSelector, type SaveArgs, type SaveResult, type ForgetResult, type SearchRung, type ListedMemories, } from './memory';
 export { MEMORY_TOOL_NAMES } from './tools';
 export { LEARNING_TOOL_NAMES } from './learning-tools';
+export { hostLearningSource, assertLearningReviewTarget, assertPracticeTransitionEvidence, governedConstitutionRevise, governedExperienceRetract, governedLearningReview, governedPracticePropose, governedPracticeTransition, LEARNING_PUBLICATION_VIEWS, createLearningPublisher, type GovernedPracticeProposal, type LearningPublisher, type LearningSubscription, } from './learning-governance';
 export { resolveMemory } from './registry';
 export { AgentSessions, AgentMessages, AgentDeltas, AgentMemories, } from '../common/collections';
 export { mergeView } from '../common/merge';
@@ -42,4 +43,10 @@ export type { TranscriptView } from './transcript';
 export declare let watcher: Watcher | null;
 /** Boot egress workers, one per enabled channel kind. Exposed for graceful shutdown. */
 export declare const egress: Map<string, EgressWorker>;
+/** Settles when the startup prelude — capped collections, indexes, erasure
+ *  recovery, publications, and methods — has completed (or rejects with the
+ *  failure). The mocha runner does not wait for `Meteor.startup` callbacks,
+ *  so test entries MUST await this before any suite touches a method; hosts
+ *  that probe readiness may await it too. */
+export declare const startupComplete: Promise<void>;
 //# sourceMappingURL=index.d.ts.map

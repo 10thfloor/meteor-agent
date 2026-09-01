@@ -1119,6 +1119,109 @@ describe('turn loop', () => {
     assert.equal(msgs[msgs.length - 1].role, 'assistant');
   });
 
+  it('a mid-stream send to an identity agent is answered by a second Turn', async function () {
+    this.timeout(30000);
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { AgentMemoryFrames } = await import('../server/learning-collections');
+    const { runTurn } = await import('../server/loop');
+    const { Agent } = await import('../server/agent');
+    const { buildRunConfig, getAgent } = await import('../server/registry');
+    const { NAMES } = await import('../common/names');
+    const { Meteor } = await import('meteor/meteor');
+
+    // A Memory Frame belongs to exactly one trigger, so an identity-enabled
+    // turn must NOT `continue` into a mid-stream interjection under the first
+    // trigger's frozen causes — it returns and relies on Activation starting
+    // a fresh Turn. That only works because the assistant row's
+    // `answeredThrough` watermark records that the model never saw the
+    // interjection; commit order lies (the blind reply commits ABOVE it), and
+    // the legacy seq comparison would classify the interjection answered,
+    // prune its wake link, and idle the session with an unanswered user row.
+    const sendHandler = (Meteor.server as any).method_handlers[NAMES.mSend];
+    let providerCalls = 0;
+    let linksAtSecondTurn: Array<{ seq: number }> | undefined;
+    const racing: Provider = {
+      async *stream() {
+        providerCalls += 1;
+        if (providerCalls === 1) {
+          yield { kind: 'text', chunk: 'blind ' };
+          await sendHandler.call(
+            { userId: 'u1' }, 'identity-interject', 's-identity-interject',
+            'a mid-stream interjection',
+          );
+          yield { kind: 'text', chunk: 'reply' };
+          yield { kind: 'done', usage: { input: 1, output: 2 } };
+          return;
+        }
+        // The second Turn is underway: the interjection's wake link must have
+        // survived the first turn's wind-down — OWED, not pruned as answered.
+        linksAtSecondTurn = (await AgentSessions.findOneAsync('s-identity-interject'))
+          ?.pendingInputs as Array<{ seq: number }> | undefined;
+        yield { kind: 'text', chunk: 'interjection answered' };
+        yield { kind: 'done', usage: { input: 1, output: 2 } };
+      },
+    };
+    new Agent('identity-interject', {
+      model: 'mock', instructions: 'x', tools: [], provider: racing,
+      identity: { id: 'identity-interject-id' },
+    });
+
+    await seed('s-identity-interject', 'first message', 'identity-interject');
+    await AgentMemoryFrames.removeAsync({ sessionId: 's-identity-interject' } as any);
+    await runTurn(
+      's-identity-interject', buildRunConfig(getAgent('identity-interject')!, 'u1'),
+    );
+
+    // The interjection is answered EVENTUALLY — by the Activation-started
+    // second Turn, never in-turn — and the session must not go permanently
+    // idle with an unanswered user row.
+    await waitFor(
+      async () => {
+        const session = await AgentSessions.findOneAsync('s-identity-interject');
+        return (await AgentMessages.find(
+          { sessionId: 's-identity-interject', role: 'assistant' },
+        ).countAsync()) === 2
+          && session?.phase === 'idle' && !session.lease
+          && (session.pendingInputs?.length ?? 0) === 0;
+      },
+      'the interjection to be answered by a second Turn',
+    );
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-identity-interject' }, { sort: { seq: 1 } }).fetchAsync();
+    const interjection = msgs.find(
+      (m) => m.role === 'user' && m.content === 'a mid-stream interjection',
+    )!;
+    assert.isDefined(interjection, 'the mid-stream send must be committed');
+    const [first, second] = msgs.filter((m) => m.role === 'assistant');
+    assert.isAbove(
+      first.seq, interjection.seq,
+      'commit order lies: the blind reply outranks the interjection it never saw',
+    );
+    assert.isBelow(
+      first.answeredThrough!, interjection.seq,
+      'the blind reply must record the context it actually saw',
+    );
+    assert.equal(second.content, 'interjection answered');
+    assert.isAtLeast(
+      second.answeredThrough!, interjection.seq,
+      'the second Turn answers the interjection',
+    );
+    assert.isTrue(
+      linksAtSecondTurn?.some((link) => link.seq === interjection.seq),
+      'the interjection wake link must still be durable when the second Turn starts',
+    );
+    // TWO Frames prove two Turns: an in-turn continue would have answered the
+    // interjection under the first trigger's frozen Frame.
+    assert.deepEqual(
+      (await AgentMemoryFrames.find(
+        { sessionId: 's-identity-interject' }, { sort: { triggerSeq: 1 } },
+      ).fetchAsync()).map((frame) => frame.triggerSeq),
+      [0, interjection.seq],
+      'the interjection is answered under its own fresh Memory Frame',
+    );
+  });
+
   it('rejects send and interrupt against a session the caller does not own', async function () {
     this.timeout(30000);
     const { AgentSessions } = await import('../common/collections');
@@ -2660,6 +2763,95 @@ describe('approval gates', () => {
       'a call that never dispatched must not be billed a tool call',
     );
     assert.isUndefined(doc.pending, 'the marker clears once resolved');
+  });
+
+  it('a thrown canUse is an application failure, not a policy denial', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+
+    // The entitlement backend being DOWN is not the host denying the tool: a
+    // durable `not-allowed` would teach the model — and the published
+    // transcript — that the agent is not entitled to a tool nobody refused.
+    // The thrown check must land as a retryable `entitlement-unavailable`
+    // result instead, and a later attempt must be free to succeed.
+    await seed('s-canuse-throw', 'look this up');
+    const ran: string[] = [];
+    let checks = 0;
+    let call = 0;
+    await runTurn('s-canuse-throw', {
+      model: 'mock',
+      system: '',
+      tools: [{
+        name: 'lookup',
+        description: 'x',
+        args: { type: 'object', properties: {} },
+        run: async () => { ran.push('lookup'); return { found: true }; },
+      }],
+      provider: mockProvider(() => {
+        call += 1;
+        if (call === 1) return { toolCalls: [{ id: 'c1', name: 'lookup', args: {} }] };
+        if (call === 2) return { toolCalls: [{ id: 'c2', name: 'lookup', args: {} }] };
+        return { text: 'succeeded on retry' };
+      }),
+      canUse: async () => {
+        checks += 1;
+        if (checks === 1) throw new Error('entitlement backend down');
+        return true;
+      },
+    });
+
+    const msgs = await AgentMessages
+      .find({ sessionId: 's-canuse-throw' }, { sort: { seq: 1 } }).fetchAsync();
+    const failed = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'c1')!;
+    assert.isDefined(failed, 'the failed check must still answer its tool_use');
+    assert.equal(
+      failed.error!.error, 'entitlement-unavailable',
+      'a crash is an application failure, never the not-allowed policy denial',
+    );
+    assert.include(failed.error!.reason!, 'not a policy denial');
+    const retried = msgs.find((m) => m.role === 'tool' && m.toolCallId === 'c2')!;
+    assert.isDefined(retried, 'the retried call must be answered');
+    assert.isUndefined(retried.error, 'the retry succeeds once the check recovers');
+    assert.deepEqual(ran, ['lookup'], 'the tool runs exactly once — never under the failed check');
+    assert.deepEqual(unansweredToolUses(msgs), []);
+    assert.equal(msgs[msgs.length - 1].content, 'succeeded on retry');
+    // Same accounting a denial gets: the call that never dispatched is free.
+    const doc = (await AgentSessions.findOneAsync('s-canuse-throw'))!;
+    assert.equal(
+      (doc.budgetSpent as any).toolCalls, 1,
+      'only the dispatched retry is billed a tool call',
+    );
+
+    // The documented contract is boolean, but hosts predate the strict check:
+    // a truthy non-boolean return is honored as allowed, not refused.
+    await seed('s-canuse-truthy', 'look this up too');
+    const truthyRan: string[] = [];
+    let truthyCall = 0;
+    await runTurn('s-canuse-truthy', {
+      model: 'mock',
+      system: '',
+      tools: [{
+        name: 'lookup',
+        description: 'x',
+        args: { type: 'object', properties: {} },
+        run: async () => { truthyRan.push('lookup'); return { found: true }; },
+      }],
+      provider: mockProvider(() => {
+        truthyCall += 1;
+        return truthyCall === 1
+          ? { toolCalls: [{ id: 't1', name: 'lookup', args: {} }] }
+          : { text: 'done' };
+      }),
+      canUse: (() => 1) as any,
+    });
+    const truthyMsgs = await AgentMessages
+      .find({ sessionId: 's-canuse-truthy' }, { sort: { seq: 1 } }).fetchAsync();
+    const allowed = truthyMsgs.find((m) => m.role === 'tool' && m.toolCallId === 't1')!;
+    assert.deepEqual(truthyRan, ['lookup'], 'a truthy non-boolean canUse allows the tool');
+    assert.isDefined(allowed);
+    assert.isUndefined(allowed.error);
   });
 
   it('clamps a committed row error.reason to maxResultChars (L-ERRREASON)', async function () {

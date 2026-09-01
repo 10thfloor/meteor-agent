@@ -42,6 +42,15 @@ export {
 } from './memory';
 export { MEMORY_TOOL_NAMES } from './tools';
 export { LEARNING_TOOL_NAMES } from './learning-tools';
+// Learning governance: host-callable mutations (validation + idempotency keys
+// + structured errors in-package) and the reviewed publication allowlists.
+export {
+  hostLearningSource, assertLearningReviewTarget, assertPracticeTransitionEvidence,
+  governedConstitutionRevise, governedExperienceRetract, governedLearningReview,
+  governedPracticePropose, governedPracticeTransition,
+  LEARNING_PUBLICATION_VIEWS, createLearningPublisher,
+  type GovernedPracticeProposal, type LearningPublisher, type LearningSubscription,
+} from './learning-governance';
 export { resolveMemory } from './registry';
 export {
   AgentSessions, AgentMessages, AgentDeltas, AgentMemories,
@@ -211,7 +220,32 @@ function warnUncappedAgents(settings: any): void {
   );
 }
 
+let startupResolve: () => void;
+let startupReject: (error: unknown) => void;
+/** Settles when the startup prelude — capped collections, indexes, erasure
+ *  recovery, publications, and methods — has completed (or rejects with the
+ *  failure). The mocha runner does not wait for `Meteor.startup` callbacks,
+ *  so test entries MUST await this before any suite touches a method; hosts
+ *  that probe readiness may await it too. */
+export const startupComplete: Promise<void> = new Promise((resolve, reject) => {
+  startupResolve = resolve;
+  startupReject = reject;
+});
+// The rejection reaches awaiters; this no-op keeps a host that never awaits
+// from also logging an unhandled rejection on top of the startup throw.
+startupComplete.catch(() => {});
+
 Meteor.startup(async () => {
+  try {
+    await startupPrelude();
+    startupResolve();
+  } catch (error) {
+    startupReject(error);
+    throw error;
+  }
+});
+
+async function startupPrelude(): Promise<void> {
   // Synchronous — no tick between boot and deny where a client could slip past `insecure`.
   denyAllClientWrites();
 
@@ -258,4 +292,4 @@ Meteor.startup(async () => {
       egress.set(kind, startEgress(kind));
     }
   }
-});
+}

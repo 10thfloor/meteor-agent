@@ -6,7 +6,7 @@ import {
   ChannelBindings, ChannelVerdictTokens, DeliveryReceipts,
 } from './channels/collections';
 import { AttachmentDownloadTokens } from './downloads';
-import { AgentMemoryFrames } from './learning-collections';
+import { AgentExperiences, AgentMemoryFrames } from './learning-collections';
 import { isRunning } from './turn-state';
 import { discardTurn, locateBatch, UserMessageReservations } from './transcript';
 
@@ -43,29 +43,45 @@ export async function abandonPendingAgentTurns(
 ): Promise<AbandonedAgentTurns> {
   const toolCalls: string[] = [];
   const sessionIds = new Set<string>();
+  const selector = {
+    userId,
+    'pending.agent': agent,
+    erasingAt: { $exists: false },
+    purgingAt: { $exists: false },
+  };
   // Activation can change a phase between the read and the conditional fence.
   // Once the host's availability fence is durable that race is finite, so
   // repeat to a fixed point instead of silently declaring a missed candidate
   // clean. A storage failure throws and leaves the host cleanup receipt set.
   for (let pass = 0; pass < 40; pass += 1) {
     // eslint-disable-next-line no-await-in-loop
-    const candidates = await AgentSessions.find({
-      userId,
-      'pending.agent': agent,
-      erasingAt: { $exists: false },
-      purgingAt: { $exists: false },
-    }, {
-      fields: { _id: 1, phase: 1, pending: 1 },
+    const candidates = await AgentSessions.find(selector, {
+      fields: {
+        _id: 1, phase: 1, pending: 1, lease: 1,
+      },
       sort: { _id: 1 },
     }).fetchAsync();
     if (candidates.length === 0) {
       return { sessions: sessionIds.size, toolCalls };
     }
     let progressed = false;
+    let waitingOnCall = false;
 
     for (const candidate of candidates) {
       const pending = candidate.pending;
       if (!pending) continue;
+      // An approved call may be EXECUTING right now — phase 'calling', with
+      // `pending` cleared only after its result commits. Fencing it here
+      // would strip the lease and discard the transcript of a side effect
+      // that still completes. Wait while its worker's lease is live (the
+      // per-pass pause stretches, giving in-flight calls ~10s); a dead lease
+      // means the worker died mid-call and its commit is already impossible,
+      // so it is fenced like any other candidate.
+      if (candidate.phase === 'calling'
+        && candidate.lease && candidate.lease.until > new Date()) {
+        waitingOnCall = true;
+        continue;
+      }
       const at = new Date();
       // Include the observed phase and exact call identity. If activation or a
       // replacement park wins first, the next fixed-point pass adopts it.
@@ -113,11 +129,17 @@ export async function abandonPendingAgentTurns(
     if (!progressed) {
       // A resume already beyond its own atomic phase change is winding down.
       // Give its revoked Lease a bounded opportunity to observe the host
-      // fence; never spin forever inside an archive command.
+      // fence; never spin forever inside an archive command. An executing
+      // approved call gets the longer beat — 40 passes at 250ms is ~10s of
+      // patience before the archive gives up.
       // eslint-disable-next-line no-await-in-loop
-      await pause(POLL_MS);
+      await pause(waitingOnCall ? 250 : POLL_MS);
     }
   }
+  // The zero-check runs at the TOP of a pass — success achieved during the
+  // final pass must not read as failure.
+  const remaining = await AgentSessions.find(selector, { fields: { _id: 1 } }).countAsync();
+  if (remaining === 0) return { sessions: sessionIds.size, toolCalls };
   throw new Error('[10thfloor:agent] pending Agent turns did not quiesce');
 }
 
@@ -237,6 +259,13 @@ async function purge(rootId: string, rows: AgentSession[]): Promise<void> {
   // Experience, and Practice records. Delete Frames before Session rows so a
   // crash leaves the durable root fence available for an idempotent retry.
   await AgentMemoryFrames.removeAsync({ sessionId: { $in: ids } });
+  // Erasure symmetry: session-audience Experiences quote this conversation
+  // verbatim, no recall path can ever target a dead session key, and nothing
+  // else reaps them — an erase must not leave conversation-derived text
+  // behind in an unreachable partition.
+  await AgentExperiences.removeAsync(
+    { 'audience.scope': 'session', 'audience.key': { $in: ids } } as any,
+  );
 
   // Root last: a durable fence remains visible until every dependent store is
   // gone. Forks survive because lineage is not a parent relationship.

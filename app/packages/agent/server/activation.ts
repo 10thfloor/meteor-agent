@@ -7,6 +7,7 @@ import { getAgent, buildRunConfig, resolveBudget, memoryOpt } from './registry';
 import {
   resolveWakeAgent, unansweredAddressee, unansweredMessageAddressee,
 } from './participants';
+import { assistantAnswers } from '../common/participants';
 import { running } from './turn-state';
 import {
   beginSessionOperation, beginSessionTreeOperation,
@@ -98,7 +99,7 @@ async function inputState(session: AgentSession): Promise<InputState> {
         } else {
           answered.push(link);
         }
-      } else if (!lastAssistant || lastAssistant.seq < link.seq) {
+      } else if (!lastAssistant || !assistantAnswers(lastAssistant, link.seq)) {
         owed ??= { seq: link.seq, agent: session.agent };
       } else {
         answered.push(link);
@@ -124,7 +125,7 @@ async function inputState(session: AgentSession): Promise<InputState> {
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
   return {
-    owed: !lastAssistant || lastAssistant.seq < lastUser.seq
+    owed: !lastAssistant || !assistantAnswers(lastAssistant, lastUser.seq)
       ? { seq: lastUser.seq, agent: session.agent }
       : null,
     answered: [],
