@@ -338,8 +338,11 @@ describe('subagents', () => {
     await approve.call({ userId: 'u1' }, 'sub-parker-2', childId);
 
     await waitFor(
+      // Phase belongs in the condition: the final commit lands a beat before
+      // the wind-down idles the phase, and sampling between them is a race.
       async () => (await AgentMessages
-        .find({ sessionId: childId, role: 'assistant' }).countAsync()) === 2,
+        .find({ sessionId: childId, role: 'assistant' }).countAsync()) === 2
+        && (await AgentSessions.findOneAsync(childId))?.phase === 'idle',
       'the approved child to finish its own turn',
     );
 
