@@ -2,6 +2,7 @@ import { Random } from 'meteor/random';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import { DECIDED_PHASES, type ResolvedMemory } from '../common/types';
 import { memoryBlock, memoryHint } from './memory';
+import type { IdentityConfig, ResolvedExperience, ResolvedPractice } from '../common/learning';
 import {
   modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
   unroutedMention,
@@ -46,6 +47,10 @@ export { assembleContext, estimateContext, findCompactionCut } from './compactio
 import { dispatchCalls, resumeParkedTurn, type DispatchLimits } from './dispatch';
 import { activate, installTurnRunner } from './activation';
 import type { SessionQuery } from '../common/db';
+import {
+  LearningIntegrityError, prepareTurnLearning, type TurnLearningSnapshot,
+} from './learning-runtime';
+import { recordProviderRequestDigest } from './learning';
 
 // `runTurn` passes itself to `dispatchCalls`/`resumeParkedTurn` (see the RunTurn
 // note in `./dispatch`); `DispatchLimits` is the bundle it builds for them.
@@ -87,13 +92,26 @@ export interface RunConfig {
   /** §7's backstop: agent-level tool authorization, checked before gates and
    *  before dispatch. A refusal is a structured result the model reads and
    *  routes around — never a park, never a throw. */
-  canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
+  canUse?: (tool: string, ctx: {
+    userId: string | null;
+    sessionId: string;
+    /** Exact model arguments for this call. Optional preserves source
+     * compatibility for hosts that invoke an existing predicate directly. */
+    args?: unknown;
+    /** Stable provider tool-call id when the call came from a committed
+     * assistant batch. */
+    toolCallId?: string;
+  })
     => boolean | Promise<boolean>;
   /** Skills available to the `skill` loader tool. Absent = no loader. */
   skills?: Skill[];
   /** Durable recall (memory spec). Always the PRIMARY's config so every
    *  participant sees the same memory. Absent = disabled. */
   memory?: ResolvedMemory;
+  /** Stable Agent Identity and the settled episodic-learning policy. */
+  identity?: IdentityConfig;
+  experience?: ResolvedExperience;
+  practice?: ResolvedPractice;
 }
 
 function sleep(ms: number): Promise<void> {
@@ -177,6 +195,71 @@ export async function runTurn(
       // matching tool eligibility and reserves the names on every surface.
       const memoryForPrompt = config.memory && !entry.parent && !entry.ephemeral
         ? config.memory : undefined;
+      let learning: TurnLearningSnapshot | undefined;
+      if (config.identity) {
+        try {
+          learning = await prepareTurnLearning({
+            session: entry,
+            agentName: selfAgent,
+            identity: config.identity,
+            experience: config.experience,
+            practice: config.practice,
+            factMemory: memoryForPrompt,
+          });
+        } catch (learningError) {
+          console.error(
+            '[10thfloor:agent] the Agent Memory Frame could not be prepared:',
+            (learningError as Error)?.message ?? learningError,
+          );
+          if (entry.pending && !(learningError instanceof LearningIntegrityError)) {
+            // Only a changed-causes verdict may destroy a park. Anything
+            // else — a store read failure, an identity read hiccup — leaves
+            // the park and its recorded verdict as the repairable state.
+            // Activation latches an unchanged cause per drain, so the retry
+            // arrives with the watcher sweep or the next session activity;
+            // the pause bounds spin when a drain does re-attempt.
+            await sleep(1000);
+            return;
+          }
+          // A parked Turn may be recovering after its frozen Fact Memory
+          // EVIDENCE was edited or erased. Fail closed without leaving its
+          // approval marker immortal: fence the park and record the
+          // actionable restart state atomically, then discard the incomplete
+          // tool batch. The next user message gets a new trigger and
+          // therefore a fresh immutable Frame.
+          let pendingBatch: ReturnType<typeof locateBatch> = null;
+          if (entry.pending) {
+            const messages = await AgentMessages.find(
+              { sessionId }, { sort: { seq: 1 } },
+            ).fetchAsync();
+            pendingBatch = locateBatch(messages, entry.pending.toolCallId);
+          }
+          const errorSeq = await commitLeasedMessage(sessionId, {
+            _id: Random.id(), role: 'note', kind: 'error',
+            error: {
+              error: 'learning-unavailable',
+              reason: entry.pending
+                ? 'The Agent memory snapshot changed while this turn was waiting. Send the request again to restart with current memory.'
+                : 'The Agent identity and learning frame could not be prepared.',
+            },
+            createdAt: new Date(),
+          }, {
+            set: { phase: 'error' },
+            ...(entry.pending ? { unset: { pending: 1 as const } } : {}),
+            unlessStopped: true,
+          });
+          if (errorSeq !== null && pendingBatch) {
+            await discardTurn(
+              sessionId,
+              pendingBatch.assistant._id,
+              pendingBatch.assistant.seq,
+              (pendingBatch.assistant.toolCalls ?? []).map((call) => call.id),
+              pendingBatch.windowEnd,
+            );
+          }
+          return;
+        }
+      }
       // Discovery runs only after the exact Lease claim. One Prepared Runtime
       // owns both the dispatch catalog and provider schemas, including the
       // built-in name precedence, so those two views cannot drift.
@@ -190,6 +273,20 @@ export async function runTurn(
             agent: selfAgent,
           }
           : undefined,
+        learning: learning && (
+          config.experience || config.practice
+          || learning.frame.learningPolicy?.experienceRecording
+          || (learning.frame.learningPolicy?.experienceRecallLimit ?? 0) > 0
+          || (learning.frame.learningPolicy?.practiceAcquisition ?? 'disabled') !== 'disabled'
+        )
+          ? {
+            config: config.experience,
+            practice: config.practice,
+            agentId: learning.agentId,
+            frame: learning.frame,
+          }
+          : undefined,
+        reserveLearningNames: !!(config.experience || config.practice),
       });
       const { tools, schemas } = prepared;
       // Hint cached by user-row seq (§6) — recomputed only on interjection
@@ -238,6 +335,9 @@ export async function runTurn(
             sessionId, entry.pending, tools, entry.userId, selfAgent,
             config.budget, limits, runTurn,
             entry.participants?.length ? modelFrom(selfAgent) : undefined,
+            learning ? {
+              agentId: learning.agentId, memoryFrameId: learning.memoryFrameId,
+            } : undefined,
           );
           // 'parked' means the NEXT gate in the same batch is now waiting on a
           // human; 'abandoned' means the turn is gone. Either way the think
@@ -298,6 +398,12 @@ export async function runTurn(
         // committed seq but the row still supersedes the in-flight one.
         // Retries reuse msgSeq (only messageId changes per attempt).
         const msgSeq = session.nextSeq;
+        // Distinguishes THIS process's attempts from a pre-crash run's: the
+        // attempt counter restarts at zero on recovery, and the rebuilt
+        // request is not guaranteed byte-identical (roster, MCP tool order, a
+        // redeployed prompt), so a durable key reusing the counter would
+        // conflict at the paid-work boundary instead of recording truthfully.
+        const attemptRun = Random.id(8);
 
         let text = '';
         let thinking = '';
@@ -346,8 +452,8 @@ export async function runTurn(
             } : undefined);
             // Memory block (§6). Listing rebuilt per attempt so freshly saved
             // facts are immediately visible; hint is cached (see above).
-            let memoryText = '';
-            if (memoryForPrompt) {
+            let memoryText = learning?.factMemoryText ?? '';
+            if (memoryForPrompt && !learning) {
               if (memoryForPrompt.hints) {
                 const lastUser = [...history].reverse().find((m) => m.role === 'user');
                 if (lastUser && hintSeq !== lastUser.seq) {
@@ -375,7 +481,12 @@ export async function runTurn(
               sessionId,
               provider: config.provider,
               interruptCheckMs,
-              context: { agent: selfAgent, sessionId, purpose: 'think' },
+              context: {
+                agent: selfAgent, sessionId, purpose: 'think',
+                ...(learning ? {
+                  agentId: learning.agentId, memoryFrameId: learning.memoryFrameId,
+                } : {}),
+              },
               request: {
                 model: config.model,
                 // Participants block appended per iteration so roster changes
@@ -386,6 +497,26 @@ export async function runTurn(
                 messages: assembled,
                 tools: schemas,
               },
+              protectedSystem: learning?.protectedSystem,
+              onEffectiveRequest: learning
+                ? async (_request, digest) => {
+                  await recordProviderRequestDigest(
+                    learning!.memoryFrameId,
+                    digest,
+                    {
+                      kind: 'system',
+                      // The durable assistant commit slot survives process
+                      // restarts; the per-run nonce keeps a recovery's
+                      // attempt 0 from aliasing the pre-crash attempt 0 whose
+                      // rebuilt bytes may differ. Every attempt records; the
+                      // audit trail carries them all.
+                      key: `provider:${learning!.memoryFrameId}:${msgSeq}:${attemptRun}:${attemptIndex}`,
+                      sessionId,
+                      triggerSeq: learning!.triggerSeq,
+                    },
+                  );
+                }
+                : undefined,
               onChunk(chunk) {
                 if (chunk.kind === 'text') { text += chunk.chunk; writer.push('text', chunk.chunk); }
                 else if (chunk.kind === 'thinking') {
@@ -502,6 +633,12 @@ export async function runTurn(
 
         const commitSeq = await commitLeasedMessage(sessionId, {
           _id: messageId, role: 'assistant',
+          // What this reply actually answered: the newest user row the model
+          // SAW. A mid-stream interjection outranks it, so activation starts
+          // a fresh turn instead of classifying the interjection answered.
+          answeredThrough: history.reduce(
+            (max, m) => (m.role === 'user' && m.seq > max ? m.seq : max), 0,
+          ),
           content: text, thinking: thinking || undefined,
           toolCalls, usage,
           ...(staged.length > 0 ? { attachments: staged } : {}),
@@ -599,6 +736,10 @@ export async function runTurn(
                 return;
               }
             }
+            // A Memory Frame belongs to exactly one trigger. Let Activation
+            // start a new Turn so a same-Agent interjection cannot continue
+            // under the previous trigger's frozen causes.
+            if (learning) return;
             continue;
           }
           return;
@@ -612,6 +753,9 @@ export async function runTurn(
           messageId,
           assistantSeq: commitSeq,
           batchIds: callIds,
+          ...(learning ? {
+            agentId: learning.agentId, memoryFrameId: learning.memoryFrameId,
+          } : {}),
           ...(roster ? { from: modelFrom(selfAgent) } : {}),
         }, config.budget, limits, runTurn);
         // A park exits the turn with the batch deliberately unanswered; an

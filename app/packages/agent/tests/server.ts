@@ -1,3 +1,13 @@
+import { startupComplete } from 'meteor/10thfloor:agent';
+
+// The mocha runner does not wait for Meteor.startup callbacks, so on a slow
+// boot the early suites race method/publication registration — the exact
+// startup race that broke CI. Every suite waits behind the prelude.
+before(async function awaitPackageStartup() {
+  this.timeout(120_000);
+  await startupComplete;
+});
+
 import './smoke.test';
 import './merge.test';
 import './loader.test';
@@ -28,5 +38,7 @@ import './media.test';
 import './downloads.test';
 import './multimodal.test';
 import './memory.test';
+import './learning.test';
+import './learning-loop.test';
 import './perf.test';
 import './integration.server';

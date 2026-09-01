@@ -1,4 +1,5 @@
 import { type ResolvedMemory } from '../common/types';
+import type { IdentityConfig, ResolvedExperience, ResolvedPractice } from '../common/learning';
 import type { Provider } from './providers/types';
 import type { Skill, ToolSpec } from './tools';
 export { classifyProviderError } from './turn-state';
@@ -60,12 +61,22 @@ export interface RunConfig {
     canUse?: (tool: string, ctx: {
         userId: string | null;
         sessionId: string;
+        /** Exact model arguments for this call. Optional preserves source
+         * compatibility for hosts that invoke an existing predicate directly. */
+        args?: unknown;
+        /** Stable provider tool-call id when the call came from a committed
+         * assistant batch. */
+        toolCallId?: string;
     }) => boolean | Promise<boolean>;
     /** Skills available to the `skill` loader tool. Absent = no loader. */
     skills?: Skill[];
     /** Durable recall (memory spec). Always the PRIMARY's config so every
      *  participant sees the same memory. Absent = disabled. */
     memory?: ResolvedMemory;
+    /** Stable Agent Identity and the settled episodic-learning policy. */
+    identity?: IdentityConfig;
+    experience?: ResolvedExperience;
+    practice?: ResolvedPractice;
 }
 /** Full jitter to prevent lockstep retries after a provider-wide failure. */
 export declare function backoffDelay(attemptIndex: number, baseMs: number, maxDelayMs: number): number;

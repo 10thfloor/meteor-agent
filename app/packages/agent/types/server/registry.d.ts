@@ -1,7 +1,12 @@
 import { type MemoryConfig, type ResolvedMemory } from '../common/types';
+import type { ExperienceConfig, IdentityConfig, PracticeConfig } from '../common/learning';
 import type { Provider } from './providers/types';
 import { type Skill, type ToolSpec } from './tools';
 import type { RunConfig } from './loop';
+/** Stable identity configuration supplied by application code. The runtime
+ * registry name is authoritative and is added by `buildRunConfig`; making it a
+ * second configurable field would let the two names drift. */
+export type AgentIdentityConfig = Omit<IdentityConfig, 'name'>;
 export interface AgentConfig {
     /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
      *  custom `provider` gives the string its own meaning. */
@@ -14,6 +19,16 @@ export interface AgentConfig {
      *  no memory tools, no standing block, and no writes — today's behavior,
      *  bit-for-bit. */
     memory?: MemoryConfig;
+    /** Durable continuity for Constitution, Experience, Practice, and Frames.
+     * `id` must remain stable when display name, model, Team, or instructions
+     * change. Omit to disable those identity-owned layers; independently
+     * configured Fact Memory is unaffected. */
+    identity?: AgentIdentityConfig;
+    /** Agent-owned episodic learning. Requires `identity`; `true` enables the
+     * gated proposal Tool and bounded on-demand recall with safe defaults. */
+    experience?: ExperienceConfig;
+    /** Opt-in Agent-authored Practice candidates and their validation policy. */
+    practice?: PracticeConfig;
     /** On-demand prompt fragments: listed by name/description in the system
      *  prompt, full content loaded via the skill tool only when needed. */
     skills?: Skill[];
@@ -68,10 +83,7 @@ export interface AgentConfig {
     maxToolArgBytes?: number;
     /** §7 backstop: agent-level tool gate, checked before dispatch AND parking
      *  so a forbidden tool never reaches a human for approval. */
-    canUse?: (tool: string, ctx: {
-        userId: string | null;
-        sessionId: string;
-    }) => boolean | Promise<boolean>;
+    canUse?: RunConfig['canUse'];
     /** Who may answer a gate:'ask' approval, on top of the ownership check.
      *  Omit and the session owner decides; false refuses with 'not-allowed'. */
     approve?: (ctx: {

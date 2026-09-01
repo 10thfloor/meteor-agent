@@ -2,6 +2,9 @@ import {
   MEMORY_MAX_APP_DEFAULT, MEMORY_MAX_DEFAULT, MEMORY_SCOPES,
   type MemoryConfig, type MemoryScope, type ResolvedMemory,
 } from '../common/types';
+import type {
+  ExperienceConfig, IdentityConfig, PracticeConfig, ResolvedExperience, ResolvedPractice,
+} from '../common/learning';
 import type { Provider } from './providers/types';
 import {
   assertMemoryNamesFree, validateSkills, type Skill, type ToolSpec,
@@ -9,6 +12,13 @@ import {
 import { ensureMemoryMethods } from './memory-methods';
 import type { RunConfig } from './loop';
 import { piAiProvider } from './providers/piai';
+import { resolveExperienceConfig, resolvePracticeConfig } from './learning';
+import { assertLearningNamesFree } from './learning-tools';
+
+/** Stable identity configuration supplied by application code. The runtime
+ * registry name is authoritative and is added by `buildRunConfig`; making it a
+ * second configurable field would let the two names drift. */
+export type AgentIdentityConfig = Omit<IdentityConfig, 'name'>;
 
 export interface AgentConfig {
   /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
@@ -20,6 +30,16 @@ export interface AgentConfig {
    *  no memory tools, no standing block, and no writes — today's behavior,
    *  bit-for-bit. */
   memory?: MemoryConfig;
+  /** Durable continuity for Constitution, Experience, Practice, and Frames.
+   * `id` must remain stable when display name, model, Team, or instructions
+   * change. Omit to disable those identity-owned layers; independently
+   * configured Fact Memory is unaffected. */
+  identity?: AgentIdentityConfig;
+  /** Agent-owned episodic learning. Requires `identity`; `true` enables the
+   * gated proposal Tool and bounded on-demand recall with safe defaults. */
+  experience?: ExperienceConfig;
+  /** Opt-in Agent-authored Practice candidates and their validation policy. */
+  practice?: PracticeConfig;
   /** On-demand prompt fragments: listed by name/description in the system
    *  prompt, full content loaded via the skill tool only when needed. */
   skills?: Skill[];
@@ -63,8 +83,7 @@ export interface AgentConfig {
   maxToolArgBytes?: number;
   /** §7 backstop: agent-level tool gate, checked before dispatch AND parking
    *  so a forbidden tool never reaches a human for approval. */
-  canUse?: (tool: string, ctx: { userId: string | null; sessionId: string })
-    => boolean | Promise<boolean>;
+  canUse?: RunConfig['canUse'];
   /** Who may answer a gate:'ask' approval, on top of the ownership check.
    *  Omit and the session owner decides; false refuses with 'not-allowed'. */
   approve?: (ctx: { userId: string | null }) => boolean | Promise<boolean>;
@@ -320,9 +339,50 @@ export function defineAgent(name: string, config: AgentConfig): void {
   assertPricing(config.pricing);
   validateSkills(config.skills);
   const memory = resolveMemory(config.memory);
+  const experience = resolveExperienceConfig(config.experience);
+  const practice = resolvePracticeConfig(config.practice);
+  if ((experience || practice) && !config.identity) {
+    throw new Error(
+      '[10thfloor:agent] `experience` and `practice` require an explicit stable `identity.id`; '
+      + 'a registry name is a runtime handle, not durable identity.',
+    );
+  }
+  if (config.identity) {
+    const { id, displayName, aliases, flexibility, constitution } = config.identity;
+    if (typeof id !== 'string' || !/^[A-Za-z0-9._-]{1,128}$/.test(id)) {
+      throw new Error('[10thfloor:agent] identity.id must be a stable 1-128 character id');
+    }
+    if (displayName !== undefined
+      && (typeof displayName !== 'string' || !displayName.trim() || displayName.length > 128)) {
+      throw new Error('[10thfloor:agent] identity.displayName must be 1-128 characters');
+    }
+    if (aliases !== undefined && (!Array.isArray(aliases)
+      || aliases.some((alias) => typeof alias !== 'string'
+        || !alias.trim() || alias.length > 128))) {
+      throw new Error('[10thfloor:agent] identity.aliases must contain 1-128 character names');
+    }
+    if (flexibility !== undefined && (!Number.isInteger(flexibility)
+      || flexibility < 0 || flexibility > 1000)) {
+      throw new Error('[10thfloor:agent] identity.flexibility must be an integer from 0-1000');
+    }
+    if (constitution !== undefined && (typeof constitution !== 'string'
+      || !constitution.trim() || constitution.length > 2_000)) {
+      throw new Error('[10thfloor:agent] identity.constitution must be 1-2000 characters');
+    }
+    const collision = [...registry.entries()].find(([registeredName, registered]) => (
+      registeredName !== name && registered.identity?.id === id
+    ));
+    if (collision) {
+      throw new Error(
+        `[10thfloor:agent] identity.id "${id}" is already used by Agent "${collision[0]}"; `
+        + 'a clone or second registry Agent needs a distinct stable identity id',
+      );
+    }
+  }
   // The three model-facing names are reserved the way SKILL_TOOL_NAME is: a
   // collision is decidable here, at define time, where the operator can see it.
   if (memory) assertMemoryNamesFree(config.tools);
+  if (experience || practice) assertLearningNamesFree(config.tools);
   registry.set(name, config);
   // Registering the UI caps is LATCHED, not per-agent: Meteor.methods throws
   // on a duplicate name and defineAgent is re-entrant (hot reload redefines
@@ -361,12 +421,26 @@ export function buildRunConfig(
   config: AgentConfig, userId: string | null,
   opts?: { agentName?: string; budget?: ResolvedBudget; memory?: ResolvedMemory },
 ): RunConfig {
+  const registeredName = opts?.agentName ?? [...registry.entries()]
+    .find(([, candidate]) => candidate === config)?.[0];
+  if (config.identity && !registeredName) {
+    throw new Error(
+      '[10thfloor:agent] an identity-enabled RunConfig must come from a registered Agent',
+    );
+  }
+  const experience: ResolvedExperience | undefined = resolveExperienceConfig(config.experience);
+  const practice: ResolvedPractice | undefined = resolvePracticeConfig(config.practice);
   return {
     model: config.model,
     system: buildSystemPrompt(config, { userId }),
     tools: config.tools ?? [],
     provider: resolveProvider(config.provider),
     ...(opts?.agentName !== undefined ? { agentName: opts.agentName } : {}),
+    ...(config.identity ? {
+      identity: { ...config.identity, name: registeredName! },
+    } : {}),
+    ...(experience ? { experience } : {}),
+    ...(practice ? { practice } : {}),
     maxIterations: config.maxIterations,
     budget: opts?.budget ?? resolveBudget(config.budget),
     pricing: config.pricing,

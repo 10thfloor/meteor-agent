@@ -340,9 +340,11 @@ describe('manual compaction (Agent.compact)', () => {
     const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
     await approve.call({ userId: 'u1', unblock() {} }, 'compact-park', 's-compact-park');
     await waitFor(
+      // Phase belongs in the condition: the final commit lands a beat before
+      // the wind-down idles the phase, and sampling between them is a race.
       async () => !!(await AgentMessages.findOneAsync(
         { sessionId: 's-compact-park', role: 'assistant', content: 'all done' } as any,
-      )),
+      )) && (await AgentSessions.findOneAsync('s-compact-park'))?.phase === 'idle',
       'the approved turn to resume and finish',
     );
     assert.equal(toolRan, 1, 'the approved tool must run exactly once');

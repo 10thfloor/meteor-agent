@@ -12,7 +12,8 @@ Meteor 3.5+ · [MIT](LICENSE)
 [Constellation](#constellation) ·
 [Quick start](#quick-start) · [Why Meteor?](#why-this-exists) ·
 [Tools](#tools--five-kinds) · [Durability](#durability) ·
-[Channels](#channels) · [API reference](app/packages/agent/README.md)
+[Learning](#agent-identity-and-experience) · [Channels](#channels) ·
+[API reference](app/packages/agent/README.md)
 
 ## Constellation
 
@@ -399,7 +400,7 @@ Support.define({
 The model sees a `## Skills` listing and a `skill` tool. It calls the tool to
 load the content it needs for the current question.
 
-## Memory
+## Fact Memory
 
 Agents that remember — the person, and the work. It is a Mongo collection, so
 your UI can show the user exactly what is stored and let them delete it.
@@ -412,8 +413,9 @@ Support.define({ model, instructions, memory: true });
 Three tools appear (`memory_save`, `memory_search`, `memory_forget`) and a
 compact listing of what is remembered rides the system prompt — titles only, so
 ten memories cost ten lines and the details arrive through a tool call the
-transcript records. Memory is keyed by **user**, not by agent, so every model in
-a session shares one store: what `support` learns, `analyst` recalls.
+transcript records. With the default `memory: true` configuration, Fact Memory
+is keyed by **user**, so every model in a session shares one store: what
+`support` learns, `analyst` recalls.
 
 Facts about the *work* — true for every user — live in a shared pool that a
 human approves before it lands, and approves again before it is deleted:
@@ -443,7 +445,61 @@ await Meteor.callAsync('agent.memoryForget', { id });
 The client surface is deliberately narrower than the model's: approval gates
 run only inside the turn loop, so writing shared knowledge from a browser is
 refused outright. See the
-[memory spec](docs/superpowers/specs/2026-08-23-agent-memory-design.md).
+[Fact Memory design](docs/superpowers/specs/2026-08-23-agent-memory-design.md).
+
+## Agent identity and Experience
+
+The split is intentional: **Fact Memory is what the Agent knows. Practice is
+how the Agent gets good at the job. Constitution is how the Agent chooses to
+be.** Experience is the expectation-versus-observation evidence from which a
+Practice may be reviewed, and a Memory Frame is the exact causal receipt for
+one Turn. These are separate records because facts, competence, and character
+must not silently rewrite one another.
+
+```ts
+Support.define({
+  model,
+  instructions,
+  identity: {
+    id: 'support-agent-v1',       // keep stable across renames and model changes
+    displayName: 'Support',
+    constitution: 'Protect customer trust. State uncertainty.',
+    flexibility: 4,
+  },
+  experience: { record: true, recall: { recent: 8 }, approval: 'ask' },
+  practice: { acquire: true, approval: 'ask' },
+});
+```
+
+The conservative defaults remain attended: `experience_propose` asks before it
+records, and `practice_propose` leaves an inert candidate in Reviews.
+`experience.approval: 'auto'` records immediately for post-admission audit;
+`practice.approval: 'auto'` may validate an evidence-bound candidate as a
+reversible trial, but can never harden it. The two policies are independent.
+`experience_search` returns bounded active evidence. Each Experience records
+whether its expectation was `explicit`, `inferred`, or `retrospective`, so
+hindsight is visible instead of smuggled in as prediction.
+
+Validated and hardened Practices plus the active Constitution are frozen into
+a per-Agent, per-Session-trigger Memory Frame before provider work. Retries and
+approval resume adopt the same Frame; learning changes apply on the next Turn.
+The same identity layer applies to `Agent.ask()`: its Constitution and
+Practices shape the one-shot, while its Session-owned Frame and transcript are
+erased in `finally`. When Experience recall is enabled, its frozen evidence
+remains searchable. An ask-gated Experience proposal parks for an approval a
+headless caller cannot provide; automatic policy can admit it before cleanup,
+while `canUse` may still deny either route.
+
+Session erasure deletes its Frames but retains Agent-owned Constitution,
+Experience, and Practice. Archiving an Agent preserves that identity history
+while blocking new work.
+
+The package's `Agent.learning` Interface is server-only. Constellation layers a
+filtered owner-authorized publication, mutation methods, Agent learning tabs,
+and a Reviews queue on top. See the
+[primer](docs/agent-experience-primer.md) and
+[ADR 0001](docs/adr/0001-agent-experience-memory.md) and
+[ADR 0002](docs/adr/0002-automatic-learning-governance.md).
 
 ## Hooks
 

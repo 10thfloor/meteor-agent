@@ -90,6 +90,54 @@ const parkFixture = async (sessionId: string, childAgent: string) => {
 };
 
 describe('subagents', () => {
+  it('re-authorizes after awaited validation before creating a child', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { Agent } = await import('../server/agent');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { setToolArgsValidator } = await import('../server/tools');
+    let allowed = true;
+    let childRan = false;
+    new Agent('sub-revoked-during-validation', {
+      model: 'mock', instructions: '', tools: [],
+      provider: mockProvider(() => { childRan = true; return { text: 'must not run' }; }),
+    });
+    await seedRoot('s-sub-revoked-during-validation', 'revocation-parent');
+    const restore = setToolArgsValidator(async () => {
+      await Promise.resolve();
+      allowed = false;
+      return { ok: true };
+    });
+    try {
+      await runTurn('s-sub-revoked-during-validation', {
+        model: 'mock', system: '',
+        tools: [{
+          subagent: 'sub-revoked-during-validation',
+          description: 'Delegate',
+        }],
+        canUse: async () => allowed,
+        provider: await delegating('sub-revoked-during-validation'),
+      });
+      assert.isFalse(childRan);
+      assert.isUndefined(await AgentSessions.findOneAsync({
+        'parent.sessionId': 's-sub-revoked-during-validation',
+      } as any));
+      const row = await AgentMessages.findOneAsync({
+        sessionId: 's-sub-revoked-during-validation',
+        role: 'tool',
+      } as any);
+      assert.equal(row?.error?.error, 'not-allowed');
+      assert.equal(
+        (await AgentSessions.findOneAsync('s-sub-revoked-during-validation'))
+          ?.budgetSpent.toolCalls,
+        0,
+      );
+    } finally {
+      restore();
+    }
+  });
+
   it('runs a child session that persists, with lineage, and answers the parent', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');
@@ -290,8 +338,11 @@ describe('subagents', () => {
     await approve.call({ userId: 'u1' }, 'sub-parker-2', childId);
 
     await waitFor(
+      // Phase belongs in the condition: the final commit lands a beat before
+      // the wind-down idles the phase, and sampling between them is a race.
       async () => (await AgentMessages
-        .find({ sessionId: childId, role: 'assistant' }).countAsync()) === 2,
+        .find({ sessionId: childId, role: 'assistant' }).countAsync()) === 2
+        && (await AgentSessions.findOneAsync(childId))?.phase === 'idle',
       'the approved child to finish its own turn',
     );
 

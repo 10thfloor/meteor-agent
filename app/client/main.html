@@ -50,7 +50,7 @@
           </button>
         </div>
         <div class="rail-bottom">
-          <button class="avatar-button" id="profile-button" type="button" aria-label="Local workspace account" title="Local workspace account">
+          <button class="avatar-button" id="profile-button" type="button" aria-label="Local workspace account" title="Local workspace account" aria-haspopup="dialog" aria-controls="account-dialog">
             <span class="account-avatar" aria-hidden="true">
               <svg viewBox="0 0 20 20"><circle cx="10" cy="7" r="3"/><path d="M4.75 16c.5-3 2.25-4.5 5.25-4.5s4.75 1.5 5.25 4.5"/></svg>
             </span>
@@ -81,8 +81,8 @@
         <div class="sidebar-foot">
           <div class="continuity-card">
             <div class="continuity-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
-            <div><strong>Session continuity</strong><span id="continuity-state">Enabled</span></div>
-            <button type="button" id="configure-continuity" aria-label="Configure session continuity" data-loading="false">→</button>
+            <div><strong>Resume this mission</strong><span id="continuity-state">Enabled</span></div>
+            <button type="button" id="configure-continuity" aria-label="Configure mission resume" data-loading="false">→</button>
           </div>
         </div>
       </aside>
@@ -100,16 +100,24 @@
             <div class="mission-actions">
               <button class="toolbar-button" id="configure-mission" type="button" title="Configure mission" aria-haspopup="dialog" aria-controls="mission-dialog" data-loading="false" data-loading-label="Loading">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h8M15 5h2M3 10h2M9 10h8M3 15h6M13 15h4"/><circle cx="13" cy="5" r="2"/><circle cx="7" cy="10" r="2"/><circle cx="11" cy="15" r="2"/></svg>
-                Configure
+                Mission settings
               </button>
-              <button class="toolbar-button" id="fork-mission" type="button" title="Branch this mission" data-loading="false" data-loading-label="Forking">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="14" cy="5" r="2"/><circle cx="10" cy="15" r="2"/><path d="M6 7v1.5c0 2 4 2 4 4.5M14 7v1.5c0 2-4 2-4 4.5"/></svg>
-                Fork
-              </button>
-              <button class="toolbar-button" id="compact-mission" type="button" title="Compact the session context" data-loading="false" data-loading-label="Compacting">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3v5H2M15 3v5h3M5 17v-5H2M15 17v-5h3"/><path d="m2 8 5-5M18 8l-5-5M2 12l5 5M18 12l-5 5"/></svg>
-                Compact
-              </button>
+              <details class="mission-more-actions" id="mission-more-actions">
+                <summary class="toolbar-button" id="mission-more-trigger" role="button" tabindex="0" aria-label="More mission actions" aria-haspopup="menu" aria-controls="mission-more-menu" aria-expanded="false" title="More mission actions">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="4" cy="10" r="1"/><circle cx="10" cy="10" r="1"/><circle cx="16" cy="10" r="1"/></svg>
+                  More
+                </summary>
+                <div class="mission-more-menu" id="mission-more-menu" role="menu">
+                  <button class="toolbar-button" id="fork-mission" type="button" role="menuitem" title="Create a new mission from this point" data-loading="false" data-loading-label="Forking">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="6" cy="5" r="2"/><circle cx="14" cy="5" r="2"/><circle cx="10" cy="15" r="2"/><path d="M6 7v1.5c0 2 4 2 4 4.5M14 7v1.5c0 2-4 2-4 4.5"/></svg>
+                    Fork mission
+                  </button>
+                  <button class="toolbar-button" id="compact-mission" type="button" role="menuitem" title="Reduce this mission's saved context" data-loading="false" data-loading-label="Reducing">
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3v5H2M15 3v5h3M5 17v-5H2M15 17v-5h3"/><path d="m2 8 5-5M18 8l-5-5M2 12l5 5M18 12l-5 5"/></svg>
+                    Reduce context
+                  </button>
+                </div>
+              </details>
               <button class="toolbar-button icon-only active" id="toggle-inspector" type="button" aria-label="Toggle inspector" title="Toggle inspector">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M12.5 3v14"/></svg>
               </button>
@@ -186,7 +194,7 @@
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
                   <section class="inspector-section">
-                    <div class="section-heading"><span>MISSION CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button></span></div>
+                    <div class="section-heading"><span>MISSION CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention">Reviews <b id="mission-reviews-count">0</b></button><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button></span></div>
                     <div class="crew-subsection">
                       <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
                       <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
@@ -238,7 +246,7 @@
             <div class="control-stat"><span>Next</span><strong id="pulse-next-run">—</strong></div>
           </div>
           <div class="resource-toolbar">
-            <span>Pulses</span>
+            <span>Show</span>
             <div class="segmented" role="group" aria-label="Filter pulses">
               <button class="active" type="button" data-pulse-filter="all">All</button>
               <button type="button" data-pulse-filter="active">Active</button>
@@ -252,9 +260,21 @@
           <header class="page-header">
             <div><p class="eyebrow page-scope">Workspace</p><h2>Memory</h2></div>
           </header>
+          <nav class="memory-hub-nav" id="memory-hub-nav" aria-label="Memory sections">
+            <span class="memory-hub-item active" id="memory-facts-current" aria-current="page">
+              <span><strong>Facts</strong><small>Personal + shared work</small></span>
+            </span>
+            <button class="memory-hub-item" id="memory-open-agent-learning" type="button" aria-controls="crew-dialog">
+              <span><strong>Agent learning</strong><small>Experience · Practices · Frames</small></span>
+            </button>
+            <button class="memory-hub-item" id="memory-open-reviews" type="button" aria-controls="crew-dialog">
+              <span><strong>Reviews</strong><small>Approval + audit</small></span>
+              <b id="memory-reviews-count" aria-live="polite">0</b>
+            </button>
+          </nav>
           <div class="memory-layout">
             <aside class="memory-summary">
-              <span class="green-label">SAVED MEMORIES</span>
+              <span class="green-label">FACTS</span>
               <div class="memory-scope-stat"><span>Personal</span><strong id="personal-memory-count">0</strong></div>
               <div class="memory-scope-stat"><span>Shared work</span><strong id="work-memory-count">0</strong></div>
             </aside>
@@ -419,6 +439,7 @@
     </div>
     <div class="command-group"><span>Actions</span>
       <button type="button" data-command="new"><i>＋</i><span><strong>New mission</strong></span><kbd>⌘ N</kbd></button>
+      <button type="button" data-command="reviews"><i>✓</i><span><strong>Learning reviews</strong><small id="command-reviews-count">0 items need attention</small></span></button>
     </div>
   </dialog>
 
@@ -434,6 +455,37 @@
       </div>
     </header>
     <div id="child-chat-mount" class="child-chat-mount" data-agent-state="loading" aria-busy="true"></div>
+  </dialog>
+
+  <dialog class="settings-dialog account-dialog" id="account-dialog" aria-labelledby="account-dialog-title">
+    <header>
+      <div><h2 id="account-dialog-title">Local workspace</h2><span class="settings-record-id">Owner account</span></div>
+      <button id="close-account-dialog" type="button" aria-label="Close local workspace details">×</button>
+    </header>
+    <div class="account-dialog-content">
+      <div class="account-dialog-identity">
+        <span class="account-dialog-avatar" aria-hidden="true">
+          <svg viewBox="0 0 20 20"><circle cx="10" cy="7" r="3"/><path d="M4.75 16c.5-3 2.25-4.5 5.25-4.5s4.75 1.5 5.25 4.5"/></svg>
+        </span>
+        <span><strong>You</strong><small>Local desktop owner</small></span>
+        <span class="account-dialog-state"><i></i> Signed in</span>
+      </div>
+      <dl class="account-runtime-details">
+        <div><dt>Authority</dt><dd>Workspace owner</dd></div>
+        <div><dt>Scope</dt><dd>This local workspace</dd></div>
+        <div><dt>Runtime</dt><dd id="account-runtime-value">Local runtime</dd></div>
+        <div><dt>Release</dt><dd id="account-release-value">RC1</dd></div>
+        <div><dt>Credential storage</dt><dd id="account-credential-value">Checking</dd></div>
+        <div><dt>Channels</dt><dd id="account-channel-value">0 active</dd></div>
+      </dl>
+      <p class="account-scope-note">Approvals and configuration apply to this workspace only.</p>
+    </div>
+    <footer class="settings-form-actions account-dialog-actions">
+      <button class="secondary-action" id="account-open-directory" type="button">Open directory</button>
+      <button class="secondary-action" id="account-open-channels" type="button">Configure channels</button>
+      <span></span>
+      <button class="primary-action" id="account-dialog-done" type="button">Done</button>
+    </footer>
   </dialog>
 
   <dialog class="settings-dialog settings-dialog-wide" id="mission-dialog" aria-labelledby="mission-dialog-title">
@@ -463,16 +515,16 @@
         <fieldset class="form-section mission-controls">
           <legend>Behavior</legend>
           <div class="mission-control-options">
-            <label class="mission-control-option"><input id="mission-config-auto-title" name="autoTitle" type="checkbox"><span><strong>Auto title</strong><small>Use the first operator message</small></span></label>
+            <label class="mission-control-option"><input id="mission-config-auto-title" name="autoTitle" type="checkbox"><span><strong>Auto title</strong><small>Use the first human message</small></span></label>
             <label class="mission-control-option"><input id="mission-config-continuity" name="continuity" type="checkbox"><span><strong>Restore after restart</strong><small>Reopen if this was your last mission</small></span></label>
-            <label class="mission-control-option"><input id="mission-config-approvals" name="approvals" type="checkbox"><span><strong>Require approval before publishing briefs</strong><small id="mission-config-approvals-hint">Atlas asks before each Publish brief call</small></span></label>
+            <label class="mission-control-option"><input id="mission-config-approvals" name="approvals" type="checkbox"><span><strong>Require approval for mission-controlled actions</strong><small id="mission-config-approvals-hint">Other tool approval policies stay unchanged</small></span></label>
             <label class="mission-control-option"><input id="mission-config-debug-traces" name="debugTraces" type="checkbox"><span><strong>Show debug traces</strong><small>Include raw tool payloads in transcripts</small></span></label>
           </div>
         </fieldset>
       </div>
       <footer class="settings-form-actions">
         <button id="archive-mission" class="danger-button" type="button" data-loading="false" data-loading-label="Saving">Complete mission</button>
-        <span id="mission-complete-effect" class="mission-destructive-hint">Stops work, pauses linked Pulses, and disables resume.</span>
+        <span class="form-action-context"><span id="mission-complete-effect" class="mission-destructive-hint">Stops work, pauses linked Pulses, and disables resume.</span><span class="form-save-status" id="mission-form-status" role="status" aria-live="polite">Saved</span></span>
         <button id="cancel-mission-edit" class="secondary-action" type="button">Cancel</button>
         <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save mission</button>
       </footer>
@@ -481,15 +533,17 @@
 
   <dialog class="crew-dialog" id="crew-dialog" aria-labelledby="crew-dialog-title">
     <header>
-      <div><p class="eyebrow">WORKSPACE</p><h2 id="crew-dialog-title">Crew directory</h2></div>
+      <div><p class="eyebrow">WORKSPACE</p><h2 id="crew-dialog-title">Directory</h2></div>
       <div class="crew-dialog-actions">
         <button class="header-primary-action" id="crew-new-person" type="button" aria-haspopup="dialog" aria-controls="crew-person-dialog">+ New person</button>
-        <button id="close-crew-dialog" type="button" aria-label="Close crew directory">×</button>
+        <button class="header-primary-action" id="crew-new-agent" type="button" aria-controls="crew-form" hidden>+ New agent</button>
+        <button id="close-crew-dialog" type="button" aria-label="Close directory">×</button>
       </div>
     </header>
-    <div class="crew-directory-tabs" role="tablist" aria-label="Crew type">
+    <div class="crew-directory-tabs" role="tablist" aria-label="Directory section">
       <button id="crew-directory-tab-people" type="button" data-crew-directory-tab="people" role="tab" aria-selected="false" aria-controls="crew-directory-panel-people" tabindex="-1">People <span id="crew-people-count">0</span></button>
       <button class="active" id="crew-directory-tab-agents" type="button" data-crew-directory-tab="agents" role="tab" aria-selected="true" aria-controls="crew-directory-panel-agents">Agents <span id="crew-settings-tab-count">0</span></button>
+      <button id="crew-directory-tab-reviews" type="button" data-crew-directory-tab="reviews" role="tab" aria-selected="false" aria-controls="crew-directory-panel-reviews" tabindex="-1">Reviews <span id="crew-reviews-count">0</span></button>
     </div>
     <section class="crew-directory-panel people-directory-panel" id="crew-directory-panel-people" data-crew-directory-panel="people" role="tabpanel" aria-labelledby="crew-directory-tab-people" hidden>
       <div class="people-directory-layout">
@@ -527,8 +581,7 @@
       <div class="crew-settings-layout">
         <aside class="crew-settings-sidebar">
           <div class="crew-settings-label"><span id="crew-settings-label">Agents</span><span id="crew-settings-count">0</span></div>
-          <div id="crew-settings-list" class="crew-settings-list" role="group" aria-labelledby="crew-settings-label"></div>
-          <button id="add-crew-agent" class="add-agent-button" type="button" data-loading="false" data-loading-label="Adding">+ Add agent</button>
+          <div id="crew-settings-list" class="crew-settings-list" role="listbox" aria-labelledby="crew-settings-label"></div>
         </aside>
         <form id="crew-form" class="crew-form" aria-busy="false">
           <div class="crew-form-scroll">
@@ -538,34 +591,139 @@
               <label class="crew-enabled"><input id="crew-enabled" type="checkbox"><span>Active</span></label>
             </div>
             <p class="crew-edit-state" id="crew-edit-state" role="status" aria-live="polite">Saved</p>
-            <div class="form-grid two">
-              <label><span>Name</span><input id="crew-name" name="displayName" type="text" maxlength="40" required></label>
-              <label><span>Role</span><input id="crew-role" name="role" type="text" maxlength="60" required></label>
-              <label><span>Avatar</span><input id="crew-avatar" name="avatar" type="text" maxlength="2" required></label>
-              <label><span>Color</span><select id="crew-color" name="color"><option value="amber">Amber</option><option value="blue">Blue</option><option value="green">Green</option><option value="red">Red</option><option value="violet">Violet</option><option value="steel">Steel</option></select></label>
+            <div class="agent-learning-stats" id="agent-learning-stats" aria-label="Agent learning summary">
+              <span><strong id="agent-constitution-stat">—</strong><small>Constitution</small></span>
+              <span><strong id="agent-experience-stat">0</strong><small>Experience active</small></span>
+              <span><strong id="agent-practice-stat">0</strong><small>Practices active</small></span>
+              <span><strong id="agent-frame-stat">—</strong><small>Latest frame</small></span>
             </div>
-            <label class="form-field"><span>Instructions</span><textarea id="crew-instructions" name="instructions" rows="7" maxlength="4000" required></textarea></label>
-            <label class="form-field model-field" id="crew-model-field"><span>Model</span><select id="crew-model" name="model" aria-describedby="crew-model-hint" required><option value="default">Use workspace default</option></select><small id="crew-model-hint" class="model-field-hint" data-model-state="loading" aria-live="polite">Loading available models…</small></label>
-            <fieldset class="form-section">
-              <legend>Budget</legend>
-              <div class="form-grid three">
-                <label><span>Turns</span><input id="crew-turns" type="number" min="1" max="200" required></label>
-                <label><span>Tool calls</span><input id="crew-tool-calls" type="number" min="0" max="100" required></label>
-                <label><span>Spend cap</span><div class="money-input"><span>$</span><input id="crew-spend" type="number" min="0" max="100" step="0.25" required></div></label>
+            <div class="agent-detail-tabs" role="tablist" aria-label="Agent configuration">
+              <button class="active" id="agent-detail-tab-profile" type="button" data-agent-detail-tab="profile" role="tab" aria-selected="true" aria-controls="agent-detail-panel-profile">Profile</button>
+              <button id="agent-detail-tab-constitution" type="button" data-agent-detail-tab="constitution" role="tab" aria-selected="false" aria-controls="agent-detail-panel-constitution" tabindex="-1">Constitution</button>
+              <button id="agent-detail-tab-experience" type="button" data-agent-detail-tab="experience" role="tab" aria-selected="false" aria-controls="agent-detail-panel-experience" tabindex="-1">Experience <span id="agent-experience-count">0</span></button>
+              <button id="agent-detail-tab-practices" type="button" data-agent-detail-tab="practices" role="tab" aria-selected="false" aria-controls="agent-detail-panel-practices" tabindex="-1">Practices <span id="agent-practice-count">0</span></button>
+              <button id="agent-detail-tab-frames" type="button" data-agent-detail-tab="frames" role="tab" aria-selected="false" aria-controls="agent-detail-panel-frames" tabindex="-1">Frames <span id="agent-frame-count">0</span></button>
+            </div>
+            <div class="agent-learning-error" id="agent-learning-error" role="alert" hidden><span id="agent-learning-error-message"></span><button id="agent-learning-error-action" type="button" data-loading="false" data-loading-label="Retrying" hidden>Retry</button></div>
+            <div class="agent-learning-read-only" id="agent-learning-read-only" role="status" hidden><span>Archived · learning history is read-only.</span><button id="restore-crew-agent-learning" type="button" class="secondary-action" data-loading="false" data-loading-label="Restoring">Restore agent</button></div>
+
+            <section class="agent-detail-panel active" id="agent-detail-panel-profile" data-agent-detail-panel="profile" role="tabpanel" aria-labelledby="agent-detail-tab-profile">
+              <div class="form-grid two">
+                <label><span>Name</span><input id="crew-name" name="displayName" type="text" maxlength="40" required></label>
+                <label><span>Role</span><input id="crew-role" name="role" type="text" maxlength="60" required></label>
+                <label><span>Avatar</span><input id="crew-avatar" name="avatar" type="text" maxlength="2" required></label>
+                <label><span>Color</span><select id="crew-color" name="color"><option value="amber">Amber</option><option value="blue">Blue</option><option value="green">Green</option><option value="red">Red</option><option value="violet">Violet</option><option value="steel">Steel</option></select></label>
               </div>
-            </fieldset>
-            <fieldset class="form-section">
-              <legend>Capabilities</legend>
-              <div class="capability-checks">
-                <label><input id="crew-cap-inspect" type="checkbox"><span><strong>Workspace state</strong><small>inspect_workspace</small></span></label>
-                <label><input id="crew-cap-memory" type="checkbox"><span><strong>Memory</strong><small>Personal + shared</small></span></label>
-                <label><input id="crew-cap-publish" type="checkbox"><span><strong>Publish brief</strong><small>Approval gated</small></span></label>
+              <label class="form-field"><span>Instructions</span><textarea id="crew-instructions" name="instructions" rows="7" maxlength="4000" required></textarea></label>
+              <label class="form-field model-field" id="crew-model-field"><span>Model</span><select id="crew-model" name="model" aria-describedby="crew-model-hint" required><option value="default">Use workspace default</option></select><small id="crew-model-hint" class="model-field-hint" data-model-state="loading" aria-live="polite">Loading available models…</small></label>
+              <fieldset class="form-section">
+                <legend>Budget</legend>
+                <div class="form-grid three">
+                  <label><span>Turns</span><input id="crew-turns" type="number" min="1" max="200" required></label>
+                  <label><span>Tool calls</span><input id="crew-tool-calls" type="number" min="0" max="100" required></label>
+                  <label><span>Spend cap</span><div class="money-input"><span>$</span><input id="crew-spend" type="number" min="0" max="100" step="0.25" required></div></label>
+                </div>
+              </fieldset>
+              <fieldset class="form-section">
+                <legend>Capabilities</legend>
+                <div class="capability-checks">
+                  <label><input id="crew-cap-inspect" type="checkbox"><span><strong>Workspace state</strong><small>inspect_workspace</small></span></label>
+                  <label><input id="crew-cap-memory" type="checkbox"><span><strong>Fact memory</strong><small>Personal + shared work</small></span></label>
+                  <label><input id="crew-cap-publish" type="checkbox"><span><strong>Publish brief</strong><small>Approval gated</small></span></label>
+                </div>
+              </fieldset>
+              <fieldset class="form-section agent-learning-controls" aria-describedby="crew-learning-next-turn-note">
+                <legend>Learning</legend>
+                <div class="learning-policy-groups">
+                  <section class="learning-policy-group" id="experience-learning-settings" aria-labelledby="experience-learning-settings-title">
+                    <header><strong id="experience-learning-settings-title">Experience</strong><span>What the agent records and recalls</span></header>
+                    <div class="capability-checks learning-checks">
+                      <label><input id="crew-experience-record" type="checkbox" aria-describedby="crew-experience-record-hint" aria-controls="crew-experience-automatic"><span><strong>Capture new experience</strong><small id="crew-experience-record-hint">Agent can add Experience records</small></span></label>
+                      <label><input id="crew-experience-recall" type="checkbox" aria-describedby="crew-experience-recall-hint" aria-controls="crew-experience-recent"><span><strong>Use experience in turns</strong><small id="crew-experience-recall-hint">Recall is frozen for each turn</small></span></label>
+                    </div>
+                    <div class="capability-checks learning-policy-checks">
+                      <label id="crew-experience-automatic-control"><input id="crew-experience-automatic" type="checkbox" aria-describedby="crew-experience-automatic-hint"><span><strong>Save without prior approval</strong><small id="crew-experience-automatic-hint">Off: ask in chat before saving</small></span></label>
+                    </div>
+                    <div class="form-grid two learning-fields">
+                      <label><span>Scope</span><select id="crew-experience-scope" aria-describedby="crew-experience-scope-hint"><option value="owner">Workspace</option><option value="session">Chat only</option><option value="identity">Agent identity · global</option></select><small class="learning-field-hint" id="crew-experience-scope-hint">New turns · all workspace chats</small></label>
+                      <label><span>Recall limit</span><input id="crew-experience-recent" type="number" min="1" max="20" step="1" required aria-describedby="crew-experience-recent-hint"><small class="learning-field-hint" id="crew-experience-recent-hint">Most recent eligible records</small></label>
+                    </div>
+                  </section>
+                  <section class="learning-policy-group" id="practice-learning-settings" aria-labelledby="practice-learning-settings-title">
+                    <header><strong id="practice-learning-settings-title">Practices</strong><span>Reusable guidance learned from Experience</span></header>
+                    <div class="capability-checks learning-policy-checks">
+                      <label id="crew-practice-acquire-control"><input id="crew-practice-acquire" type="checkbox" aria-describedby="crew-practice-acquire-hint" aria-controls="crew-practice-automatic"><span><strong>Let agent propose practices</strong><small id="crew-practice-acquire-hint">Off: people can still propose Practices</small></span></label>
+                      <label id="crew-practice-automatic-control"><input id="crew-practice-automatic" type="checkbox" aria-describedby="crew-practice-automatic-hint" aria-controls="crew-practice-scoped-promotion"><span><strong>Start eligible proposals as trials</strong><small id="crew-practice-automatic-hint">Off: send agent proposals to Reviews</small></span></label>
+                      <label id="crew-practice-scoped-promotion-control" class="learning-policy-wide"><input id="crew-practice-scoped-promotion" type="checkbox" aria-describedby="crew-practice-scoped-promotion-hint"><span><strong>Allow workspace/chat evidence for agent-wide practices</strong><small id="crew-practice-scoped-promotion-hint">Required only when Experience is not agent-identity scoped</small></span></label>
+                    </div>
+                    <div class="learning-capacity-field">
+                      <label><span>Practice capacity</span><input id="crew-flexibility" type="number" min="0" max="1000" step="1" required aria-describedby="crew-flexibility-hint"></label>
+                      <p class="learning-control-hint" id="crew-flexibility-hint">Capacity unavailable</p>
+                    </div>
+                  </section>
+                </div>
+                <p class="learning-next-turn-note" id="crew-learning-next-turn-note">Changes apply on this agent’s next turn.</p>
+              </fieldset>
+            </section>
+
+            <section class="agent-detail-panel" id="agent-detail-panel-constitution" data-agent-detail-panel="constitution" role="tabpanel" aria-labelledby="agent-detail-tab-constitution" hidden>
+              <div class="learning-panel-state" id="constitution-loading" role="status"><span>Loading constitution…</span></div>
+              <div id="constitution-content" hidden>
+                <header class="learning-panel-header"><div><h3>Current constitution</h3><span id="constitution-version">No version</span></div><span class="learning-status" id="constitution-state">None</span></header>
+                <div class="constitution-current"><p id="constitution-current-body"></p></div>
+                <details class="learning-compose constitution-compose" id="constitution-compose">
+                  <summary class="learning-compose-summary"><span><strong>Revise constitution</strong><small id="constitution-draft-state">Publish a new version while preserving history.</small></span><i aria-hidden="true">+</i></summary>
+                  <div class="learning-compose-body">
+                    <label><span>New version</span><textarea id="constitution-body" maxlength="2000" rows="8"></textarea></label>
+                    <label><span>Reason</span><input id="constitution-reason" type="text" maxlength="500" placeholder="Required"></label>
+                    <div class="learning-compose-actions"><button class="primary-action" id="constitution-submit" type="button" data-loading="false" data-loading-label="Publishing">Publish version</button></div>
+                  </div>
+                </details>
+                <section class="learning-history"><header><h4>History</h4><span id="constitution-history-count">0 versions</span></header><div id="constitution-history-list" class="learning-list"></div></section>
               </div>
-            </fieldset>
+            </section>
+
+            <section class="agent-detail-panel" id="agent-detail-panel-experience" data-agent-detail-panel="experience" role="tabpanel" aria-labelledby="agent-detail-tab-experience" hidden>
+              <div class="learning-panel-state" id="experience-loading" role="status"><span>Loading experience…</span></div>
+              <div id="experience-content" hidden>
+                <header class="learning-panel-header"><div><h3>Experience</h3><span id="experience-summary">0 active</span></div><div class="learning-panel-policy"><span class="learning-policy-badge" id="experience-policy-badge">Approval required</span><button type="button" data-learning-configure="experience" aria-label="Configure Experience learning">Configure</button></div></header>
+                <div id="experience-list" class="learning-list" aria-live="polite"></div>
+              </div>
+            </section>
+
+            <section class="agent-detail-panel" id="agent-detail-panel-practices" data-agent-detail-panel="practices" role="tabpanel" aria-labelledby="agent-detail-tab-practices" hidden>
+              <div class="learning-panel-state" id="practices-loading" role="status"><span>Loading practices…</span></div>
+              <div id="practices-content" hidden>
+                <header class="learning-panel-header"><div><h3>Practices</h3><span id="practices-summary">0 active</span></div><div class="learning-panel-policy"><span class="learning-policy-badge" id="practice-policy-badge">Agent proposals off</span><button type="button" data-learning-configure="practice" aria-label="Configure Practice learning">Configure</button></div></header>
+                <details class="learning-compose practice-compose" id="practice-compose">
+                  <summary class="learning-compose-summary"><span><strong>New practice</strong><small id="practice-draft-state">Add reusable guidance from selected Experience.</small></span><i aria-hidden="true">+</i></summary>
+                  <div class="learning-compose-body">
+                    <div class="form-grid two">
+                      <label><span>Key</span><input id="practice-key" type="text" maxlength="128" placeholder="e.g. verify-before-publish"></label>
+                      <label><span>Context</span><input id="practice-context" type="text" maxlength="256" placeholder="e.g. publishing"></label>
+                    </div>
+                    <label><span>Trigger</span><input id="practice-trigger" type="text" maxlength="2000" placeholder="Condition"></label>
+                    <label><span>Guidance</span><textarea id="practice-guidance" maxlength="2000" rows="5"></textarea></label>
+                    <fieldset class="practice-evidence"><legend><span>Evidence</span><small id="practice-evidence-count">0 / 50 selected</small></legend><div id="practice-evidence-list"></div></fieldset>
+                    <p class="practice-scope-note" id="practice-scope-note" role="status" aria-live="polite">Promotion makes guidance Agent-identity-wide across every chat and owner using this identity.</p>
+                    <div class="learning-compose-actions"><button class="primary-action" id="practice-submit" type="button" data-loading="false" data-loading-label="Submitting">Propose practice</button></div>
+                  </div>
+                </details>
+                <div id="practice-list" class="learning-list" aria-live="polite"></div>
+              </div>
+            </section>
+
+            <section class="agent-detail-panel" id="agent-detail-panel-frames" data-agent-detail-panel="frames" role="tabpanel" aria-labelledby="agent-detail-tab-frames" hidden>
+              <div class="learning-panel-state" id="frames-loading" role="status"><span>Loading memory frames…</span></div>
+              <div id="frames-content" hidden>
+                <header class="learning-panel-header"><div><h3>Memory frames</h3><span id="memory-frame-count">No frames</span></div></header>
+                <div id="memory-frame-list" class="learning-list" aria-live="polite"></div>
+              </div>
+            </section>
           </div>
-          <footer class="crew-form-actions">
+          <footer class="crew-form-actions" id="crew-form-actions">
             <div class="crew-leading-action">
-              <button id="remove-crew-agent" class="danger-button" type="button" data-loading="false" data-loading-label="Removing">Remove</button>
+              <button id="archive-crew-agent" class="danger-button" type="button" data-loading="false" data-loading-label="Archiving">Archive</button>
               <span id="crew-primary-label" class="crew-primary-label" hidden>Primary agent · always active</span>
             </div>
             <span></span>
@@ -573,6 +731,22 @@
             <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save changes</button>
           </footer>
         </form>
+      </div>
+    </section>
+    <section class="crew-directory-panel reviews-directory-panel" id="crew-directory-panel-reviews" data-crew-directory-panel="reviews" role="tabpanel" aria-labelledby="crew-directory-tab-reviews" hidden>
+      <div class="reviews-directory-layout">
+        <header class="reviews-directory-header"><div><h3>Learning reviews</h3><span id="reviews-directory-summary">0 need attention</span></div></header>
+        <div class="learning-panel-state" id="reviews-loading" role="status"><span>Loading reviews…</span><button id="reviews-retry-learning" type="button" data-loading="false" data-loading-label="Retrying" hidden>Retry</button></div>
+        <div class="reviews-content" id="reviews-content" hidden>
+          <section class="reviews-section reviews-needs-section" aria-labelledby="reviews-needs-title">
+            <header><h4 id="reviews-needs-title">Needs attention</h4><span id="reviews-needs-count">0</span></header>
+            <div class="reviews-list" id="reviews-list" role="list" aria-live="polite"></div>
+          </section>
+          <section class="reviews-section reviews-recent-section" aria-labelledby="reviews-recent-title">
+            <header><h4 id="reviews-recent-title">Recent learning</h4><span id="reviews-recent-count">0</span></header>
+            <div class="reviews-list" id="reviews-recent-list" role="list"></div>
+          </section>
+        </div>
       </div>
     </section>
   </dialog>
@@ -640,15 +814,15 @@
     </form>
   </dialog>
 
-  <dialog class="settings-dialog crew-remove-dialog person-remove-dialog" id="person-remove-dialog" aria-labelledby="person-remove-title">
+  <dialog class="settings-dialog impact-dialog person-remove-dialog" id="person-remove-dialog" aria-labelledby="person-remove-title">
     <header>
       <div><h2 id="person-remove-title">Remove person?</h2><span>Workspace-wide change</span></div>
       <button id="close-person-remove" type="button" aria-label="Close person removal">×</button>
     </header>
-    <div class="crew-remove-content">
+    <div class="impact-dialog-content">
       <p id="person-remove-summary"></p>
-      <div id="person-remove-impact" class="crew-remove-impact"></div>
-      <p class="crew-remove-warning">They will lose access to every Mission listed here. This cannot be undone.</p>
+      <div id="person-remove-impact" class="impact-dialog-grid"></div>
+      <p class="impact-dialog-warning">They will lose access to every Mission listed here. This cannot be undone.</p>
     </div>
     <footer class="settings-form-actions">
       <span></span><span></span>
@@ -657,20 +831,20 @@
     </footer>
   </dialog>
 
-  <dialog class="settings-dialog crew-remove-dialog" id="crew-remove-dialog" aria-labelledby="crew-remove-title">
+  <dialog class="settings-dialog impact-dialog" id="crew-archive-dialog" aria-labelledby="crew-archive-title">
     <header>
-      <div><h2 id="crew-remove-title">Remove agent?</h2><span>Workspace-wide change</span></div>
-      <button id="close-crew-remove" type="button" aria-label="Close removal impact">×</button>
+      <div><h2 id="crew-archive-title">Archive agent?</h2><span>Workspace-wide change</span></div>
+      <button id="close-crew-archive" type="button" aria-label="Close archive impact">×</button>
     </header>
-    <div class="crew-remove-content">
-      <p id="crew-remove-summary"></p>
-      <div id="crew-remove-impact" class="crew-remove-impact"></div>
-      <p class="crew-remove-warning">This cannot be undone. Pulses using this agent will be disabled and reassigned to the primary agent.</p>
+    <div class="impact-dialog-content">
+      <p id="crew-archive-summary"></p>
+      <div id="crew-archive-impact" class="impact-dialog-grid"></div>
+      <p class="impact-dialog-warning">The Agent and learning can be restored. Mission, Skill, MCP, and Pulse assignments will stay detached.</p>
     </div>
     <footer class="settings-form-actions">
       <span></span><span></span>
-      <button id="cancel-crew-remove" class="secondary-action" type="button">Keep agent</button>
-      <button id="confirm-crew-remove" class="danger-button" type="button" data-loading="false" data-loading-label="Removing">Remove from workspace</button>
+      <button id="cancel-crew-archive" class="secondary-action" type="button">Keep agent</button>
+      <button id="confirm-crew-archive" class="danger-button" type="button" data-loading="false" data-loading-label="Archiving">Archive agent</button>
     </footer>
   </dialog>
 
@@ -696,11 +870,12 @@
           <label><span>Unit</span><select id="pulse-interval-unit"><option value="minutes">Minutes</option><option value="hours" selected>Hours</option><option value="days">Days</option></select></label>
         </div>
         <label class="form-field schedule-fields" id="pulse-cron-field" hidden><span>Cron expression</span><input id="pulse-cron" type="text" maxlength="120" placeholder="0 9 * * 1" autocomplete="off"><small>5 fields · local time</small></label>
+        <p class="pulse-schedule-preview" id="pulse-schedule-preview" data-tone="ready" role="status" aria-live="polite"></p>
         <label class="form-field"><span>Instructions</span><textarea id="pulse-prompt" rows="8" maxlength="8000" required></textarea></label>
       </div>
       <footer class="settings-form-actions">
         <button id="delete-pulse" class="danger-button" type="button" data-loading="false" data-loading-label="Deleting">Delete</button>
-        <span></span>
+        <span class="form-save-status" id="pulse-form-status" role="status" aria-live="polite">Not saved</span>
         <button id="cancel-pulse-edit" class="secondary-action" type="button">Cancel</button>
         <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save pulse</button>
       </footer>
@@ -817,9 +992,9 @@
       </div>
       <footer class="settings-form-actions mcp-form-actions">
         <button id="delete-mcp-server" class="danger-button" type="button" data-loading="false" data-loading-label="Deleting">Delete</button>
-        <span></span>
+        <span class="form-save-status" id="mcp-form-status" role="status" aria-live="polite">Not saved</span>
         <button id="cancel-mcp-edit" class="secondary-action" type="button">Cancel</button>
-        <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save server</button>
+        <button class="primary-action" id="mcp-submit" type="submit" data-loading="false" data-loading-label="Saving &amp; testing">Save &amp; test</button>
       </footer>
     </form>
   </dialog>
@@ -869,7 +1044,7 @@
       </div>
       <footer class="settings-form-actions">
         <button id="channel-clear" class="danger-button" type="button" data-loading="false" data-loading-label="Clearing">Clear credentials</button>
-        <button id="channel-test" class="secondary-action" type="button" data-loading="false" data-loading-label="Testing">Test saved connection</button>
+        <span class="form-action-context"><button id="channel-test" class="secondary-action" type="button" data-loading="false" data-loading-label="Testing">Test saved connection</button><span class="form-save-status" id="channel-form-status" role="status" aria-live="polite">Saved</span></span>
         <button id="cancel-channel-edit" class="secondary-action" type="button">Cancel</button>
         <button class="primary-action" id="channel-save" type="submit" data-loading="false" data-loading-label="Saving">Save connection</button>
       </footer>
@@ -931,5 +1106,5 @@
     </div>
   </section>
 
-  <div class="toast-region" id="toast-region" aria-live="polite"></div>
+  <div class="toast-region" id="toast-region" popover="manual" aria-live="polite"></div>
 </body>

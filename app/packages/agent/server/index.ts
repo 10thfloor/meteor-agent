@@ -23,17 +23,34 @@ import {
   resumeSessionErasures, startSessionLifecycleRecovery,
 } from './session-lifecycle';
 import { UserMessageReservations } from './transcript';
+import {
+  AgentConstitutions, AgentExperiences, AgentIdentities, AgentLearningEvents,
+  AgentMemoryFrames, AgentPractices,
+} from './learning-collections';
+import { ensureLearningIndexes } from './learning';
 
 export * from '../common/types';
+export * from '../common/learning';
 export { NAMES } from '../common/names';
 // Memory: core and types. App reaches the store via `Agent.memory`.
 export {
   saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint,
+  memoryBlockSnapshot, memoryHintSnapshot,
   readSelector,
   type SaveArgs, type SaveResult, type ForgetResult, type SearchRung,
   type ListedMemories,
 } from './memory';
 export { MEMORY_TOOL_NAMES } from './tools';
+export { LEARNING_TOOL_NAMES } from './learning-tools';
+// Learning governance: host-callable mutations (validation + idempotency keys
+// + structured errors in-package) and the reviewed publication allowlists.
+export {
+  hostLearningSource, assertLearningReviewTarget, assertPracticeTransitionEvidence,
+  governedConstitutionRevise, governedExperienceRetract, governedLearningReview,
+  governedPracticePropose, governedPracticeTransition,
+  LEARNING_PUBLICATION_VIEWS, createLearningPublisher,
+  type GovernedPracticeProposal, type LearningPublisher, type LearningSubscription,
+} from './learning-governance';
 export { resolveMemory } from './registry';
 export {
   AgentSessions, AgentMessages, AgentDeltas, AgentMemories,
@@ -41,6 +58,9 @@ export {
 export { mergeView } from '../common/merge';
 // `Agent.provider` / `Agent.compact` are the public doors; internals stay unexported.
 export { Agent, type AgentConfig, type SessionErasure } from './agent';
+export {
+  abandonPendingAgentTurns, type AbandonedAgentTurns,
+} from './session-lifecycle';
 export {
   validateToolArgs, setToolArgsValidator, defineAgentMethod,
   fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME,
@@ -169,6 +189,10 @@ function denyAllClientWrites(): void {
     AttachmentDownloadTokens,
     // Forged memory inserts would be prompt injection with a write primitive.
     AgentMemories,
+    // Learning state is authority-bearing prompt material. Browser mutation
+    // remains denied even when an app accidentally ships `insecure`.
+    AgentIdentities, AgentConstitutions, AgentExperiences,
+    AgentPractices, AgentMemoryFrames, AgentLearningEvents,
   ]) {
     (c as any).deny(deny);
   }
@@ -196,11 +220,40 @@ function warnUncappedAgents(settings: any): void {
   );
 }
 
+let startupResolve: () => void;
+let startupReject: (error: unknown) => void;
+/** Settles when the startup prelude — capped collections, indexes, erasure
+ *  recovery, publications, and methods — has completed (or rejects with the
+ *  failure). The mocha runner does not wait for `Meteor.startup` callbacks,
+ *  so test entries MUST await this before any suite touches a method; hosts
+ *  that probe readiness may await it too. */
+export const startupComplete: Promise<void> = new Promise((resolve, reject) => {
+  startupResolve = resolve;
+  startupReject = reject;
+});
+// The rejection reaches awaiters; this no-op keeps a host that never awaits
+// from also logging an unhandled rejection on top of the startup throw.
+startupComplete.catch(() => {});
+
 Meteor.startup(async () => {
+  try {
+    await startupPrelude();
+    startupResolve();
+  } catch (error) {
+    startupReject(error);
+    throw error;
+  }
+});
+
+async function startupPrelude(): Promise<void> {
   // Synchronous — no tick between boot and deny where a client could slip past `insecure`.
   denyAllClientWrites();
 
   await ensureCapped();
+  // Learning correctness depends on unique identity/revision/frame keys. Fail
+  // startup before methods/publications become reachable if Mongo cannot
+  // enforce them.
+  await ensureLearningIndexes();
   // Watcher sweeps and transcript reads depend on these indexes.
   await ensureIndexes();
   // A crash may leave only the root fence durable. Close its child graph
@@ -239,4 +292,4 @@ Meteor.startup(async () => {
       egress.set(kind, startEgress(kind));
     }
   }
-});
+}

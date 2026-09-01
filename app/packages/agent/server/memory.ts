@@ -1,5 +1,6 @@
 import { Random } from 'meteor/random';
 import { AgentMemories } from '../common/collections';
+import { isDuplicateKey } from './channels/collections';
 import {
   MEMORY_TEXT_MAX,
   type AgentMemory, type MemoryScope, type ResolvedMemory,
@@ -157,13 +158,6 @@ function isFilterPathError(e: unknown): boolean {
   const msg = String((e as Error)?.message ?? e ?? '').toLowerCase();
   return msg.includes('filter')
     && (msg.includes('path') || msg.includes('not indexed') || msg.includes('must be indexed'));
-}
-
-/** Mongo's duplicate-key signal, however the driver phrases it. */
-function isDuplicateKey(e: unknown): boolean {
-  const err = e as { code?: unknown; message?: unknown };
-  if (err?.code === 11000 || err?.code === 11001) return true;
-  return String(err?.message ?? '').includes('E11000');
 }
 
 /** Escape regex metacharacters — raw user text would otherwise SyntaxError. */
@@ -516,7 +510,8 @@ export async function forgetMemory(
           + 'an approved agent action or server-side.',
       };
     }
-  } else if (opts.userId === null || row.userId !== opts.userId) {
+  } else if (opts.userId === null || row.userId !== opts.userId
+    || (row.scope === 'agent' && row.agent !== opts.agent)) {
     // Not "not found": a row that exists but belongs to someone else must not
     // be distinguishable from one that never existed.
     return { ok: true, forgotten: false };
@@ -545,7 +540,23 @@ export async function memoryHint(
   query: string,
   opts: { userId: string | null; agent: string; config: ResolvedMemory },
 ): Promise<string[]> {
-  if (!opts.config.hints) return [];
+  return (await memoryHintSnapshot(query, opts)).titles;
+}
+
+export interface MemoryHintSnapshot {
+  titles: string[];
+  /** Exact source rows represented by the titles. A Memory Frame records
+   * these alongside standing-block rows so hint evidence is not invisible. */
+  rows: AgentMemory[];
+}
+
+/** Hint text and its evidence in one read. The legacy `memoryHint` Interface
+ * remains a title-only convenience wrapper. */
+export async function memoryHintSnapshot(
+  query: string,
+  opts: { userId: string | null; agent: string; config: ResolvedMemory },
+): Promise<MemoryHintSnapshot> {
+  if (!opts.config.hints) return { titles: [], rows: [] };
   const { minScore } = opts.config.hints;
   try {
     const rows = await searchMemory(query, { ...opts, limit: 3 });
@@ -555,34 +566,31 @@ export async function memoryHint(
       const score = (r as { score?: unknown }).score;
       return typeof score === 'number' ? score >= minScore : true;
     });
-    return scored.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`);
+    return {
+      titles: scored.map((r) => `${title(r.text)}${r.scope === 'app' ? ' (work)' : ''}`),
+      rows: scored,
+    };
   } catch {
     // Hints are best-effort — a failure here must never reach the turn.
-    return [];
+    return { titles: [], rows: [] };
   }
 }
 
-/** Render the memory block for the system prompt. Returns `''` when empty. */
-export async function memoryBlock(opts: {
-  userId: string | null;
-  agent: string;
-  config: ResolvedMemory;
-  /** Titles from the turn's cached hint, already computed. */
-  hint?: string[];
-}): Promise<string> {
-  // Guarded: an unguarded rejection here would be mis-classified as a
-  // provider failure and retried with backoff.
-  let listed: ListedMemories;
-  try {
-    listed = await listForBlock(opts.userId, opts.agent, opts.config);
-  } catch {
-    return '';
-  }
+export interface MemoryBlockSnapshot {
+  /** Exact frozen Fact Memory prompt fragment. */
+  text: string;
+  /** Exact rows represented by the standing listing. Hint-only search hits are
+   * intentionally not included because the hint carries titles, not row ids. */
+  rows: AgentMemory[];
+}
+
+function renderMemoryBlock(
+  opts: { userId: string | null; hint?: string[] },
+  listed: ListedMemories,
+): string {
   const lines: string[] = [];
 
   if (opts.userId === null) {
-    // Anonymous: no person store exists, and saying so is better than the
-    // model discovering it through a refused save.
     if (listed.work.length === 0) return '';
   } else if (listed.person.length > 0) {
     lines.push(`About this person (${listed.personTotal} remembered):`);
@@ -594,8 +602,6 @@ export async function memoryBlock(opts: {
   if (listed.work.length > 0) {
     lines.push(`About this work (${listed.workTotal} remembered):`);
     for (const r of listed.work) {
-      // Provenance is visible here on purpose: a colleague's approved fact
-      // reads as theirs, which is what makes shared knowledge legible.
       lines.push(`- ${title(r.text)} [learned by ${r.by}]`);
     }
   }
@@ -612,4 +618,37 @@ export async function memoryBlock(opts: {
     : 'Use memory_search to recall details, memory_save to remember something new.';
 
   return `\n\n## Memory\n${lines.join('\n')}\n${foot}`;
+}
+
+/** Read and render Fact Memory once so an Agent Experience Memory Frame can
+ * freeze both the prompt bytes and their durable evidence ids for a Turn. */
+export async function memoryBlockSnapshot(opts: {
+  userId: string | null;
+  agent: string;
+  config: ResolvedMemory;
+  /** Titles from the turn's cached hint, already computed. */
+  hint?: string[];
+}): Promise<MemoryBlockSnapshot> {
+  // Guarded: an unguarded rejection here would be mis-classified as a
+  // provider failure and retried with backoff.
+  let listed: ListedMemories;
+  try {
+    listed = await listForBlock(opts.userId, opts.agent, opts.config);
+  } catch {
+    return { text: '', rows: [] };
+  }
+  return {
+    text: renderMemoryBlock(opts, listed),
+    rows: [...listed.person, ...listed.work],
+  };
+}
+
+/** Render the memory block for the system prompt. Returns `''` when empty. */
+export async function memoryBlock(opts: {
+  userId: string | null;
+  agent: string;
+  config: ResolvedMemory;
+  hint?: string[];
+}): Promise<string> {
+  return (await memoryBlockSnapshot(opts)).text;
 }

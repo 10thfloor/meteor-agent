@@ -82,12 +82,40 @@ export declare function memoryHint(query: string, opts: {
     agent: string;
     config: ResolvedMemory;
 }): Promise<string[]>;
+export interface MemoryHintSnapshot {
+    titles: string[];
+    /** Exact source rows represented by the titles. A Memory Frame records
+     * these alongside standing-block rows so hint evidence is not invisible. */
+    rows: AgentMemory[];
+}
+/** Hint text and its evidence in one read. The legacy `memoryHint` Interface
+ * remains a title-only convenience wrapper. */
+export declare function memoryHintSnapshot(query: string, opts: {
+    userId: string | null;
+    agent: string;
+    config: ResolvedMemory;
+}): Promise<MemoryHintSnapshot>;
+export interface MemoryBlockSnapshot {
+    /** Exact frozen Fact Memory prompt fragment. */
+    text: string;
+    /** Exact rows represented by the standing listing. Hint-only search hits are
+     * intentionally not included because the hint carries titles, not row ids. */
+    rows: AgentMemory[];
+}
+/** Read and render Fact Memory once so an Agent Experience Memory Frame can
+ * freeze both the prompt bytes and their durable evidence ids for a Turn. */
+export declare function memoryBlockSnapshot(opts: {
+    userId: string | null;
+    agent: string;
+    config: ResolvedMemory;
+    /** Titles from the turn's cached hint, already computed. */
+    hint?: string[];
+}): Promise<MemoryBlockSnapshot>;
 /** Render the memory block for the system prompt. Returns `''` when empty. */
 export declare function memoryBlock(opts: {
     userId: string | null;
     agent: string;
     config: ResolvedMemory;
-    /** Titles from the turn's cached hint, already computed. */
     hint?: string[];
 }): Promise<string>;
 //# sourceMappingURL=memory.d.ts.map

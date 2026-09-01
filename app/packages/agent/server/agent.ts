@@ -32,6 +32,17 @@ import {
 } from './participants';
 import { eraseOwnedSession, type SessionErasure } from './session-lifecycle';
 import { createInitialTranscript } from './transcript';
+import {
+  auditLearningState, buildProtectedLearningPrompt, ensureAgentIdentity,
+  freezeMemoryFrame, listExperiences, practiceTransitionAllowed,
+  proposePractice, recordExperience, recordProviderRequestDigest,
+  retractExperience, reviewLearning, reviseConstitution,
+  setIdentityLifecycle, transitionPractice,
+} from './learning';
+import {
+  AgentConstitutions, AgentExperiences, AgentIdentities, AgentLearningEvents,
+  AgentMemoryFrames, AgentPractices,
+} from './learning-collections';
 
 /** Named agent wins; otherwise first memory-declaring agent (person memory
  *  resolves one store per spec decision 2). */
@@ -80,7 +91,8 @@ export class Agent {
     return startSystemTurn(sessionId, prompt, opts);
   }
 
-  /** One question, one answer — throwaway session, inline turn, no trace.
+  /** One question, one answer — throwaway Session, inline Turn, no Session trace.
+   *  Agent-owned identity/learning remains; its Frame is erased with the Session.
    *  Rejects with `ask-parked` or `ask-failed` since headless callers
    *  cannot notice a stall. */
   async ask(text: string, opts?: { userId?: string | null }): Promise<string> {
@@ -132,11 +144,17 @@ export class Agent {
       throw new Meteor.Error('ask-failed', outcome.reason);
     } finally {
       // Delete in reverse-read order so nothing points at a gone session.
-      // Own try/catch: cleanup failure must not replace the caller's outcome.
+      // A successful one-shot promises that no temporary Session or Frame is
+      // left behind. Withhold the answer when the durable erasure is merely
+      // fenced/pending; lifecycle recovery can still finish it safely.
       try {
         await eraseOwnedSession(this.name, sessionId, userId);
       } catch {
         console.error('[10thfloor:agent] ask() could not clean up its throwaway session');
+        throw new Meteor.Error(
+          'ask-failed',
+          'The one-shot result was withheld because temporary data cleanup is still pending.',
+        );
       }
     }
   }
@@ -164,7 +182,9 @@ export class Agent {
 
   /** Permanently erase one owned root Session and its subagent descendants.
    *  Server-only. `userId` is required; explicit null means anonymous owner.
-   *  Memory and account-wide channel identities are preserved. */
+   *  Agent-owned Identity, Constitution, Experience, Practice, Fact Memory,
+   *  and account-wide Channel identities are preserved; Session-owned Memory
+   *  Frames are erased with the conversation. */
   erase(
     sessionId: string, opts: { userId: string | null },
   ): Promise<SessionErasure> {
@@ -311,6 +331,47 @@ export class Agent {
     async forget(userId: string | null, id: string, opts?: { agent?: string }) {
       const { agent } = memoryConfigFor(opts?.agent);
       return forgetMemory(id, { userId, agent, allowApp: true });
+    },
+  };
+
+  /** Server-only Agent learning Interface. Mutations stay behind the Learning
+   * Module's Identity, Experience, Practice, and Frame boundaries; hosts receive scoped cursor
+   * factories for reactive, read-only publications without exposing a browser
+   * write path. */
+  static learning = {
+    ensureIdentity: ensureAgentIdentity,
+    reviseConstitution,
+    setLifecycle: setIdentityLifecycle,
+    recordExperience,
+    recordProviderRequestDigest,
+    retractExperience,
+    review: reviewLearning,
+    listExperiences,
+    proposePractice,
+    transitionPractice,
+    transitionAllowed: practiceTransitionAllowed,
+    freezeFrame: freezeMemoryFrame,
+    protectedPrompt: buildProtectedLearningPrompt,
+    audit: auditLearningState,
+    read: {
+      identities(agentIds: string[], options?: any) {
+        return AgentIdentities.find({ _id: { $in: agentIds } }, options);
+      },
+      constitutions(agentIds: string[], options?: any) {
+        return AgentConstitutions.find({ agentId: { $in: agentIds } }, options);
+      },
+      experiences(agentIds: string[], options?: any) {
+        return AgentExperiences.find({ agentId: { $in: agentIds } }, options);
+      },
+      practices(agentIds: string[], options?: any) {
+        return AgentPractices.find({ agentId: { $in: agentIds } }, options);
+      },
+      frames(agentIds: string[], options?: any) {
+        return AgentMemoryFrames.find({ agentId: { $in: agentIds } }, options);
+      },
+      events(agentIds: string[], options?: any) {
+        return AgentLearningEvents.find({ agentId: { $in: agentIds } }, options);
+      },
     },
   };
 

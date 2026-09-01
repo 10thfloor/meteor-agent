@@ -1,5 +1,8 @@
 import type { ToolSchema } from './providers/types';
 import type { AgentSession, ResolvedMemory } from '../common/types';
+import type {
+  AgentMemoryFrame, ExperienceAudience, ResolvedExperience, ResolvedPractice,
+} from '../common/learning';
 import { modelParticipantId } from '../common/participants';
 import {
   assertMemoryNamesFree, expandMcpTools, MEMORY_TOOL_NAMES, resolveTools,
@@ -7,6 +10,9 @@ import {
   type ResolvedTool, type Skill, type ToolSpec,
 } from './tools';
 import { withMemoryTools } from './memory-tools';
+import {
+  assertLearningNamesFree, LEARNING_TOOL_NAMES, withLearningTools,
+} from './learning-tools';
 
 /** @internal The Prepared Tool Runtime is the one executable catalog a Turn
  * and its provider schema see. Preparation owns discovery and name precedence;
@@ -27,6 +33,20 @@ export interface PrepareToolRuntimeOptions {
     session: Pick<AgentSession, 'parent' | 'ephemeral' | 'userId'>;
     agent: string;
   };
+  /** Stable identity-bound Experience Tools. Presence reserves their names;
+   * the Frame closes proposal provenance and frozen recall. */
+  learning?: {
+    config?: ResolvedExperience;
+    practice?: ResolvedPractice;
+    agentId: string;
+    frame?: AgentMemoryFrame;
+    /** Required when constructing recall outside a frozen Turn Frame. */
+    audience?: ExperienceAudience;
+  };
+  /** Reserve framework-owned Experience Tool names when a caller intentionally
+   * prepares a runtime without a Learning snapshot. Identity-enabled
+   * `Agent.ask()` Turns supply their throwaway Frame and enabled Learning Tools. */
+  reserveLearningNames?: boolean;
 }
 
 function assertUniqueAuthored(tools: ResolvedTool[]): void {
@@ -60,9 +80,15 @@ export async function prepareToolRuntime(
   options: PrepareToolRuntimeOptions,
 ): Promise<PreparedToolRuntime> {
   if (options.memory) assertMemoryNamesFree(options.specs);
+  if (options.learning || options.reserveLearningNames) {
+    assertLearningNamesFree(options.specs);
+  }
   const resolved = resolveTools(options.specs);
   assertUniqueAuthored(resolved);
-  const reserved = options.memory ? MEMORY_TOOL_NAMES : [];
+  const reserved = [
+    ...(options.memory ? MEMORY_TOOL_NAMES : []),
+    ...(options.learning || options.reserveLearningNames ? LEARNING_TOOL_NAMES : []),
+  ];
   const discovered = await expandMcpTools(resolved, reserved);
   const memory = options.memory
     && !options.memory.session.parent
@@ -74,9 +100,9 @@ export async function prepareToolRuntime(
       userId: options.memory.session.userId,
     }
     : undefined;
-  const tools = withMemoryTools(
-    withSkillTool(discovered, options.skills),
-    memory,
+  const tools = withLearningTools(
+    withMemoryTools(withSkillTool(discovered, options.skills), memory),
+    options.learning,
   );
   assertUniquePrepared(tools);
   return { tools, schemas: toolSchemas(tools) };

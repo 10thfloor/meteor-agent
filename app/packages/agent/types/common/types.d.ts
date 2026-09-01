@@ -73,6 +73,12 @@ export interface AgentSession {
         /** Which model parked this call — resume uses its config, not the
          *  primary's. Absent on primary-model parks (falls back to `session.agent`). */
         agent?: string;
+        /** Causal anchor for identity-enabled parks: the exact Memory Frame the
+         *  batch was proposed under. Resume adopts THIS frame instead of
+         *  re-deriving the trigger, so rows landing while parked cannot move the
+         *  approved call onto a fresh Frame. Absent on legacy/no-identity parks. */
+        agentId?: string;
+        memoryFrameId?: string;
         /** Tool's one-line account of the call, from `describe(args, ctx)` at park
          *  time. Absent when no `describe` or it threw. Advisory only. */
         display?: string;
@@ -182,6 +188,12 @@ export interface AgentMessage {
     sessionId: string;
     seq: number;
     role: 'user' | 'assistant' | 'tool' | 'note' | 'system';
+    /** Assistant rows: the highest user-row seq in the context this reply was
+     *  generated from — the honest "answered as of" watermark. A user message
+     *  committed mid-stream has a higher seq than this, so activation knows the
+     *  reply did not answer it even though the reply committed later. Absent on
+     *  rows from before the field existed (falls back to the seq heuristic). */
+    answeredThrough?: number;
     content?: string;
     thinking?: string;
     toolCalls?: AgentToolCall[];

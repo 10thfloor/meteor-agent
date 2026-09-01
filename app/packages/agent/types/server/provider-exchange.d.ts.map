@@ -1,1 +1,1 @@
-{"version":3,"file":"provider-exchange.d.ts","sourceRoot":"","sources":["../../server/provider-exchange.ts"],"names":[],"mappings":""}
+{"version":3,"file":"provider-exchange.d.ts","sourceRoot":"","sources":["../../server/provider-exchange.ts"],"names":[],"mappings":"AAIA,OAAO,KAAK,EAA2B,eAAe,EAAE,MAAM,mBAAmB,CAAC;AAsClF,wBAAgB,8BAA8B,CAC5C,OAAO,EAAE,IAAI,CAAC,eAAe,EAAE,QAAQ,CAAC,GACvC,MAAM,CAER"}

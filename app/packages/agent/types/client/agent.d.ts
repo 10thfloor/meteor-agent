@@ -58,6 +58,8 @@ export declare class Agent {
         mcpServer?: string;
         runAs?: string | null;
         agent?: string;
+        agentId?: string;
+        memoryFrameId?: string;
         display?: string;
         wakeToken?: string;
     } | undefined;

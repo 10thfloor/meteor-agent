@@ -149,8 +149,16 @@ async function reuseChild(child: AgentSession, name: string): Promise<SubagentDi
  *  stream and accept approvals independently. */
 export async function runSubagent(
   tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn,
+  authorize?: () => boolean | Promise<boolean>,
 ): Promise<SubagentDispatch> {
   const name = tool.subagent!;
+  const authorized = async (): Promise<boolean> => {
+    if (!authorize) return true;
+    try { return (await authorize()) === true; } catch { return false; }
+  };
+  const denied = (): SubagentDispatch => ({
+    result: failure('not-allowed', `This agent may not use ${tool.name}.`),
+  });
 
   // Validate like inline tools — subagents bypass runTool.
   const verdict = await validateToolArgs(tool.args, args);
@@ -190,7 +198,7 @@ export async function runSubagent(
     const existing = await findReusableChild(ctx.sessionId, ctx.toolCallId, name, prompt);
     if (existing) {
       const reused = await reuseChild(existing, name);
-      if (reused) return reused;
+      if (reused) return (await authorized()) ? reused : denied();
     }
   }
 
@@ -229,6 +237,10 @@ export async function runSubagent(
   }
   let born = false;
   try {
+    // Validation, registry lookup, orphan adoption, and operation acquisition
+    // may all await. Re-read host authorization immediately before the atomic
+    // child birth; a child born after this boundary may finish its turn.
+    if (!(await authorized())) return denied();
     born = await withSessionOperationTransaction(parentOperation, async (mongoSession) => {
       // Parent Lease, active-child marker, child Session, and first Message are
       // one birth transaction. A crash cannot strand an unowned child or an
@@ -237,6 +249,7 @@ export async function runSubagent(
         {
           _id: ctx.sessionId,
           'lease.serverId': SERVER_ID,
+          'lease.until': { $gt: new Date() },
           erasingAt: { $exists: false },
           purgingAt: { $exists: false },
         },

@@ -20,6 +20,10 @@ interface TurnAnchor {
     /** The running agent (addressee on addressed turns) — hooks and parks
      *  follow this name, so an addressee's turn uses the addressee's chain. */
     agent: string;
+    /** Stable experiential identity and the deterministic frame for this
+     * trigger. Optional keeps legacy RunConfig callers source compatible. */
+    agentId?: string;
+    memoryFrameId?: string;
     /** The committed assistant carrying the `tool_use`s — the discard anchor. */
     messageId: string;
     assistantSeq: number;
@@ -45,6 +49,9 @@ export declare function resumeParkedTurn(sessionId: string, pending: NonNullable
 from?: {
     participant: string;
     name: string;
+}, learning?: {
+    agentId: string;
+    memoryFrameId: string;
 }): Promise<DispatchOutcome>;
 export {};
 //# sourceMappingURL=dispatch.d.ts.map

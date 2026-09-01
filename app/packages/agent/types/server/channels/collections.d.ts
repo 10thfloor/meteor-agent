@@ -187,7 +187,10 @@ export declare const DeliveryReceipts: TypedCollection<DeliveryReceipt, string |
 export declare const InboundSubmissions: TypedCollection<InboundSubmission, string | SubmissionQuery, never>;
 export declare const ChannelLinkTokens: TypedCollection<ChannelLinkToken, string | LinkTokenQuery, never>;
 export declare const ChannelVerdictTokens: TypedCollection<ChannelVerdictToken, string | VerdictTokenQuery, never>;
-/** True when the error is a duplicate-key (11000 or message match). */
+/** True when the error is a duplicate-key, however the driver phrases it:
+ *  code 11000/11001, codeName, or either message form. Load-bearing wherever
+ *  a derived-`_id` insert treats "lost the race" as adoption — a phrasing
+ *  this misses turns an idempotent replay into a thrown error. */
 export declare function isDuplicateKey(e: unknown): boolean;
 /** Insert a derived-`_id` row: `true` = inserted (won), `false` = duplicate
  *  key (adopt theirs). Real failures propagate. */

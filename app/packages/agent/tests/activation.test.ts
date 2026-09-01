@@ -4,6 +4,7 @@ import {
   activate, installTurnRunner, requestSystemTurn, startActivationRecovery,
 } from '../server/activation';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
+import { assistantAnswers } from '../common/participants';
 import { mockProvider } from '../server/providers/mock';
 import type { Provider } from '../server/providers/types';
 import { beginSessionOperation } from '../server/session-operations';
@@ -851,5 +852,29 @@ describe('Activation Module Interface', () => {
     const done = (await AgentSessions.findOneAsync('activation-system-token-session'))!;
     assert.isUndefined(done.pendingSystem);
     assert.equal(done.budgetSpent.systemTurns, 1);
+  });
+});
+
+describe('assistantAnswers()', () => {
+  it('answers a user row its context watermark reaches', () => {
+    assert.isTrue(assistantAnswers({ seq: 5, answeredThrough: 4 }, 4));
+    assert.isTrue(assistantAnswers({ seq: 5, answeredThrough: 4 }, 3));
+  });
+
+  it('keeps a mid-stream interjection owed even though the assistant committed above it', () => {
+    // The interjection shape: user seq 4 lands while streaming, and the blind
+    // reply commits at seq 5 having seen only through seq 3. The legacy
+    // comparison (5 >= 4) would call this answered.
+    assert.isFalse(assistantAnswers({ seq: 5, answeredThrough: 3 }, 4));
+    // A zero watermark is a present watermark — the first turn's reply saw
+    // only the seq-0 trigger, so it does not answer a seq-1 interjection.
+    assert.isFalse(assistantAnswers({ seq: 2, answeredThrough: 0 }, 1));
+    assert.isTrue(assistantAnswers({ seq: 1, answeredThrough: 0 }, 0));
+  });
+
+  it('falls back to the legacy commit-order comparison when no watermark exists', () => {
+    assert.isTrue(assistantAnswers({ seq: 5 }, 4));
+    assert.isTrue(assistantAnswers({ seq: 4 }, 4));
+    assert.isFalse(assistantAnswers({ seq: 3 }, 4));
   });
 });

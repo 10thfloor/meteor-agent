@@ -101,7 +101,7 @@ export declare function warnMcp(message: string): void;
 /** Map an MCP call result to ToolResult. Errors are sanitized. */
 export declare function mapMcpResult(raw: McpCallResult | undefined | null): ToolResult;
 /** Call one tool on one server. Failures are structured, never throws. */
-export declare function callMcpTool(server: string, tool: string, args: unknown): Promise<ToolResult>;
+export declare function callMcpTool(server: string, tool: string, args: unknown, authorize?: () => boolean | Promise<boolean>, displayName?: string): Promise<ToolResult>;
 /** Close every current and in-flight client. Registrations remain available so
  * a long-lived process can reconnect after a coordinated runtime stop. */
 export declare function stopMcp(): Promise<void>;

@@ -56,5 +56,14 @@ export declare function needsAttribution(participants: SessionParticipant[]): bo
 /** System-prompt participants block (§4.3). Appended per iteration because
  *  the roster can mutate mid-conversation. */
 export declare function participantsBlock(session: Roster, selfAgent: string): string;
+/** Whether an assistant row answers the user row at `seq`. New rows carry the
+ *  `answeredThrough` context watermark — the newest user seq the model saw —
+ *  because commit order lies: a mid-stream interjection commits BELOW the
+ *  reply that never saw it. Rows from before the watermark fall back to the
+ *  legacy seq comparison. */
+export declare function assistantAnswers(assistant: {
+    seq: number;
+    answeredThrough?: number;
+}, seq: number): boolean;
 export {};
 //# sourceMappingURL=participants.d.ts.map

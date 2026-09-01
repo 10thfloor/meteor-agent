@@ -3,7 +3,8 @@ import {
   MAX_PARTICIPANTS, type AgentMessage, type AgentSession, type SessionParticipant,
 } from '../common/types';
 import {
-  humanParticipantId, modelParticipantId, resolveAddressee, sanitizeDisplayName,
+  assistantAnswers, humanParticipantId, modelParticipantId, resolveAddressee,
+  sanitizeDisplayName,
 } from '../common/participants';
 import { ChannelBindings } from './channels/collections';
 
@@ -150,23 +151,24 @@ export async function unansweredMessageAddressee(
   const hit = resolveAddressee(user.content, user.to, session);
   if (hit) {
     const primaryId = modelParticipantId(session.agent);
-    const answer = await AgentMessages.findOneAsync({
+    // Newest reply from the addressee: watermarks are monotone per session,
+    // so if the newest doesn't answer this row, no older one does either.
+    const [answer] = await AgentMessages.find({
       sessionId: session._id,
       role: 'assistant',
-      seq: { $gt: user.seq },
       ...(hit.id === primaryId ? {
         $or: [
           { 'from.participant': hit.id },
           { from: { $exists: false } },
         ],
       } : { 'from.participant': hit.id }),
-    } as any);
-    return answer ? null : hit;
+    } as any, { sort: { seq: -1 }, limit: 1 }).fetchAsync();
+    return answer && assistantAnswers(answer, user.seq) ? null : hit;
   }
   const [lastAssistant] = await AgentMessages.find(
     { sessionId: session._id, role: 'assistant' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
-  if (!lastAssistant || lastAssistant.seq < user.seq) {
+  if (!lastAssistant || !assistantAnswers(lastAssistant, user.seq)) {
     return { id: modelParticipantId(session.agent), agent: session.agent };
   }
   return null;

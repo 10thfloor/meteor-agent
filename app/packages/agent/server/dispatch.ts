@@ -30,9 +30,10 @@ export interface DispatchLimits {
  *  everything else to `runTool`. Returns child session id for subagents. */
 async function dispatchTool(
   tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn,
+  authorize?: () => boolean | Promise<boolean>,
 ): Promise<SubagentDispatch> {
-  if (tool.kind === 'subagent') return runSubagent(tool, args, ctx, runTurn);
-  return { result: await runTool(tool, args, ctx) };
+  if (tool.kind === 'subagent') return runSubagent(tool, args, ctx, runTurn, authorize);
+  return { result: await runTool(tool, args, ctx, authorize) };
 }
 
 /** Latch: warn once per distinct serialization failure kind. */
@@ -89,11 +90,41 @@ function clampErrorReason(
  *  completed = all calls answered (safe to re-enter think loop). */
 export type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
 
+/** A host `canUse` predicate THREW — an application failure, not a policy
+ *  denial. Callers convert it into an `entitlement-unavailable` result so the
+ *  transcript never claims the agent is not entitled to a tool the host
+ *  never denied. The raw cause stays server-side. */
+class EntitlementCheckError extends Error {
+  constructor(name: string, cause: unknown) {
+    super(`[10thfloor:agent] canUse(${name}) threw: ${String((cause as Error)?.message ?? cause)}`);
+  }
+}
+
+/** The single fail-closed entitlement predicate — both the streaming and
+ *  resume paths share it. Truthy returns are honored as allowed (the
+ *  documented contract is boolean; hosts predate the strict check). */
+function entitlementFor(
+  limits: DispatchLimits, userId: string | null, sessionId: string,
+): (name: string, args?: unknown, toolCallId?: string) => Promise<boolean> {
+  return async (name, args, toolCallId) => {
+    if (!limits.canUse) return true;
+    try {
+      return Boolean(await limits.canUse(name, { userId, sessionId, args, toolCallId }));
+    } catch (error) {
+      throw new EntitlementCheckError(name, error);
+    }
+  };
+}
+
 interface TurnAnchor {
   userId: string | null;
   /** The running agent (addressee on addressed turns) — hooks and parks
    *  follow this name, so an addressee's turn uses the addressee's chain. */
   agent: string;
+  /** Stable experiential identity and the deterministic frame for this
+   * trigger. Optional keeps legacy RunConfig callers source compatible. */
+  agentId?: string;
+  memoryFrameId?: string;
   /** The committed assistant carrying the `tool_use`s — the discard anchor. */
   messageId: string;
   assistantSeq: number;
@@ -120,7 +151,10 @@ export async function dispatchCalls(
   };
   const hookCtx: ToolResultHookContext = {
     agent: turn.agent, sessionId, userId: turn.userId,
+    ...(turn.agentId ? { agentId: turn.agentId } : {}),
+    ...(turn.memoryFrameId ? { memoryFrameId: turn.memoryFrameId } : {}),
   };
+  const mayUse = entitlementFor(limits, turn.userId, sessionId);
 
   /** Write a refusal row (canUse or predicate gate). No toolCalls budget
    *  charge — nothing was dispatched. Returns false if the turn is gone. */
@@ -142,8 +176,25 @@ export async function dispatchCalls(
 
   for (const call of calls) {
     // §7 backstop: a config-forbidden tool must not park (nothing may grant it).
-    if (limits.canUse
-      && !(await limits.canUse(call.name, { userId: turn.userId, sessionId }))) {
+    let entitled: boolean;
+    try {
+      entitled = await mayUse(call.name, call.args, call.id);
+    } catch (error) {
+      // Application failure, not a denial: answer the tool_use truthfully so
+      // the model may retry, charge nothing, and keep the raw cause out of
+      // the published transcript.
+      console.error(String((error as Error)?.message ?? error));
+      if (!(await refuse(call, {
+        ok: false,
+        error: {
+          error: 'entitlement-unavailable',
+          reason: 'The application entitlement check failed — not a policy '
+            + 'denial. The tool may be retried.',
+        },
+      }))) return abandon();
+      continue;
+    }
+    if (!entitled) {
       if (!(await refuse(call, {
         ok: false,
         error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
@@ -196,20 +247,57 @@ export async function dispatchCalls(
           }
         } catch { /* no display beats no park */ }
       }
+      // `describe` is application code and may await while host entitlements
+      // change. Do not park a request that is no longer authorizable — and a
+      // THROWN check here is an application failure, answered truthfully.
+      let stillEntitled: boolean;
+      try {
+        stillEntitled = await mayUse(call.name, call.args, call.id);
+      } catch (error) {
+        console.error(String((error as Error)?.message ?? error));
+        if (!(await refuse(call, {
+          ok: false,
+          error: {
+            error: 'entitlement-unavailable',
+            reason: 'The application entitlement check failed — not a policy '
+              + 'denial. The tool may be retried.',
+          },
+        }))) return abandon();
+        continue;
+      }
+      if (!stillEntitled) {
+        if (!(await refuse(call, {
+          ok: false,
+          error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+        }))) return abandon();
+        continue;
+      }
+      const requestedAt = new Date();
       // Park by exiting — the durable state is the marker + phase:'awaiting'.
       // Guarded on phase too: a lease-only guard would overwrite a `stopped`
       // that landed between the read and this write.
       const parked = await AgentSessions.updateAsync(
         {
-          _id: sessionId, 'lease.serverId': SERVER_ID, phase: { $ne: 'stopped' },
+          _id: sessionId,
+          'lease.serverId': SERVER_ID,
+          'lease.until': { $gt: new Date() },
+          erasingAt: { $exists: false },
+          purgingAt: { $exists: false },
+          phase: { $ne: 'stopped' },
         },
         {
           $set: {
             phase: 'awaiting',
             pending: {
-              toolCallId: call.id, name: call.name, args: call.args, requestedAt: new Date(),
+              toolCallId: call.id, name: call.name, args: call.args, requestedAt,
               // Which agent parked — resume rebuilds config from this.
               agent: turn.agent,
+              // The causal anchor. Without it, a user row landing while
+              // parked would move the re-derived trigger and the approved
+              // call would resume under a fresh Frame — bypassing the
+              // fail-closed evidence check and mislabeling provenance.
+              ...(turn.agentId !== undefined && turn.memoryFrameId !== undefined
+                ? { agentId: turn.agentId, memoryFrameId: turn.memoryFrameId } : {}),
               ...(display !== undefined ? { display } : {}),
               // Resume uses this to distinguish "renamed away" from "server down".
               ...(tool?.kind === 'mcp' && tool.mcp?.server
@@ -224,6 +312,47 @@ export async function dispatchCalls(
       );
       // Zero matched = interrupt or lost lease; park never became durable.
       if (parked !== 1) return abandon();
+
+      // A host lifecycle fence can land after the pre-park check but before
+      // the pending marker commits. Re-read entitlement after that atomic
+      // write. On revocation, reclaim only this exact ask under our live lease,
+      // clear it, and answer with a no-budget refusal. If cleanup or another
+      // owner changed it first, ordinary abandon repair is the safe path.
+      let postParkEntitled: boolean;
+      try {
+        postParkEntitled = await mayUse(call.name, call.args, call.id);
+      } catch (error) {
+        // The park is already durable and the resume path re-checks
+        // entitlement anyway — a failed CHECK must not tear the park down.
+        console.error(String((error as Error)?.message ?? error));
+        return 'parked';
+      }
+      if (!postParkEntitled) {
+        const reclaimed = await AgentSessions.updateAsync(
+          {
+            _id: sessionId,
+            'lease.serverId': SERVER_ID,
+            'lease.until': { $gt: new Date() },
+            phase: 'awaiting',
+            'pending.toolCallId': call.id,
+            'pending.name': call.name,
+            'pending.agent': turn.agent,
+            'pending.requestedAt': requestedAt,
+            erasingAt: { $exists: false },
+            purgingAt: { $exists: false },
+          },
+          {
+            $set: { phase: 'calling', updatedAt: new Date() },
+            $unset: { pending: 1 },
+          },
+        );
+        if (reclaimed !== 1) return abandon();
+        if (!(await refuse(call, {
+          ok: false,
+          error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+        }))) return abandon();
+        continue;
+      }
       return 'parked';
     }
 
@@ -234,18 +363,55 @@ export async function dispatchCalls(
 
     // Collect attachment refs the tool stamps onto its result.
     const resultRefs: import('../common/types').AttachmentRef[] = [];
+    let refusedByCanUse = false;
+    let checkUnavailable = false;
+    const authorize = async (): Promise<boolean> => {
+      let allowed: boolean;
+      try {
+        allowed = await mayUse(call.name, call.args, call.id);
+      } catch (error) {
+        // At the side-effect boundary a check failure fails CLOSED — better
+        // to refuse a tool than run one unauthorized. The runner reports the
+        // false as a policy denial; the flag rewrites that row truthfully.
+        console.error(String((error as Error)?.message ?? error));
+        refusedByCanUse = true;
+        checkUnavailable = true;
+        return false;
+      }
+      if (!allowed) refusedByCanUse = true;
+      if (!allowed) return false;
+      // Argument validation and MCP/subagent setup may await. Re-prove the
+      // exact worker lease at the final implementation boundary as well.
+      return holdsLease(sessionId);
+    };
     const dispatched = tool
       ? await dispatchTool(tool, call.args, {
-        userId: turn.userId, sessionId, toolCallId: call.id, agent: turn.agent,
+        userId: turn.userId, sessionId, toolCallId: call.id,
+        assistantMessageId: turn.messageId, agent: turn.agent,
+        ...(turn.agentId ? { agentId: turn.agentId } : {}),
+        ...(turn.memoryFrameId ? { memoryFrameId: turn.memoryFrameId } : {}),
         ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
         attachToResult: (ref) => { resultRefs.push(ref); },
-      }, runTurn)
+      }, runTurn, authorize)
       : {
         result: {
           ok: false, error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
         } as ToolResult,
         childSessionId: undefined,
       };
+    if (checkUnavailable && dispatched.result.ok === false
+      && (dispatched.result.error as { error?: string } | undefined)?.error === 'not-allowed') {
+      // The host never denied this tool — its check failed. The durable row
+      // must not steer the model away from a tool it is entitled to.
+      dispatched.result = {
+        ok: false,
+        error: {
+          error: 'entitlement-unavailable',
+          reason: 'The application entitlement check failed — not a policy '
+            + 'denial. The tool may be retried.',
+        },
+      };
+    }
     const { childSessionId } = dispatched;
     // `afterToolResult` runs before truncation/storage — hooks see the full
     // result and can replace it or drop attachments.
@@ -267,7 +433,7 @@ export async function dispatchCalls(
       // Attachments that survived the hook chain.
       ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
-    }, { inc: { 'budgetSpent.toolCalls': 1 } });
+    }, { inc: refusedByCanUse ? {} : { 'budgetSpent.toolCalls': 1 } });
     // Null seq = turn gone; abandon to avoid stranding a tool_use.
     if (toolSeq === null) return abandon();
   }
@@ -288,7 +454,10 @@ export async function resumeParkedTurn(
   runTurn: RunTurn,
   /** Attribution stamp for the resuming (= parking) agent. */
   from?: { participant: string; name: string },
+  // Stable learning context adopted from the trigger's Memory Frame.
+  learning?: { agentId: string; memoryFrameId: string },
 ): Promise<DispatchOutcome> {
+  const mayUse = entitlementFor(limits, userId, sessionId);
   const msgs = await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
   const batch = locateBatch(msgs, pending.toolCallId);
   if (!batch) {
@@ -308,6 +477,7 @@ export async function resumeParkedTurn(
     assistantSeq: assistant.seq,
     batchIds: calls.map((c) => c.id),
     ...(from ? { from } : {}),
+    ...(learning ?? {}),
   };
   const abandon = async (): Promise<DispatchOutcome> => {
     await discardTurn(sessionId, turn.messageId, turn.assistantSeq, turn.batchIds);
@@ -352,30 +522,80 @@ export async function resumeParkedTurn(
           ok: false,
           error: { error: 'unknown-tool', reason: `No tool named ${call.name}` },
         };
-    } else if (limits.canUse
-      && !(await limits.canUse(call.name, { userId, sessionId }))) {
+    } else {
       // §7 backstop re-checked at resume — entitlements may have changed while
       // parked. The GATE is not re-evaluated (a human answered it); `canUse`
-      // is a separate "may this agent use this tool at all" question.
-      refusedByCanUse = true;
-      result = {
-        ok: false,
-        error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
-      };
-    } else {
+      // is a separate "may this agent use this tool at all" question. A THROWN
+      // check is an application failure, answered truthfully, never as denial.
+      let entitled: boolean | 'unavailable';
+      try {
+        entitled = await mayUse(call.name, call.args, call.id);
+      } catch (error) {
+        console.error(String((error as Error)?.message ?? error));
+        entitled = 'unavailable';
+      }
+      if (entitled === 'unavailable') {
+        refusedByCanUse = true; // nothing dispatched — no budget charge
+        result = {
+          ok: false,
+          error: {
+            error: 'entitlement-unavailable',
+            reason: 'The application entitlement check failed — not a policy '
+              + 'denial. The tool may be retried.',
+          },
+        };
+      } else if (!entitled) {
+        refusedByCanUse = true;
+        result = {
+          ok: false,
+          error: { error: 'not-allowed', reason: `This agent may not use ${call.name}.` },
+        };
+      } else {
       if (!(await holdsLease(sessionId))) return abandon();
+      let checkUnavailable = false;
+      const authorize = async (): Promise<boolean> => {
+        let allowed: boolean;
+        try {
+          allowed = await mayUse(call.name, call.args, call.id);
+        } catch (error) {
+          // Side-effect boundary: fail closed rather than run unauthorized;
+          // the flag rewrites the runner's denial row truthfully below.
+          console.error(String((error as Error)?.message ?? error));
+          refusedByCanUse = true;
+          checkUnavailable = true;
+          return false;
+        }
+        if (!allowed) refusedByCanUse = true;
+        if (!allowed) return false;
+        return holdsLease(sessionId);
+      };
       // Gate deliberately NOT re-evaluated — a human already answered it.
       // The batch remainder IS re-gated via `dispatchCalls` below.
       ({ result, childSessionId } = await dispatchTool(tool, call.args, {
-        userId, sessionId, toolCallId: call.id, agent,
+        userId, sessionId, toolCallId: call.id,
+        assistantMessageId: turn.messageId, agent,
+        ...(learning ?? {}),
         ...(limits.imageInput !== undefined ? { imageInput: limits.imageInput } : {}),
         attachToResult: (ref) => { resultRefs.push(ref); },
-      }, runTurn));
+      }, runTurn, authorize));
+      if (checkUnavailable && result.ok === false
+        && (result.error as { error?: string } | undefined)?.error === 'not-allowed') {
+        result = {
+          ok: false,
+          error: {
+            error: 'entitlement-unavailable',
+            reason: 'The application entitlement check failed — not a policy '
+              + 'denial. The tool may be retried.',
+          },
+        };
+      }
+      }
     }
 
     // Same `afterToolResult` seam as the streaming path (before truncation).
     result = await runAfterToolResult(result, call, {
       agent, sessionId, userId,
+      ...(learning ?? {}),
       ...(resultRefs.length > 0 ? { resultAttachments: resultRefs } : {}),
     });
 

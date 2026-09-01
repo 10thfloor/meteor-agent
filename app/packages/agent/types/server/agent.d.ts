@@ -10,6 +10,7 @@ import { type ChannelDef } from './channels/registry';
 import { createAttachment } from './attachments';
 import { addParticipant, listParticipants, removeParticipant } from './participants';
 import { type SessionErasure } from './session-lifecycle';
+import { auditLearningState, buildProtectedLearningPrompt, ensureAgentIdentity, freezeMemoryFrame, listExperiences, practiceTransitionAllowed, proposePractice, recordExperience, recordProviderRequestDigest, retractExperience, reviewLearning, reviseConstitution, setIdentityLifecycle, transitionPractice } from './learning';
 export declare class Agent {
     readonly name: string;
     constructor(name: string, config?: AgentConfig);
@@ -21,7 +22,8 @@ export declare class Agent {
         agent?: string;
         source?: string;
     }): Promise<SystemTurnResult>;
-    /** One question, one answer — throwaway session, inline turn, no trace.
+    /** One question, one answer — throwaway Session, inline Turn, no Session trace.
+     *  Agent-owned identity/learning remains; its Frame is erased with the Session.
      *  Rejects with `ask-parked` or `ask-failed` since headless callers
      *  cannot notice a stall. */
     ask(text: string, opts?: {
@@ -42,7 +44,9 @@ export declare class Agent {
     }): Promise<string>;
     /** Permanently erase one owned root Session and its subagent descendants.
      *  Server-only. `userId` is required; explicit null means anonymous owner.
-     *  Memory and account-wide channel identities are preserved. */
+     *  Agent-owned Identity, Constitution, Experience, Practice, Fact Memory,
+     *  and account-wide Channel identities are preserved; Session-owned Memory
+     *  Frames are erased with the conversation. */
     erase(sessionId: string, opts: {
         userId: string | null;
     }): Promise<SessionErasure>;
@@ -108,6 +112,34 @@ export declare class Agent {
         forget(userId: string | null, id: string, opts?: {
             agent?: string;
         }): Promise<import("./memory").ForgetResult>;
+    };
+    /** Server-only Agent learning Interface. Mutations stay behind the Learning
+     * Module's Identity, Experience, Practice, and Frame boundaries; hosts receive scoped cursor
+     * factories for reactive, read-only publications without exposing a browser
+     * write path. */
+    static learning: {
+        ensureIdentity: typeof ensureAgentIdentity;
+        reviseConstitution: typeof reviseConstitution;
+        setLifecycle: typeof setIdentityLifecycle;
+        recordExperience: typeof recordExperience;
+        recordProviderRequestDigest: typeof recordProviderRequestDigest;
+        retractExperience: typeof retractExperience;
+        review: typeof reviewLearning;
+        listExperiences: typeof listExperiences;
+        proposePractice: typeof proposePractice;
+        transitionPractice: typeof transitionPractice;
+        transitionAllowed: typeof practiceTransitionAllowed;
+        freezeFrame: typeof freezeMemoryFrame;
+        protectedPrompt: typeof buildProtectedLearningPrompt;
+        audit: typeof auditLearningState;
+        read: {
+            identities(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentIdentity, any>;
+            constitutions(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentConstitution, any>;
+            experiences(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentExperience, any>;
+            practices(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentPractice, any>;
+            frames(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentMemoryFrame, any>;
+            events(agentIds: string[], options?: any): import("meteor/mongo").Mongo.Cursor<import(".").AgentLearningEvent, any>;
+        };
     };
     /** Register a named provider so configs can reference it by string.
      *  Resolved lazily on first turn, not at define() time. */

@@ -4,7 +4,7 @@ import {
   DECIDED_PHASES, type AgentSession, type Phase,
 } from '../common/types';
 import type { SessionQuery } from '../common/db';
-import { systemFrom } from '../common/participants';
+import { modelParticipantId, systemFrom } from '../common/participants';
 import { getAgent, resolveBudget, memoryOpt, type AgentConfig } from './registry';
 import { SERVER_ID } from './lease';
 import { beginSessionTreeOperation } from './session-operations';
@@ -109,6 +109,10 @@ export async function consumeSystemIntent(
           content: intent.prompt,
           // Unconditional (decision 3) — roster-gating would drop attribution in 1:1.
           from: systemFrom(intent.source),
+          // The intent marker is consumed by this Turn's first commit. Persist
+          // the addressee on the trigger itself so approval/restart recovery can
+          // still bind the immutable Memory Frame to the intended Agent.
+          to: modelParticipantId(intent.agent ?? session.agent),
           createdAt: now,
         }),
       );

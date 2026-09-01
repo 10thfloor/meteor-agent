@@ -49,6 +49,17 @@ Budget 3–5 minutes. The client half needs Playwright's Chromium
 their opt-in environment is present: pi-ai uses `ANTHROPIC_API_KEY`, and MCP
 uses `MCP_LIVE_TEST=1`.
 
+The example app carries a second, full-app suite (`app/tests/main.js` — the
+Constellation learning control plane: owner gating, hardening evidence, crew
+archive). CI runs it as its own job; locally:
+
+```bash
+meteor npm run test-app:once
+```
+
+A test entry point no CI job executes is coverage that does not exist — the
+control-plane suite ran only on developers' machines until this job landed.
+
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
 The package has four app-level npm dependencies — `@earendil-works/pi-ai`,

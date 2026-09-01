@@ -25,7 +25,7 @@ from the demo app in [`app/`](../app), it says so.
 | **Forking** — branch a conversation at a batch-safe point | [Forking](#forking) |
 | **Compaction** — the model's view shrinks, the transcript keeps everything | [Compaction](#compaction) |
 | **Skills & hooks** — on-demand prompt fragments; the two extension seams | [Skills](#skills) · [Hooks](#hooks) |
-| **Memory** — durable recall about people and about the work, in a collection your UI can read | [Memory](#memory) |
+| **Fact Memory** — durable propositions about people and the work, in a collection your UI can read | [Fact Memory](#fact-memory) |
 | **UI** — `<agent-chat>`, one tag, themable through custom properties and `::part()` | [`<agent-chat>`](#agent-chat) |
 | **Validation** — model arguments checked against full JSON Schema, fail-closed on public endpoints | [Validation](#validation) |
 
@@ -1650,7 +1650,7 @@ permanently suppress "a hook returned a malformed request". An unknown hook name
 — or a non-function — throws at **registration**: a typo'd hook is a hook that
 silently never runs, and you would find out when your redaction did not happen.
 
-## Memory
+## Fact Memory
 
 An agent with `memory` remembers across conversations — and because the store is a Mongo collection, your
 UI can show the user exactly what it knows and let them delete it.
@@ -1683,7 +1683,7 @@ The last line before the footer is the **hint**: once per turn the harness itsel
 the newest message and appends matching titles. No model call, no tokens, and content never arrives this
 way. `memory: { hints: false }` turns it off.
 
-### Memory is shared across the agents in a session
+### Person Fact Memory is shared across the agents in a session
 
 ```ts
 // server — support saves
@@ -1696,7 +1696,7 @@ Person memory is keyed by `userId` alone, and a turn always runs as the session 
 the roster reads one store. This is a consequence of the participants model, not a separate feature —
 see [Participants](#participants--nn-sessions).
 
-### Work memory, and the approval that guards it
+### Work Fact Memory, and the approval that guards it
 
 ```ts
 // server
@@ -1863,12 +1863,14 @@ memory: { search: async (query, { userId, scopes, limit }) => myVectorStore.quer
 
 ### The edges, named
 
-- **Anonymous sessions write nothing.** Not personal memory (a store keyed on `null` would be one store
+- **Anonymous sessions write no Fact Memory.** Not personal memory (a store keyed on `null` would be one store
   shared by every anonymous visitor) and not the work pool. The gate is no guard there — `approve` is
   optional, and with none configured the approval check is skipped entirely — so the refusal lives in the
   core, on the delete path too. They still *read* work memory, and the listing says so plainly.
-- **Subagent children and `Agent.ask()` throwaways get no memory** — a child's work folds back into its
-  parent, which is the memory-bearing conversation. Checked against the session, not the config.
+- **Subagent children and `Agent.ask()` throwaways get no Fact Memory** — a child's work folds back into
+  its parent, which is the Fact-Memory-bearing conversation. Checked against the Session, not the config.
+  Identity-enabled children and one-shots still receive Constitution and Practice through their own
+  Session-owned Memory Frame; throwaway Frames are erased with their Session.
 - **`by` is the model, not the speaker.** On a model-initiated save it is `m:<agent>`; the human who
   prompted it is on the message's `from`.
 - **Caps refuse, they do not evict.** `max` (200) and `maxApp` (500) return a structured `memory-full` the

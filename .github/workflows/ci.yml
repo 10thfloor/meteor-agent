@@ -88,6 +88,40 @@ jobs:
           TEST_BROWSER_DRIVER: playwright
         run: npm test
 
+  test-app:
+    name: Full-app suite (Constellation control plane)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Meteor
+        run: curl https://install.meteor.com/?release=3.5 | sh
+
+      - name: Cache Meteor packages
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.meteor
+            app/.meteor/local
+          key: meteor-3.5-app-${{ runner.os }}-${{ hashFiles('app/.meteor/versions') }}
+
+      - name: npm install
+        working-directory: app
+        run: meteor npm ci || meteor npm install
+
+      - name: Install Playwright browser
+        working-directory: app
+        run: npx playwright install --with-deps chromium
+
+      - name: Run the full-app suite
+        working-directory: app
+        # tests/main.js — the Constellation learning control plane: owner
+        # gating, hardening evidence, crew archive. These tests ran on no
+        # machine but a developer's until this job existed, which is exactly
+        # how a governance regression shipped a green check.
+        run: meteor npm run test-app:once
+
   verify-build:
     name: Production bundle verification
     runs-on: ubuntu-latest

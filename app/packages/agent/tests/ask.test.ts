@@ -66,6 +66,39 @@ describe('Agent.ask', () => {
     assert.deepEqual(await leftovers(), { sessions: 0, messages: 0, deltas: 0 });
   });
 
+  it('withholds a successful reply while throwaway erasure is incomplete', async function () {
+    this.timeout(30000);
+    const { Agent } = await import('../server/agent');
+    const { AgentMessages, AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { resumeSessionErasures } = await import('../server/session-lifecycle');
+
+    await clean();
+    const originalRemoveAsync = AgentMessages.removeAsync;
+    (AgentMessages as any).removeAsync = async () => {
+      throw new Error('injected cleanup failure');
+    };
+    try {
+      const oneshot = new Agent('ask-cleanup-fence', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => ({ text: 'must be withheld' })),
+      });
+      const error = await rejectsWith(
+        () => oneshot.ask('answer only if cleanup completes', { userId: 'u-cleanup' }),
+        'ask-failed',
+      );
+      assert.include(error.reason, 'cleanup is still pending');
+      const fenced = await AgentSessions.findOneAsync({ agent: 'ask-cleanup-fence' });
+      assert.exists(fenced, 'the fixture must leave cleanup work for recovery');
+      assert.exists(fenced?.erasingAt);
+      assert.equal(fenced?.phase, 'stopped');
+    } finally {
+      (AgentMessages as any).removeAsync = originalRemoveAsync;
+      await resumeSessionErasures({ strict: true });
+    }
+    assert.deepEqual(await leftovers(), { sessions: 0, messages: 0, deltas: 0 });
+  });
+
   it('threads userId into the instructions and the tool context', async function () {
     this.timeout(30000);
     const { Agent } = await import('../server/agent');

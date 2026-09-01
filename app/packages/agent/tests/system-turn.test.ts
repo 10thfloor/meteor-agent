@@ -199,12 +199,12 @@ describe('system turns — attribution', () => {
     assert.isUndefined(doc.participants, 'attribution needs an id, not a roster row');
   });
 
-  it('A3: leaves the roster untouched, and the `s:` id never resolves as an addressee', async function () {
+  it('A3: leaves the roster untouched, and the `s:` origin never resolves as an addressee', async function () {
     this.timeout(30000);
     const { Agent } = await import('../server/agent');
     const { mockProvider } = await import('../server/providers/mock');
     const { startSystemTurn } = await import('../server/methods');
-    const { resolveAddressee } = await import('../common/participants');
+    const { modelParticipantId, resolveAddressee } = await import('../common/participants');
     const { AgentSessions } = await import('../common/collections');
 
     // eslint-disable-next-line no-new
@@ -234,7 +234,13 @@ describe('system turns — attribution', () => {
     );
 
     const row = (await systemRow('sst-a3'))!;
-    assert.isUndefined(row.to, 'a system row addresses nobody');
+    assert.equal(
+      row.to,
+      modelParticipantId('st-a3-prime'),
+      'the durable row retains its target Agent without changing the roster',
+    );
+    // The row's `from` remains the non-addressable system origin; `to` is the
+    // target model needed to preserve Turn identity through a parked resume.
     // Addressing is resolved against the roster's MODELS. An `s:` id names no
     // model, so neither an explicit `to` nor a leading mention can reach it.
     assert.isNull(resolveAddressee(row.content, 's:routine', doc));
@@ -498,7 +504,9 @@ describe('system turns — attribution', () => {
     const reply = (await AgentMessages.findOneAsync({ sessionId: 'sst-a9', role: 'assistant' }))!;
     assert.equal(reply.content, 'analyst reporting');
     assert.deepEqual(reply.from, { participant: 'm:st-a9-analyst', name: 'st-a9-analyst' });
-    assert.deepEqual((await systemRow('sst-a9'))!.from, { participant: 's:routine', name: 'routine' });
+    const addressedRow = (await systemRow('sst-a9'))!;
+    assert.deepEqual(addressedRow.from, { participant: 's:routine', name: 'routine' });
+    assert.equal(addressedRow.to, 'm:st-a9-analyst');
     assert.equal((await AgentSessions.findOneAsync('sst-a9'))!.budgetSpent.systemTurns, 1);
 
     // §4.3 step 2: an intent naming an unregistered teammate is a HARD refusal,
