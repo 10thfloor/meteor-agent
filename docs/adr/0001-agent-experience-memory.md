@@ -194,6 +194,28 @@ the original Frame audience and a later trigger resolves the new one. Exact
 Fact Memory prompt text is not copied into the durable
 Frame; recovery re-renders it and fails closed if its evidence or digest changed.
 
+*Amendment (2026-09-01).* "Its evidence changed" means the FROZEN evidence:
+recovery fetches the frame's evidence rows by id and fails closed only when a
+frozen row was edited or erased. Rows added since the freeze — including the
+Turn's own auto-gated `memory_save`, or another session's — are not this
+frame's causes and do not void a parked approval; a store read failure is
+transient and leaves the park and its recorded verdict intact for retry. A
+park additionally persists its exact Frame id, so an approval resume adopts
+the anchored Frame rather than re-deriving the trigger, and the
+provider-request audit event is an append-only insert (deterministic id, no
+transaction, no identity write) so concurrent sessions of one Agent no longer
+serialize on the identity document.
+
+Three accepted tradeoffs, named so they are decisions rather than surprises:
+evidence integrity covers each frozen row's id, scope, and text — a pin
+toggle or `by` edit changes presentation, not the causes, and does not void a
+park; the append-only audit event tolerates the narrow window where an
+archive commits between its lifecycle read and the insert (the event is a
+record of a call already in flight); and a user message that lands while a
+turn is PARKED is answered by the resumed turn under its anchored Frame — the
+model sees and addresses it, at the cost of that one reply spanning a second
+trigger, where the alternative was answering it twice.
+
 Protected-prompt rendering is part of the immutable causal record, not current
 presentation code. New Frames record renderer version 2 in their payload and
 digest. Unversioned Frames remain immutable: their stored prompt digest selects

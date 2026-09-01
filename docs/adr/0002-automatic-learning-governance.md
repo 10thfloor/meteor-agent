@@ -134,3 +134,20 @@ uninterrupted learning. The cost is a larger governance and audit surface,
 especially when owner- or session-scoped evidence is promoted into
 identity-wide Practice. Hosts must make automatic admission and pending review
 visible and preserve a deliberate correction path.
+
+## Amendment (2026-09-01)
+
+Governance refusals that can reach a model tool call are structured
+`Meteor.Error` codes, not opaque failures: `learning-review-backlog-full`,
+`practice-candidate-limit`, `practice-live-revision`, and
+`practice-review-backlog-full`. A refused automatic Practice activation is not
+a tool failure — the candidate stands in Reviews and the tool reports that
+truthfully, so a model does not retry into the standing-revision refusal.
+
+The protected-frame forgery boundary covers the whole provider request:
+reserved `<agent-memory-frame>` markers arriving inside message content (tool
+results, MCP output, user text, compaction summaries) are neutralized with a
+zero-width space, so only the harness-appended block ever wears the reviewed
+branding. A thrown host `canUse` predicate is an application failure and
+surfaces as `entitlement-unavailable` — never as the durable policy denial
+`not-allowed`.
