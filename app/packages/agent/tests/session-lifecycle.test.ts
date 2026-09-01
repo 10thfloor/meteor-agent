@@ -11,8 +11,14 @@ import {
 } from '../server/downloads';
 import { _setLeaseTimings, claimLease } from '../server/lease';
 import { deliverOnce } from '../server/channels/egress';
+import {
+  AgentConstitutions, AgentExperiences, AgentIdentities, AgentMemoryFrames,
+  AgentPractices,
+} from '../server/learning-collections';
 import { beginSessionOperation } from '../server/session-operations';
-import { resumeSessionErasures } from '../server/session-lifecycle';
+import {
+  abandonPendingAgentTurns, resumeSessionErasures,
+} from '../server/session-lifecycle';
 import { UserMessageReservations } from '../server/transcript';
 
 const ids = {
@@ -21,7 +27,11 @@ const ids = {
   memory: 'erase-memory', attachment: 'erase-attachment', download: 'erase-download',
   verdict: 'erase-verdict', receipt: 'erase-receipt', legacyReceipt: 'erase-legacy-receipt',
   reservation: 'erase-reservation',
+  constitution: 'erase-constitution', experience: 'erase-experience',
+  practice: 'erase-practice',
 };
+
+const frameId = (sessionId: string): string => `erase-frame-${sessionId}`;
 
 function session(
   _id: string, agent: string, parent?: { sessionId: string; toolCallId: string },
@@ -48,14 +58,72 @@ async function clean(): Promise<void> {
   await AgentDeltas.removeAsync({ sessionId: { $in: sessionIds } });
   await AgentMessages.removeAsync({ sessionId: { $in: sessionIds } });
   await AgentMemories.removeAsync(ids.memory);
+  await AgentMemoryFrames.removeAsync({ _id: { $in: [
+    frameId(ids.root), frameId(ids.child), frameId(ids.grandchild), frameId(ids.fork),
+  ] } });
+  await AgentPractices.removeAsync(ids.practice);
+  await AgentExperiences.removeAsync(ids.experience);
+  await AgentConstitutions.removeAsync(ids.constitution);
+  await AgentIdentities.removeAsync('erase-agent');
   await AgentSessions.removeAsync({ _id: { $in: sessionIds } });
+}
+
+async function insertFrame(sessionId: string): Promise<void> {
+  await AgentMemoryFrames.insertAsync({
+    _id: frameId(sessionId), sessionId, agentId: 'erase-agent', triggerSeq: 0,
+    context: 'Session erasure test', practices: [], experiences: [],
+    audience: { scope: 'session', key: sessionId },
+    factMemory: { evidence: [], promptDigest: `fact-${sessionId}` },
+    protectedPromptDigest: `prompt-${sessionId}`, digest: `frame-${sessionId}`,
+    createdAt: new Date(),
+  });
+}
+
+async function insertAgentLearning(): Promise<void> {
+  const now = new Date();
+  await AgentIdentities.insertAsync({
+    _id: 'erase-agent', generation: 1, experienceSeq: 1,
+    currentName: 'erase-agent', aliases: [], displayName: 'Erase agent',
+    lifecycle: 'active', constitutionVersionId: ids.constitution,
+    flexibility: { capacity: 3, available: 3 }, createdAt: now, updatedAt: now,
+  });
+  await AgentConstitutions.insertAsync({
+    _id: ids.constitution, agentId: 'erase-agent', revision: 1,
+    content: 'Preserve identity across Session erasure.', reason: 'Test seed',
+    digest: 'constitution-digest', source: { kind: 'app', key: 'erase-seed' },
+    createdAt: now,
+  });
+  await AgentExperiences.insertAsync({
+    _id: ids.experience, agentId: 'erase-agent', sequence: 1,
+    expectationBasis: 'explicit',
+    expected: 'Session remains', observed: 'Session was erased',
+    difference: 'The Session lifecycle changed',
+    lesson: 'Experience belongs to the Agent, not its source Session.',
+    context: 'session-lifecycle', confidence: 1, status: 'active',
+    audience: { scope: 'session', key: ids.root },
+    source: {
+      kind: 'model', key: 'experience-propose:erase-call',
+      sessionId: ids.root, triggerSeq: 0, toolCallId: 'erase-call',
+      assistantMessageId: 'erase-assistant-message',
+    },
+    frameId: frameId(ids.root), digest: 'experience-digest', createdAt: now,
+  });
+  await AgentPractices.insertAsync({
+    _id: ids.practice, practiceId: 'erase-practice-family', agentId: 'erase-agent',
+    key: 'preserve-agent-learning', revision: 1,
+    trigger: 'When erasing a Session',
+    guidance: 'Remove Session Frames but preserve Agent-owned learning.',
+    context: 'session-lifecycle', evidenceIds: [ids.experience],
+    source: { kind: 'app', key: 'erase-practice-seed' }, digest: 'practice-digest',
+    status: 'candidate', createdAt: now, updatedAt: now,
+  });
 }
 
 describe('Agent.erase — server-side Session lifecycle', () => {
   beforeEach(clean);
   afterEach(clean);
 
-  it('recursively erases Session-owned state while preserving forks, Memory, and identity', async () => {
+  it('erases descendant Frames while preserving forks, Fact Memory, and Agent learning', async () => {
     await AgentSessions.insertAsync(session(ids.root, 'erase-agent'));
     await AgentSessions.insertAsync(session(
       ids.child, 'specialist', { sessionId: ids.root, toolCallId: 'call-1' },
@@ -121,6 +189,11 @@ describe('Agent.erase — server-side Session lifecycle', () => {
       draft: { content: 'reserved private input' }, resetRelay: true,
       createdAt: new Date(),
     });
+    await Promise.all([
+      insertFrame(ids.root), insertFrame(ids.child), insertFrame(ids.grandchild),
+      insertFrame(ids.fork),
+    ]);
+    await insertAgentLearning();
 
     const result = await new Agent('erase-agent').erase(ids.root, { userId: 'erase-owner' });
 
@@ -144,6 +217,17 @@ describe('Agent.erase — server-side Session lifecycle', () => {
     assert.isUndefined(await UserMessageReservations.findOneAsync(ids.reservation));
     assert.isDefined(await ChannelIdentities.findOneAsync(ids.identity));
     assert.isDefined(await AgentMemories.findOneAsync(ids.memory));
+    assert.isUndefined(await AgentMemoryFrames.findOneAsync(frameId(ids.root)));
+    assert.isUndefined(await AgentMemoryFrames.findOneAsync(frameId(ids.child)));
+    assert.isUndefined(await AgentMemoryFrames.findOneAsync(frameId(ids.grandchild)));
+    assert.isDefined(
+      await AgentMemoryFrames.findOneAsync(frameId(ids.fork)),
+      'an independent fork keeps its own Memory Frame',
+    );
+    assert.isDefined(await AgentIdentities.findOneAsync('erase-agent'));
+    assert.isDefined(await AgentConstitutions.findOneAsync(ids.constitution));
+    assert.isDefined(await AgentExperiences.findOneAsync(ids.experience));
+    assert.isDefined(await AgentPractices.findOneAsync(ids.practice));
   });
 
   it('does not disclose or mutate a wrong-owner, wrong-agent, or child Session', async () => {
@@ -263,6 +347,49 @@ describe('Agent.erase — server-side Session lifecycle', () => {
     assert.isUndefined(await AgentSessions.findOneAsync(ids.root));
     assert.isUndefined(await AgentSessions.findOneAsync(ids.child));
     assert.isUndefined(await ChannelBindings.findOneAsync(ids.binding));
+  });
+
+  it('replays Frame cleanup after a crash before Session row deletion', async () => {
+    await AgentSessions.insertAsync({
+      ...session(ids.root, 'erase-agent'), phase: 'stopped', erasingAt: new Date(),
+    });
+    await AgentSessions.insertAsync(session(
+      ids.child, 'specialist', { sessionId: ids.root, toolCallId: 'call-1' },
+    ));
+    await Promise.all([insertFrame(ids.root), insertFrame(ids.child)]);
+    await insertAgentLearning();
+
+    const removeSession = AgentSessions.removeAsync;
+    let crashed = false;
+    (AgentSessions as any).removeAsync = async (selector: unknown): Promise<number> => {
+      if (!crashed && typeof selector === 'object') {
+        crashed = true;
+        throw new Error('injected crash after dependent purge');
+      }
+      return removeSession.call(AgentSessions, selector as any);
+    };
+    try {
+      await resumeSessionErasures();
+    } finally {
+      (AgentSessions as any).removeAsync = removeSession;
+    }
+
+    assert.isTrue(crashed);
+    assert.isDefined(
+      await AgentSessions.findOneAsync(ids.root),
+      'the durable root fence survives an interrupted purge',
+    );
+    assert.isUndefined(await AgentMemoryFrames.findOneAsync(frameId(ids.root)));
+    assert.isUndefined(await AgentMemoryFrames.findOneAsync(frameId(ids.child)));
+
+    await resumeSessionErasures();
+
+    assert.isUndefined(await AgentSessions.findOneAsync(ids.root));
+    assert.isUndefined(await AgentSessions.findOneAsync(ids.child));
+    assert.isDefined(await AgentIdentities.findOneAsync('erase-agent'));
+    assert.isDefined(await AgentConstitutions.findOneAsync(ids.constitution));
+    assert.isDefined(await AgentExperiences.findOneAsync(ids.experience));
+    assert.isDefined(await AgentPractices.findOneAsync(ids.practice));
   });
 
   it('keeps periodic recovery best-effort when one fenced root is malformed', async () => {
@@ -408,5 +535,58 @@ describe('Agent.erase — server-side Session lifecycle', () => {
     assert.equal((failure as Error)?.name, 'SessionOperationRevokedError');
     assert.isTrue(operation!.signal.aborted);
     await operation!.close();
+  });
+});
+
+describe('Agent participant lifecycle — parked turn cancellation', () => {
+  const parkedSession = 'archive-parked-session';
+  const otherSession = 'archive-other-session';
+
+  beforeEach(async () => {
+    await AgentDeltas.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
+    await AgentMessages.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
+    await AgentSessions.removeAsync({ _id: { $in: [parkedSession, otherSession] } });
+  });
+  afterEach(async () => {
+    await AgentDeltas.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
+    await AgentMessages.removeAsync({ sessionId: { $in: [parkedSession, otherSession] } });
+    await AgentSessions.removeAsync({ _id: { $in: [parkedSession, otherSession] } });
+  });
+
+  it('revokes only the archived Agent park and removes its incomplete batch', async () => {
+    const now = new Date();
+    const parked = {
+      toolCallId: 'archive-call', name: 'dangerous', args: {}, agent: 'archived-specialist',
+      requestedAt: now,
+    };
+    await AgentSessions.insertAsync({
+      ...session(parkedSession, 'orchestrator'), phase: 'awaiting', pending: parked,
+      lease: { serverId: 'resume-server', until: new Date(Date.now() + 60_000) },
+    });
+    await AgentSessions.insertAsync({
+      ...session(otherSession, 'orchestrator'), phase: 'awaiting',
+      pending: { ...parked, toolCallId: 'other-call', agent: 'other-specialist' },
+    });
+    await AgentMessages.insertAsync({
+      _id: 'archive-assistant', sessionId: parkedSession, seq: 0, role: 'assistant',
+      content: '', toolCalls: [{ id: 'archive-call', name: 'dangerous', args: {} }],
+      createdAt: now,
+    });
+    await AgentDeltas.insertAsync({
+      _id: 'archive-delta', sessionId: parkedSession,
+      messageId: 'archive-assistant', msgSeq: 0, seq: 0,
+      kind: 'tool_args', text: '{}', at: now,
+    } as any);
+
+    const result = await abandonPendingAgentTurns('archived-specialist', 'erase-owner');
+
+    assert.deepEqual(result, { sessions: 1, toolCalls: ['archive-call'] });
+    const released = await AgentSessions.findOneAsync(parkedSession);
+    assert.equal(released?.phase, 'idle');
+    assert.isUndefined(released?.pending);
+    assert.isUndefined(released?.lease);
+    assert.isUndefined(await AgentMessages.findOneAsync('archive-assistant'));
+    assert.isUndefined(await AgentDeltas.findOneAsync('archive-delta'));
+    assert.equal((await AgentSessions.findOneAsync(otherSession))?.phase, 'awaiting');
   });
 });

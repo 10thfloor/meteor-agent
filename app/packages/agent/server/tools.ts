@@ -2,6 +2,7 @@ import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
 import { DDP } from 'meteor/ddp';
 import { DDPCommon } from 'meteor/ddp-common';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ToolSchema } from './providers/types';
 import type { FromSchema } from '../common/schema';
 import { loadTypebox, typeboxValueResolvable } from './providers/loader';
@@ -38,8 +39,15 @@ export interface ToolContext {
   sessionId: string;
   /** Set by loop dispatch; optional for direct `runTool` callers. */
   toolCallId?: string;
+  /** Committed assistant Message that contains this Tool call. Set by loop
+   * dispatch so built-in provenance never depends on model arguments. */
+  assistantMessageId?: string;
   // Set by loop dispatch; optional for direct callers.
   agent?: string;
+  /** Stable Agent Identity and its frozen Turn frame. Built-in learning Tools
+   * require both and never accept either from model arguments. */
+  agentId?: string;
+  memoryFrameId?: string;
   /** Present only when `runAs` replaced `userId`; the real caller. */
   callerUserId?: string | null;
   /** Whether the provider supports image input (§9); `read_attachment` gates on it. */
@@ -655,6 +663,12 @@ export function withInvocation<T>(userId: string | null, fn: () => Promise<T>): 
   return (DDP as any)._CurrentMethodInvocation.withValue(invocation, fn);
 }
 
+/** Carries the host's live tool entitlement into co-registered Agent.method
+ * handlers. Plain UI/DDP calls have no store and keep their normal behavior. */
+const adoptedToolAuthorization = new AsyncLocalStorage<
+  () => boolean | Promise<boolean>
+>();
+
 /** Default and type-check a gate. A typo discovered at dispatch would silently
  *  ungate the tool, so refuse invalid gates here at resolve time. */
 function normalizeGate(gate: unknown, label: string): Gate {
@@ -1222,6 +1236,18 @@ export function defineAgentMethod(name: string, options: AgentMethodOptions): Ad
       }
       const verdict = await validateToolArgs(options.args, args);
       if (!verdict.ok) throw new Meteor.Error('invalid-args', verdict.reason);
+      // An agent-initiated call carries its host authorization across
+      // Meteor.callAsync. Re-read it after this handler's own awaited
+      // validation and immediately before the co-registered body. Direct UI
+      // callers have no ambient callback and retain their normal method path.
+      const authorize = adoptedToolAuthorization.getStore();
+      if (authorize) {
+        let allowed = false;
+        try { allowed = (await authorize()) === true; } catch { /* fail closed */ }
+        if (!allowed) {
+          throw new Meteor.Error('not-allowed', `This agent may not use ${name}.`);
+        }
+      }
       return options.run.call(this, args);
     },
   });
@@ -1236,9 +1262,21 @@ export function defineAgentMethod(name: string, options: AgentMethodOptions): Ad
 
 export async function runTool(
   tool: ResolvedTool, args: unknown, ctx: ToolContext,
+  authorize?: () => boolean | Promise<boolean>,
 ): Promise<ToolResult> {
-  // Validate inline args here (one guard for all dispatch paths). Adopted tools
-  // validate in their own DDP handler. Subagents route through the loop, not here.
+  const authorized = async (): Promise<boolean> => {
+    if (!authorize) return true;
+    try { return (await authorize()) === true; } catch { return false; }
+  };
+  const denied = (): ToolResult => ({
+    ok: false,
+    error: { error: 'not-allowed', reason: `This agent may not use ${tool.name}.` },
+  });
+  // Validate inline and adopted args here (one pre-dispatch guard for both
+  // paths). An adopted method still validates in its own DDP handler, but that
+  // handler may await a lazily loaded checker. Doing the same validation here
+  // lets authorization be re-read after that setup and before callAsync starts.
+  // Subagents route through the loop, not here.
   if (tool.kind === 'subagent') {
     return {
       ok: false,
@@ -1276,17 +1314,26 @@ export async function runTool(
         },
       };
     }
+    // Argument validation may load or compile a checker asynchronously. The
+    // host entitlement is re-read after that await, at the last boundary
+    // before the external MCP side effect starts.
+    if (!(await authorized())) return denied();
     // No `withInvocation`: there is no Meteor method here and no `this` for a
     // handler to read. `ctx.userId` still governs the call through `canUse` and
     // the gate, which run before dispatch.
-    return callMcpTool(server, name, args);
+    return callMcpTool(server, name, args, authorize, tool.name);
   }
-  if (tool.kind === 'inline') {
+  if (tool.kind === 'inline' || tool.kind === 'adopted') {
     const verdict = await validateToolArgs(tool.args, args);
     if (!verdict.ok) {
       return { ok: false, error: { error: 'invalid-args', reason: verdict.reason } };
     }
   }
+  // Inline and adopted Tools share this final authorization boundary. For an
+  // adopted Tool it precedes Meteor.callAsync (after its host-side validation);
+  // for an inline Tool it precedes the implementation body. A call already
+  // beyond this boundary may finish.
+  if (!(await authorized())) return denied();
   // `runAs` replaces userId for this tool; authorization already ran against
   // the real owner. `callerUserId` carries the real owner for the tool body.
   const escalated = tool.runAs !== undefined;
@@ -1299,7 +1346,9 @@ export async function runTool(
       if (tool.kind === 'adopted') {
         // Meteor derives its own MethodInvocation here, inheriting userId from
         // the ambient one, and the method's own check() calls run as written.
-        return Meteor.callAsync(tool.method!, args);
+        return authorize
+          ? adoptedToolAuthorization.run(authorize, () => Meteor.callAsync(tool.method!, args))
+          : Meteor.callAsync(tool.method!, args);
       }
       return tool.run!(args, toolCtx);
     });

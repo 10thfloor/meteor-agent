@@ -87,7 +87,8 @@ Support.define({
   maxResultChars: 8000,                      // tool results truncated past this
   maxToolArgBytes: 262144,                   // per-turn tool_args delta ceiling
                                              // (display only; see Operations)
-  canUse: (tool, { userId }) => true,        // agent-level tool backstop
+  canUse: (tool, { userId, args, toolCallId }) => true,
+                                             // live agent-level entitlement
   approve: ({ userId }) => userId !== null,  // who may answer ask-gates
   provider: mockProvider(...),               // an impl, or 'name' registered
                                              // with Agent.provider; omit for pi-ai
@@ -174,6 +175,15 @@ remainder. The one exception is the approved call itself, which is dispatched
 rather than re-gated — a human has already answered the question, in writing, in
 the transcript, and a predicate reading mutable state routinely gives a
 different answer by the time somebody clicks Approve.
+
+**`canUse` is the non-overridable entitlement fence.** It receives the exact
+`tool`, model `args`, stable `toolCallId`, session owner, and `sessionId`. The
+runtime checks it before a gate, immediately before execution after awaited
+validation/setup, after an ask marker commits, and again when approval resumes.
+An MCP connection may be established while setup is in flight, but a revoked
+call never reaches `tools/call`; a revoked subagent never gets a child Session.
+Treat the callback as a read-only, idempotent predicate because one logical
+call is deliberately checked more than once.
 
 **Co-registration** defines the method and the tool at once, so your UI and the
 model call the same code through the same schema:
@@ -540,8 +550,9 @@ every other result.
 
 **Gates, `canUse` and budgets apply unchanged.** An MCP tool is dispatched
 through the same `runTool` an inline tool is, so `gate: 'ask'` parks it, a
-`canUse` refusal never reaches the server, arguments are checked against the
-discovered schema before the call, and each call costs one `budget.toolCalls`.
+`canUse` refusal never reaches the server's `tools/call`, arguments are checked
+against the discovered schema before the call, and each call costs one
+`budget.toolCalls`.
 
 ## Types
 
@@ -1412,7 +1423,27 @@ message, and deletes the session and its transcript before returning. Two
 rejections instead of a half-answer: `ask-parked` when the turn hits a
 `gate: 'ask'` tool (nobody is there to approve it — keep ask-gated tools on
 interactive agents), and `ask-failed` when the provider failed terminally or a
-budget stopped the run, with `reason` naming which.
+budget stopped the run, with `reason` naming which. `ask-failed` also withholds
+an otherwise successful answer if throwaway cleanup is still pending; durable
+lifecycle recovery finishes the fenced erasure rather than falsely returning
+while temporary state remains.
+
+If the Agent has an identity, `ask` also enforces its lifecycle and freezes the
+same protected Constitution and applicable Practices used by an interactive
+Turn. The throwaway Session, transcript, and Memory Frame are erased in
+`finally`; Agent-owned Identity, Constitution, Experience, and Practice remain.
+Fact Memory is deliberately excluded. When Experience recall is enabled,
+`experience_search` remains available against the Frame's frozen evidence. If
+`experience.approval` is `ask`, an allowed `experience_propose` reaches its Gate
+and parks the headless Turn; `canUse` may instead deny it before parking. With
+`auto`, the Experience can be admitted and survive throwaway erasure. Enabled
+Practice acquisition may likewise leave a candidate for later review or
+validate a trial for later Turns. Configure these automatic effects deliberately:
+`ask` has no live reviewer.
+
+Within the protected layer, Constitution is the higher authority. A Practice
+applies only when its trigger matches and its guidance remains consistent with
+the Constitution; a conflict is resolved in favor of Constitution.
 
 Because an agent's `ask` is a plain async function returning a string, it is
 also a legal tool body — but for agent composition prefer a `{ subagent }` tool
@@ -1994,7 +2025,7 @@ an `afterToolResult` hook, degradable when a provider refuses them.
 
 Full design: `docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md`.
 
-## Memory
+## Fact Memory
 
 An agent that only knows this conversation forgets the person the moment it
 ends. `memory` gives it durable recall — about the people it serves, and about
@@ -2009,13 +2040,13 @@ That is the whole opt-in. Declaring it registers three model-facing tools
 listing to the system prompt on every iteration. Omit it and nothing changes:
 no tools, no listing, no writes — today's behavior, bit-for-bit.
 
-**Memory follows the human, not the model.** The default scope is keyed by
+**Fact Memory follows the human, not the model.** The default scope is keyed by
 `userId` alone, and a turn always runs as the session owner, so every model
 participant in a session reads the *same* store. What `support` learns,
 `analyst` recalls — sharing is a consequence of the participants model, not a
 second feature.
 
-**Two kinds of memory.** Person memory (`scope: 'user'`) is what the
+**Two kinds of Fact Memory.** Person memory (`scope: 'user'`) is what the
 deployment knows about one human. Work memory (`scope: 'app'`) is what it has
 learned about its own domain — one pool, no `userId`, read by every agent in
 every session:
@@ -2073,12 +2104,14 @@ await Agent.memory.forget(userId, id);
 await Agent.memory.save(userId, { text: '…', scope: 'agent' }, { agent: 'support' });
 ```
 
-Anonymous sessions write nothing — not personal memory (a store keyed on
+Anonymous sessions write no Fact Memory — not personal memory (a store keyed on
 `null` would be one store shared by every anonymous visitor) and not the work
 pool (`approve` is optional, so a gate is no guard there). They still read work
 memory, and the listing says so plainly. Subagent children and `Agent.ask()`
-throwaways get no memory at all: a child's work folds back into its parent,
-which is the memory-bearing conversation.
+throwaways get no **Fact Memory**: a child's work folds back into its parent,
+which is the Fact-Memory-bearing conversation. An identity-enabled child or
+one-shot still receives its Agent-owned Constitution and applicable Practices
+through a Memory Frame; that Session-owned Frame is erased with the throwaway.
 
 ### Search, and what your database needs
 
@@ -2147,6 +2180,257 @@ features at the time of writing — the ladder is what makes depending on them
 safe.
 
 Full design: `docs/superpowers/specs/2026-08-23-agent-memory-design.md`.
+
+## Agent identity and experiential learning
+
+Fact Memory stores propositions about a person or the work. Agent learning is a
+separate, opt-in system for stable identity, expected-versus-observed evidence,
+reviewed ways of working, and Turn causality.
+
+```ts
+Support.define({
+  model,
+  instructions,
+  identity: {
+    id: 'support-agent-v1',
+    displayName: 'Support',
+    aliases: ['customer-support'],
+    constitution: 'Protect customer trust. State uncertainty.',
+    flexibility: 4,
+  },
+  experience: {
+    record: true,
+    recall: { recent: 12 },
+    scope: 'owner',
+    approval: 'ask',
+  },
+  practice: {
+    acquire: true,
+    approval: 'ask',
+    allowScopedEvidencePromotion: false,
+  },
+});
+```
+
+`identity.id` is the durable continuity key. Keep it stable when changing a
+registry/display name, model, Team, instructions, or other configuration. A
+clone needs a new id. `constitution` seeds immutable revision 1 only when a new
+identity has no Constitution; later config drift never silently revises it.
+`flexibility` defaults to 3 and limits how many Practices can be hardened at
+once.
+
+`experience` requires `identity`:
+
+- `true` enables recording and recall of up to 4 recent Experiences;
+- `{ record: false, recall: { recent: 8 } }` is recall-only;
+- `{ record: true, recall: false }` records without a search Tool; and
+- omitted/`false` disables Experience for that Agent.
+
+`experience.approval` is `ask` by default. Set it to `auto` to admit a
+model-authored Experience without parking the Turn; the row records
+`admission: 'automatic'` and remains pending post-admission audit.
+
+`practice` also requires `identity`. It is omitted/`false` by default.
+`practice: true` enables Agent-authored candidates with approval `ask` and no
+scoped-evidence promotion. The object form accepts `acquire`, `approval`, and
+`allowScopedEvidencePromotion`; `approval` is independently `ask` or `auto`.
+
+Omitting `identity` disables the identity-owned learning layers; it does not
+disable independently configured Fact Memory.
+
+`scope` selects one exact Experience audience for both recording and recall:
+
+- `identity` (the default) uses the stable `identity.id` and intentionally
+  shares Experience across every owner and Session using that identity;
+- `owner` uses the authenticated Session owner's `userId` and shares only
+  across that owner's Sessions; an anonymous owner safely falls back to the
+  current Session; and
+- `session` confines Experience to the current Session. Forks and child
+  Sessions have different keys.
+
+Audiences are exact partitions, not a union: an owner-scoped Turn does not also
+recall identity- or session-scoped rows. `identity.id` is therefore the tenant
+and privacy boundary for identity scope. A multi-tenant host must allocate a
+tenant-distinct identity id or choose a narrower scope. `owner` means the
+Session owner—not a roster participant, approver, Tool `runAs`, or model.
+
+Object configuration is strict: Experience accepts only `record`, `recall`,
+`scope`, and `approval`.
+`record` must be boolean; `recall` must be `false` or an object containing only
+`recent`. `recall.recent` must be an integer from 0–20; 0 is equivalent to
+`recall: false`. `scope` must be `identity`, `owner`, or `session`. Unknown
+options and invalid value types are startup errors. Practice accepts only the
+three fields named above, with booleans for `acquire` and
+`allowScopedEvidencePromotion`.
+
+The options reserve three Tool names. An app-authored Tool with any of them is
+a configuration error:
+
+- `experience_propose` is `gate: 'ask'` by default and `gate: 'auto'` when the
+  frozen `experience.approval` is `auto`. Its model arguments are
+  `expectationBasis`, `expected`, `observed`, `difference`, `lesson`, `context`,
+  and `confidence`. Agent, Session, trigger, committed assistant Message
+  (`assistantMessageId`), Tool-call, and Frame provenance are runtime-owned
+  closure fields. Audience is also runtime-owned and cannot be selected by
+  model arguments. The Provider receives only a recorded/replayed receipt,
+  never the durable row's audience key or internal provenance.
+- `experience_search` is automatic and returns bounded active evidence from the
+  current frozen Frame. Results include `expectationBasis`, which is `explicit`
+  (known before the outcome), `inferred` (derived from prior state), or
+  `retrospective` (reconstructed after the outcome).
+- `practice_propose` is available only when acquisition is enabled and the
+  Frame contains Experience evidence. It accepts a key, trigger, guidance,
+  context, and exact Experience ids from that Frame. It can create a candidate
+  and, under eligible automatic policy, validate it as a trial. It cannot
+  harden a Practice.
+
+### Constitution, Experience, Practice, and Frames
+
+The operative split is: **Fact Memory is what the Agent knows; Practice is how
+the Agent gets good at the job; Constitution is how the Agent chooses to be.**
+Experience supplies reviewable expectation-versus-observation evidence, and a
+Memory Frame proves what shaped a Turn. The records therefore have different
+jobs and lifecycles:
+
+| Record | Ownership | Mutation rule |
+|---|---|---|
+| Constitution | Agent | Immutable revision; identity pointer advances with generation CAS |
+| Experience | Agent, with exact recall audience | Immutable evidence; `active` may become `retracted` with reason/source |
+| Practice | Agent | Immutable content revision; controlled status transitions |
+| Memory Frame | Session | Immutable snapshot for one Agent/Session/trigger |
+
+A Practice candidate references exact active, same-Agent, same-context
+Experience. A proposal accepts 1–50 distinct, non-empty Experience ids; invalid
+or duplicate ids are rejected before evidence is queried, and the accepted list
+is sorted into canonical order. The implemented transitions are `candidate →
+validated → hardened → retired`, plus `candidate → rejected` and `validated →
+retired|rejected`.
+Validation rechecks that every proposal evidence id remains active for the same
+Agent and context, then records a per-Agent Experience watermark. Hardening
+requires the trusted caller to name one exact active same-Agent/same-context
+Experience whose sequence is later than that watermark; the framework never
+silently selects an eligible row. It consumes one flexibility unit. Retiring a
+hardened Practice returns it.
+
+With `practice.acquire`, `practice_propose` may create a candidate from exact
+Experience ids in its Memory Frame. `practice.approval: 'ask'` leaves it in
+Reviews. `auto` validates it immediately as a trial only when the evidence is
+identity-scoped or `allowScopedEvidencePromotion` is true. The row records
+`validationAdmission: 'automatic'`; automatic policy has no hardening
+Interface.
+
+Practices and Constitution remain identity-wide. Promoting owner- or
+session-scoped Experience is therefore a deliberate declassification boundary.
+Without explicit scoped-promotion consent, an automatic proposal remains a
+candidate. An audience-partitioned hardening proof may still be selected by a
+trusted caller; its exact id and audience remain in the audit record.
+
+Retracting evidence does not silently demote a validated or hardened Practice.
+`Agent.learning.audit` reports separate review-needed notices for proposal
+evidence retracted after application and for retracted hardening evidence, so
+host policy can choose a deliberate retirement.
+
+Automatic Experience and validated Practice rows remain pending
+post-admission audit until a trusted caller invokes `Agent.learning.review`.
+The resulting `review: { at, source, reason? }` acknowledges the record without
+changing `admission`, `validationAdmission`, semantic content, or status.
+Corrections remain retract/retire plus a replacement revision.
+
+Before provider work, the Turn loop freezes a Memory Frame containing the
+active Constitution, applicable validated/hardened Practices, selected active
+Experience digests from one persisted exact audience, Fact Memory
+evidence/digest, and Learning Governance for Experience admission and Practice
+acquisition. The Frame also freezes the protected-prompt renderer version;
+retained byte-exact renderers keep unversioned legacy Frames verifiable, while
+unknown or explicitly mismatched versions fail closed. Frames are never
+backfilled when prompt wording changes. Provider retries, Tool
+iterations, approval resume, and recovery adopt the same Frame. Config edits
+and newly admitted Experience or Practice apply on the next trigger, never the
+Turn that created them. Exact Fact Memory
+prompt text stays Turn-local; recovery
+re-renders it and fails closed if it no longer matches the Frame.
+
+### Server-only `Agent.learning`
+
+The public server Interface is:
+
+```ts
+Agent.learning.ensureIdentity(config)
+Agent.learning.reviseConstitution(agentId, expectedGeneration, body, reason, source)
+Agent.learning.setLifecycle(agentId, expectedGeneration, 'active' | 'archived', source)
+Agent.learning.recordExperience(input)
+Agent.learning.retractExperience(agentId, experienceId, reason, source)
+Agent.learning.review({ agentId, target: 'experience' | 'practice', id, source, reason? })
+Agent.learning.listExperiences(agentId, { limit?, status?, context?, audience? })
+Agent.learning.proposePractice(input)
+Agent.learning.transitionPractice(agentId, practiceRevisionId, nonHardeningStatus, reason, source)
+Agent.learning.transitionPractice(agentId, practiceRevisionId, 'hardened', reason, source, hardeningEvidenceId)
+Agent.learning.transitionAllowed(from, to)
+Agent.learning.freezeFrame(input)
+Agent.learning.protectedPrompt(frameOrId)
+Agent.learning.recordProviderRequestDigest(frameId, effectiveRequestDigest, source)
+Agent.learning.audit(agentId)
+```
+
+`listExperiences` exact-filters by `audience`; omission uses the compatibility
+identity audience. An `experience_search` Tool constructed outside a Memory
+Frame must receive an explicit resolved audience and fails closed without one.
+Trusted app/system/migration `recordExperience` calls still require stable
+`source.sessionId` and `source.triggerSeq`. They may set an explicit audience;
+omission safely defaults to `{ scope: 'identity', key: agentId }`. Any
+Frame-bound record must match that Frame's audience and source tuple.
+If `freezeFrame` receives an explicit source, its `sessionId` and `triggerSeq`
+must match the Frame tuple; provenance cannot rename the causal owner.
+
+`Agent.learning.read` also provides privileged cursor factories for identities,
+constitutions, experiences, practices, Frames, and audit events. They exist so a
+host can build a filtered publication without importing private collections.
+They enumerate all audience partitions unless the host adds an audience
+selector. They are not a browser mutation API, and a host must enforce tenant
+authorization and audience filtering before publishing end-user recall data.
+
+Every mutation receives a `LearningSource` with a stable `key`. The source
+identity plus canonical command digest is the idempotency contract: the same
+logical command adopts prior state; reusing the key for different content
+conflicts. A hardening command includes its selected `hardeningEvidenceId`, so
+changing the proof while reusing a source conflicts. Mongo transactions commit
+the state change and its Learning Event together. Active-identity write fences,
+unique indexes, generation/status
+selectors, deterministic IDs, and Experience watermarks enforce the first-form
+race invariants. If archival wins the Identity fence, a concurrent learning
+mutation cannot commit afterward. External model or evaluator cost can still
+repeat after an ambiguous crash.
+
+For a model-authored Experience, `frameId` is mandatory. The runtime inherits
+the Frame's exact audience, rejects a supplied mismatch, and verifies that
+`assistantMessageId` names a committed assistant row in the declared Session and
+that the row contains the declared `toolCallId`. An exact replay can still adopt
+its durable Experience after Session erasure; a new record cannot rely on
+invented transcript provenance.
+
+### Archive, Session erasure, and audit
+
+Agent archival preserves Identity, Constitution, Experience, Practice, and
+Learning Events but blocks new Turns and non-lifecycle learning mutations;
+explicit lifecycle restoration remains available. Session erasure
+deletes Session-owned Frames for the erased root and descendants while retaining
+Agent-owned learning and Fact Memory. Audience controls exposure, not durable
+ownership: a retained session-scoped Experience becomes unreachable from other
+Sessions but remains available to privileged audit/history reads. A retained Experience may therefore point
+to deliberately erased Session/Frame provenance. `Agent.learning.audit` reports
+that as a notice; a missing Frame for a surviving Session remains an integrity
+issue.
+
+An already-running remote provider may finish after a host archives an Agent.
+Hosts must re-check current lifecycle before consequential Tool work; archival
+does not promise cancellation of computation already streaming elsewhere.
+
+The package never changes Constitution automatically, never treats retracted
+evidence as a silent Practice demotion, and does not claim that `hardened` means
+true. See [`docs/agent-experience-primer.md`](../../../docs/agent-experience-primer.md)
+and [ADR 0001](../../../docs/adr/0001-agent-experience-memory.md) plus
+[ADR 0002](../../../docs/adr/0002-automatic-learning-governance.md) for the
+complete contract and limitations.
 
 ## Scope and stability
 

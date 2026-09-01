@@ -6,6 +6,7 @@ import {
   Agent,
   AgentMemories,
   AgentSessions,
+  PRACTICE_EVIDENCE_MAX,
   NAMES,
   defineAgentChat,
 } from 'meteor/10thfloor:agent';
@@ -13,6 +14,7 @@ import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,
   deriveRuntimeState,
+  nextScheduledAt,
 } from '../imports/constellation/config';
 
 const SESSION_KEY = 'constellation.session';
@@ -36,9 +38,15 @@ const SkillConfigs = new Mongo.Collection('constellation_skills');
 const ChannelConfigs = new Mongo.Collection('constellation_channel_configs');
 const McpConfigs = new Mongo.Collection('constellation_mcp_configs');
 const ToolCatalog = new Mongo.Collection('constellation_tool_catalog');
+const AgentIdentities = new Mongo.Collection('agent_identities');
+const AgentConstitutions = new Mongo.Collection('agent_constitutions');
+const AgentExperiences = new Mongo.Collection('agent_experiences');
+const AgentPractices = new Mongo.Collection('agent_practices');
+const AgentMemoryFrames = new Mongo.Collection('agent_memory_frames');
 const workspace = new Agent('orchestrator');
 const sessionChanged = new Tracker.Dependency();
 const memoryViewChanged = new Tracker.Dependency();
+const learningViewChanged = new Tracker.Dependency();
 const $ = (id) => document.getElementById(id);
 
 let currentSessionId = null;
@@ -49,8 +57,20 @@ let editingMissionSessionId = null;
 let editingMissionRevision = null;
 let selectedCrewId = null;
 let crewEditor = null;
-let pendingCrewImpact = null;
+let pendingCrewArchiveImpact = null;
 let crewDirectoryTab = 'agents';
+let agentDetailTab = 'profile';
+let constitutionDraft = null;
+const constitutionDrafts = new Map();
+let experienceRetractDraftId = null;
+let practiceTransitionDraft = null;
+let practiceEvidenceDraft = new Set();
+let practiceDraft = null;
+const practiceDrafts = new Map();
+let agentLearningErrorAction = null;
+let learningSubscription = null;
+let learningSubscriptionError = null;
+let reviewFocusRequest = null;
 let selectedWorkspaceMemberId = null;
 let editingWorkspaceMemberId = null;
 let editingWorkspaceMemberRevision = null;
@@ -72,6 +92,9 @@ let editingChannelRevision = null;
 let selectedMcpId = null;
 let editingMcpId = null;
 let editingMcpRevision = null;
+let editingMcpPersistedEnabled = null;
+let editingMcpDiscoveredTools = null;
+let editingMcpSelectedTools = new Set();
 let selectedToolId = null;
 let pulseFilter = 'all';
 let capabilityTab = 'tools';
@@ -82,8 +105,9 @@ let mcpDetailTab = 'overview';
 let removedMcpEnvKeys = new Set();
 const renaming = new Set();
 const pendingControls = new WeakSet();
-const pendingCrewRemovals = new Set();
+const pendingCrewArchives = new Set();
 const pendingSkillStates = new Map();
+const guardedEditors = new Map();
 let childRunComputation = null;
 let applicationWired = false;
 let applicationWiringStarted = false;
@@ -140,7 +164,46 @@ function messageOf(error) {
   return error?.reason || error?.message || String(error);
 }
 
+let toastDialogRecoveryBound = false;
+
+function toastLayerOwner() {
+  const focusedDialog = document.activeElement?.closest?.('dialog[open]');
+  if (focusedDialog) return focusedDialog;
+  const hitDialog = document.elementFromPoint?.(
+    Math.floor(window.innerWidth / 2), Math.floor(window.innerHeight / 2),
+  )?.closest?.('dialog[open]');
+  if (hitDialog) return hitDialog;
+  return [...document.querySelectorAll('dialog[open]')].at(-1) ?? document.body;
+}
+
+function presentToastRegion(region) {
+  const supportsPopover = typeof region.showPopover === 'function';
+  try {
+    if (supportsPopover && region.matches(':popover-open')) region.hidePopover();
+  } catch { /* The fixed high-z fallback remains visible in older runtimes. */ }
+  const owner = toastLayerOwner();
+  if (region.parentElement !== owner) owner.append(region);
+  try {
+    if (supportsPopover) region.showPopover();
+  } catch { /* Nesting in the active dialog keeps the fallback above its backdrop. */ }
+}
+
+function bindToastDialogRecovery() {
+  if (toastDialogRecoveryBound) return;
+  toastDialogRecoveryBound = true;
+  document.addEventListener('close', () => {
+    requestAnimationFrame(() => {
+      const region = $('toast-region');
+      if (!region) return;
+      if (region.childElementCount) presentToastRegion(region);
+      else if (region.parentElement !== document.body) document.body.append(region);
+    });
+  }, true);
+}
+
 function toast(message, tone = 'success') {
+  const region = $('toast-region');
+  bindToastDialogRecovery();
   const row = document.createElement('div');
   row.className = `toast ${tone}`;
   row.setAttribute('role', tone === 'error' ? 'alert' : 'status');
@@ -148,9 +211,20 @@ function toast(message, tone = 'success') {
   const copy = document.createElement('span');
   copy.textContent = message;
   row.append(light, copy);
-  $('toast-region').append(row);
+  region.append(row);
+  presentToastRegion(region);
   window.setTimeout(() => row.classList.add('out'), 2800);
-  window.setTimeout(() => row.remove(), 3100);
+  window.setTimeout(() => {
+    row.remove();
+    if (!region.childElementCount) {
+      try {
+        if (typeof region.hidePopover === 'function' && region.matches(':popover-open')) {
+          region.hidePopover();
+        }
+      } catch { /* Already closed or unsupported. */ }
+      if (region.parentElement !== document.body) document.body.append(region);
+    }
+  }, 3100);
 }
 
 function clearFormError(formOrId) {
@@ -223,6 +297,83 @@ async function withControlBusy(control, label, operation) {
       else form.setAttribute('aria-busy', priorFormBusy);
     }
   }
+}
+
+function editorSignature(value) {
+  return JSON.stringify(value);
+}
+
+function updateGuardedEditor(formId) {
+  const editor = guardedEditors.get(formId);
+  if (!editor?.active) return false;
+  const form = $(formId);
+  const dirty = editorSignature(editor.read()) !== editor.baseline;
+  editor.dirty = dirty;
+  form.dataset.dirty = String(dirty);
+  const status = $(editor.statusId);
+  status.textContent = dirty ? 'Unsaved changes' : editor.cleanLabel;
+  status.dataset.state = dirty ? 'dirty' : 'clean';
+  status.classList.remove('error');
+  status.setAttribute('role', 'status');
+  const cancel = $(editor.cancelId);
+  cancel.textContent = dirty ? 'Discard changes' : 'Cancel';
+  const submit = form.querySelector('[type="submit"]');
+  if (submit && !pendingControls.has(submit)) {
+    submit.disabled = !dirty || (editor.requireValidity && !form.checkValidity());
+  }
+  return dirty;
+}
+
+function beginGuardedEditor(formId, { cleanLabel = 'Saved' } = {}) {
+  const editor = guardedEditors.get(formId);
+  if (!editor) return;
+  editor.cleanLabel = cleanLabel;
+  editor.baseline = editorSignature(editor.read());
+  editor.active = true;
+  editor.dirty = false;
+  updateGuardedEditor(formId);
+}
+
+function endGuardedEditor(formId) {
+  const editor = guardedEditors.get(formId);
+  if (!editor) return;
+  editor.active = false;
+  editor.dirty = false;
+  editor.baseline = null;
+  const form = $(formId);
+  delete form.dataset.dirty;
+  $(editor.cancelId).textContent = 'Cancel';
+}
+
+function closeGuardedEditor(formId) {
+  const editor = guardedEditors.get(formId);
+  if (!editor) return false;
+  const dirty = updateGuardedEditor(formId);
+  if (dirty && !window.confirm(`Discard unsaved changes to ${editor.label}?`)) return false;
+  $(editor.dialogId).close();
+  return true;
+}
+
+function registerGuardedEditor({
+  formId, dialogId, statusId, closeId, cancelId, label, read, requireValidity = false,
+}) {
+  const form = $(formId);
+  const dialog = $(dialogId);
+  const editor = {
+    dialogId, statusId, cancelId, label, read, requireValidity,
+    active: false, dirty: false, baseline: null, cleanLabel: 'Saved',
+  };
+  guardedEditors.set(formId, editor);
+  const capture = () => updateGuardedEditor(formId);
+  form.addEventListener('input', capture);
+  form.addEventListener('change', capture);
+  $(closeId).addEventListener('click', () => closeGuardedEditor(formId));
+  $(cancelId).addEventListener('click', () => closeGuardedEditor(formId));
+  dialog.addEventListener('cancel', (event) => {
+    event.preventDefault();
+    closeGuardedEditor(formId);
+  });
+  dialog.addEventListener('close', () => endGuardedEditor(formId));
 }
 
 async function copyText(value, success) {
@@ -424,6 +575,28 @@ function activateView(name) {
   });
 }
 
+function renderLocalAccountDetails() {
+  const runtime = $('runtime-label').textContent.trim() || 'Local runtime';
+  const activeChannels = Array.isArray(bootstrap?.channels) ? bootstrap.channels.length : 0;
+  $('account-runtime-value').textContent = runtime;
+  $('account-release-value').textContent = bootstrap?.release ?? 'RC1';
+  $('account-credential-value').textContent = bootstrap?.secureCredentials
+    ? 'Encrypted on this device'
+    : 'Locked';
+  $('account-channel-value').textContent = `${activeChannels} active`;
+}
+
+function openLocalAccountDetails() {
+  renderLocalAccountDetails();
+  const dialog = $('account-dialog');
+  if (!dialog.open) dialog.showModal();
+}
+
+function closeLocalAccountDetails() {
+  const dialog = $('account-dialog');
+  if (dialog.open) dialog.close();
+}
+
 function currentMissionMessages() {
   const chat = $('mission-chat');
   return chat?.agentInstance && currentSessionId
@@ -513,7 +686,8 @@ function specialistDefinitions(includeDisabled = false) {
   return CrewConfigs.find(
     includeDisabled ? { agent: { $ne: 'orchestrator' } } : { agent: { $ne: 'orchestrator' }, enabled: true },
     { sort: { order: 1, createdAt: 1 } },
-  ).fetch().filter((config) => !pendingCrewRemovals.has(config._id)).map((config) => ({
+  ).fetch().filter((config) => !pendingCrewArchives.has(config._id)
+    && !crewConfigArchived(config)).map((config) => ({
     agent: config.agent,
     label: config.displayName,
     role: config.role,
@@ -840,18 +1014,1484 @@ function renderCrew(
   $('crew-count').textContent = String(definitions.length);
 }
 
-function crewConfigs() {
-  for (const configId of pendingCrewRemovals) {
-    if (!CrewConfigs.findOne(configId)) pendingCrewRemovals.delete(configId);
+function crewConfigArchived(config) {
+  const identity = agentIdentityForConfig(config);
+  return config?.status === 'archived' || identity?.lifecycle === 'archived';
+}
+
+function crewConfigs({ includeArchived = false } = {}) {
+  for (const configId of pendingCrewArchives) {
+    if (!CrewConfigs.findOne(configId)) pendingCrewArchives.delete(configId);
   }
   const configs = CrewConfigs.find({}, { sort: { order: 1, createdAt: 1 } }).fetch()
-    .filter((config) => !pendingCrewRemovals.has(config._id));
+    .filter((config) => !pendingCrewArchives.has(config._id))
+    .filter((config) => includeArchived || !crewConfigArchived(config));
+  if (includeArchived) {
+    configs.sort((left, right) => Number(crewConfigArchived(left))
+      - Number(crewConfigArchived(right)));
+  }
   if (crewEditor?.isNew) configs.push(crewEditor.config);
   return configs;
 }
 
-function crewConfigPatch(config) {
+function learningIsReady() {
+  learningViewChanged.depend();
+  return !!learningSubscription?.ready?.();
+}
+
+function agentIdentityForConfig(config) {
+  if (!config || config._draft) return null;
+  return AgentIdentities.findOne(config.agentId ?? config._id)
+    ?? AgentIdentities.findOne({ currentName: config.agent });
+}
+
+function agentIdForConfig(config) {
+  return agentIdentityForConfig(config)?._id ?? config?.agentId ?? config?._id ?? null;
+}
+
+function agentConfigForId(agentId) {
+  if (!agentId) return null;
+  const identity = AgentIdentities.findOne(agentId);
+  return CrewConfigs.findOne(agentId)
+    ?? CrewConfigs.findOne({ agentId })
+    ?? CrewConfigs.findOne({ agent: identity?.currentName });
+}
+
+function agentDisplayName(agentId) {
+  const config = agentConfigForId(agentId);
+  const identity = AgentIdentities.findOne(agentId);
+  return config?.displayName ?? identity?.displayName ?? identity?.currentName ?? 'Agent';
+}
+
+function learningText(value) {
+  if (typeof value === 'string') return value.trim();
+  if (!value || typeof value !== 'object') return '';
+  for (const key of ['text', 'summary', 'lesson', 'guidance', 'content', 'message']) {
+    if (typeof value[key] === 'string' && value[key].trim()) return value[key].trim();
+  }
+  return '';
+}
+
+function learningAt(row) {
+  return row?.updatedAt ?? row?.createdAt ?? row?.at ?? new Date(0);
+}
+
+function learningSourceLabel(row) {
+  const source = row?.source ?? {};
+  const sessionId = source.sessionId ?? row?.sessionId;
+  const session = sessionId ? AgentSessions.findOne(sessionId) : null;
+  const mission = sessionId ? MissionConfigs.findOne(sessionId) : null;
+  const missionName = mission?.title ?? session?.title;
+  const seq = source.triggerSeq ?? row?.triggerSeq;
+  const sourceKind = typeof source.kind === 'string'
+    ? source.kind.charAt(0).toUpperCase() + source.kind.slice(1) : null;
+  return [sourceKind, missionName, Number.isInteger(seq) ? `turn ${seq}` : null,
+    timeAgo(learningAt(row))]
+    .filter(Boolean).join(' · ');
+}
+
+function appendLearningEmpty(container, text) {
+  const empty = document.createElement('div');
+  empty.className = 'learning-empty';
+  empty.textContent = text;
+  container.append(empty);
+}
+
+function learningStatus(value) {
+  const status = document.createElement('span');
+  const clean = String(value || 'active').toLowerCase();
+  status.className = `learning-status ${clean}`;
+  status.textContent = clean;
+  return status;
+}
+
+function learningCard({ title, subtitle, body, status, muted = false }) {
+  const card = document.createElement('article');
+  card.className = `learning-card${muted ? ' is-muted' : ''}`;
+  const header = document.createElement('header');
+  const copy = document.createElement('div');
+  copy.className = 'learning-card-title';
+  const heading = document.createElement('strong');
+  heading.textContent = title;
+  copy.append(heading);
+  if (subtitle) {
+    const meta = document.createElement('span');
+    meta.textContent = subtitle;
+    copy.append(meta);
+  }
+  header.append(copy);
+  if (status) header.append(learningStatus(status));
+  card.append(header);
+  if (body) {
+    const content = document.createElement('p');
+    content.textContent = body;
+    card.append(content);
+  }
+  return card;
+}
+
+function learningAdmissionState(target, record) {
+  const admission = target === 'experience'
+    ? record?.admission : record?.validationAdmission;
+  const reviewed = !!record?.review?.at;
+  const active = target === 'experience'
+    ? (record?.status ?? 'active') === 'active'
+    : ['validated', 'hardened'].includes(record?.status);
+  if (admission === 'automatic') {
+    return {
+      admission,
+      label: reviewed ? 'Automatic · Reviewed' : 'Automatic · Review needed',
+      pending: active && !reviewed,
+      state: reviewed ? 'automatic-reviewed' : 'automatic-pending',
+    };
+  }
+  if (admission === 'reviewed') {
+    return {
+      admission,
+      label: target === 'experience' ? 'Approved before recording' : 'Reviewed before use',
+      pending: false,
+      state: 'approved',
+    };
+  }
+  if (target === 'experience' && admission === 'trusted') {
+    return { admission, label: 'Trusted source', pending: false, state: 'trusted' };
+  }
+  if (target === 'practice' && record?.status === 'candidate') {
+    return { admission: null, label: 'Waiting for review', pending: false, state: 'candidate' };
+  }
   return {
+    admission: null,
+    label: target === 'experience' ? 'Admission not recorded' : 'Validation admission not recorded',
+    pending: false,
+    state: 'legacy',
+  };
+}
+
+function appendLearningAdmission(container, target, record) {
+  const admission = learningAdmissionState(target, record);
+  const label = document.createElement('span');
+  label.className = `learning-admission is-${admission.state}`;
+  label.textContent = admission.label;
+  if (record?.review?.at) {
+    label.title = `Reviewed ${new Intl.DateTimeFormat(undefined, {
+      dateStyle: 'medium', timeStyle: 'short',
+    }).format(new Date(record.review.at))}`;
+  }
+  container.append(label);
+  return admission;
+}
+
+function learningReviewButton(agentId, target, record, {
+  inlineError = true,
+  label = 'Acknowledge audit',
+  ariaLabel = null,
+} = {}) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'learning-review-action';
+  button.textContent = label;
+  button.dataset.loadingLabel = 'Acknowledging';
+  if (ariaLabel) button.setAttribute('aria-label', ariaLabel);
+  button.addEventListener('click', async () => {
+    const queue = button.closest('#reviews-list');
+    const currentRow = button.closest('.review-row');
+    const queueRows = queue ? [...queue.querySelectorAll('.review-row')] : [];
+    const currentIndex = currentRow ? queueRows.indexOf(currentRow) : -1;
+    const nextFocusKey = currentIndex >= 0
+      ? (queueRows[currentIndex + 1]?.dataset.reviewKey
+        ?? queueRows[currentIndex - 1]?.dataset.reviewKey
+        ?? 'queue')
+      : null;
+    await withControlBusy(button, 'Acknowledging', async () => {
+      try {
+        await Meteor.callAsync(
+          'constellation.learningReview', agentId, target, record._id,
+        );
+        if (nextFocusKey) reviewFocusRequest = nextFocusKey;
+        learningViewChanged.changed();
+        toast(`${target === 'experience' ? 'Experience' : 'Practice'} audit acknowledged.`);
+      } catch (error) {
+        if (inlineError) showAgentLearningError(error);
+        else toast(messageOf(error), 'error');
+      }
+    });
+  });
+  return button;
+}
+
+function clearAgentLearningError() {
+  const error = $('agent-learning-error');
+  error.hidden = true;
+  $('agent-learning-error-message').textContent = '';
+  const action = $('agent-learning-error-action');
+  action.hidden = true;
+  action.textContent = 'Retry';
+  agentLearningErrorAction = null;
+}
+
+function showAgentLearningError(error, { actionLabel, action } = {}) {
+  const region = $('agent-learning-error');
+  $('agent-learning-error-message').textContent = messageOf(error);
+  const control = $('agent-learning-error-action');
+  agentLearningErrorAction = typeof action === 'function' ? action : null;
+  control.hidden = !agentLearningErrorAction;
+  control.textContent = actionLabel || 'Retry';
+  control.dataset.loadingLabel = actionLabel === 'Rebase draft' ? 'Rebasing' : 'Retrying';
+  region.hidden = false;
+  region.scrollIntoView({ block: 'nearest' });
+}
+
+function setLearningPanelState(region, state, text) {
+  region.hidden = false;
+  region.dataset.state = state;
+  region.setAttribute('aria-busy', String(state === 'loading'));
+  const copy = region.querySelector('span') ?? region;
+  copy.textContent = text;
+}
+
+function setAgentDetailTab(tab, { focus = false } = {}) {
+  if (!['profile', 'constitution', 'experience', 'practices', 'frames'].includes(tab)) return;
+  if (crewEditor?.isNew && tab !== 'profile') return;
+  agentDetailTab = tab;
+  if (!learningSubscriptionError) clearAgentLearningError();
+  document.querySelectorAll('[data-agent-detail-tab]').forEach((button) => {
+    const active = button.dataset.agentDetailTab === tab;
+    button.classList.toggle('active', active);
+    button.setAttribute('aria-selected', String(active));
+    button.tabIndex = active ? 0 : -1;
+    if (active && focus) button.focus();
+  });
+  document.querySelectorAll('[data-agent-detail-panel]').forEach((panel) => {
+    const active = panel.dataset.agentDetailPanel === tab;
+    panel.hidden = !active;
+    panel.classList.toggle('active', active);
+  });
+  $('crew-form-actions').hidden = tab !== 'profile' && !crewEditor?.dirty;
+  $('restore-crew-agent-learning').hidden = tab === 'profile';
+}
+
+function renderAgentDetailTabs(config) {
+  const draft = !!config?._draft;
+  document.querySelectorAll('[data-agent-detail-tab]').forEach((button) => {
+    button.disabled = draft && button.dataset.agentDetailTab !== 'profile';
+  });
+  if (draft && agentDetailTab !== 'profile') agentDetailTab = 'profile';
+  setAgentDetailTab(agentDetailTab);
+}
+
+function constitutionDraftIsDirty(draft) {
+  return !!draft && (
+    draft.body.trim() !== draft.baseBody.trim() || draft.reason.trim().length > 0
+  );
+}
+
+function updateConstitutionDraftState() {
+  const dirty = constitutionDraftIsDirty(constitutionDraft);
+  $('constitution-compose').classList.toggle('has-draft', dirty);
+  $('constitution-draft-state').textContent = dirty
+    ? 'Draft not published · open to continue'
+    : 'Publish a new version while preserving history.';
+}
+
+function activateConstitutionDraft(identity, body) {
+  let draft = constitutionDrafts.get(identity._id);
+  const generation = Number(identity.generation ?? 1);
+  if (!draft || (!constitutionDraftIsDirty(draft) && draft.baseGeneration !== generation)) {
+    draft = {
+      agentId: identity._id,
+      baseBody: body,
+      baseGeneration: generation,
+      body,
+      reason: '',
+    };
+    constitutionDrafts.set(identity._id, draft);
+  }
+  const changedAgent = constitutionDraft !== draft;
+  constitutionDraft = draft;
+  if (changedAgent) {
+    $('constitution-body').value = draft.body;
+    $('constitution-reason').value = draft.reason;
+  }
+  updateConstitutionDraftState();
+  return draft;
+}
+
+function rebaseConstitutionDraft(agentId) {
+  const draft = constitutionDrafts.get(agentId);
+  const identity = AgentIdentities.findOne(agentId);
+  if (!draft || !identity) {
+    throw new Error('Latest Agent identity is not available yet.');
+  }
+  const current = identity.constitutionVersionId
+    ? AgentConstitutions.findOne({
+      _id: identity.constitutionVersionId, agentId: identity._id,
+    }) : null;
+  if (identity.constitutionVersionId && !current) {
+    throw new Error('The active Constitution is unavailable. Reload learning data before rebasing.');
+  }
+  draft.baseBody = learningText(current?.content);
+  draft.baseGeneration = Number(identity.generation ?? 1);
+  constitutionDraft = draft;
+  clearAgentLearningError();
+  renderCrewSettings();
+  toast('Constitution draft rebased. Review it before publishing.');
+}
+
+function renderConstitution(config, identity, ready, readOnly = false) {
+  const loading = $('constitution-loading');
+  const content = $('constitution-content');
+  if (!ready) {
+    setLearningPanelState(
+      loading,
+      learningSubscriptionError ? 'error' : 'loading',
+      learningSubscriptionError ? 'Constitution unavailable.' : 'Loading constitution…',
+    );
+    content.hidden = true;
+    return { versions: [], current: null };
+  }
+  if (!identity) {
+    setLearningPanelState(
+      loading, 'empty', config?._draft ? 'Save this agent first.' : 'Constitution unavailable.',
+    );
+    content.hidden = true;
+    return { versions: [], current: null };
+  }
+  loading.hidden = true;
+  content.hidden = false;
+  const versions = AgentConstitutions.find(
+    { agentId: identity._id }, { sort: { revision: -1, createdAt: -1 } },
+  ).fetch();
+  const activeVersionId = typeof identity.constitutionVersionId === 'string'
+    && identity.constitutionVersionId ? identity.constitutionVersionId : null;
+  const current = activeVersionId ? AgentConstitutions.findOne({
+    _id: activeVersionId, agentId: identity._id,
+  }) : null;
+  const unresolved = !!activeVersionId && !current;
+  content.querySelector('.constitution-compose').hidden = readOnly || unresolved;
+  const body = learningText(current?.content);
+  $('constitution-version').textContent = unresolved
+    ? 'Active version unavailable'
+    : current ? `Version ${current.revision ?? '—'}` : 'No active version';
+  $('constitution-state').textContent = unresolved ? 'Unavailable' : current ? 'Active' : 'None';
+  $('constitution-state').className = `learning-status${unresolved ? ' integrity' : current ? ' active' : ''}`;
+  const currentPanel = content.querySelector('.constitution-current');
+  currentPanel.classList.toggle('has-integrity-warning', unresolved);
+  $('constitution-current-body').textContent = unresolved
+    ? `Active Constitution ${activeVersionId} is not available in the published history. Revision is disabled.`
+    : body || 'No active constitution.';
+  if (!unresolved) activateConstitutionDraft(identity, body);
+  else constitutionDraft = null;
+  $('constitution-history-count').textContent = versions.length
+    ? `Latest ${versions.length} published version${versions.length === 1 ? '' : 's'}`
+    : 'No published versions';
+  const history = $('constitution-history-list');
+  history.replaceChildren();
+  if (!versions.length) appendLearningEmpty(history, 'No constitution history.');
+  for (const version of versions) {
+    const active = version._id === current?._id;
+    const row = learningCard({
+      title: `Version ${version.revision ?? '—'}`,
+      subtitle: [active ? 'Active' : null, learningSourceLabel(version)].filter(Boolean).join(' · '),
+      body: concise(learningText(version.content), 220),
+      status: active ? 'active' : null,
+    });
+    if (version.reason) {
+      const metadata = document.createElement('div');
+      metadata.className = 'learning-card-meta';
+      const reason = document.createElement('span');
+      reason.textContent = `Reason · ${concise(version.reason, 160)}`;
+      metadata.append(reason);
+      row.append(metadata);
+    }
+    history.append(row);
+  }
+  return { versions, current, unresolved };
+}
+
+function experienceSummary(experience) {
+  return learningText(experience.lesson)
+    || learningText(experience.difference)
+    || learningText(experience.observed)
+    || 'Recorded experience';
+}
+
+function experienceBody(experience) {
+  const expected = learningText(experience.expected);
+  const observed = learningText(experience.observed);
+  const difference = learningText(experience.difference);
+  return [
+    expected ? `Expected · ${expected}` : null,
+    observed ? `Observed · ${observed}` : null,
+    difference ? `Difference · ${difference}` : null,
+  ]
+    .filter(Boolean).join('\n');
+}
+
+function experienceAudienceLabel(audience) {
+  if (typeof audience?.key !== 'string' || !audience.key) return 'Unknown';
+  return ({ identity: 'Agent identity', owner: 'Workspace', session: 'Chat' })[
+    audience?.scope
+  ] ?? 'Unknown';
+}
+
+function experienceAudienceText(audience) {
+  const label = experienceAudienceLabel(audience);
+  return label === 'Unknown' ? 'Unknown' : `${label} · ${audience.key}`;
+}
+
+function renderExperience(identity, ready, readOnly = false) {
+  const loading = $('experience-loading');
+  const content = $('experience-content');
+  if (!ready) {
+    setLearningPanelState(
+      loading,
+      learningSubscriptionError ? 'error' : 'loading',
+      learningSubscriptionError ? 'Experience unavailable.' : 'Loading experience…',
+    );
+    content.hidden = true;
+    return [];
+  }
+  if (!identity) {
+    setLearningPanelState(loading, 'empty', 'Experience unavailable.');
+    content.hidden = true;
+    return [];
+  }
+  loading.hidden = true;
+  content.hidden = false;
+  const rows = AgentExperiences.find(
+    { agentId: identity._id }, { sort: { createdAt: -1 } },
+  ).fetch();
+  const activeCount = rows.filter((row) => (row.status ?? 'active') === 'active').length;
+  $('experience-summary').textContent = `Latest ${rows.length} records · ${activeCount} active · ${rows.length - activeCount} retracted`;
+  const list = $('experience-list');
+  list.replaceChildren();
+  if (!rows.length) appendLearningEmpty(
+    list,
+    'No Experience yet. New records appear after this agent proposes and saves one.',
+  );
+  for (const experience of rows) {
+    const status = experience.status ?? 'active';
+    const row = learningCard({
+      title: experienceSummary(experience),
+      subtitle: learningSourceLabel(experience),
+      body: experienceBody(experience),
+      status,
+      muted: status !== 'active',
+    });
+    const metadata = document.createElement('div');
+    metadata.className = 'learning-card-meta';
+    const admission = appendLearningAdmission(metadata, 'experience', experience);
+    const basis = document.createElement('span');
+    basis.textContent = `Expectation ${experience.expectationBasis ?? 'unspecified'}`;
+    metadata.append(basis);
+    if (learningText(experience.context)) {
+      const context = document.createElement('span');
+      context.textContent = `Context · ${learningText(experience.context)}`;
+      metadata.append(context);
+    }
+    const audience = document.createElement('span');
+    audience.textContent = `${experienceAudienceLabel(experience.audience)} scope`;
+    audience.classList.toggle(
+      'is-integrity-warning', experienceAudienceLabel(experience.audience) === 'Unknown',
+    );
+    metadata.append(audience);
+    if (Number.isFinite(experience.confidence)) {
+      const confidence = document.createElement('span');
+      confidence.textContent = `Confidence ${Math.round(experience.confidence * 100)}%`;
+      metadata.append(confidence);
+    }
+    if (experience.frameId) {
+      const frame = AgentMemoryFrames.findOne(experience.frameId);
+      const frameLabel = document.createElement('span');
+      frameLabel.textContent = frame ? `Frame ${String(frame._id).slice(-6)}` : 'Frame unavailable';
+      metadata.append(frameLabel);
+    }
+    if (experience.retractionReason) {
+      const reason = document.createElement('span');
+      reason.textContent = `Reason · ${concise(experience.retractionReason, 160)}`;
+      metadata.append(reason);
+    }
+    if (metadata.childElementCount) row.append(metadata);
+    if (status === 'active' && !readOnly) {
+      const actions = document.createElement('div');
+      actions.className = 'learning-card-actions';
+      if (admission.pending) {
+        actions.append(learningReviewButton(identity._id, 'experience', experience));
+      }
+      const retract = document.createElement('button');
+      retract.type = 'button';
+      retract.className = 'danger-inline';
+      retract.textContent = 'Retract';
+      retract.addEventListener('click', () => {
+        experienceRetractDraftId = experience._id;
+        learningViewChanged.changed();
+      });
+      actions.append(retract);
+      row.append(actions);
+      if (experienceRetractDraftId === experience._id) {
+        const inline = document.createElement('div');
+        inline.className = 'learning-inline-action';
+        const label = document.createElement('label');
+        label.textContent = 'Reason';
+        const input = document.createElement('input');
+        input.id = `experience-retract-reason-${experience._id}`;
+        label.htmlFor = input.id;
+        input.type = 'text';
+        input.maxLength = 500;
+        input.placeholder = 'Required';
+        const controls = document.createElement('div');
+        const cancel = document.createElement('button');
+        cancel.type = 'button';
+        cancel.textContent = 'Cancel';
+        cancel.addEventListener('click', () => {
+          experienceRetractDraftId = null;
+          learningViewChanged.changed();
+        });
+        const confirm = document.createElement('button');
+        confirm.type = 'button';
+        confirm.className = 'danger-inline';
+        confirm.textContent = 'Retract experience';
+        confirm.addEventListener('click', async () => {
+          const reason = input.value.trim();
+          if (!reason) { input.setCustomValidity('Enter a reason.'); input.reportValidity(); return; }
+          input.setCustomValidity('');
+          await withControlBusy(confirm, 'Retracting', async () => {
+            try {
+              await Meteor.callAsync(
+                'constellation.experienceRetract', identity._id, experience._id, reason,
+              );
+              experienceRetractDraftId = null;
+              learningViewChanged.changed();
+              toast('Experience retracted.');
+            } catch (error) {
+              showAgentLearningError(error);
+            }
+          });
+        });
+        controls.append(cancel, confirm);
+        inline.append(label, input, controls);
+        row.append(inline);
+        requestAnimationFrame(() => input.focus());
+      }
+    }
+    list.append(row);
+  }
+  return rows;
+}
+
+function appendFrameAuditField(list, label, value, { code = false, integrity = false } = {}) {
+  if (value === undefined || value === null || value === '') return;
+  const term = document.createElement('dt');
+  term.textContent = label;
+  const description = document.createElement('dd');
+  description.classList.toggle('is-integrity-warning', integrity);
+  const content = document.createElement(code ? 'code' : 'span');
+  content.textContent = String(value);
+  description.append(content);
+  list.append(term, description);
+}
+
+function appendFrameEvidenceGroup(container, title, rows, describe) {
+  const section = document.createElement('section');
+  const heading = document.createElement('h5');
+  heading.textContent = `${title} · ${rows.length}`;
+  section.append(heading);
+  if (!rows.length) {
+    const empty = document.createElement('p');
+    empty.textContent = 'None';
+    section.append(empty);
+  } else {
+    const list = document.createElement('ul');
+    for (const row of rows) {
+      const item = document.createElement('li');
+      const value = document.createElement('code');
+      value.textContent = describe(row);
+      item.append(value);
+      list.append(item);
+    }
+    section.append(list);
+  }
+  container.append(section);
+}
+
+function memoryFrameAuditDetails(frame) {
+  const details = document.createElement('details');
+  details.className = 'frame-audit-details';
+  const audienceLabel = experienceAudienceLabel(frame.audience);
+  const promptVersion = frame.protectedPromptVersion;
+  const promptVersionAbsent = promptVersion === undefined || promptVersion === null;
+  const promptVersionSupported = promptVersion === 1 || promptVersion === 2;
+  const integrityWarning = audienceLabel === 'Unknown'
+    || (!promptVersionAbsent && !promptVersionSupported);
+  details.classList.toggle('has-integrity-warning', integrityWarning);
+  const summary = document.createElement('summary');
+  summary.textContent = integrityWarning ? 'Inspect snapshot · integrity warning' : 'Inspect snapshot';
+  const fields = document.createElement('dl');
+  appendFrameAuditField(fields, 'Frame ID', frame._id, { code: true });
+  appendFrameAuditField(fields, 'Trigger context', frame.context);
+  appendFrameAuditField(
+    fields,
+    'Audience',
+    `${audienceLabel} · ${frame.audience?.key ?? 'Unknown'}`,
+    { code: true, integrity: audienceLabel === 'Unknown' },
+  );
+  const policy = frame.learningPolicy;
+  const legacyPolicy = !policy;
+  const experienceAdmission = policy?.experienceAdmission ?? 'reviewed';
+  const practiceAcquisition = policy?.practiceAcquisition ?? 'disabled';
+  const experienceAdmissionLabel = ({
+    reviewed: 'Approval required', automatic: 'Automatic',
+  })[experienceAdmission] ?? `Unknown · ${String(experienceAdmission)}`;
+  const practiceAcquisitionLabel = ({
+    disabled: 'Disabled', reviewed: 'Review candidates', automatic: 'Auto-validate candidates',
+  })[practiceAcquisition] ?? `Unknown · ${String(practiceAcquisition)}`;
+  appendFrameAuditField(
+    fields,
+    'Experience admission',
+    `${experienceAdmissionLabel}${legacyPolicy ? ' · legacy default' : ''}`,
+    { integrity: !['reviewed', 'automatic'].includes(experienceAdmission) },
+  );
+  appendFrameAuditField(
+    fields,
+    'Practice acquisition',
+    `${practiceAcquisitionLabel}${legacyPolicy ? ' · legacy default' : ''}`,
+    { integrity: !['disabled', 'reviewed', 'automatic'].includes(practiceAcquisition) },
+  );
+  appendFrameAuditField(
+    fields,
+    'Scoped evidence promotion',
+    `${policy?.allowScopedEvidencePromotion === true ? 'Allowed' : 'Blocked'}${legacyPolicy ? ' · legacy default' : ''}`,
+  );
+  appendFrameAuditField(fields, 'Frame digest', frame.digest, { code: true });
+  appendFrameAuditField(
+    fields,
+    'Prompt format',
+    promptVersionAbsent
+      ? 'Unversioned · legacy compatibility'
+      : promptVersionSupported ? `v${promptVersion}` : `Unsupported · ${String(promptVersion)}`,
+    { integrity: !promptVersionAbsent && !promptVersionSupported },
+  );
+  appendFrameAuditField(fields, 'Protected prompt digest', frame.protectedPromptDigest, { code: true });
+  appendFrameAuditField(fields, 'Fact prompt digest', frame.factMemory?.promptDigest, { code: true });
+  details.append(summary, fields);
+
+  const evidence = document.createElement('div');
+  evidence.className = 'frame-audit-evidence';
+  appendFrameEvidenceGroup(
+    evidence,
+    'Constitution',
+    frame.constitution ? [frame.constitution] : [],
+    (row) => `${row.id ?? 'unknown'} · v${row.revision ?? '—'} · ${row.digest ?? 'digest unavailable'}`,
+  );
+  appendFrameEvidenceGroup(
+    evidence,
+    'Practices',
+    Array.isArray(frame.practices) ? frame.practices : [],
+    (row) => `${row.id ?? 'unknown'} · v${row.revision ?? '—'} · ${row.status ?? 'unknown'} · ${row.digest ?? 'digest unavailable'}`,
+  );
+  appendFrameEvidenceGroup(
+    evidence,
+    'Experience',
+    Array.isArray(frame.experiences) ? frame.experiences : [],
+    (row) => `${row.id ?? 'unknown'} · ${row.digest ?? 'digest unavailable'}`,
+  );
+  appendFrameEvidenceGroup(
+    evidence,
+    'Fact memory',
+    Array.isArray(frame.factMemory?.evidence) ? frame.factMemory.evidence : [],
+    (row) => `${row.id ?? 'unknown'} · ${row.scope ?? 'unknown'} · ${row.digest ?? 'digest unavailable'}`,
+  );
+  details.append(evidence);
+  if (frame.digest) {
+    const actions = document.createElement('div');
+    actions.className = 'frame-audit-actions';
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.textContent = 'Copy frame digest';
+    copy.addEventListener('click', () => void copyText(frame.digest, 'Frame digest copied.'));
+    actions.append(copy);
+    details.append(actions);
+  }
+  return details;
+}
+
+function renderMemoryFrames(identity, ready) {
+  const loading = $('frames-loading');
+  const content = $('frames-content');
+  const list = $('memory-frame-list');
+  list.replaceChildren();
+  if (!ready) {
+    setLearningPanelState(
+      loading,
+      learningSubscriptionError ? 'error' : 'loading',
+      learningSubscriptionError ? 'Memory frames unavailable.' : 'Loading memory frames…',
+    );
+    content.hidden = true;
+    $('agent-frame-count').textContent = '…';
+    return [];
+  }
+  if (!identity) {
+    setLearningPanelState(loading, 'empty', 'Memory frames unavailable.');
+    content.hidden = true;
+    $('agent-frame-count').textContent = '0';
+    return [];
+  }
+  loading.hidden = true;
+  content.hidden = false;
+  const published = AgentMemoryFrames.find(
+    { agentId: identity._id }, { sort: { createdAt: -1 } },
+  ).fetch();
+  const frames = published.slice(0, 12);
+  $('agent-frame-count').textContent = String(frames.length);
+  $('memory-frame-count').textContent = frames.length
+    ? `Latest ${frames.length} frames` : 'No frames';
+  if (!frames.length) appendLearningEmpty(
+    list,
+    'No Memory Frames yet. A Frame is created after this agent’s next turn.',
+  );
+  for (const frame of frames) {
+    const session = AgentSessions.findOne(frame.sessionId);
+    const mission = MissionConfigs.findOne(frame.sessionId);
+    const title = mission?.title ?? session?.title ?? `Session ${String(frame.sessionId).slice(-6)}`;
+    const facts = frame.factMemory?.evidence?.length ?? 0;
+    const practices = frame.practices?.length ?? 0;
+    const experiences = frame.experiences?.length ?? 0;
+    const constitution = frame.constitution?.revision
+      ? `Constitution v${frame.constitution.revision}` : 'No constitution';
+    const row = learningCard({
+      title,
+      subtitle: `Turn ${frame.triggerSeq} · ${timeAgo(frame.createdAt)}`,
+      body: `${constitution} · ${practices} practices · ${experiences} experiences · ${facts} facts`,
+    });
+    const metadata = document.createElement('div');
+    metadata.className = 'learning-card-meta';
+    const audience = document.createElement('span');
+    audience.textContent = `${experienceAudienceLabel(frame.audience)} scope`;
+    audience.classList.toggle(
+      'is-integrity-warning', experienceAudienceLabel(frame.audience) === 'Unknown',
+    );
+    const digest = document.createElement('span');
+    digest.textContent = `Digest ${String(frame.digest).slice(0, 12)}`;
+    metadata.append(audience, digest);
+    row.append(metadata, memoryFrameAuditDetails(frame));
+    list.append(row);
+  }
+  return frames;
+}
+
+function practiceGuidance(practice) {
+  return learningText(practice.guidance) || 'No guidance.';
+}
+
+function activatePracticeDraft(identity) {
+  let draft = practiceDrafts.get(identity._id);
+  if (!draft) {
+    draft = {
+      agentId: identity._id,
+      key: '',
+      context: '',
+      trigger: '',
+      guidance: '',
+      evidenceIds: new Set(),
+    };
+    practiceDrafts.set(identity._id, draft);
+  }
+  const changedAgent = practiceDraft !== draft;
+  practiceDraft = draft;
+  practiceEvidenceDraft = draft.evidenceIds;
+  if (changedAgent) {
+    $('practice-key').value = draft.key;
+    $('practice-context').value = draft.context;
+    $('practice-trigger').value = draft.trigger;
+    $('practice-guidance').value = draft.guidance;
+  }
+  updatePracticeDraftState();
+  return draft;
+}
+
+function practiceDraftIsDirty(draft) {
+  return !!draft && !!(
+    draft.key.trim() || draft.context.trim() || draft.trigger.trim() || draft.guidance.trim()
+    || draft.evidenceIds.size
+  );
+}
+
+function updatePracticeDraftState() {
+  const dirty = !!practiceDraftIsDirty(practiceDraft);
+  $('practice-compose').classList.toggle('has-draft', dirty);
+  $('practice-draft-state').textContent = dirty
+    ? 'Draft not proposed · open to continue'
+    : 'Add reusable guidance from selected Experience.';
+}
+
+function practiceEvidenceRows(practice, experiences) {
+  const byId = new Map(experiences.map((experience) => [experience._id, experience]));
+  const evidenceIds = Array.isArray(practice.evidenceIds) ? practice.evidenceIds : [];
+  return evidenceIds.map((id) => ({ id, experience: byId.get(id) ?? null }));
+}
+
+function laterPracticeEvidence(practice, experiences) {
+  if (!Number.isInteger(practice.validationWatermark)) return [];
+  return experiences.filter((experience) => (
+    (experience.status ?? 'active') === 'active'
+    && learningText(experience.context) === learningText(practice.context)
+    && Number(experience.sequence) > practice.validationWatermark
+  ));
+}
+
+function practiceTransitions(practice, experiences, identity) {
+  const evidenceRows = practiceEvidenceRows(practice, experiences);
+  const evidenceBlockers = [
+    ...(!evidenceRows.length ? ['Needs at least one exact Experience.'] : []),
+    ...(evidenceRows.some(({ experience }) => !experience)
+      ? ['One or more evidence Experiences are unavailable.'] : []),
+    ...(evidenceRows.some(({ experience }) => (
+      experience && (experience.status ?? 'active') !== 'active'
+    )) ? ['One or more evidence Experiences are not active.'] : []),
+  ];
+  if (practice.status === 'candidate') {
+    return [
+      {
+        next: 'validated', label: 'Validate', disabled: evidenceBlockers.length > 0,
+        title: evidenceBlockers.join(' '),
+      },
+      { next: 'rejected', label: 'Reject' },
+    ];
+  }
+  if (practice.status === 'validated') {
+    const hardeningEvidenceOptions = laterPracticeEvidence(practice, experiences);
+    const capacityAvailable = Number(identity?.flexibility?.available ?? 0) > 0;
+    const blockers = [
+      ...evidenceBlockers,
+      ...(!hardeningEvidenceOptions.length
+        ? ['Needs a later active Experience in this context.'] : []),
+      ...(!capacityAvailable ? ['No Practice capacity is available.'] : []),
+    ];
+    return [
+      {
+        next: 'hardened',
+        label: 'Harden',
+        disabled: blockers.length > 0,
+        title: blockers.join(' '),
+        hardeningEvidenceOptions,
+      },
+      { next: 'retired', label: 'Retire' },
+      { next: 'rejected', label: 'Reject' },
+    ];
+  }
+  if (practice.status === 'hardened') return [{ next: 'retired', label: 'Retire' }];
+  return [];
+}
+
+function appendPracticeEvidenceRecords(card, practice, experiences) {
+  const evidenceRows = practiceEvidenceRows(practice, experiences);
+  const section = document.createElement('section');
+  section.className = 'practice-evidence-records';
+  const heading = document.createElement('h5');
+  heading.textContent = `Exact evidence · ${evidenceRows.length}`;
+  section.append(heading);
+  if (!evidenceRows.length) {
+    const missing = document.createElement('p');
+    missing.className = 'is-integrity-warning';
+    missing.textContent = 'No Experience evidence is attached.';
+    section.append(missing);
+  }
+  for (const { id, experience } of evidenceRows) {
+    const evidence = document.createElement('div');
+    evidence.className = `practice-evidence-record${experience ? '' : ' is-unresolved'}`;
+    const copy = document.createElement('span');
+    copy.textContent = experience
+      ? experienceSummary(experience) : 'Experience unavailable in the latest published records';
+    const audience = document.createElement('small');
+    audience.textContent = experience
+      ? `Audience · ${experienceAudienceText(experience.audience)} · ${experience.status ?? 'active'}`
+      : 'Unknown audience · unresolved';
+    const exactId = document.createElement('code');
+    exactId.textContent = id;
+    evidence.append(copy, audience, exactId);
+    section.append(evidence);
+  }
+  card.append(section);
+  return evidenceRows.some(({ experience }) => !experience) || !evidenceRows.length;
+}
+
+function appendPracticePromotionWarning(card) {
+  const warning = document.createElement('p');
+  warning.className = 'practice-promotion-warning';
+  warning.textContent = 'Promotion makes this guidance Agent-identity-wide across every chat and owner using this identity.';
+  card.append(warning);
+}
+
+function updatePracticeEvidenceState(experiences) {
+  $('practice-evidence-count').textContent = `${practiceEvidenceDraft.size} / ${PRACTICE_EVIDENCE_MAX} selected`;
+  const selected = experiences.filter((row) => practiceEvidenceDraft.has(row._id));
+  const promotedAudiences = [...new Set(selected
+    .map((row) => experienceAudienceLabel(row.audience))
+    .filter((audience) => audience !== 'Agent identity'))];
+  const note = $('practice-scope-note');
+  note.dataset.scopeState = promotedAudiences.length ? 'declassification' : 'identity';
+  note.textContent = promotedAudiences.length
+    ? `Declassification · selected Experience scope: ${promotedAudiences.join(' / ')} · promotion makes guidance Agent-identity-wide across every chat and owner using this identity`
+    : 'Promotion makes guidance Agent-identity-wide across every chat and owner using this identity.';
+}
+
+function renderPracticeEvidence(experiences) {
+  const list = $('practice-evidence-list');
+  list.replaceChildren();
+  const active = experiences.filter((row) => (row.status ?? 'active') === 'active');
+  const contextField = $('practice-context');
+  const requestedContext = contextField.value.trim();
+  const eligible = active.filter((row) => (
+    !requestedContext || learningText(row.context) === requestedContext
+  ));
+  const activeIds = new Set(eligible.map((row) => row._id));
+  practiceEvidenceDraft = new Set(
+    [...practiceEvidenceDraft].filter((experienceId) => activeIds.has(experienceId)),
+  );
+  if (practiceDraft) practiceDraft.evidenceIds = practiceEvidenceDraft;
+  updatePracticeDraftState();
+  updatePracticeEvidenceState(experiences);
+  if (!active.length) {
+    const empty = document.createElement('p');
+    empty.className = 'compact-empty';
+    empty.textContent = 'No active experience.';
+    list.append(empty);
+    return;
+  }
+  if (!eligible.length) {
+    const empty = document.createElement('p');
+    empty.className = 'compact-empty';
+    empty.textContent = 'No active experience in this context.';
+    list.append(empty);
+    return;
+  }
+  for (const experience of eligible) {
+    const label = document.createElement('label');
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.value = experience._id;
+    input.checked = practiceEvidenceDraft.has(experience._id);
+    input.addEventListener('change', () => {
+      if (input.checked) {
+        if (practiceEvidenceDraft.size >= PRACTICE_EVIDENCE_MAX) {
+          input.checked = false;
+          showAgentLearningError(new Error(
+            `Select no more than ${PRACTICE_EVIDENCE_MAX} Experience records.`,
+          ));
+          return;
+        }
+        practiceEvidenceDraft.add(experience._id);
+        if (!contextField.value.trim() && experience.context) {
+          contextField.value = experience.context;
+          if (practiceDraft) practiceDraft.context = contextField.value;
+          renderPracticeEvidence(experiences);
+          return;
+        }
+      } else practiceEvidenceDraft.delete(experience._id);
+      if (practiceDraft) practiceDraft.evidenceIds = practiceEvidenceDraft;
+      updatePracticeDraftState();
+      updatePracticeEvidenceState(experiences);
+    });
+    const copy = document.createElement('span');
+    copy.textContent = [
+      experienceSummary(experience),
+      learningText(experience.context),
+      `${experienceAudienceLabel(experience.audience)} scope`,
+    ]
+      .filter(Boolean).join(' · ');
+    label.append(input, copy);
+    list.append(label);
+  }
+}
+
+function renderPractices(identity, experiences, ready, readOnly = false) {
+  const loading = $('practices-loading');
+  const content = $('practices-content');
+  if (!ready) {
+    setLearningPanelState(
+      loading,
+      learningSubscriptionError ? 'error' : 'loading',
+      learningSubscriptionError ? 'Practices unavailable.' : 'Loading practices…',
+    );
+    content.hidden = true;
+    return [];
+  }
+  if (!identity) {
+    setLearningPanelState(loading, 'empty', 'Practices unavailable.');
+    content.hidden = true;
+    return [];
+  }
+  loading.hidden = true;
+  content.hidden = false;
+  content.querySelector('.practice-compose').hidden = readOnly;
+  activatePracticeDraft(identity);
+  const rows = AgentPractices.find(
+    { agentId: identity._id }, { sort: { updatedAt: -1, createdAt: -1 } },
+  ).fetch();
+  const activeCount = rows.filter((row) => ['validated', 'hardened'].includes(row.status)).length;
+  $('practices-summary').textContent = `Latest ${rows.length} records · ${activeCount} active · ${rows.filter((row) => row.status === 'candidate').length} candidate`;
+  renderPracticeEvidence(experiences);
+  const list = $('practice-list');
+  list.replaceChildren();
+  if (!rows.length) appendLearningEmpty(
+    list,
+    'No Practices yet. Add one here or let this agent propose one during a turn.',
+  );
+  for (const practice of rows) {
+    const row = learningCard({
+      title: practice.key || 'Practice',
+      subtitle: [practice.context, `Version ${practice.revision ?? '—'}`, learningSourceLabel(practice)]
+        .filter(Boolean).join(' · '),
+      body: practiceGuidance(practice),
+      status: practice.status,
+      muted: ['retired', 'rejected'].includes(practice.status),
+    });
+    const metadata = document.createElement('div');
+    metadata.className = 'learning-card-meta';
+    const admission = appendLearningAdmission(metadata, 'practice', practice);
+    const trigger = learningText(practice.trigger);
+    if (trigger) {
+      const triggerLabel = document.createElement('span');
+      triggerLabel.textContent = `Trigger · ${trigger}`;
+      metadata.append(triggerLabel);
+    }
+    const evidenceIds = Array.isArray(practice.evidenceIds) ? practice.evidenceIds : [];
+    const evidence = document.createElement('span');
+    evidence.textContent = `${evidenceIds.length} evidence`;
+    metadata.append(evidence);
+    if (practice.transitionReason) {
+      const reason = document.createElement('span');
+      reason.textContent = `Reason · ${concise(practice.transitionReason, 160)}`;
+      metadata.append(reason);
+    }
+    if (practice.status === 'validated' && Number.isInteger(practice.validationWatermark)) {
+      const eligible = laterPracticeEvidence(practice, experiences).length > 0;
+      const validation = document.createElement('span');
+      validation.textContent = eligible
+        ? 'Later evidence available'
+        : 'Needs later active evidence in this context';
+      metadata.append(validation);
+      if (Number(identity.flexibility?.available ?? 0) < 1) {
+        const capacity = document.createElement('span');
+        capacity.className = 'learning-capacity-blocker';
+        capacity.textContent = 'No Practice capacity available';
+        metadata.append(capacity);
+      }
+    }
+    if (practice.hardenedEvidenceId) {
+      const proof = AgentExperiences.findOne({
+        _id: practice.hardenedEvidenceId, agentId: identity._id,
+      });
+      const hardening = document.createElement('span');
+      hardening.textContent = proof
+        ? `Hardened with · ${concise(experienceSummary(proof), 120)} · Audience ${experienceAudienceText(proof.audience)} · ${proof._id}`
+        : `Hardening evidence unavailable · ${practice.hardenedEvidenceId}`;
+      hardening.classList.toggle('is-integrity-warning', !proof);
+      metadata.append(hardening);
+    }
+    row.append(metadata);
+    if (['candidate', 'validated'].includes(practice.status)) {
+      const evidenceIntegrityIssue = appendPracticeEvidenceRecords(row, practice, experiences);
+      row.classList.toggle('has-integrity-warning', evidenceIntegrityIssue);
+      appendPracticePromotionWarning(row);
+    }
+    const transitions = practiceTransitions(practice, experiences, identity);
+    if ((transitions.length || admission.pending) && !readOnly) {
+      const actions = document.createElement('div');
+      actions.className = 'learning-card-actions';
+      if (admission.pending) {
+        actions.append(learningReviewButton(identity._id, 'practice', practice));
+      }
+      for (const transition of transitions) {
+        const { next, label } = transition;
+        const action = document.createElement('button');
+        action.type = 'button';
+        action.className = ['retired', 'rejected'].includes(next) ? 'danger-inline' : '';
+        action.textContent = label;
+        action.disabled = !!transition.disabled;
+        if (transition.title) action.title = transition.title;
+        action.addEventListener('click', () => {
+          practiceTransitionDraft = {
+            id: practice._id,
+            next,
+            ...(next === 'hardened' ? { hardeningEvidenceId: '' } : {}),
+          };
+          learningViewChanged.changed();
+        });
+        actions.append(action);
+      }
+      const disabledReasons = transitions
+        .filter((transition) => transition.disabled && transition.title)
+        .map((transition) => `${transition.label}: ${transition.title}`);
+      if (disabledReasons.length) {
+        const blocker = document.createElement('p');
+        blocker.className = 'learning-action-blocker';
+        blocker.textContent = disabledReasons.join(' ');
+        actions.append(blocker);
+      }
+      row.append(actions);
+    }
+    const pendingTransition = transitions.find(
+      ({ next }) => next === practiceTransitionDraft?.next,
+    );
+    if (!readOnly && practiceTransitionDraft?.id === practice._id
+      && pendingTransition && !pendingTransition.disabled) {
+      const inline = document.createElement('div');
+      inline.className = 'learning-inline-action';
+      let hardeningEvidenceSelect = null;
+      if (practiceTransitionDraft.next === 'hardened') {
+        const evidenceLabel = document.createElement('label');
+        evidenceLabel.textContent = 'Later Experience used to harden';
+        hardeningEvidenceSelect = document.createElement('select');
+        hardeningEvidenceSelect.id = `practice-hardening-evidence-${practice._id}`;
+        hardeningEvidenceSelect.required = true;
+        evidenceLabel.htmlFor = hardeningEvidenceSelect.id;
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = 'Select exact later evidence';
+        hardeningEvidenceSelect.append(placeholder);
+        for (const experience of pendingTransition.hardeningEvidenceOptions ?? []) {
+          const option = document.createElement('option');
+          option.value = experience._id;
+          option.textContent = [
+            experienceSummary(experience),
+            `Audience ${experienceAudienceText(experience.audience)}`,
+            `sequence ${experience.sequence ?? '—'}`,
+            experience._id,
+          ].join(' · ');
+          hardeningEvidenceSelect.append(option);
+        }
+        hardeningEvidenceSelect.value = practiceTransitionDraft.hardeningEvidenceId ?? '';
+        hardeningEvidenceSelect.addEventListener('change', () => {
+          if (practiceTransitionDraft?.id === practice._id) {
+            practiceTransitionDraft.hardeningEvidenceId = hardeningEvidenceSelect.value;
+          }
+        });
+        evidenceLabel.append(hardeningEvidenceSelect);
+        inline.append(evidenceLabel);
+      }
+      const label = document.createElement('label');
+      label.textContent = `Reason to ${practiceTransitionDraft.next}`;
+      const input = document.createElement('input');
+      input.id = `practice-transition-reason-${practice._id}`;
+      label.htmlFor = input.id;
+      input.type = 'text';
+      input.maxLength = 500;
+      input.placeholder = 'Required';
+      const controls = document.createElement('div');
+      const cancel = document.createElement('button');
+      cancel.type = 'button';
+      cancel.textContent = 'Cancel';
+      cancel.addEventListener('click', () => {
+        practiceTransitionDraft = null;
+        learningViewChanged.changed();
+      });
+      const confirm = document.createElement('button');
+      confirm.type = 'button';
+      confirm.textContent = practiceTransitionDraft.next === 'rejected' ? 'Reject' : 'Confirm';
+      confirm.addEventListener('click', async () => {
+        const reason = input.value.trim();
+        if (!reason) { input.setCustomValidity('Enter a reason.'); input.reportValidity(); return; }
+        input.setCustomValidity('');
+        const next = practiceTransitionDraft?.next;
+        if (!next) return;
+        const hardeningEvidenceId = next === 'hardened'
+          ? hardeningEvidenceSelect?.value.trim() : undefined;
+        if (next === 'hardened' && !hardeningEvidenceId) {
+          hardeningEvidenceSelect.setCustomValidity('Select the exact later Experience.');
+          hardeningEvidenceSelect.reportValidity();
+          return;
+        }
+        hardeningEvidenceSelect?.setCustomValidity('');
+        await withControlBusy(confirm, 'Saving', async () => {
+          try {
+            const args = [
+              'constellation.practiceTransition', identity._id, practice._id, next, reason,
+            ];
+            if (next === 'hardened') args.push(hardeningEvidenceId);
+            await Meteor.callAsync(...args);
+            practiceTransitionDraft = null;
+            learningViewChanged.changed();
+            toast(`Practice ${next}.`);
+          } catch (error) {
+            showAgentLearningError(error);
+          }
+        });
+      });
+      controls.append(cancel, confirm);
+      inline.append(label, input, controls);
+      row.append(inline);
+      requestAnimationFrame(() => (hardeningEvidenceSelect ?? input).focus());
+    }
+    list.append(row);
+  }
+  return rows;
+}
+
+function renderAgentLearning(config) {
+  renderAgentDetailTabs(config);
+  const ready = learningIsReady();
+  const identity = agentIdentityForConfig(config);
+  updateCrewLearningControls(config);
+  const readOnly = crewConfigArchived(config);
+  $('agent-learning-read-only').hidden = !readOnly;
+  const constitution = renderConstitution(config, identity, ready, readOnly);
+  const experiences = renderExperience(identity, ready, readOnly);
+  const frames = renderMemoryFrames(identity, ready);
+  const practices = renderPractices(identity, experiences, ready, readOnly);
+  const activeExperiences = experiences.filter((row) => (row.status ?? 'active') === 'active');
+  const activePractices = practices.filter((row) => ['validated', 'hardened'].includes(row.status));
+  if (!ready) {
+    for (const id of [
+      'agent-constitution-stat', 'agent-experience-stat', 'agent-practice-stat',
+      'agent-frame-stat', 'agent-experience-count', 'agent-practice-count', 'agent-frame-count',
+    ]) $(id).textContent = '…';
+    $('agent-constitution-stat').classList.remove('is-integrity-warning');
+  } else {
+    $('agent-constitution-stat').textContent = constitution.unresolved
+      ? 'Unavailable'
+      : constitution.current ? `v${constitution.current.revision ?? '—'}` : '—';
+    $('agent-constitution-stat').classList.toggle('is-integrity-warning', !!constitution.unresolved);
+    $('agent-experience-stat').textContent = String(activeExperiences.length);
+    $('agent-practice-stat').textContent = String(activePractices.length);
+    $('agent-frame-stat').textContent = frames[0] ? timeAgo(frames[0].createdAt) : '—';
+    $('agent-experience-count').textContent = String(experiences.length);
+    $('agent-practice-count').textContent = String(practices.length);
+  }
+  if (learningSubscriptionError) {
+    showAgentLearningError(learningSubscriptionError, {
+      actionLabel: 'Retry', action: retryLearningSubscription,
+    });
+  }
+}
+
+function reviewAgentConfig(agentId) {
+  return agentConfigForId(agentId);
+}
+
+function focusAgentLearning(agentId, tab) {
+  const config = reviewAgentConfig(agentId);
+  if (!config || !selectCrewConfig(config._id)) return;
+  setCrewDirectoryTab('agents');
+  setAgentDetailTab(tab);
+  requestAnimationFrame(() => $(`agent-detail-tab-${tab}`)?.focus());
+}
+
+function openLearningReviews() {
+  openCrewSettings();
+  setCrewDirectoryTab('reviews');
+  requestAnimationFrame(() => {
+    const firstAction = $('reviews-list')?.querySelector('button:not(:disabled)');
+    (firstAction ?? $('crew-directory-tab-reviews'))?.focus();
+  });
+}
+
+function reviewKey(item) {
+  return `${String(item.kind).toLowerCase()}:${item.row._id}`;
+}
+
+function appendReviewRow(list, item, { recent = false } = {}) {
+  const row = document.createElement('article');
+  row.className = `review-row${recent ? ' is-recent' : ''}`;
+  row.setAttribute('role', 'listitem');
+  row.dataset.reviewKey = reviewKey(item);
+  const icon = document.createElement('span');
+  icon.className = 'review-row-icon';
+  icon.setAttribute('aria-hidden', 'true');
+  icon.textContent = item.kind.slice(0, 1);
+  const copy = document.createElement('div');
+  copy.className = 'review-row-copy';
+  const title = document.createElement('strong');
+  const agentName = agentDisplayName(item.agentId);
+  title.textContent = `${agentName} · ${item.title}`;
+  const body = document.createElement('p');
+  body.textContent = concise(item.body, 180) || item.kind;
+  const meta = document.createElement('span');
+  meta.textContent = [
+    item.pendingKind === 'approval' ? 'Approval needed'
+      : item.pendingKind === 'audit' ? 'Audit acknowledgment needed' : item.state ?? item.kind,
+    item.lifecycle,
+    learningSourceLabel(item.row),
+  ]
+    .filter(Boolean).join(' · ');
+  copy.append(title, body, meta);
+  const actions = document.createElement('div');
+  actions.className = 'review-row-actions';
+  if (item.pendingKind === 'audit') {
+    const config = reviewAgentConfig(item.agentId);
+    const review = learningReviewButton(item.agentId, item.target, item.row, {
+      inlineError: false,
+      ariaLabel: `Acknowledge ${item.kind.toLowerCase()} audit for ${agentName}: ${item.title}`,
+    });
+    review.disabled = !config || crewConfigArchived(config);
+    if (review.disabled) review.title = config ? 'Restore this agent first.' : 'Agent unavailable.';
+    actions.append(review);
+  }
+  const open = document.createElement('button');
+  open.type = 'button';
+  open.textContent = item.pendingKind === 'approval'
+    ? 'Review practice'
+    : item.pendingKind === 'audit' ? `Open ${item.kind.toLowerCase()}` : 'Open';
+  open.setAttribute(
+    'aria-label',
+    `${item.pendingKind === 'approval' ? 'Review' : 'Open'} ${item.kind.toLowerCase()} for ${agentName}: ${item.title}`,
+  );
+  open.disabled = !reviewAgentConfig(item.agentId);
+  open.addEventListener('click', () => focusAgentLearning(item.agentId, item.tab));
+  actions.append(open);
+  row.append(icon, copy, actions);
+  list.append(row);
+}
+
+function restoreReviewFocus() {
+  if (!reviewFocusRequest) return;
+  const requested = reviewFocusRequest;
+  reviewFocusRequest = null;
+  requestAnimationFrame(() => {
+    const escaped = requested === 'queue' ? null : CSS.escape(requested);
+    const row = escaped
+      ? $('reviews-list')?.querySelector(`[data-review-key="${escaped}"]`)
+      : null;
+    const target = row?.querySelector('button:not(:disabled)')
+      ?? $('reviews-list')?.querySelector('button:not(:disabled)')
+      ?? $('crew-directory-tab-reviews');
+    target?.focus({ preventScroll: true });
+  });
+}
+
+function renderReviews() {
+  learningViewChanged.depend();
+  const ready = learningIsReady();
+  const loading = $('reviews-loading');
+  const content = $('reviews-content');
+  const needsList = $('reviews-list');
+  const recentList = $('reviews-recent-list');
+  if (!ready) {
+    setLearningPanelState(
+      loading,
+      learningSubscriptionError ? 'error' : 'loading',
+      learningSubscriptionError ? 'Reviews unavailable.' : 'Loading reviews…',
+    );
+    $('reviews-retry-learning').hidden = !learningSubscriptionError;
+    content.hidden = true;
+    return;
+  }
+  const practices = AgentPractices.find(
+    {}, { sort: { updatedAt: -1, createdAt: -1 } },
+  ).fetch();
+  const candidates = practices.filter((row) => row.status === 'candidate');
+  const automaticPracticeReviews = practices.filter(
+    (row) => learningAdmissionState('practice', row).pending,
+  );
+  const constitutions = AgentConstitutions.find(
+    {}, { sort: { createdAt: -1 }, limit: 12 },
+  ).fetch();
+  const allExperiences = AgentExperiences.find(
+    {}, { sort: { createdAt: -1 } },
+  ).fetch();
+  const automaticExperienceReviews = allExperiences.filter(
+    (row) => learningAdmissionState('experience', row).pending,
+  );
+  const pendingCount = candidates.length
+    + automaticPracticeReviews.length + automaticExperienceReviews.length;
+  const attentionCopy = `${pendingCount} ${pendingCount === 1 ? 'item needs' : 'items need'} attention`;
+  $('crew-reviews-count').textContent = String(pendingCount);
+  $('mission-reviews-count').textContent = String(pendingCount);
+  $('open-learning-reviews').setAttribute(
+    'aria-label',
+    `Open learning reviews, ${attentionCopy}`,
+  );
+  $('command-reviews-count').textContent = attentionCopy;
+  $('reviews-directory-summary').textContent = attentionCopy;
+  $('reviews-needs-count').textContent = String(pendingCount);
+  loading.hidden = true;
+  $('reviews-retry-learning').hidden = true;
+  content.hidden = false;
+  needsList.replaceChildren();
+  recentList.replaceChildren();
+  const actionable = [
+    ...candidates.map((row) => ({
+      kind: 'Practice', agentId: row.agentId, row, pendingKind: 'approval',
+      title: row.key || 'Practice candidate', body: practiceGuidance(row), tab: 'practices',
+      lifecycle: 'Candidate',
+    })),
+    ...automaticPracticeReviews.map((row) => ({
+      kind: 'Practice', target: 'practice', agentId: row.agentId, row,
+      pendingKind: 'audit', title: row.key || 'Practice', body: practiceGuidance(row),
+      tab: 'practices',
+      lifecycle: row.status,
+    })),
+    ...automaticExperienceReviews.map((row) => ({
+      kind: 'Experience', target: 'experience', agentId: row.agentId, row,
+      pendingKind: 'audit', title: experienceSummary(row), body: experienceBody(row),
+      tab: 'experience', lifecycle: row.status === 'retracted' ? 'Retracted' : 'Active',
+    })),
+  ].sort((left, right) => new Date(learningAt(right.row)) - new Date(learningAt(left.row)));
+  if (!actionable.length) appendLearningEmpty(needsList, 'Nothing needs attention.');
+  for (const item of actionable) appendReviewRow(needsList, item);
+
+  const pendingPracticeIds = new Set([
+    ...candidates, ...automaticPracticeReviews,
+  ].map((row) => row._id));
+  const pendingExperienceIds = new Set(automaticExperienceReviews.map((row) => row._id));
+  const recent = [
+    ...constitutions.map((row) => ({
+      kind: 'Constitution', agentId: row.agentId, row,
+      title: `Constitution v${row.revision ?? '—'}`,
+      body: learningText(row.content), tab: 'constitution',
+      state: AgentIdentities.findOne(row.agentId)?.constitutionVersionId === row._id
+        ? 'Active' : 'Superseded',
+    })),
+    ...practices.filter((row) => !pendingPracticeIds.has(row._id)).map((row) => ({
+      kind: 'Practice', agentId: row.agentId, row,
+      title: row.key || 'Practice', body: practiceGuidance(row), tab: 'practices',
+      state: learningAdmissionState('practice', row).label,
+      lifecycle: row.status,
+    })),
+    ...allExperiences.filter((row) => !pendingExperienceIds.has(row._id)).map((row) => {
+      const admission = learningAdmissionState('experience', row);
+      return {
+        kind: 'Experience', target: 'experience', agentId: row.agentId, row,
+        title: experienceSummary(row), body: experienceBody(row), tab: 'experience',
+        state: admission.label,
+        lifecycle: row.status === 'retracted' ? 'Retracted' : 'Active',
+      };
+    }),
+  ]
+    .sort((left, right) => new Date(learningAt(right.row)) - new Date(learningAt(left.row)))
+    .slice(0, 24);
+  $('reviews-recent-count').textContent = String(recent.length);
+  if (!recent.length) appendLearningEmpty(recentList, 'No learning history yet.');
+  for (const item of recent) appendReviewRow(recentList, item, { recent: true });
+  restoreReviewFocus();
+}
+
+function crewExperienceConfig(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  const recent = Number.isSafeInteger(source.recent) ? source.recent : 4;
+  return {
+    record: source.record !== false,
+    recall: source.recall !== false && recent > 0,
+    recent,
+    scope: ['owner', 'session', 'identity'].includes(source.scope) ? source.scope : 'owner',
+    approval: source.approval === 'auto' ? 'auto' : 'ask',
+  };
+}
+
+function crewPracticeConfig(value) {
+  const source = value && typeof value === 'object' ? value : {};
+  return {
+    acquire: source.acquire === true,
+    approval: source.approval === 'auto' ? 'auto' : 'ask',
+    allowScopedEvidencePromotion: source.allowScopedEvidencePromotion === true,
+  };
+}
+
+function crewConfigPatch(config) {
+  const experience = crewExperienceConfig(config.experience);
+  const practice = crewPracticeConfig(config.practice);
+  return {
+    ...(Number.isSafeInteger(config.revision) ? { expectedRevision: config.revision } : {}),
     displayName: config.displayName,
     role: config.role,
     avatar: config.avatar,
@@ -859,6 +2499,9 @@ function crewConfigPatch(config) {
     instructions: config.instructions,
     model: config.model,
     enabled: config.enabled,
+    flexibility: Number(config.flexibility ?? 3),
+    experience,
+    practice,
     budget: {
       turns: Number(config.budget?.turns ?? 24),
       toolCalls: Number(config.budget?.toolCalls ?? 8),
@@ -884,8 +2527,13 @@ function newCrewDraft() {
     color: 'violet',
     enabled: true,
     order: 10_000,
-    instructions: 'You are a specialist. Work only within the assigned scope, state assumptions, and return a concise recommendation with next actions.',
+    instructions: 'Analyze the assigned scope. State assumptions and return a concise recommendation with next actions.',
     model: 'default',
+    flexibility: 3,
+    experience: {
+      record: true, recall: true, recent: 4, scope: 'owner', approval: 'ask',
+    },
+    practice: { acquire: false, approval: 'ask', allowScopedEvidencePromotion: false },
     budget: { turns: 24, toolCalls: 8, spend: 1 },
     capabilities: { inspect: true, framing: false, memory: false, publish: false },
     _draft: true,
@@ -989,6 +2637,7 @@ function renderCrewModelSelector(selectedModel = 'default') {
     option.disabled = true;
     option.selected = true;
     select.append(option);
+    select.dataset.availabilityDisabled = 'true';
     select.disabled = true;
     hint.dataset.modelState = 'loading';
     hint.textContent = 'Loading available models…';
@@ -1003,11 +2652,13 @@ function renderCrewModelSelector(selectedModel = 'default') {
     option.disabled = true;
     option.selected = true;
     select.append(option);
+    select.dataset.availabilityDisabled = 'true';
     select.disabled = true;
     hint.dataset.modelState = 'empty';
     hint.textContent = 'No model provider is available. Configure a provider or start a local runtime, then restart Constellation.';
     return;
   }
+  select.dataset.availabilityDisabled = 'false';
   select.disabled = false;
   const workspaceGroup = document.createElement('optgroup');
   workspaceGroup.label = 'Workspace';
@@ -1071,6 +2722,8 @@ function resetCrewEditor(config, isNew = false) {
 }
 
 function populateCrewForm(config) {
+  const experience = crewExperienceConfig(config.experience);
+  const practice = crewPracticeConfig(config.practice);
   $('crew-name').value = config.displayName;
   $('crew-role').value = config.role;
   $('crew-avatar').value = config.avatar;
@@ -1078,6 +2731,15 @@ function populateCrewForm(config) {
   $('crew-instructions').value = config.instructions;
   renderCrewModelSelector(config.model);
   $('crew-enabled').checked = config.enabled;
+  $('crew-experience-record').checked = experience.record;
+  $('crew-experience-recall').checked = experience.recall;
+  $('crew-experience-automatic').checked = experience.approval === 'auto';
+  $('crew-experience-scope').value = experience.scope;
+  $('crew-experience-recent').value = String(experience.recent);
+  $('crew-practice-acquire').checked = practice.acquire;
+  $('crew-practice-automatic').checked = practice.approval === 'auto';
+  $('crew-practice-scoped-promotion').checked = practice.allowScopedEvidencePromotion;
+  $('crew-flexibility').value = String(config.flexibility ?? 3);
   $('crew-turns').value = String(config.budget?.turns ?? 24);
   $('crew-tool-calls').value = String(config.budget?.toolCalls ?? 8);
   $('crew-spend').value = String(config.budget?.spend ?? 1);
@@ -1086,25 +2748,119 @@ function populateCrewForm(config) {
   $('crew-cap-publish').checked = !!config.capabilities?.publish;
 }
 
+function updateCrewLearningControls(config) {
+  const archived = crewConfigArchived(config);
+  const recordsExperience = $('crew-experience-record').checked;
+  const recallsExperience = $('crew-experience-recall').checked;
+  const experienceScope = $('crew-experience-scope').value;
+  const experienceAutomatic = $('crew-experience-automatic');
+  const acquiresPractice = $('crew-practice-acquire').checked;
+  const practiceAutomatic = $('crew-practice-automatic');
+  const scopedPromotion = $('crew-practice-scoped-promotion');
+  const scopedPromotionRelevant = experienceScope !== 'identity';
+  const automaticPracticeEligible = !scopedPromotionRelevant || scopedPromotion.checked;
+  experienceAutomatic.disabled = archived || !recordsExperience;
+  practiceAutomatic.disabled = archived || !acquiresPractice;
+  scopedPromotion.disabled = archived || !acquiresPractice || !practiceAutomatic.checked
+    || !scopedPromotionRelevant;
+  $('crew-experience-recent').disabled = archived || !recallsExperience;
+  $('crew-experience-automatic-control').classList.toggle(
+    'is-dependent-disabled', !recordsExperience,
+  );
+  $('crew-practice-automatic-control').classList.toggle(
+    'is-dependent-disabled', !acquiresPractice,
+  );
+  $('crew-practice-scoped-promotion-control').classList.toggle(
+    'is-dependent-disabled', !acquiresPractice || !practiceAutomatic.checked
+      || !scopedPromotionRelevant,
+  );
+  $('crew-experience-automatic-hint').textContent = !recordsExperience
+    ? 'Turn on Capture new experience first'
+    : experienceAutomatic.checked
+      ? 'Save immediately · acknowledge later in Reviews'
+      : 'Ask in chat before saving';
+  $('crew-practice-acquire-hint').textContent = acquiresPractice
+    ? 'Agent may create Practice candidates' : 'Off: people can still propose Practices';
+  $('crew-practice-automatic-hint').textContent = !acquiresPractice
+    ? 'Turn on Let agent propose practices first'
+    : practiceAutomatic.checked
+      ? automaticPracticeEligible
+        ? 'Eligible agent proposals start as trials · acknowledge later in Reviews'
+        : 'Scoped proposals stay in Reviews'
+      : 'Agent proposals wait in Reviews';
+  $('crew-practice-scoped-promotion-hint').textContent = !acquiresPractice
+    ? 'Turn on Let agent propose practices first'
+    : !practiceAutomatic.checked ? 'Turn on automatic trials first'
+      : !scopedPromotionRelevant ? 'Not needed for Agent identity scope'
+        : 'Allows scoped evidence to support an agent-wide Practice';
+  $('crew-experience-scope-hint').textContent = ({
+    owner: 'New turns · all workspace chats · existing Experience keeps its scope',
+    session: 'New turns · current chat only · existing Experience keeps its scope',
+    identity: 'New turns · every host reusing this identity · existing Experience keeps its scope',
+  })[$('crew-experience-scope').value]
+    ?? 'New turns · all workspace chats · existing Experience keeps its scope';
+  const experiencePolicy = $('experience-policy-badge');
+  experiencePolicy.textContent = !recordsExperience
+    ? 'Capture off'
+    : experienceAutomatic.checked ? 'Automatic · audit later' : 'Approval required';
+  experiencePolicy.dataset.policy = !recordsExperience
+    ? 'off' : experienceAutomatic.checked ? 'automatic' : 'reviewed';
+  const practicePolicy = $('practice-policy-badge');
+  practicePolicy.textContent = !acquiresPractice
+    ? 'Agent proposals off'
+    : practiceAutomatic.checked ? 'Automatic trials · audit later' : 'Review before trial';
+  practicePolicy.dataset.policy = !acquiresPractice
+    ? 'off' : practiceAutomatic.checked ? 'automatic' : 'reviewed';
+  const identity = agentIdentityForConfig(config);
+  const requestedCapacity = Number($('crew-flexibility').value || config.flexibility || 3);
+  if (!identity?.flexibility) {
+    $('crew-flexibility').min = '0';
+    $('crew-flexibility-hint').textContent = 'Capacity is initialized when the Agent is saved.';
+    return;
+  }
+  const committed = identity.flexibility.capacity - identity.flexibility.available;
+  $('crew-flexibility').min = String(committed);
+  $('crew-flexibility-hint').textContent = requestedCapacity === identity.flexibility.capacity
+    ? `${identity.flexibility.available} available · ${committed} committed to hardened Practices`
+    : `Saved capacity ${identity.flexibility.capacity} · ${committed} committed · pending ${requestedCapacity}`;
+}
+
 function renderCrewEditState(config) {
   const primary = config.agent === 'orchestrator';
+  const archived = crewConfigArchived(config);
   const state = $('crew-edit-state');
-  state.dataset.state = crewEditor?.dirty ? 'dirty' : 'saved';
-  state.textContent = crewEditor?.isNew
-    ? 'New agent · not saved'
-    : (crewEditor?.dirty ? 'Unsaved changes' : 'Saved');
+  state.dataset.state = archived ? 'archived' : (crewEditor?.dirty ? 'dirty' : 'saved');
+  state.textContent = archived
+    ? 'Archived · history retained'
+    : (crewEditor?.isNew
+      ? 'New agent · not saved'
+      : (crewEditor?.dirty ? 'Unsaved changes' : 'Saved'));
   $('crew-form-id').textContent = crewEditor?.isNew
     ? 'Not in the workspace yet'
-    : (primary ? 'Primary agent' : 'Workspace agent');
-  $('crew-enabled').disabled = primary;
-  $('remove-crew-agent').hidden = primary || crewEditor?.isNew;
-  $('remove-crew-agent').disabled = primary || crewEditor?.isNew
-    || pendingControls.has($('remove-crew-agent'));
+    : (primary ? 'Primary agent · always available' : 'Workspace agent');
+  for (const control of document.querySelectorAll(
+    '#agent-detail-panel-profile input, #agent-detail-panel-profile select, '
+    + '#agent-detail-panel-profile textarea',
+  )) control.disabled = archived || control.dataset.availabilityDisabled === 'true';
+  $('crew-enabled').disabled = primary || archived;
+  const lifecycleAction = $('archive-crew-agent');
+  lifecycleAction.hidden = primary || crewEditor?.isNew;
+  lifecycleAction.disabled = primary || crewEditor?.isNew
+    || pendingControls.has(lifecycleAction);
+  lifecycleAction.textContent = archived ? 'Restore agent' : 'Archive';
+  lifecycleAction.dataset.loadingLabel = archived ? 'Restoring' : 'Archiving';
+  lifecycleAction.className = archived ? 'secondary-action' : 'danger-button';
   $('crew-primary-label').hidden = !primary;
-  $('cancel-crew-edit').textContent = crewEditor?.dirty ? 'Discard changes' : 'Close';
-  $('crew-form').querySelector('[type="submit"]').textContent = crewEditor?.isNew
-    ? 'Add to workspace'
-    : 'Save changes';
+  $('cancel-crew-edit').textContent = archived
+    ? 'Close'
+    : (crewEditor?.dirty ? 'Discard changes' : 'Close');
+  const submit = $('crew-form').querySelector('[type="submit"]');
+  submit.hidden = archived;
+  submit.disabled = archived || (!crewEditor?.dirty && !crewEditor?.isNew)
+    || pendingControls.has(submit);
+  submit.textContent = crewEditor?.isNew ? 'Add to workspace' : 'Save changes';
+  $('crew-form').classList.toggle('is-archived', archived);
+  updateCrewLearningControls(config);
 }
 
 function captureCrewEdit() {
@@ -1127,13 +2883,19 @@ function selectCrewConfig(configId) {
   if (configId === selectedCrewId) return true;
   if (!discardCrewChanges()) return false;
   crewEditor = null;
+  constitutionDraft = null;
+  experienceRetractDraftId = null;
+  practiceTransitionDraft = null;
+  practiceDraft = null;
+  practiceEvidenceDraft = new Set();
+  clearAgentLearningError();
   selectedCrewId = configId;
   renderCrewSettings();
   return true;
 }
 
 function renderCrewSettings() {
-  const configs = crewConfigs();
+  const configs = crewConfigs({ includeArchived: true });
   const list = $('crew-settings-list');
   const focusedConfigId = document.activeElement?.closest?.('.crew-settings-row')?.dataset.configId ?? null;
   let restoreFocus = null;
@@ -1148,11 +2910,14 @@ function renderCrewSettings() {
   for (const config of configs) {
     const button = document.createElement('button');
     const selected = config._id === selectedCrewId;
+    const archived = crewConfigArchived(config);
     button.type = 'button';
-    button.className = `crew-settings-row${selected ? ' active' : ''}`;
+    button.className = `crew-settings-row${selected ? ' active' : ''}${archived ? ' archived' : ''}`;
     button.dataset.configId = config._id;
-    button.setAttribute('aria-pressed', String(selected));
-    button.setAttribute('aria-label', `${config.displayName}. ${config.role}. ${config.enabled ? 'Active' : 'Inactive'}.`);
+    button.setAttribute('role', 'option');
+    button.setAttribute('aria-selected', String(selected));
+    button.setAttribute('aria-label', `${config.displayName}. ${config.role}. ${archived ? 'Archived' : (config.enabled ? 'Active' : 'Inactive')}.`);
+    button.tabIndex = selected ? 0 : -1;
     const avatar = document.createElement('span');
     avatar.className = config.color;
     avatar.setAttribute('aria-hidden', 'true');
@@ -1161,13 +2926,28 @@ function renderCrewSettings() {
     const name = document.createElement('strong');
     name.textContent = config.displayName;
     const role = document.createElement('small');
-    role.textContent = config.role;
+    role.textContent = `${config.role}${archived ? ' · Archived' : ''}`;
     copy.append(name, role);
     const status = document.createElement('i');
-    status.className = config.enabled ? 'enabled' : '';
+    status.className = archived ? 'archived' : (config.enabled ? 'enabled' : '');
     status.setAttribute('aria-hidden', 'true');
     button.append(avatar, copy, status);
     button.addEventListener('click', () => selectCrewConfig(config._id));
+    button.addEventListener('keydown', (event) => {
+      if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const index = configs.findIndex((item) => item._id === config._id);
+      const nextIndex = event.key === 'Home' ? 0
+        : event.key === 'End' ? configs.length - 1
+          : Math.max(0, Math.min(
+            configs.length - 1, index + (event.key === 'ArrowDown' ? 1 : -1),
+          ));
+      const nextId = configs[nextIndex]?._id ?? config._id;
+      if (!selectCrewConfig(nextId)) return;
+      requestAnimationFrame(() => list.querySelector(
+        `[data-config-id="${CSS.escape(nextId)}"]`,
+      )?.focus());
+    });
     list.append(button);
     if (focusedConfigId === config._id) restoreFocus = button;
   }
@@ -1191,10 +2971,11 @@ function renderCrewSettings() {
   $('crew-form-avatar').className = `crew-form-avatar ${visible.color}`;
   $('crew-form-avatar').textContent = visible.avatar;
   renderCrewEditState({ ...config, ...visible });
+  renderAgentLearning({ ...config, ...visible });
 }
 
 function setCrewDirectoryTab(tab, { focus = false } = {}) {
-  if (!['people', 'agents'].includes(tab)) return;
+  if (!['people', 'agents', 'reviews'].includes(tab)) return;
   crewDirectoryTab = tab;
   document.querySelectorAll('[data-crew-directory-tab]').forEach((button) => {
     const active = button.dataset.crewDirectoryTab === tab;
@@ -1209,6 +2990,8 @@ function setCrewDirectoryTab(tab, { focus = false } = {}) {
     panel.classList.toggle('active', active);
   });
   $('crew-new-person').hidden = tab !== 'people';
+  $('crew-new-agent').hidden = tab !== 'agents';
+  if (tab === 'reviews') renderReviews();
 }
 
 function workspaceMembers() {
@@ -1449,6 +3232,9 @@ function openCrewSettings(configId) {
 
 function crewFormPatch() {
   return {
+    ...(!crewEditor?.isNew && Number.isSafeInteger(crewEditor?.config?.revision)
+      ? { expectedRevision: crewEditor.config.revision }
+      : {}),
     displayName: $('crew-name').value,
     role: $('crew-role').value,
     avatar: $('crew-avatar').value,
@@ -1456,6 +3242,19 @@ function crewFormPatch() {
     instructions: $('crew-instructions').value,
     model: $('crew-model').value,
     enabled: $('crew-enabled').checked,
+    flexibility: Number($('crew-flexibility').value),
+    experience: {
+      record: $('crew-experience-record').checked,
+      recall: $('crew-experience-recall').checked,
+      recent: Number($('crew-experience-recent').value),
+      scope: $('crew-experience-scope').value,
+      approval: $('crew-experience-automatic').checked ? 'auto' : 'ask',
+    },
+    practice: {
+      acquire: $('crew-practice-acquire').checked,
+      approval: $('crew-practice-automatic').checked ? 'auto' : 'ask',
+      allowScopedEvidencePromotion: $('crew-practice-scoped-promotion').checked,
+    },
     budget: {
       turns: Number($('crew-turns').value),
       toolCalls: Number($('crew-tool-calls').value),
@@ -1463,6 +3262,9 @@ function crewFormPatch() {
     },
     capabilities: {
       inspect: $('crew-cap-inspect').checked,
+      framing: !!(crewEditor?.patch?.capabilities?.framing
+        ?? crewEditor?.original?.capabilities?.framing
+        ?? crewEditor?.config?.capabilities?.framing),
       memory: $('crew-cap-memory').checked,
       publish: $('crew-cap-publish').checked,
     },
@@ -1505,17 +3307,19 @@ function appendCrewImpactSection(container, title, rows, describe) {
   container.append(section);
 }
 
-function renderCrewRemovalImpact(impact) {
-  $('crew-remove-title').textContent = `Remove ${impact.displayName}?`;
+function renderCrewArchiveImpact(impact) {
+  $('crew-archive-title').textContent = `Archive ${impact.displayName}?`;
   const total = impact.missions.length + impact.skills.length
     + impact.mcpServers.length + impact.pulses.length;
-  $('crew-remove-summary').textContent = total
-    ? `${impact.displayName} will be removed from the workspace and the following references will change.`
-    : `${impact.displayName} will be removed from the workspace.`;
-  const container = $('crew-remove-impact');
+  $('crew-archive-summary').textContent = total
+    ? `${impact.displayName} will stop receiving work. The following references will change.`
+    : `${impact.displayName} will stop receiving work.`;
+  const container = $('crew-archive-impact');
   container.replaceChildren();
   appendCrewImpactSection(container, 'Missions', impact.missions, (row) =>
-    `${row.name} · ${row.status}${row.active ? ' · work in progress' : ''}`);
+    `${row.name} · ${row.status}${row.awaitingApproval
+      ? ` · awaiting ${row.pendingTool || 'approval'}`
+      : (row.active ? ' · work in progress' : '')}`);
   appendCrewImpactSection(container, 'Skills', impact.skills, (row) =>
     `${row.name} · ${row.enabled ? 'enabled' : 'disabled'}`);
   appendCrewImpactSection(container, 'MCP access', impact.mcpServers, (row) =>
@@ -1853,14 +3657,208 @@ function wireCrewSettings() {
   document.querySelectorAll('[data-crew-directory-tab]').forEach((button) => {
     button.addEventListener('click', () => setCrewDirectoryTab(button.dataset.crewDirectoryTab));
     button.addEventListener('keydown', (event) => {
-      if (!['ArrowLeft', 'ArrowRight'].includes(event.key)) return;
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
       event.preventDefault();
-      setCrewDirectoryTab(
-        button.dataset.crewDirectoryTab === 'people' ? 'agents' : 'people',
-        { focus: true },
-      );
+      const tabs = ['people', 'agents', 'reviews'];
+      const current = tabs.indexOf(button.dataset.crewDirectoryTab);
+      const next = event.key === 'Home' ? tabs[0]
+        : event.key === 'End' ? tabs.at(-1)
+          : tabs[(current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+      setCrewDirectoryTab(next, { focus: true });
     });
   });
+  document.querySelectorAll('[data-agent-detail-tab]').forEach((button) => {
+    button.addEventListener('click', () => setAgentDetailTab(button.dataset.agentDetailTab));
+    button.addEventListener('keydown', (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      event.preventDefault();
+      const tabs = [...document.querySelectorAll('[data-agent-detail-tab]:not(:disabled)')];
+      const current = tabs.indexOf(button);
+      const next = event.key === 'Home' ? tabs[0]
+        : event.key === 'End' ? tabs.at(-1)
+          : tabs[(current + (event.key === 'ArrowRight' ? 1 : -1) + tabs.length) % tabs.length];
+      if (next) setAgentDetailTab(next.dataset.agentDetailTab, { focus: true });
+    });
+  });
+  document.querySelectorAll('[data-learning-configure]').forEach((button) => {
+    button.addEventListener('click', () => {
+      const target = button.dataset.learningConfigure;
+      const section = target === 'practice'
+        ? $('practice-learning-settings') : $('experience-learning-settings');
+      const control = target === 'practice'
+        ? $('crew-practice-acquire') : $('crew-experience-record');
+      setAgentDetailTab('profile');
+      requestAnimationFrame(() => {
+        section?.scrollIntoView({ block: 'center', behavior: 'smooth' });
+        control?.focus({ preventScroll: true });
+      });
+    });
+  });
+  $('open-learning-reviews').addEventListener('click', openLearningReviews);
+  $('agent-learning-error-action').addEventListener('click', async (event) => {
+    const action = agentLearningErrorAction;
+    if (!action) return;
+    await withControlBusy(
+      event.currentTarget,
+      event.currentTarget.dataset.loadingLabel || 'Working',
+      async () => {
+        try {
+          await action();
+        } catch (error) {
+          showAgentLearningError(error, learningSubscriptionError
+            ? { actionLabel: 'Retry', action: retryLearningSubscription }
+            : {});
+        }
+      },
+    );
+  });
+  $('reviews-retry-learning').addEventListener('click', async (event) => {
+    await withControlBusy(event.currentTarget, 'Retrying', async () => {
+      try {
+        await retryLearningSubscription();
+      } catch (error) {
+        showAgentLearningError(error, {
+          actionLabel: 'Retry', action: retryLearningSubscription,
+        });
+      }
+    });
+  });
+  $('constitution-body').addEventListener('input', (event) => {
+    if (constitutionDraft) constitutionDraft.body = event.currentTarget.value;
+    updateConstitutionDraftState();
+  });
+  $('constitution-reason').addEventListener('input', (event) => {
+    if (constitutionDraft) constitutionDraft.reason = event.currentTarget.value;
+    updateConstitutionDraftState();
+  });
+  $('constitution-submit').addEventListener('click', async (event) => {
+    const config = selectedCrewId ? CrewConfigs.findOne(selectedCrewId) : null;
+    if (crewConfigArchived(config)) {
+      toast('Restore this agent to revise its constitution.', 'error');
+      renderCrewSettings();
+      return;
+    }
+    const identity = agentIdentityForConfig(config);
+    const body = $('constitution-body').value.trim();
+    const reason = $('constitution-reason').value.trim();
+    if (!identity) { showAgentLearningError(new Error('Agent identity unavailable.')); return; }
+    if (!body) { $('constitution-body').setCustomValidity('Enter constitution text.'); $('constitution-body').reportValidity(); return; }
+    $('constitution-body').setCustomValidity('');
+    if (body === constitutionDraft?.baseBody?.trim()) {
+      showAgentLearningError(new Error('Change the constitution text before submitting.'));
+      return;
+    }
+    if (!reason) { $('constitution-reason').setCustomValidity('Enter a reason.'); $('constitution-reason').reportValidity(); return; }
+    $('constitution-reason').setCustomValidity('');
+    clearAgentLearningError();
+    await withControlBusy(event.currentTarget, 'Publishing', async () => {
+      try {
+        await Meteor.callAsync(
+          'constellation.constitutionRevise',
+          identity._id,
+          Number(constitutionDraft?.baseGeneration ?? identity.generation ?? 1),
+          body,
+          reason,
+        );
+        constitutionDrafts.delete(identity._id);
+        constitutionDraft = null;
+        $('constitution-compose').open = false;
+        learningViewChanged.changed();
+        toast('Constitution version published.');
+      } catch (error) {
+        if (String(error?.error ?? error?.message ?? error)
+          .includes('identity-generation-conflict')) {
+          showAgentLearningError(
+            new Error('The Constitution changed after this draft started. Rebase keeps your text and updates its base version.'),
+            { actionLabel: 'Rebase draft', action: () => rebaseConstitutionDraft(identity._id) },
+          );
+        } else showAgentLearningError(error);
+      }
+    });
+  });
+  for (const [id, key] of [
+    ['practice-key', 'key'],
+    ['practice-context', 'context'],
+    ['practice-trigger', 'trigger'],
+    ['practice-guidance', 'guidance'],
+  ]) {
+    $(id).addEventListener('input', (event) => {
+      if (practiceDraft) practiceDraft[key] = event.currentTarget.value;
+      updatePracticeDraftState();
+    });
+  }
+  $('practice-submit').addEventListener('click', async (event) => {
+    const config = selectedCrewId ? CrewConfigs.findOne(selectedCrewId) : null;
+    if (crewConfigArchived(config)) {
+      toast('Restore this agent to propose a practice.', 'error');
+      renderCrewSettings();
+      return;
+    }
+    const identity = agentIdentityForConfig(config);
+    if (!identity) { showAgentLearningError(new Error('Agent identity unavailable.')); return; }
+    const proposal = {
+      commandId: randomToken(16),
+      key: $('practice-key').value.trim(),
+      context: $('practice-context').value.trim(),
+      trigger: $('practice-trigger').value.trim(),
+      guidance: $('practice-guidance').value.trim(),
+      evidenceIds: [...practiceEvidenceDraft],
+    };
+    const required = [
+      ['practice-key', proposal.key, 'Enter a key.'],
+      ['practice-context', proposal.context, 'Enter a context.'],
+      ['practice-trigger', proposal.trigger, 'Enter a trigger.'],
+      ['practice-guidance', proposal.guidance, 'Enter guidance.'],
+    ];
+    for (const [id, value, message] of required) {
+      const field = $(id);
+      field.setCustomValidity(value ? '' : message);
+      if (!value) { field.reportValidity(); return; }
+    }
+    if (!proposal.evidenceIds.length) {
+      showAgentLearningError(new Error('Select at least one active Experience as evidence.'));
+      return;
+    }
+    clearAgentLearningError();
+    await withControlBusy(event.currentTarget, 'Submitting', async () => {
+      try {
+        await Meteor.callAsync('constellation.practicePropose', identity._id, proposal);
+        for (const id of ['practice-key', 'practice-context', 'practice-trigger', 'practice-guidance']) {
+          $(id).value = '';
+        }
+        practiceDrafts.delete(identity._id);
+        practiceDraft = null;
+        practiceEvidenceDraft = new Set();
+        $('practice-compose').open = false;
+        learningViewChanged.changed();
+        toast('Practice proposed for review.');
+      } catch (error) {
+        showAgentLearningError(error);
+      }
+    });
+  });
+  $('practice-context').addEventListener('input', () => {
+    const config = selectedCrewId ? CrewConfigs.findOne(selectedCrewId) : null;
+    const identity = agentIdentityForConfig(config);
+    if (!identity) return;
+    renderPracticeEvidence(AgentExperiences.find(
+      { agentId: identity._id }, { sort: { createdAt: -1 } },
+    ).fetch());
+  });
+  $('crew-experience-recall').addEventListener('change', (event) => {
+    const limit = $('crew-experience-recent');
+    if (event.currentTarget.checked && Number(limit.value) < 1) limit.value = '1';
+    updateCrewLearningControls(crewEditor?.patch ?? crewEditor?.config ?? {});
+  });
+  for (const id of [
+    'crew-experience-record', 'crew-experience-automatic',
+    'crew-experience-scope', 'crew-practice-acquire', 'crew-practice-automatic',
+    'crew-practice-scoped-promotion',
+  ]) {
+    $(id).addEventListener('change', () => {
+      updateCrewLearningControls(crewEditor?.patch ?? crewEditor?.config ?? {});
+    });
+  }
   $('crew-new-person').addEventListener('click', () => openPersonEditor());
   $('crew-edit-person').addEventListener('click', () => {
     if (selectedWorkspaceMemberId) openPersonEditor(selectedWorkspaceMemberId);
@@ -2088,7 +4086,7 @@ function wireCrewSettings() {
     event.preventDefault();
     closeCrewSettings();
   });
-  $('add-crew-agent').addEventListener('click', () => {
+  const addCrewAgent = () => {
     if (!currentSessionId || !discardCrewChanges('Discard these changes and add a new agent?')) return;
     const draft = newCrewDraft();
     resetCrewEditor(draft, true);
@@ -2096,7 +4094,8 @@ function wireCrewSettings() {
     populateCrewForm(draft);
     renderCrewSettings();
     requestAnimationFrame(() => $('crew-name').select());
-  });
+  };
+  $('crew-new-agent').addEventListener('click', addCrewAgent);
   $('crew-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     if (!currentSessionId || !selectedCrewId || !crewEditor) return;
@@ -2118,53 +4117,100 @@ function wireCrewSettings() {
         sessionChanged.changed();
         toast(wasNew ? 'Agent added to the workspace.' : 'Agent saved.');
       } catch (error) {
-        showFormError('crew-form', error);
+        showFormError(
+          'crew-form', error,
+          staleReloadOptions(error, () => {
+            crewEditor = null;
+            renderCrewSettings();
+          }),
+        );
         toast(messageOf(error), 'error');
       }
     });
   });
-  $('remove-crew-agent').addEventListener('click', async (event) => {
-    if (!currentSessionId || !selectedCrewId) return;
+  const restoreCrewAgent = async (config, control) => {
+    await withControlBusy(control, 'Restoring', async () => {
+      try {
+        await Meteor.callAsync('constellation.crewRestore', config._id, config.revision);
+        crewEditor = null;
+        renderCrewSettings();
+        sessionChanged.changed();
+        toast(`${config.displayName} restored as inactive.`);
+      } catch (error) {
+        toast(messageOf(error), 'error');
+      }
+    });
+  };
+  $('restore-crew-agent-learning').addEventListener('click', async (event) => {
+    const config = selectedCrewId ? CrewConfigs.findOne(selectedCrewId) : null;
+    if (!config || !crewConfigArchived(config)) return;
+    await restoreCrewAgent(config, event.currentTarget);
+  });
+  $('archive-crew-agent').addEventListener('click', async (event) => {
+    if (!selectedCrewId) return;
     const configId = selectedCrewId;
     const config = CrewConfigs.findOne(configId);
     if (!config) return;
+    if (crewConfigArchived(config)) {
+      await restoreCrewAgent(config, event.currentTarget);
+      return;
+    }
+    if (!currentSessionId) return;
+    if (crewEditor?.dirty) {
+      if (!discardCrewChanges('Discard unsaved changes and continue to archive this agent?')) return;
+      crewEditor = null;
+      renderCrewSettings();
+    }
     await withControlBusy(event.currentTarget, 'Checking', async () => {
       try {
-        pendingCrewImpact = await Meteor.callAsync('constellation.crewImpact', configId);
-        renderCrewRemovalImpact(pendingCrewImpact);
-        $('crew-remove-dialog').showModal();
+        pendingCrewArchiveImpact = await Meteor.callAsync('constellation.crewImpact', configId);
+        renderCrewArchiveImpact(pendingCrewArchiveImpact);
+        $('crew-archive-dialog').showModal();
       } catch (error) { toast(messageOf(error), 'error'); }
     });
     renderCrewSettings();
   });
-  const closeRemoval = () => {
-    pendingCrewImpact = null;
-    $('crew-remove-dialog').close();
+  const closeCrewArchive = () => {
+    pendingCrewArchiveImpact = null;
+    $('crew-archive-dialog').close();
   };
-  $('close-crew-remove').addEventListener('click', closeRemoval);
-  $('cancel-crew-remove').addEventListener('click', closeRemoval);
-  $('confirm-crew-remove').addEventListener('click', async (event) => {
-    if (!currentSessionId || !pendingCrewImpact) return;
-    const impact = pendingCrewImpact;
+  $('close-crew-archive').addEventListener('click', closeCrewArchive);
+  $('cancel-crew-archive').addEventListener('click', closeCrewArchive);
+  $('confirm-crew-archive').addEventListener('click', async (event) => {
+    if (!currentSessionId || !pendingCrewArchiveImpact) return;
+    const impact = pendingCrewArchiveImpact;
     const primary = crewConfigs().find((candidate) => candidate.agent === 'orchestrator');
-    await withControlBusy(event.currentTarget, 'Removing', async () => {
-      pendingCrewRemovals.add(impact.configId);
+    await withControlBusy(event.currentTarget, 'Archiving', async () => {
+      pendingCrewArchives.add(impact.configId);
       crewEditor = null;
       selectedCrewId = primary?._id ?? null;
       renderCrewSettings();
       sessionChanged.changed();
       try {
         await Meteor.callAsync(
-          'constellation.crewRemove', currentSessionId, impact.configId, impact.agent,
+          'constellation.crewArchive', currentSessionId, impact.configId, impact.agent,
+          impact.configRevision, impact.digest,
         );
-        pendingCrewImpact = null;
-        $('crew-remove-dialog').close();
+        pendingCrewArchives.delete(impact.configId);
+        pendingCrewArchiveImpact = null;
+        $('crew-archive-dialog').close();
         renderCrewSettings();
         sessionChanged.changed();
-        toast(`${impact.displayName} removed from the workspace.`);
+        toast(`${impact.displayName} archived. History preserved.`);
       } catch (error) {
-        pendingCrewRemovals.delete(impact.configId);
+        pendingCrewArchives.delete(impact.configId);
         selectedCrewId = impact.configId;
+        if (['stale-impact', 'stale-agent'].includes(error?.error)) {
+          try {
+            pendingCrewArchiveImpact = await Meteor.callAsync(
+              'constellation.crewImpact', impact.configId,
+            );
+            renderCrewArchiveImpact(pendingCrewArchiveImpact);
+          } catch {
+            pendingCrewArchiveImpact = null;
+            $('crew-archive-dialog').close();
+          }
+        }
         renderCrewSettings();
         sessionChanged.changed();
         toast(messageOf(error), 'error');
@@ -2173,6 +4219,10 @@ function wireCrewSettings() {
   });
   $('crew-model').addEventListener('change', (event) => {
     renderCrewModelSelector(event.currentTarget.value);
+  });
+  $('crew-form').addEventListener('keydown', (event) => {
+    if (agentDetailTab !== 'profile' && event.key === 'Enter'
+      && event.target instanceof HTMLInputElement) event.preventDefault();
   });
   $('crew-form').addEventListener('input', captureCrewEdit);
   $('crew-form').addEventListener('change', captureCrewEdit);
@@ -2438,8 +4488,27 @@ function renderMissionState() {
   }
 }
 
+function memoryReviewAttentionCount() {
+  if (!learningIsReady()) return null;
+  const practices = AgentPractices.find({}).fetch();
+  const experiences = AgentExperiences.find({}).fetch();
+  return practices.filter((row) => row.status === 'candidate').length
+    + practices.filter((row) => learningAdmissionState('practice', row).pending).length
+    + experiences.filter((row) => learningAdmissionState('experience', row).pending).length;
+}
+
 function renderMemory() {
   memoryViewChanged.depend();
+  const reviewCount = memoryReviewAttentionCount();
+  const reviewCountElement = $('memory-reviews-count');
+  reviewCountElement.textContent = reviewCount === null ? '—' : String(reviewCount);
+  reviewCountElement.dataset.state = reviewCount > 0 ? 'attention' : 'clear';
+  $('memory-open-reviews').setAttribute(
+    'aria-label',
+    reviewCount === null
+      ? 'Open learning reviews, status unavailable'
+      : `Open learning reviews, ${reviewCount} ${reviewCount === 1 ? 'item needs' : 'items need'} attention`,
+  );
   const query = $('memory-search').value.trim().toLowerCase();
   const all = AgentMemories.find({}, { sort: { pinned: -1, at: -1 } }).fetch();
   $('personal-memory-count').textContent = String(all.filter((row) => row.scope !== 'app').length);
@@ -2562,7 +4631,7 @@ async function openMissionSettings(sessionId = currentSessionId) {
   $('mission-config-auto-title').checked = config.autoTitle ?? true;
   $('mission-config-continuity').checked = config.continuity ?? true;
   $('mission-config-approvals').checked = config.approvals ?? true;
-  $('mission-config-approvals-hint').textContent = `${primaryDefinition().label} asks before each Publish brief call`;
+  $('mission-config-approvals-hint').textContent = 'Other tool approval policies stay unchanged';
   $('mission-config-debug-traces').checked = config.debugTraces ?? false;
   $('mission-config-continuity').disabled = config.status === 'completed';
   $('archive-mission').textContent = config.status === 'completed' ? 'Reactivate mission' : 'Complete mission';
@@ -2571,6 +4640,7 @@ async function openMissionSettings(sessionId = currentSessionId) {
     : 'Stops work, pauses linked Pulses, and disables resume.';
   updateMissionStatusHint(config.status);
   updateMissionConfigBadge(config.status);
+  beginGuardedEditor('mission-form');
   if (!$('mission-dialog').open) $('mission-dialog').showModal();
   requestAnimationFrame(() => $('mission-config-title').focus());
 }
@@ -2622,14 +4692,17 @@ function confirmMissionStateChange(current, nextStatus) {
 }
 
 function wireMissionSettings() {
+  registerGuardedEditor({
+    formId: 'mission-form', dialogId: 'mission-dialog', statusId: 'mission-form-status',
+    closeId: 'close-mission-dialog', cancelId: 'cancel-mission-edit',
+    label: 'this mission', read: missionFormPatch,
+  });
   $('configure-mission').addEventListener('click', (event) => {
     void withControlBusy(event.currentTarget, 'Loading', openMissionSettings);
   });
   $('configure-continuity').addEventListener('click', (event) => {
     void withControlBusy(event.currentTarget, 'Loading', openMissionSettings);
   });
-  $('close-mission-dialog').addEventListener('click', () => $('mission-dialog').close());
-  $('cancel-mission-edit').addEventListener('click', () => $('mission-dialog').close());
   $('mission-dialog').addEventListener('close', () => {
     editingMissionSessionId = null;
     editingMissionRevision = null;
@@ -2652,6 +4725,7 @@ function wireMissionSettings() {
       if (config.status !== 'completed') statusSelect.querySelector('option[value="completed"]')?.remove();
       updateMissionConfigBadge(config.status);
       updateMissionStatusHint(config.status);
+      updateGuardedEditor('mission-form');
       return;
     }
     const submit = event.submitter ?? $('mission-form').querySelector('[type="submit"]');
@@ -2685,6 +4759,7 @@ function wireMissionSettings() {
     $('mission-config-status').value = completed ? 'active' : 'completed';
     updateMissionConfigBadge(completed ? 'active' : 'completed');
     updateMissionStatusHint(completed ? 'active' : 'completed');
+    updateGuardedEditor('mission-form');
     $('mission-form').requestSubmit();
   });
 }
@@ -2701,10 +4776,55 @@ function wireNavigation() {
   $('mission-search').addEventListener('keydown', (event) => {
     if (event.key === 'Escape') { event.currentTarget.value = ''; renderMissionList(); }
   });
-  $('profile-button').addEventListener('click', () => toast('Local-only account.'));
+  $('profile-button').addEventListener('click', openLocalAccountDetails);
+  $('close-account-dialog').addEventListener('click', closeLocalAccountDetails);
+  $('account-dialog-done').addEventListener('click', closeLocalAccountDetails);
+  $('account-open-directory').addEventListener('click', () => {
+    closeLocalAccountDetails();
+    setCrewDirectoryTab('people');
+    openCrewSettings();
+    requestAnimationFrame(() => $('crew-directory-tab-people')?.focus());
+  });
+  $('account-open-channels').addEventListener('click', () => {
+    closeLocalAccountDetails();
+    activateView('channels');
+    requestAnimationFrame(() => document.querySelector('.rail-button[data-view="channels"]')?.focus());
+  });
 }
 
 function wireMissionActions() {
+  const moreActions = $('mission-more-actions');
+  const moreTrigger = $('mission-more-trigger');
+  moreActions.addEventListener('toggle', () => {
+    moreTrigger.setAttribute('aria-expanded', String(moreActions.open));
+    if (moreActions.open) requestAnimationFrame(() => $('fork-mission').focus());
+  });
+  moreActions.querySelectorAll('button').forEach((button) => {
+    button.addEventListener('click', () => {
+      moreActions.open = false;
+      moreTrigger.focus();
+    });
+  });
+  document.addEventListener('click', (event) => {
+    if (moreActions.open && !moreActions.contains(event.target)) moreActions.open = false;
+  });
+  moreActions.addEventListener('keydown', (event) => {
+    if (event.key === 'Escape') {
+      moreActions.open = false;
+      moreTrigger.focus();
+      return;
+    }
+    if (!['ArrowUp', 'ArrowDown', 'Home', 'End'].includes(event.key)
+      || !moreActions.open) return;
+    event.preventDefault();
+    const items = [...moreActions.querySelectorAll('[role="menuitem"]:not(:disabled)')];
+    if (!items.length) return;
+    const current = items.indexOf(document.activeElement);
+    const next = event.key === 'Home' ? items[0]
+      : event.key === 'End' ? items.at(-1)
+        : items[(Math.max(0, current) + (event.key === 'ArrowDown' ? 1 : -1) + items.length) % items.length];
+    next.focus();
+  });
   document.querySelectorAll('[data-prompt]').forEach((button) => {
     button.addEventListener('click', () => {
       void withControlBusy(button, 'Sending', () => sendPrompt(button.dataset.prompt));
@@ -2743,7 +4863,7 @@ function wireMissionActions() {
       toast('Activate this mission before compacting.', 'error');
       return;
     }
-    await withControlBusy(event.currentTarget, 'Compacting', async () => {
+    await withControlBusy(event.currentTarget, 'Reducing', async () => {
       try {
         const changed = await workspace.compact(currentSessionId);
         toast(changed ? 'Context compacted.' : 'No compaction needed.');
@@ -2791,6 +4911,13 @@ function wireMissionActions() {
 }
 
 function wireMemory() {
+  $('memory-open-agent-learning').addEventListener('click', () => {
+    setCrewDirectoryTab('agents');
+    setAgentDetailTab('experience');
+    openCrewSettings();
+    requestAnimationFrame(() => $('agent-detail-tab-experience')?.focus());
+  });
+  $('memory-open-reviews').addEventListener('click', openLearningReviews);
   $('memory-form').addEventListener('submit', async (event) => {
     event.preventDefault();
     clearFormError(event.currentTarget);
@@ -3025,6 +5152,35 @@ function setPulseScheduleFields(kind) {
   $('pulse-cron').required = cron;
 }
 
+function updatePulseSchedulePreview() {
+  const preview = $('pulse-schedule-preview');
+  const cron = $('pulse-cron');
+  const patch = pulseFormPatch();
+  const mission = MissionConfigs.findOne(patch.sessionId);
+  cron.setCustomValidity('');
+  try {
+    const next = nextScheduledAt(patch.schedule, new Date());
+    const nextLabel = new Intl.DateTimeFormat(undefined, {
+      weekday: 'short', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+    }).format(next);
+    const schedule = humanSchedule(patch.schedule);
+    if (mission && mission.status !== 'active') {
+      preview.dataset.tone = 'warning';
+      preview.textContent = `${schedule} · ${mission.status === 'completed' ? 'Mission completed' : 'Mission paused'} · activate the Mission before enabling this Pulse.`;
+      return;
+    }
+    preview.dataset.tone = patch.enabled ? 'ready' : 'paused';
+    preview.textContent = patch.enabled
+      ? `${schedule} · next ${nextLabel}`
+      : `${schedule} · paused until enabled`;
+  } catch (error) {
+    const reason = messageOf(error);
+    if (patch.schedule.kind === 'cron') cron.setCustomValidity(reason);
+    preview.dataset.tone = 'error';
+    preview.textContent = `Check the schedule · ${reason}`;
+  }
+}
+
 function openPulseDialog(id = null) {
   clearFormError('pulse-form');
   const pulse = id ? PulseConfigs.findOne(id) : null;
@@ -3050,6 +5206,8 @@ function openPulseDialog(id = null) {
   $('delete-pulse').hidden = !pulse;
   populatePulseTargets(pulse);
   setPulseScheduleFields(kind);
+  updatePulseSchedulePreview();
+  beginGuardedEditor('pulse-form', { cleanLabel: pulse ? 'Saved' : 'Not saved' });
   if (!$('pulse-dialog').open) $('pulse-dialog').showModal();
   requestAnimationFrame(() => $('pulse-name').focus());
 }
@@ -3075,14 +5233,26 @@ function pulseFormPatch() {
 }
 
 function wirePulses() {
+  registerGuardedEditor({
+    formId: 'pulse-form', dialogId: 'pulse-dialog', statusId: 'pulse-form-status',
+    closeId: 'close-pulse-dialog', cancelId: 'cancel-pulse-edit',
+    label: 'this pulse', read: pulseFormPatch,
+  });
   $('add-pulse').addEventListener('click', () => openPulseDialog());
-  $('close-pulse-dialog').addEventListener('click', closePulseDialog);
-  $('cancel-pulse-edit').addEventListener('click', closePulseDialog);
   $('pulse-dialog').addEventListener('close', () => {
     selectedPulseId = null;
     editingPulseRevision = null;
   });
-  $('pulse-schedule-kind').addEventListener('change', (event) => setPulseScheduleFields(event.currentTarget.value));
+  $('pulse-schedule-kind').addEventListener('change', (event) => {
+    setPulseScheduleFields(event.currentTarget.value);
+    updatePulseSchedulePreview();
+  });
+  for (const id of [
+    'pulse-interval-value', 'pulse-interval-unit', 'pulse-cron', 'pulse-session', 'pulse-enabled',
+  ]) {
+    $(id).addEventListener('input', updatePulseSchedulePreview);
+    $(id).addEventListener('change', updatePulseSchedulePreview);
+  }
   document.querySelectorAll('[data-pulse-filter]').forEach((button) => button.addEventListener('click', () => {
     pulseFilter = button.dataset.pulseFilter;
     document.querySelectorAll('[data-pulse-filter]').forEach((candidate) => candidate.classList.toggle('active', candidate === button));
@@ -3140,6 +5310,7 @@ const FRAMEWORK_CATEGORY_LABELS = Object.freeze({
   skill: 'Skills',
   skills: 'Skills',
   memory: 'Memory',
+  learning: 'Learning',
 });
 
 const TOOL_SOURCE_ORDER = Object.freeze({ framework: 0, app: 1, 'app-mcp': 2, 'workspace-mcp': 3 });
@@ -3264,6 +5435,13 @@ function toolProvenance(tool) {
           ? `${tool.assignmentSummary || (inheritsPrimary ? `${inherited} memory` : 'Agent memory')} · root missions`
           : 'Agent memory configuration',
         why: availability || `Memory enabled for ${access}`,
+      };
+    }
+    if (tool.category === 'learning') {
+      return {
+        provider,
+        assignment: `${tool.assignmentSummary || access} · Memory Frame`,
+        why: availability || `Experience enabled for ${access}`,
       };
     }
     return { provider, assignment: 'Runtime configuration', why: availability || `Enabled for ${access}` };
@@ -3814,6 +5992,7 @@ function openSkillDialog(id = null) {
   setSkillFormStatus();
   $('delete-skill').hidden = !skill;
   populateSkillAgents(skill);
+  beginGuardedEditor('skill-form', { cleanLabel: skill ? 'Saved' : 'Not saved' });
   $('skill-dialog').showModal();
   requestAnimationFrame(() => $('skill-name').focus());
 }
@@ -3846,9 +6025,12 @@ function skillFormPatch() {
 }
 
 function wireSkills() {
+  registerGuardedEditor({
+    formId: 'skill-form', dialogId: 'skill-dialog', statusId: 'skill-form-status',
+    closeId: 'close-skill-dialog', cancelId: 'cancel-skill-edit',
+    label: 'this skill', read: skillFormPatch,
+  });
   $('add-skill').addEventListener('click', () => openSkillDialog());
-  $('close-skill-dialog').addEventListener('click', () => $('skill-dialog').close());
-  $('cancel-skill-edit').addEventListener('click', () => $('skill-dialog').close());
   $('skill-enabled').addEventListener('change', () => updateSkillEditorState());
   $('skill-demo').addEventListener('click', (event) => {
     void withControlBusy(event.currentTarget, 'Starting', () => sendPrompt('Choose and load the best available skill for framing this mission, then apply it.'));
@@ -4123,7 +6305,10 @@ function renderMcpServers(servers, allTools) {
 function addMcpArgRow(value = '') {
   const row = $('mcp-arg-row-template').content.firstElementChild.cloneNode(true);
   row.querySelector('[name="mcpArg"]').value = value;
-  row.querySelector('[data-remove-mcp-arg]').addEventListener('click', () => row.remove());
+  row.querySelector('[data-remove-mcp-arg]').addEventListener('click', () => {
+    row.remove();
+    updateGuardedEditor('mcp-form');
+  });
   $('mcp-args-rows').append(row);
   return row;
 }
@@ -4138,6 +6323,7 @@ function addMcpEnvRow(key = '', stored = false) {
   row.querySelector('[data-remove-mcp-env]').addEventListener('click', () => {
     if (row.dataset.originalKey) removedMcpEnvKeys.add(row.dataset.originalKey);
     row.remove();
+    updateGuardedEditor('mcp-form');
   });
   $('mcp-env-rows').append(row);
   return row;
@@ -4165,9 +6351,9 @@ function populateMcpAgents(server) {
   }
 }
 
-function renderMcpToolOptions(server, discovered = null) {
+function renderMcpToolOptions(server, discovered = null, selectedTools = null) {
   const existing = discovered ?? (server?._id ? toolsForServer(server._id) : []);
-  const selected = new Set(server?.selectedTools ?? []);
+  const selected = new Set(selectedTools ?? server?.selectedTools ?? []);
   const all = $('mcp-tool-access').value === 'all';
   const mount = $('mcp-tool-options');
   mount.replaceChildren();
@@ -4190,6 +6376,59 @@ function renderMcpToolOptions(server, discovered = null) {
   $('mcp-discovery-count').textContent = String(existing.length);
 }
 
+function updateMcpPrimaryAction() {
+  const submit = $('mcp-submit');
+  if (!editingMcpId) {
+    submit.textContent = 'Save & test';
+    submit.dataset.loadingLabel = 'Saving & testing';
+    return;
+  }
+  const enabling = $('mcp-enabled').checked && editingMcpPersistedEnabled === false;
+  submit.textContent = enabling ? 'Enable server' : 'Save server';
+  submit.dataset.loadingLabel = enabling ? 'Enabling' : 'Saving';
+}
+
+function updateMcpTrustRequirement() {
+  // A new server must be trusted because its first save immediately runs discovery.
+  $('mcp-trust-local').required = !editingMcpId || $('mcp-enabled').checked;
+}
+
+function clearMcpToolSelectionError() {
+  const error = $('mcp-form').querySelector(
+    ':scope > .form-inline-error[data-error-code="mcp-no-selected-tools"]',
+  );
+  error?.remove();
+  $('mcp-tool-access').removeAttribute('aria-invalid');
+  $('mcp-tool-options').removeAttribute('aria-describedby');
+}
+
+function showMcpToolSelectionError() {
+  const firstTool = $('mcp-tool-options').querySelector('input:not(:disabled)');
+  showFormError(
+    'mcp-form',
+    { reason: 'Choose at least one discovered tool before enabling this server.' },
+    {
+      actionLabel: firstTool ? 'Choose a tool' : 'Go to test',
+      action: () => {
+        const target = firstTool ?? $('mcp-test-discover');
+        target.scrollIntoView({ block: 'nearest' });
+        target.focus();
+      },
+    },
+  );
+  const error = $('mcp-form').querySelector(':scope > .form-inline-error');
+  if (error) {
+    error.id = 'mcp-tool-selection-error';
+    error.dataset.errorCode = 'mcp-no-selected-tools';
+    $('mcp-tool-access').setAttribute('aria-invalid', 'true');
+    $('mcp-tool-options').setAttribute('aria-describedby', error.id);
+  }
+}
+
+function mcpPatchNeedsToolSelection(patch) {
+  return patch.enabled && patch.toolMode === 'selected' && patch.selectedTools.length === 0;
+}
+
 function updateMcpEditorState(server) {
   const state = resolveMcpState(server);
   setMcpStatus($('mcp-dialog-runtime-status'), state.key, state.label);
@@ -4201,11 +6440,15 @@ function updateMcpEditorState(server) {
 }
 
 function openMcpDialog(id = null) {
+  clearMcpToolSelectionError();
   clearFormError('mcp-form');
   const server = id ? McpConfigs.findOne(id) : null;
   if (id && !server) {
     editingMcpId = null;
     editingMcpRevision = null;
+    editingMcpPersistedEnabled = null;
+    editingMcpDiscoveredTools = null;
+    editingMcpSelectedTools = new Set();
     if ($('mcp-dialog').open) $('mcp-dialog').close();
     toast('MCP server no longer exists.', 'error');
     return;
@@ -4217,6 +6460,9 @@ function openMcpDialog(id = null) {
   }
   editingMcpId = id;
   editingMcpRevision = server?.revision ?? null;
+  editingMcpPersistedEnabled = server?.enabled ?? null;
+  editingMcpDiscoveredTools = null;
+  editingMcpSelectedTools = new Set(server?.selectedTools ?? []);
   removedMcpEnvKeys = new Set();
   $('mcp-dialog-title').textContent = server ? 'Configure MCP server' : 'Add MCP server';
   $('mcp-dialog-id').textContent = server ? 'Workspace server' : 'New workspace server';
@@ -4229,7 +6475,7 @@ function openMcpDialog(id = null) {
     || (server?.timeoutMs && server.timeoutMs !== 15_000) || (server?.cooldownMs && server.cooldownMs !== 30_000));
   $('mcp-enabled').checked = server?.enabled ?? false;
   $('mcp-trust-local').checked = server?.trusted ?? false;
-  $('mcp-trust-local').required = $('mcp-enabled').checked;
+  updateMcpTrustRequirement();
   $('mcp-tool-access').value = server?.toolMode ?? 'selected';
   $('mcp-approval').value = server?.approval ?? 'ask';
   $('mcp-args-rows').replaceChildren();
@@ -4237,10 +6483,12 @@ function openMcpDialog(id = null) {
   $('mcp-env-rows').replaceChildren();
   for (const key of server?.envKeys ?? []) addMcpEnvRow(key, true);
   populateMcpAgents(server);
-  renderMcpToolOptions(server);
+  renderMcpToolOptions(server, null, editingMcpSelectedTools);
   updateMcpEditorState(server);
   $('delete-mcp-server').hidden = !server;
   $('mcp-test-discover').disabled = !server;
+  updateMcpPrimaryAction();
+  beginGuardedEditor('mcp-form', { cleanLabel: server ? 'Saved' : 'Not saved' });
   if (!$('mcp-dialog').open) $('mcp-dialog').showModal();
   requestAnimationFrame(() => $('mcp-name').focus());
 }
@@ -4253,6 +6501,12 @@ function mcpFormPatch() {
     if (key && value) env[key] = value;
   }
   const removeEnv = [...removedMcpEnvKeys].filter((key) => !(key in env));
+  const toolMode = $('mcp-tool-access').value;
+  if (toolMode === 'selected') {
+    editingMcpSelectedTools = new Set(
+      [...$('mcp-tool-options').querySelectorAll('input:checked')].map((input) => input.value),
+    );
+  }
   return {
     name: $('mcp-name').value,
     enabled: $('mcp-enabled').checked,
@@ -4263,56 +6517,140 @@ function mcpFormPatch() {
     env,
     removeEnv,
     agents: [...$('mcp-agent-options').querySelectorAll('input:checked')].map((input) => input.value),
-    toolMode: $('mcp-tool-access').value,
-    selectedTools: [...$('mcp-tool-options').querySelectorAll('input:checked')].map((input) => input.value),
+    toolMode,
+    selectedTools: [...editingMcpSelectedTools],
     approval: $('mcp-approval').value,
     timeoutMs: Number($('mcp-timeout-ms').value || 15_000),
     cooldownMs: Number($('mcp-cooldown-ms').value || 30_000),
   };
 }
 
+function adoptCreatedMcpServer(saved, requestedEnabled) {
+  editingMcpId = saved._id;
+  editingMcpRevision = saved.revision;
+  editingMcpPersistedEnabled = !!saved.enabled;
+  editingMcpDiscoveredTools = [];
+  editingMcpSelectedTools = new Set(saved.selectedTools ?? []);
+  selectedMcpId = saved._id;
+  $('mcp-dialog-title').textContent = 'Configure MCP server';
+  $('mcp-dialog-id').textContent = 'Workspace server';
+  $('mcp-server-id').value = saved._id;
+  $('delete-mcp-server').hidden = false;
+  $('mcp-test-discover').disabled = false;
+  $('mcp-enabled').checked = !!saved.enabled;
+  renderMcpToolOptions(saved, editingMcpDiscoveredTools, editingMcpSelectedTools);
+  updateMcpEditorState(saved);
+  updateMcpTrustRequirement();
+  updateMcpPrimaryAction();
+  beginGuardedEditor('mcp-form', { cleanLabel: 'Saved' });
+
+  // Keep the user's enable intent as the next explicit step after discovery.
+  $('mcp-enabled').checked = requestedEnabled;
+  updateMcpTrustRequirement();
+  updateMcpPrimaryAction();
+  updateGuardedEditor('mcp-form');
+}
+
+async function performMcpTest(id, { inlineFailure = false } = {}) {
+  try {
+    const result = await Meteor.callAsync('constellation.mcpTest', id);
+    if ($('mcp-dialog').open && editingMcpId === id) {
+      editingMcpDiscoveredTools = result.tools ?? [];
+      const server = McpConfigs.findOne(id) ?? { _id: id, selectedTools: [] };
+      renderMcpToolOptions(server, editingMcpDiscoveredTools, editingMcpSelectedTools);
+      const state = result.ok ? 'ready' : 'error';
+      const label = result.ok ? 'Ready' : 'Unavailable';
+      setMcpStatus($('mcp-dialog-runtime-status'), state, label);
+      setMcpStatus($('mcp-discovery-status'), state, label);
+      $('mcp-last-checked').textContent = 'Just now';
+      $('mcp-last-error').textContent = result.ok ? 'None' : (result.reason ?? 'Connection failed');
+      $('mcp-diagnostic-log').textContent = result.ok
+        ? `${result.tools?.length ?? 0} tools discovered.`
+        : (result.reason ?? 'Connection failed.');
+      updateGuardedEditor('mcp-form');
+      if (inlineFailure && !result.ok) showFormError('mcp-form', { reason: result.reason ?? 'Server unavailable.' });
+    }
+    toast(
+      result.ok ? `${result.tools?.length ?? 0} tools discovered.` : (result.reason ?? 'Server unavailable.'),
+      result.ok ? 'success' : 'error',
+    );
+    return result;
+  } catch (error) {
+    if ($('mcp-dialog').open && editingMcpId === id) {
+      setMcpStatus($('mcp-dialog-runtime-status'), 'error', 'Unavailable');
+      setMcpStatus($('mcp-discovery-status'), 'error', 'Unavailable');
+      $('mcp-last-checked').textContent = 'Just now';
+      $('mcp-last-error').textContent = messageOf(error);
+      $('mcp-diagnostic-log').textContent = messageOf(error);
+      if (inlineFailure) showFormError('mcp-form', error);
+    }
+    toast(messageOf(error), 'error');
+    return { ok: false, status: 'error', tools: [], reason: messageOf(error) };
+  }
+}
+
 async function testMcpServer(id, control) {
   if (!id) {
     toast('Save the server before testing.', 'error');
-    return;
+    return null;
   }
-  await withControlBusy(control, 'Testing', async () => {
-    try {
-      const result = await Meteor.callAsync('constellation.mcpTest', id);
-      const server = McpConfigs.findOne(id);
-      if ($('mcp-dialog').open && editingMcpId === id) {
-        renderMcpToolOptions(server, result.tools ?? []);
-        setMcpStatus($('mcp-dialog-runtime-status'), result.status ?? (result.ok ? 'ready' : 'error'), result.ok ? 'Ready' : 'Unavailable');
-        setMcpStatus($('mcp-discovery-status'), result.status ?? (result.ok ? 'ready' : 'error'), result.ok ? 'Ready' : 'Unavailable');
-        $('mcp-diagnostic-log').textContent = result.ok ? `${result.tools?.length ?? 0} tools discovered.` : (result.reason ?? 'Connection failed.');
-      }
-      toast(result.ok ? `${result.tools?.length ?? 0} tools discovered.` : (result.reason ?? 'Server unavailable.'), result.ok ? 'success' : 'error');
-    } catch (error) { toast(messageOf(error), 'error'); }
-  });
+  clearMcpToolSelectionError();
+  clearFormError('mcp-form');
+  return withControlBusy(control, 'Testing', () => performMcpTest(id, { inlineFailure: true }));
 }
 
 function wireMcpServers() {
+  registerGuardedEditor({
+    formId: 'mcp-form', dialogId: 'mcp-dialog', statusId: 'mcp-form-status',
+    closeId: 'close-mcp-dialog', cancelId: 'cancel-mcp-edit',
+    label: 'this MCP server', read: mcpFormPatch,
+  });
   const close = () => {
     $('mcp-dialog').close();
     editingMcpId = null;
     editingMcpRevision = null;
+    editingMcpPersistedEnabled = null;
+    editingMcpDiscoveredTools = null;
+    editingMcpSelectedTools = new Set();
     removedMcpEnvKeys = new Set();
   };
   $('add-mcp-server').addEventListener('click', () => openMcpDialog());
-  $('close-mcp-dialog').addEventListener('click', close);
-  $('cancel-mcp-edit').addEventListener('click', close);
   $('mcp-dialog').addEventListener('close', () => {
     editingMcpId = null;
     editingMcpRevision = null;
+    editingMcpPersistedEnabled = null;
+    editingMcpDiscoveredTools = null;
+    editingMcpSelectedTools = new Set();
     removedMcpEnvKeys = new Set();
   });
-  $('add-mcp-arg').addEventListener('click', () => addMcpArgRow().querySelector('input').focus());
-  $('add-mcp-env').addEventListener('click', () => addMcpEnvRow().querySelector('input').focus());
+  $('add-mcp-arg').addEventListener('click', () => {
+    addMcpArgRow().querySelector('input').focus();
+    updateGuardedEditor('mcp-form');
+  });
+  $('add-mcp-env').addEventListener('click', () => {
+    addMcpEnvRow().querySelector('input').focus();
+    updateGuardedEditor('mcp-form');
+  });
   $('mcp-enabled').addEventListener('change', () => {
-    $('mcp-trust-local').required = $('mcp-enabled').checked;
+    updateMcpTrustRequirement();
+    updateMcpPrimaryAction();
+    if (!$('mcp-enabled').checked) clearMcpToolSelectionError();
   });
   $('mcp-tool-access').addEventListener('change', () => {
-    renderMcpToolOptions(editingMcpId ? McpConfigs.findOne(editingMcpId) : null);
+    renderMcpToolOptions(
+      editingMcpId ? McpConfigs.findOne(editingMcpId) : null,
+      editingMcpDiscoveredTools,
+      editingMcpSelectedTools,
+    );
+    if ($('mcp-tool-access').value === 'all') clearMcpToolSelectionError();
+  });
+  $('mcp-tool-options').addEventListener('change', (event) => {
+    if (!event.target.matches('input[type="checkbox"]')
+      || $('mcp-tool-access').value !== 'selected') return;
+    editingMcpSelectedTools = new Set(
+      [...$('mcp-tool-options').querySelectorAll('input:checked')].map((input) => input.value),
+    );
+    if (editingMcpSelectedTools.size) clearMcpToolSelectionError();
   });
   const activateMcpDetailTab = (button, focus = false) => {
     mcpDetailTab = button.dataset.mcpDetailTab;
@@ -4356,15 +6694,35 @@ function wireMcpServers() {
   });
   $('mcp-form').addEventListener('submit', async (event) => {
     event.preventDefault();
+    clearMcpToolSelectionError();
     clearFormError(event.currentTarget);
     const serverId = editingMcpId;
     const expectedRevision = editingMcpRevision;
-    const submit = event.submitter ?? event.currentTarget.querySelector('[type="submit"]');
-    await withControlBusy(submit, 'Saving', async () => {
+    const patch = mcpFormPatch();
+    if (serverId && mcpPatchNeedsToolSelection(patch)) {
+      showMcpToolSelectionError();
+      return;
+    }
+    const creating = !serverId;
+    const submit = event.submitter ?? $('mcp-submit');
+    await withControlBusy(submit, creating ? 'Saving & testing' : submit.dataset.loadingLabel, async () => {
       try {
-        const saved = serverId
-          ? await Meteor.callAsync('constellation.mcpSave', serverId, expectedRevision, mcpFormPatch())
-          : await Meteor.callAsync('constellation.mcpCreate', mcpFormPatch());
+        if (creating) {
+          const requestedEnabled = patch.enabled;
+          const saved = await Meteor.callAsync(
+            'constellation.mcpCreate', { ...patch, enabled: false },
+          );
+          adoptCreatedMcpServer(saved, requestedEnabled);
+          setCapabilityTab('mcp');
+          const result = await performMcpTest(saved._id, { inlineFailure: true });
+          if (result.ok && mcpPatchNeedsToolSelection(mcpFormPatch())) {
+            showMcpToolSelectionError();
+          }
+          return;
+        }
+        const saved = await Meteor.callAsync(
+          'constellation.mcpSave', serverId, expectedRevision, patch,
+        );
         selectedMcpId = saved._id;
         close();
         setCapabilityTab('mcp');
@@ -4374,6 +6732,10 @@ function wireMcpServers() {
         toast(messageOf(error), 'error');
       }
     });
+    if ($('mcp-dialog').open) {
+      updateMcpPrimaryAction();
+      updateGuardedEditor('mcp-form');
+    }
   });
   $('delete-mcp-server').addEventListener('click', async (event) => {
     const serverId = editingMcpId;
@@ -4516,6 +6878,7 @@ function openChannelDialog(kind) {
   $('channel-test-status').textContent = '';
   delete $('channel-test-status').dataset.tone;
   $('channel-save').disabled = !$('channel-form').checkValidity();
+  beginGuardedEditor('channel-form');
   if (!$('channel-dialog').open) $('channel-dialog').showModal();
   requestAnimationFrame(() => mount.querySelector('input')?.focus());
 }
@@ -4530,9 +6893,12 @@ function channelFormPatch() {
 }
 
 function wireChannels() {
+  registerGuardedEditor({
+    formId: 'channel-form', dialogId: 'channel-dialog', statusId: 'channel-form-status',
+    closeId: 'close-channel-dialog', cancelId: 'cancel-channel-edit',
+    label: 'this channel', read: channelFormPatch, requireValidity: true,
+  });
   const close = () => { $('channel-dialog').close(); resetChannelEditor(); };
-  $('close-channel-dialog').addEventListener('click', close);
-  $('cancel-channel-edit').addEventListener('click', close);
   $('channel-dialog').addEventListener('close', resetChannelEditor);
   $('copy-channel-webhook').addEventListener('click', () => void copyText($('channel-webhook-url').value, 'Webhook URL copied.'));
   $('copy-link-command').addEventListener('click', () => void copyText('/link', '/link command copied.'));
@@ -4542,7 +6908,7 @@ function wireChannels() {
     for (const input of $('channel-field-mount').querySelectorAll('[data-channel-field]')) {
       input.required = $('channel-enabled').checked && !config.configuredFields?.includes(input.dataset.channelField);
     }
-    $('channel-save').disabled = !$('channel-form').checkValidity();
+    updateGuardedEditor('channel-form');
   };
   $('channel-enabled').addEventListener('change', updateChannelValidity);
   $('channel-field-mount').addEventListener('input', updateChannelValidity);
@@ -4602,6 +6968,7 @@ function executeCommand(command) {
   $('command-palette').close();
   if (command.startsWith('view:')) activateView(command.slice(5));
   if (command === 'new') void newMission();
+  if (command === 'reviews') openLearningReviews();
 }
 
 function wireCommandPalette() {
@@ -4970,9 +7337,49 @@ function finishStartup() {
 function stopBootSubscriptions() {
   bootSubscriptions.forEach((handle) => handle?.stop?.());
   bootSubscriptions = [];
+  learningSubscription = null;
+  learningSubscriptionError = null;
+  learningViewChanged.changed();
   missionParticipationHandle?.stop?.();
   missionParticipationHandle = null;
   missionParticipationSessionId = null;
+}
+
+function subscribeToLearning() {
+  let handle = null;
+  handle = Meteor.subscribe('constellation.learning', {
+    onReady() {
+      if (learningSubscription !== handle) return;
+      learningSubscriptionError = null;
+      clearAgentLearningError();
+      learningViewChanged.changed();
+    },
+    onStop(error) {
+      if (!error || learningSubscription !== handle) return;
+      learningSubscriptionError = messageOf(error);
+      learningViewChanged.changed();
+    },
+  });
+  return handle;
+}
+
+async function retryLearningSubscription() {
+  const previous = learningSubscription;
+  const index = bootSubscriptions.indexOf(previous);
+  previous?.stop?.();
+  learningSubscriptionError = null;
+  clearAgentLearningError();
+  learningSubscription = subscribeToLearning();
+  if (index >= 0) bootSubscriptions[index] = learningSubscription;
+  else bootSubscriptions.push(learningSubscription);
+  learningViewChanged.changed();
+  try {
+    await waitForSubscription(learningSubscription, 'agent learning');
+  } catch (error) {
+    learningSubscriptionError = messageOf(error);
+    learningViewChanged.changed();
+    throw error;
+  }
 }
 
 async function initializeWorkspace() {
@@ -4981,11 +7388,14 @@ async function initializeWorkspace() {
 
   $('profile-button').title = 'Local workspace account';
   applyBootstrap(bootstrap);
+  learningSubscriptionError = null;
+  learningSubscription = subscribeToLearning();
   const subscriptions = [
     { label: 'missions', handle: workspace.subscribeSessions() },
     { label: 'mission settings', handle: Meteor.subscribe('constellation.missions') },
     { label: 'memory', handle: Meteor.subscribe(NAMES.pubMemories) },
     { label: 'crew', handle: Meteor.subscribe('constellation.crew') },
+    { label: 'agent learning', handle: learningSubscription },
     { label: 'models', handle: Meteor.subscribe('constellation.modelCatalog') },
     { label: 'workspace members', handle: Meteor.subscribe('constellation.workspaceMembers') },
     { label: 'Pulses', handle: Meteor.subscribe('constellation.pulses') },
@@ -5070,6 +7480,7 @@ async function initializeWorkspace() {
     Tracker.autorun(renderMemory);
     Tracker.autorun(renderCrewSettings);
     Tracker.autorun(renderWorkspacePeople);
+    Tracker.autorun(renderReviews);
     Tracker.autorun(renderPulses);
     Tracker.autorun(renderCapabilities);
     Tracker.autorun(renderChannels);

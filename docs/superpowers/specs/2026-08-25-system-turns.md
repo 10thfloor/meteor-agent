@@ -406,8 +406,8 @@ Four predicates find only `role: 'user'`:
   intent. Left as-is deliberately: the human's addressed question is older and
   still unanswered, and decision 7's logic runs in this direction too — a
   machine's prompt does not outrank a person's pending question. Test E8 pins it.
-- `loop.ts:506` — the memory-hint anchor. **Consequence, stated rather than
-  discovered later:** a system turn produces no memory hint, so scheduled work
+- `loop.ts:506` — the Fact Memory hint anchor. **Consequence, stated rather than
+  discovered later:** a system turn produces no Fact Memory hint, so scheduled work
   neither writes nor benefits from recall keyed on its own prompt. Left
   user-only for now — a hint derived from a machine's own text would recall
   the machine's own prior prompts, which is noise, not memory.

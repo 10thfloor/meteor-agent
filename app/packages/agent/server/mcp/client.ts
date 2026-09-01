@@ -601,9 +601,26 @@ export function mapMcpResult(raw: McpCallResult | undefined | null): ToolResult 
 /** Call one tool on one server. Failures are structured, never throws. */
 export async function callMcpTool(
   server: string, tool: string, args: unknown,
+  authorize?: () => boolean | Promise<boolean>,
+  displayName = tool,
 ): Promise<ToolResult> {
   const c = await connect(server);
   if (!c.ok) return { ok: false, error: { error: 'mcp-unavailable', reason: c.reason } };
+
+  // Connecting may start a subprocess, perform initialization, and discover
+  // tools. Re-read the host entitlement after all of that awaited setup and
+  // immediately before the external tools/call side effect. A callback error
+  // fails closed and is deliberately not exposed.
+  if (authorize) {
+    let allowed = false;
+    try { allowed = (await authorize()) === true; } catch { /* fail closed */ }
+    if (!allowed) {
+      return {
+        ok: false,
+        error: { error: 'not-allowed', reason: `This agent may not use ${displayName}.` },
+      };
+    }
+  }
 
   const params = {
     name: tool,

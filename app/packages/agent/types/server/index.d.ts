@@ -1,13 +1,16 @@
 import { type Watcher } from './watcher';
 import { type EgressWorker } from './channels/egress';
 export * from '../common/types';
+export * from '../common/learning';
 export { NAMES } from '../common/names';
-export { saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint, readSelector, type SaveArgs, type SaveResult, type ForgetResult, type SearchRung, type ListedMemories, } from './memory';
+export { saveMemory, searchMemory, forgetMemory, listForBlock, memoryBlock, memoryHint, memoryBlockSnapshot, memoryHintSnapshot, readSelector, type SaveArgs, type SaveResult, type ForgetResult, type SearchRung, type ListedMemories, } from './memory';
 export { MEMORY_TOOL_NAMES } from './tools';
+export { LEARNING_TOOL_NAMES } from './learning-tools';
 export { resolveMemory } from './registry';
 export { AgentSessions, AgentMessages, AgentDeltas, AgentMemories, } from '../common/collections';
 export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig, type SessionErasure } from './agent';
+export { abandonPendingAgentTurns, type AbandonedAgentTurns, } from './session-lifecycle';
 export { validateToolArgs, setToolArgsValidator, defineAgentMethod, fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME, type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool, type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult, type ArgsValidator, type TypeboxValue, type TypeboxCompile, type TypeboxValidator, type Skill, type ToolResult, type Gate, type GateContext, type GatePredicate, tool, methodTool, type TypedInlineTool, type TypedAdoptedTool, } from './tools';
 export type { FromSchema } from '../common/schema';
 export type { HookName, HookMap, HookPurpose, HookToolCall, BeforeProviderRequestHook, AfterToolResultHook, ProviderRequestHookContext, ToolResultHookContext, } from './hooks';

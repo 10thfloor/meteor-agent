@@ -9,7 +9,12 @@ export type HookPurpose = 'think' | 'compaction';
 export interface ProviderRequestHookContext {
   /** A child session reports the child agent, not the parent's. */
   agent: string;
+  /** Stable experiential identity. Absent for legacy Agents without the new
+   * identity contract and for non-Turn provider work. */
+  agentId?: string;
   sessionId: string;
+  /** Frozen causal frame used by this Turn. */
+  memoryFrameId?: string;
   /** `'think'` = the turn's call; `'compaction'` = the summarization call.
    *  A custom summarizer replaces the request when purpose is compaction. */
   purpose: HookPurpose;
@@ -17,7 +22,9 @@ export interface ProviderRequestHookContext {
 
 export interface ToolResultHookContext {
   agent: string;
+  agentId?: string;
   sessionId: string;
+  memoryFrameId?: string;
   /** The session owner — redaction hooks need it to distinguish authed vs anonymous. */
   userId: string | null;
   /** Mutable so a redaction hook can drop attachments alongside rewritten text. */

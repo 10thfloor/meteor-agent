@@ -1,7 +1,9 @@
 import { AgentSessions } from '../common/collections';
+import { createHash } from 'crypto';
 import { runBeforeProviderRequest, type ProviderRequestHookContext } from './hooks';
 import { SERVER_ID } from './lease';
 import type { Provider, ProviderChunk, ProviderRequest } from './providers/types';
+import { AGENT_MEMORY_FRAME_CLOSE, AGENT_MEMORY_FRAME_OPEN } from './learning';
 
 /** @internal A Provider Exchange is one attempt, not a retry policy. It owns
  * hook ordering and cancellation so every caller presents the same request
@@ -11,6 +13,16 @@ export interface ProviderExchangeOptions {
   provider: Provider;
   request: Omit<ProviderRequest, 'signal'>;
   context: ProviderRequestHookContext;
+  /** Frozen Constitution/Practice material. Application hooks may rewrite the
+   * ordinary request, but this suffix is stamped afterwards so a hook cannot
+   * remove or replace the Agent's adopted Memory Frame. */
+  protectedSystem?: string;
+  /** Digest-only audit Seam. It runs after hooks and protected-layer
+   * finalization, immediately before paid work. Throwing fails the exchange
+   * closed; callers should never persist the raw request. */
+  onEffectiveRequest?: (
+    request: Omit<ProviderRequest, 'signal'>, digest: string,
+  ) => void | Promise<void>;
   interruptCheckMs?: number;
   onChunk: (chunk: ProviderChunk) => void;
 }
@@ -27,6 +39,37 @@ const usageCount = (value: unknown): number => (
     ? Math.min(Number.MAX_SAFE_INTEGER, Math.floor(value))
     : 0
 );
+
+export function effectiveProviderRequestDigest(
+  request: Omit<ProviderRequest, 'signal'>,
+): string {
+  return createHash('sha256').update(JSON.stringify(request)).digest('hex');
+}
+
+function count(source: string, needle: string): number {
+  return source.split(needle).length - 1;
+}
+
+/** Hooks may rewrite ordinary prompt material, but cannot forge a second
+ * protected layer. Remove complete and dangling reserved markers before the
+ * harness appends its validated Frame bytes. */
+function finalizeProtectedSystem(hooked: string, protectedSystem?: string): string {
+  if (!protectedSystem) return hooked;
+  if (count(protectedSystem, AGENT_MEMORY_FRAME_OPEN) !== 1
+    || count(protectedSystem, AGENT_MEMORY_FRAME_CLOSE) !== 1) {
+    throw new Error('[10thfloor:agent] malformed protected Agent Memory Frame');
+  }
+  const complete = new RegExp(
+    `${AGENT_MEMORY_FRAME_OPEN}[\\s\\S]*?${AGENT_MEMORY_FRAME_CLOSE}`,
+    'g',
+  );
+  const cleaned = hooked.replace(complete, '')
+    .split(AGENT_MEMORY_FRAME_OPEN).join('')
+    .split(AGENT_MEMORY_FRAME_CLOSE).join('');
+  // The protected block owns its leading separator. Removing a forged block
+  // must not leave an ever-growing run of blank lines at this boundary.
+  return `${cleaned.trimEnd()}${protectedSystem}`;
+}
 
 /** Provider Adapters are replaceable application code. Normalize their only
  * values that become arithmetic Mongo updates before callers observe them. */
@@ -103,11 +146,28 @@ export async function runProviderExchange(
     if (interrupted || abort.signal.aborted) return { kind: 'interrupted' };
     // Hooks never own cancellation. Stamp the harness signal after their
     // replacement request has been accepted.
-    const request = await runBeforeProviderRequest(options.request, options.context);
+    const hooked = await runBeforeProviderRequest(options.request, options.context);
+    const request = {
+      ...hooked,
+      system: finalizeProtectedSystem(hooked.system, options.protectedSystem),
+    };
     // A hook may have awaited long enough for the Lease to expire or move.
     // Re-prove authority immediately before starting paid Provider work rather
     // than waiting for the next periodic observation.
     if (!abort.signal.aborted) {
+      try {
+        if (!(await hasAuthority())) interrupt();
+      } catch {
+        interrupt();
+      }
+    }
+    if (!abort.signal.aborted) {
+      await options.onEffectiveRequest?.(
+        request, effectiveProviderRequestDigest(request),
+      );
+      // Auditing may itself await storage or hooks long enough for the Lease,
+      // Session, or lifecycle fence to change. Re-prove authority at the final
+      // boundary before constructing the paid Provider stream.
       try {
         if (!(await hasAuthority())) interrupt();
       } catch {

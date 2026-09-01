@@ -11,6 +11,7 @@ import { resolve } from 'node:path';
 import {
   Agent,
   AgentSessions,
+  abandonPendingAgentTurns,
   ChannelBindings,
   ChannelIdentities,
   createPiAiProvider,
@@ -19,6 +20,8 @@ import {
   egress,
   getMcpServerStatus,
   loadPiAi,
+  LEARNING_TOOL_NAMES,
+  EXPERIENCE_RECALL_MAX,
   MAX_PARTICIPANTS,
   MEMORY_TEXT_MAX,
   MEMORY_TOOL_NAMES,
@@ -63,20 +66,21 @@ let live = false;
 let model = LOCAL_MODEL;
 export const WorkspaceState = new Mongo.Collection('constellation_workspace_state');
 export const MissionConfigs = new Mongo.Collection('constellation_mission_configs');
-const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
+export const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
 const CrewStates = new Mongo.Collection('constellation_crew_states');
 export const WorkspaceMembers = new Mongo.Collection('constellation_workspace_members');
 const PulseConfigs = new Mongo.Collection('constellation_pulses');
 const PulseRuns = new Mongo.Collection('constellation_pulse_runs');
 const PulseStates = new Mongo.Collection('constellation_pulse_states');
-const SkillConfigs = new Mongo.Collection('constellation_skills');
+export const SkillConfigs = new Mongo.Collection('constellation_skills');
 const SkillStates = new Mongo.Collection('constellation_skill_states');
 const ChannelConfigs = new Mongo.Collection('constellation_channel_configs');
 const ChannelSecrets = new Mongo.Collection('constellation_channel_secrets');
-const McpConfigs = new Mongo.Collection('constellation_mcp_configs');
+export const McpConfigs = new Mongo.Collection('constellation_mcp_configs');
 const McpSecrets = new Mongo.Collection('constellation_mcp_secrets');
-const ToolCatalog = new Mongo.Collection('constellation_tool_catalog');
+export const ToolCatalog = new Mongo.Collection('constellation_tool_catalog');
 const CREW_COLORS = new Set(['amber', 'blue', 'green', 'red', 'violet', 'steel']);
+const CREW_STATUSES = new Set(['available', 'unavailable', 'archived']);
 const WORKSPACE_MEMBER_CONNECTIONS = new Set(['unlinked', 'account', 'channel']);
 const WORKSPACE_MEMBER_MAX = 64;
 const MISSION_STATUSES = new Set(['active', 'paused', 'completed']);
@@ -85,12 +89,25 @@ const MCP_TOOL_MODES = new Set(['all', 'selected']);
 const MCP_ENV_KEY = /^[A-Z_][A-Z0-9_]{0,63}$/;
 const MCP_ACTIVE_PHASES = ['streaming', 'calling', 'retrying', 'compacting', 'awaiting'];
 const MCP_DANGEROUS_ENV = new Set(['PATH', 'HOME', 'SHELL', 'NODE_OPTIONS']);
+const EXPERIENCE_SCOPES = new Set(['identity', 'owner', 'session']);
+const LEARNING_APPROVALS = new Set(['ask', 'auto']);
+const DEFAULT_CREW_EXPERIENCE = Object.freeze({
+  record: true, recall: true, recent: 4, scope: 'owner', approval: 'ask',
+});
+const DEFAULT_CREW_PRACTICE = Object.freeze({
+  acquire: false, approval: 'ask', allowScopedEvidencePromotion: false,
+});
+const DEFAULT_CREW_FLEXIBILITY = 3;
 const activeChannelDefs = new Map();
 const runtimeMcpToolsByAgent = new Map();
 const toolCatalogSyncByUser = new Map();
 const missionCrewMutationLocks = new Map();
+const crewConfigMutationLocks = new Map();
+const workspaceConfigMutationLocks = new Map();
 const [MEMORY_SAVE_TOOL_NAME, MEMORY_SEARCH_TOOL_NAME, MEMORY_FORGET_TOOL_NAME]
   = MEMORY_TOOL_NAMES;
+const [EXPERIENCE_PROPOSE_TOOL_NAME, EXPERIENCE_SEARCH_TOOL_NAME, PRACTICE_PROPOSE_TOOL_NAME]
+  = LEARNING_TOOL_NAMES;
 
 function resolveAppMcpScript() {
   const roots = [...new Set([
@@ -176,31 +193,52 @@ function channelFacade(kind) {
 // present while credentials, verification, and transport can change live.
 for (const kind of CHANNEL_KINDS) Agent.channel(kind, channelFacade(kind));
 const DEFAULT_PRIMARY = {
+  _id: 'constellation-agent-orchestrator',
   agent: 'orchestrator', displayName: 'Atlas', role: 'Orchestrator', avatar: 'A', color: 'amber', enabled: true, primary: true, order: 0,
-  instructions: 'You are Atlas, the primary orchestrator inside Constellation. Treat the durable mission as the unit of work. Delegate when a specialist improves the result, state assumptions, keep progress legible, and stop at approval boundaries.',
+  revision: 1,
+  status: 'available',
+  constitution: 'Be steady, candid, and accountable. Preserve human agency. Prefer reversible progress to confident theater. State uncertainty and never conceal consequential tradeoffs.',
+  instructions: 'Treat the durable mission as the unit of work. Delegate when a specialist improves the result. State assumptions, keep progress legible, and stop at approval boundaries.',
   model: 'default', budget: { turns: 80, toolCalls: 40, spend: 5 },
   capabilities: { inspect: true, framing: true, memory: true, publish: true },
 };
 const DEFAULT_CREW = [
   {
+    _id: 'constellation-agent-researcher',
     agent: 'researcher', displayName: 'Signal', role: 'Research', avatar: 'S', color: 'blue', enabled: true, order: 10,
-    instructions: 'You are Signal, a rigorous research specialist. Return compact evidence, meaningful uncertainty, and a recommendation. Never pretend that a source exists.',
+    revision: 1,
+    status: 'available',
+    constitution: 'Be intellectually honest and curious. Follow evidence over consensus. Separate observation from inference and say when evidence is insufficient.',
+    instructions: 'Research the assigned scope. Return compact evidence, meaningful uncertainty, and a recommendation. Distinguish verified sources from inference.',
     model: 'default', budget: { turns: 24, toolCalls: 8, spend: 1 },
     capabilities: { inspect: true, framing: false, memory: false, publish: false },
   },
   {
+    _id: 'constellation-agent-operator',
     agent: 'operator', displayName: 'Relay', role: 'Operations', avatar: 'R', color: 'green', enabled: true, order: 20,
-    instructions: 'You are Relay, an operations specialist. Convert decisions into bounded, reversible execution plans with owners, receipts, and escalation conditions.',
+    revision: 1,
+    status: 'available',
+    constitution: 'Be dependable and calm under ambiguity. Protect reversibility, ownership, and follow-through. Never mistake activity for completion.',
+    instructions: 'Convert decisions into bounded execution plans with owners, receipts, escalation conditions, and reversible steps.',
     model: 'default', budget: { turns: 24, toolCalls: 8, spend: 1 },
     capabilities: { inspect: true, framing: true, memory: false, publish: false },
   },
   {
+    _id: 'constellation-agent-critic',
     agent: 'critic', displayName: 'Vela', role: 'Critic', avatar: 'V', color: 'red', enabled: true, order: 30,
-    instructions: 'You are Vela, a constructive adversarial reviewer. Find weak assumptions, missing owners, irreversible risk, and decisions hidden inside prose.',
+    revision: 1,
+    status: 'available',
+    constitution: 'Be constructively skeptical, not cynical. Challenge ideas without diminishing people. Surface risk early and change your mind when evidence changes.',
+    instructions: 'Review assumptions, ownership, irreversible risk, and decisions hidden inside prose. Return prioritized findings and concrete mitigations.',
     model: 'default', budget: { turns: 24, toolCalls: 8, spend: 1 },
     capabilities: { inspect: true, framing: false, memory: false, publish: false },
   },
 ];
+const DEFAULT_AGENT_CONSTITUTION = 'Be candid, reliable, and respectful of human agency. State uncertainty, preserve reversibility, and never claim work you did not verify.';
+const DEFAULT_CREW_CONFIGS = [DEFAULT_PRIMARY, ...DEFAULT_CREW];
+const DEFAULT_CONSTITUTION_BY_AGENT = new Map(
+  DEFAULT_CREW_CONFIGS.map((config) => [config.agent, config.constitution]),
+);
 const DEFAULT_SKILLS = [
   {
     name: 'Mission framing',
@@ -401,7 +439,7 @@ export function withMissionExecutionContext(request, context) {
 /** Paid work is fenced at the Provider boundary, after the framework has
  *  assembled the request and immediately before the underlying adapter runs.
  *  Generic framework hooks intentionally fail open; this app policy does not. */
-export function missionScopedProvider(provider) {
+export function missionScopedProvider(provider, agent) {
   return {
     ...(provider.capabilities ? { capabilities: provider.capabilities } : {}),
     async *stream(request) {
@@ -412,7 +450,7 @@ export function missionScopedProvider(provider) {
           'Mission execution context is unavailable; provider work was not started.',
         );
       }
-      await requireActiveMissionExecution(sessionId);
+      await requireActiveMissionExecution(sessionId, agent);
       const providerRequest = { ...request };
       delete providerRequest[MISSION_EXECUTION_SESSION];
       yield* provider.stream(providerRequest);
@@ -459,14 +497,14 @@ const providerFor = (name, profile) => {
         error.retryable = false;
         throw error;
       },
-    });
+    }, name);
   }
   const localOllama = requestedModel?.startsWith('ollama/') ? ollamaProvider : null;
-  if (localOllama) return missionScopedProvider(localOllama);
+  if (localOllama) return missionScopedProvider(localOllama, name);
   const scripted = requestedModel === LOCAL_MODEL || !liveProvider;
   return missionScopedProvider(scripted ? mockProvider(
     name === 'orchestrator' ? (request) => orchestratorScript(request, profile) : specialistScript(name, profile),
-  ) : liveProvider);
+  ) : liveProvider, name);
 };
 
 const commonBudget = {
@@ -591,12 +629,27 @@ function defineCrewAgent(config, skills = runtimeSkills) {
   new Agent(config.agent, {
     model: config.model && config.model !== 'default' ? config.model : model,
     instructions: config.instructions,
+    identity: {
+      id: config._id,
+      displayName: config.displayName,
+      constitution: config.constitution,
+      flexibility: config.flexibility ?? DEFAULT_CREW_FLEXIBILITY,
+    },
+    experience: frameworkExperienceConfig(config.experience),
+    practice: frameworkPracticeConfig(config.practice),
     startable: false,
     budget: {
       turns: config.budget?.turns ?? 24,
       toolCalls: config.budget?.toolCalls ?? 8,
       spend: `$${Number(config.budget?.spend ?? 1).toFixed(2)}`,
     },
+    // Re-check host lifecycle at dispatch time. Archiving an Agent may race an
+    // already-streaming response; no consequential Tool side effect may start
+    // after the durable archive fence lands.
+    canUse: (tool, context) => configuredToolEntitlement(tool, context, config.agent),
+    // Mission participants can converse with every Crew member, but only the
+    // local workspace owner may grant a consequential Tool or learning write.
+    approve: workspaceOwnerCanApprove,
     tools,
     ...(assignedSkills.length ? { skills: assignedSkills } : {}),
     ...(config.capabilities?.memory ? { memory: { scopes: ['user', 'app'] } } : {}),
@@ -617,12 +670,22 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
   orchestrator.define({
     model: primary.model && primary.model !== 'default' ? primary.model : model,
     instructions: primary.instructions,
+    identity: {
+      id: primary._id,
+      displayName: primary.displayName,
+      constitution: primary.constitution,
+      flexibility: primary.flexibility ?? DEFAULT_CREW_FLEXIBILITY,
+    },
+    experience: frameworkExperienceConfig(primary.experience),
+    practice: frameworkPracticeConfig(primary.practice),
     tools: [
-      ...crew.filter((config) => config.enabled).map((config) => ({
+      ...crew.filter(
+        (config) => config.enabled && config.status !== 'archived',
+      ).map((config) => ({
         subagent: config.agent,
         description: `Delegate a focused ${config.role.toLowerCase()} run to ${config.displayName}.`,
         // Agent definitions are process-wide, while Mission Crew membership is
-        // per root session. The gate is the runtime fence that keeps a removed
+        // per root session. The gate is the runtime fence that keeps an archived
         // specialist from remaining callable through its still-listed tool.
         gate: (context) => missionAllowsAgent(context, config.agent),
       })),
@@ -638,6 +701,10 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
       spend: `$${Number(primary.budget?.spend ?? 5).toFixed(2)}`,
     },
     context: contextForModel(primary.model),
+    // Definitions are process-wide and a Turn can outlive a control-panel
+    // edit. Resolve the exact current entitlement again at every dispatch
+    // boundary; approval can authorize a call, but can never restore access.
+    canUse: (tool, context) => configuredToolEntitlement(tool, context, primary.agent),
     // Mission participants may contribute to the conversation, but only the
     // local workspace owner can grant authority for a consequential call.
     approve: workspaceOwnerCanApprove,
@@ -835,10 +902,156 @@ async function ensureSkillConfigs(userId) {
   return runtimeSkills;
 }
 
-async function ensureCrewConfigs(userId) {
+function inferredCrewStatus(config) {
+  if (config.archivedAt || config.status === 'archived') return 'archived';
+  return config.enabled === false ? 'unavailable' : 'available';
+}
+
+function crewExperienceConfig(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  const recent = Number.isSafeInteger(source.recent)
+    && source.recent >= 0 && source.recent <= EXPERIENCE_RECALL_MAX
+    ? source.recent : DEFAULT_CREW_EXPERIENCE.recent;
+  return {
+    record: source.record !== false,
+    recall: source.recall !== false && recent > 0,
+    recent,
+    scope: EXPERIENCE_SCOPES.has(source.scope)
+      ? source.scope : DEFAULT_CREW_EXPERIENCE.scope,
+    approval: LEARNING_APPROVALS.has(source.approval)
+      ? source.approval : DEFAULT_CREW_EXPERIENCE.approval,
+  };
+}
+
+function crewPracticeConfig(value) {
+  const source = value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+  return {
+    acquire: source.acquire === true,
+    approval: LEARNING_APPROVALS.has(source.approval)
+      ? source.approval : DEFAULT_CREW_PRACTICE.approval,
+    allowScopedEvidencePromotion: source.allowScopedEvidencePromotion === true,
+  };
+}
+
+function frameworkExperienceConfig(value) {
+  const config = crewExperienceConfig(value);
+  return {
+    record: config.record,
+    recall: config.recall && config.recent > 0 ? { recent: config.recent } : false,
+    scope: config.scope,
+    approval: config.approval,
+  };
+}
+
+function frameworkPracticeConfig(value) {
+  const config = crewPracticeConfig(value);
+  return {
+    acquire: config.acquire,
+    approval: config.approval,
+    allowScopedEvidencePromotion: config.allowScopedEvidencePromotion,
+  };
+}
+
+function initialCrewConstitution(config) {
+  return DEFAULT_CONSTITUTION_BY_AGENT.get(config.agent) ?? DEFAULT_AGENT_CONSTITUTION;
+}
+
+async function backfillCrewConfigs(userId) {
+  const configs = await CrewConfigs.find({ userId }).fetchAsync();
+  const updates = [];
+  const observed = (field, value) => (
+    value === undefined ? { [field]: { $exists: false } } : { [field]: value }
+  );
+  for (const config of configs) {
+    // `_id` is the durable Agent identity. Legacy rows are enriched in place;
+    // migration must never exchange that identity for a deterministic default.
+    if (!Number.isSafeInteger(config.revision) || config.revision < 1) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('revision', config.revision) },
+        { $set: { revision: 1 } },
+      ));
+    }
+    if (!CREW_STATUSES.has(config.status)) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('status', config.status) },
+        { $set: { status: inferredCrewStatus(config) } },
+      ));
+    }
+    if (typeof config.constitution !== 'string' || !config.constitution.trim()) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('constitution', config.constitution) },
+        { $set: { constitution: initialCrewConstitution(config) } },
+      ));
+    }
+    const experience = crewExperienceConfig(config.experience);
+    if (JSON.stringify(config.experience) !== JSON.stringify(experience)) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('experience', config.experience) },
+        { $set: { experience } },
+      ));
+    }
+    const practice = crewPracticeConfig(config.practice);
+    if (JSON.stringify(config.practice) !== JSON.stringify(practice)) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('practice', config.practice) },
+        { $set: { practice } },
+      ));
+    }
+    if (!Number.isSafeInteger(config.flexibility)
+      || config.flexibility < 0 || config.flexibility > 1000) {
+      updates.push(CrewConfigs.updateAsync(
+        { _id: config._id, userId, ...observed('flexibility', config.flexibility) },
+        { $set: { flexibility: DEFAULT_CREW_FLEXIBILITY } },
+      ));
+    }
+  }
+  await Promise.all(updates);
+}
+
+function learningSource(action, agentId, command) {
+  // Meteor may transparently replay a method after reconnect. Bind the source
+  // key to the requested command so an identical replay adopts its first
+  // result, while reuse for different content fails in the Learning Module.
+  const digest = createHash('sha256').update(JSON.stringify(command ?? null)).digest('hex');
+  return { kind: 'app', key: `constellation:${action}:${agentId}:${digest}` };
+}
+
+async function syncCrewLearningIdentity(config) {
+  await Agent.learning.ensureIdentity({
+    id: config._id,
+    name: config.agent,
+    displayName: config.displayName,
+    constitution: config.constitution,
+    flexibility: config.flexibility ?? DEFAULT_CREW_FLEXIBILITY,
+  });
+  const identity = await Agent.learning.read.identities([config._id]).fetchAsync().then((rows) => rows[0]);
+  if (!identity) throw new Error(`[constellation] Agent Identity ${config._id} was not created`);
+  const lifecycle = config.status === 'archived' ? 'archived' : 'active';
+  if (identity.lifecycle !== lifecycle) {
+    await Agent.learning.setLifecycle(
+      config._id,
+      identity.generation,
+      lifecycle,
+      learningSource('lifecycle', config._id, { lifecycle, revision: config.revision }),
+    );
+  }
+}
+
+async function ownedLearningIdentity(userId, agentId, { active = false } = {}) {
+  if (!userId) throw new Meteor.Error('not-authorized', 'Sign in to manage Agent learning.');
+  const config = await CrewConfigs.findOneAsync({
+    _id: agentId,
+    userId,
+    ...(active ? { status: { $ne: 'archived' } } : {}),
+  });
+  if (!config) throw new Meteor.Error('not-authorized', 'Agent Identity is not in this workspace.');
+  return config;
+}
+
+async function ensureCrewConfigs(userId, { reconcileArchives = true } = {}) {
   const state = await CrewStates.findOneAsync({ userId });
   if (!state) {
-    for (const defaults of [DEFAULT_PRIMARY, ...DEFAULT_CREW]) {
+    for (const defaults of DEFAULT_CREW_CONFIGS) {
       const existing = await CrewConfigs.findOneAsync({ userId, agent: defaults.agent });
       if (!existing) {
         await CrewConfigs.insertAsync({ ...defaults, userId, createdAt: new Date(), updatedAt: new Date() });
@@ -849,11 +1062,16 @@ async function ensureCrewConfigs(userId) {
   if (!await CrewConfigs.findOneAsync({ userId, agent: 'orchestrator' })) {
     await CrewConfigs.insertAsync({ ...DEFAULT_PRIMARY, userId, createdAt: new Date(), updatedAt: new Date() });
   }
+  await backfillCrewConfigs(userId);
+  if (reconcileArchives) await reconcilePendingCrewArchives(userId);
   const configs = await CrewConfigs.find({ userId }, { sort: { order: 1, createdAt: 1 } }).fetchAsync();
+  for (const config of configs) await syncCrewLearningIdentity(config);
   const effectiveConfigs = await runtimeCrewConfigs(configs, userId);
   const skills = await ensureSkillConfigs(userId);
   const primary = effectiveConfigs.find((config) => config.agent === 'orchestrator') ?? DEFAULT_PRIMARY;
-  const specialists = effectiveConfigs.filter((config) => config.agent !== 'orchestrator');
+  const specialists = effectiveConfigs.filter(
+    (config) => config.agent !== 'orchestrator' && config.status !== 'archived',
+  );
   for (const config of specialists) defineCrewAgent(config, skills);
   defineOrchestrator(specialists, primary, skills);
   await syncCodeToolCatalog(userId);
@@ -874,6 +1092,7 @@ async function syncCrewSession(userId, sessionId, preparedConfigs) {
   const enabled = configs.filter((config) => (
     config.agent !== 'orchestrator'
       && config.enabled
+      && config.status !== 'archived'
       && (!selectedAgents || selectedAgents.has(config.agent))
   ));
   const desired = new Set(enabled.map((config) => modelParticipantId(config.agent)));
@@ -954,7 +1173,11 @@ async function removeCrewParticipantEverywhere(userId, agent) {
   }
 }
 
-async function finalizeCrewRemoval(userId, sessionId, config) {
+async function finalizeCrewArchive(userId, config) {
+  // The Crew lifecycle fence is already durable. Revoke any parked approval
+  // owned by this Agent before detaching its references so a Mission cannot
+  // remain permanently awaiting a participant that no longer exists.
+  await abandonPendingAgentTurns(config.agent, userId);
   await Promise.all([
     SkillConfigs.updateAsync(
       { userId, agents: config.agent },
@@ -985,7 +1208,7 @@ async function finalizeCrewRemoval(userId, sessionId, config) {
           agent: 'orchestrator',
           enabled: false,
           lastStatus: 'error',
-          lastErrorCode: 'agent-removed',
+          lastErrorCode: 'agent-archived',
           updatedAt: new Date(),
         },
         $inc: { revision: 1 },
@@ -1003,54 +1226,234 @@ async function finalizeCrewRemoval(userId, sessionId, config) {
     ),
   ]);
   await removeCrewParticipantEverywhere(userId, config.agent);
-  const configs = await rebuildMcpToolAssignments(userId);
+  // Rebuilding Agent definitions normally re-enters ensureCrewConfigs. Skip
+  // archive reconciliation in that nested pass or this still-pending marker
+  // would recursively finalize itself before it can be cleared.
+  const configs = await rebuildMcpToolAssignments(userId, { reconcileArchives: false });
   await syncCrewAcrossMissions(userId, configs);
+
+  // The marker is the durable receipt for this idempotent reconciliation. It
+  // is cleared last so a process crash at any earlier await is recovered by
+  // the next workspace bootstrap/ensure pass.
+  await CrewConfigs.updateAsync(
+    {
+      _id: config._id,
+      userId,
+      agent: config.agent,
+      status: 'archived',
+      archiveCleanupPending: true,
+    },
+    {
+      $unset: { archiveCleanupPending: '', archiveCleanupStartedAt: '' },
+      $set: { archiveCleanupCompletedAt: new Date() },
+    },
+  );
 }
 
-async function crewRemovalImpact(userId, config) {
-  const [sessions, missionConfigs, skills, mcpServers, pulses] = await Promise.all([
-    workspaceMissionSessions(userId),
-    MissionConfigs.find({ userId }, { fields: { _id: 1, title: 1, status: 1 } }).fetchAsync(),
+async function reconcilePendingCrewArchives(userId) {
+  const pending = await CrewConfigs.find(
+    { userId, status: 'archived', archiveCleanupPending: true },
+    { sort: { archivedAt: 1, _id: 1 } },
+  ).fetchAsync();
+  for (const config of pending) await finalizeCrewArchive(userId, config);
+}
+
+async function crewArchiveImpact(userId, config) {
+  const [missionConfigs, skills, mcpServers, pulses] = await Promise.all([
+    MissionConfigs.find(
+      { userId },
+      { fields: { _id: 1, title: 1, status: 1, agents: 1, revision: 1 } },
+    ).fetchAsync(),
     SkillConfigs.find(
       { userId, agents: config.agent },
-      { fields: { _id: 1, name: 1, enabled: 1 }, sort: { name: 1 } },
+      { fields: { _id: 1, name: 1, enabled: 1, revision: 1 }, sort: { name: 1 } },
     ).fetchAsync(),
     McpConfigs.find(
       { userId, managed: 'workspace', agents: config.agent },
-      { fields: { _id: 1, name: 1, enabled: 1, status: 1 }, sort: { name: 1 } },
+      {
+        fields: { _id: 1, name: 1, enabled: 1, status: 1, revision: 1 },
+        sort: { name: 1 },
+      },
     ).fetchAsync(),
     PulseConfigs.find(
       { userId, agent: config.agent },
-      { fields: { _id: 1, name: 1, sessionId: 1, enabled: 1 }, sort: { name: 1 } },
+      {
+        fields: { _id: 1, name: 1, sessionId: 1, enabled: 1, revision: 1 },
+        sort: { name: 1 },
+      },
     ).fetchAsync(),
   ]);
+  const configuredMissionIds = missionConfigs
+    .filter((mission) => mission.agents?.includes(config.agent))
+    .map((mission) => mission._id);
+  const sessionSelectors = [
+    { participants: { $elemMatch: { kind: 'model', agent: config.agent } } },
+    { 'pending.agent': config.agent },
+  ];
+  if (configuredMissionIds.length) sessionSelectors.push({ _id: { $in: configuredMissionIds } });
+  const sessions = await AgentSessions.find(
+    {
+      userId,
+      agent: 'orchestrator',
+      erasingAt: { $exists: false },
+      $or: sessionSelectors,
+    },
+    {
+      fields: {
+        _id: 1, title: 1, phase: 1, activeChild: 1, participants: 1, pending: 1,
+      },
+      sort: { updatedAt: -1 },
+    },
+  ).fetchAsync();
   const missionById = new Map(missionConfigs.map((mission) => [mission._id, mission]));
   const sessionById = new Map(sessions.map((session) => [session._id, session]));
-  const missionRows = sessions.map((session) => ({
-    id: session._id,
-    name: missionById.get(session._id)?.title ?? session.title ?? 'Untitled mission',
-    status: missionById.get(session._id)?.status ?? 'active',
-    active: ['streaming', 'calling', 'retrying', 'compacting'].includes(session.phase),
-  }));
-  return {
+  const affectedMissionIds = new Set([...configuredMissionIds, ...sessions.map((row) => row._id)]);
+  const missionRows = [...affectedMissionIds].map((id) => {
+    const session = sessionById.get(id);
+    const mission = missionById.get(id);
+    const pending = session?.pending?.agent === config.agent ? session.pending : null;
+    return {
+      id,
+      name: mission?.title ?? session?.title ?? 'Untitled mission',
+      status: mission?.status ?? 'active',
+      revision: Number.isSafeInteger(mission?.revision) ? mission.revision : null,
+      configured: !!mission?.agents?.includes(config.agent),
+      participant: !!session?.participants?.some(
+        (participant) => participant.kind === 'model' && participant.agent === config.agent,
+      ),
+      phase: session?.phase ?? null,
+      active: ['streaming', 'calling', 'retrying', 'compacting'].includes(session?.phase),
+      awaitingApproval: session?.phase === 'awaiting' && !!pending,
+      pendingTool: pending?.name,
+      pendingToolCallId: pending?.toolCallId,
+    };
+  }).sort((left, right) => left.id.localeCompare(right.id));
+  const skillRows = skills.map((skill) => ({
+    id: skill._id, name: skill.name, enabled: skill.enabled, revision: skill.revision ?? null,
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  const mcpRows = mcpServers.map((server) => ({
+    id: server._id,
+    name: server.name,
+    enabled: server.enabled,
+    status: server.status,
+    revision: server.revision ?? null,
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  const pulseRows = pulses.map((pulse) => ({
+    id: pulse._id,
+    name: pulse.name,
+    enabled: pulse.enabled,
+    revision: pulse.revision ?? null,
+    missionId: pulse.sessionId,
+    missionName: missionById.get(pulse.sessionId)?.title
+      ?? sessionById.get(pulse.sessionId)?.title
+      ?? 'Unavailable mission',
+  })).sort((left, right) => left.id.localeCompare(right.id));
+  const snapshot = {
     configId: config._id,
     agent: config.agent,
     displayName: config.displayName,
+    configRevision: config.revision,
     missions: missionRows,
-    skills: skills.map((skill) => ({ id: skill._id, name: skill.name, enabled: skill.enabled })),
-    mcpServers: mcpServers.map((server) => ({
-      id: server._id, name: server.name, enabled: server.enabled, status: server.status,
-    })),
-    pulses: pulses.map((pulse) => ({
-      id: pulse._id,
-      name: pulse.name,
-      enabled: pulse.enabled,
-      missionId: pulse.sessionId,
-      missionName: missionById.get(pulse.sessionId)?.title
-        ?? sessionById.get(pulse.sessionId)?.title
-        ?? 'Unavailable mission',
-    })),
+    skills: skillRows,
+    mcpServers: mcpRows,
+    pulses: pulseRows,
   };
+  return {
+    ...snapshot,
+    digest: createHash('sha256').update(JSON.stringify(snapshot)).digest('hex'),
+  };
+}
+
+async function archiveCrewConfig(
+  userId, configId, expectedAgent, expectedRevision, expectedImpactDigest,
+) {
+  await backfillCrewConfigs(userId);
+  let config = await CrewConfigs.findOneAsync({ _id: configId, userId });
+  if (!config) throw new Meteor.Error('no-agent', 'Crew agent not found.');
+  if (config.agent === 'orchestrator') {
+    throw new Meteor.Error('primary-agent', 'The primary Agent cannot be archived.');
+  }
+  if (config.agent !== expectedAgent) {
+    throw new Meteor.Error('stale-agent', 'Agent changed while the archive dialog was open.');
+  }
+
+  if (config.status !== 'archived') {
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw new Meteor.Error('invalid-crew', 'Archive requires the Agent revision shown in the impact dialog.');
+    }
+    if (typeof expectedImpactDigest !== 'string' || !/^[a-f0-9]{64}$/.test(expectedImpactDigest)) {
+      throw new Meteor.Error('invalid-crew', 'Archive requires a valid impact receipt.');
+    }
+    if (config.revision !== expectedRevision) {
+      throw new Meteor.Error('stale-agent', 'This Agent changed while the archive dialog was open.');
+    }
+    const currentImpact = await crewArchiveImpact(userId, config);
+    if (currentImpact.digest !== expectedImpactDigest) {
+      throw new Meteor.Error(
+        'stale-impact',
+        'Archive impact changed. Review the updated Missions and assignments before archiving.',
+      );
+    }
+    const archivedAt = new Date();
+    const archivedBy = humanParticipantId(userId);
+    const archived = await CrewConfigs.updateAsync(
+      {
+        _id: configId,
+        userId,
+        agent: config.agent,
+        revision: expectedRevision,
+        status: { $ne: 'archived' },
+      },
+      {
+        $set: {
+          enabled: false,
+          status: 'archived',
+          archivedAt,
+          archivedBy,
+          archiveCleanupPending: true,
+          archiveCleanupStartedAt: archivedAt,
+          updatedAt: archivedAt,
+        },
+        $inc: { revision: 1 },
+      },
+    );
+    if (archived !== 1) {
+      const winner = await CrewConfigs.findOneAsync({ _id: configId, userId });
+      if (!winner || winner.agent !== config.agent || winner.status !== 'archived') {
+        throw new Meteor.Error('stale-agent', 'This Agent changed before it could be archived.');
+      }
+      config = winner;
+    } else {
+      config = {
+        ...config,
+        enabled: false,
+        status: 'archived',
+        archivedAt,
+        archivedBy,
+        archiveCleanupPending: true,
+        archiveCleanupStartedAt: archivedAt,
+        revision: config.revision + 1,
+        updatedAt: archivedAt,
+      };
+    }
+  }
+
+  await syncCrewLearningIdentity(config);
+  // Archival is visible before cleanup starts, so every dynamic execution
+  // guard denies new work even if reference reconciliation needs a retry.
+  // An earlier invocation may have committed the lifecycle fence and crashed
+  // during cleanup. Re-running the command adopts and completes that work.
+  if (config.archiveCleanupPending) await finalizeCrewArchive(userId, config);
+  if (!await CrewConfigs.findOneAsync({
+    _id: configId,
+    userId,
+    agent: config.agent,
+    status: 'archived',
+    revision: config.revision,
+  }, { fields: { _id: 1 } })) {
+    throw new Meteor.Error('stale-agent', 'Agent lifecycle changed while archive cleanup completed.');
+  }
+  return true;
 }
 
 const linkUrl = (token) => Meteor.absoluteUrl(`link/${token}`);
@@ -1566,7 +1969,8 @@ async function normalizeMcpInput(userId, current, patch) {
   const args = cleanMcpArgs(patch.args, previous.args ?? []);
   const agents = cleanMcpStringList(patch.agents, 'Agent', previous.agents ?? [], 12);
   const assigned = await CrewConfigs.find(
-    { userId, agent: { $in: agents } }, { fields: { agent: 1 } },
+    { userId, agent: { $in: agents }, status: { $ne: 'archived' } },
+    { fields: { agent: 1 } },
   ).fetchAsync();
   if (assigned.length !== agents.length) {
     throw new Meteor.Error('invalid-mcp', 'One or more assigned agents no longer exist.');
@@ -1591,6 +1995,12 @@ async function normalizeMcpInput(userId, current, patch) {
     throw new Meteor.Error(
       'mcp-untrusted',
       'Confirm that you trust this local command before enabling the MCP server.',
+    );
+  }
+  if (requestedEnabled && toolMode === 'selected' && selectedTools.length === 0) {
+    throw new Meteor.Error(
+      'invalid-mcp',
+      'Choose at least one discovered tool before enabling this MCP server.',
     );
   }
   const enabled = requestedEnabled && trusted;
@@ -1726,6 +2136,13 @@ async function authorizeMcpTool(configId, agent, sessionId) {
     || !config.agents?.includes(agent) || config.approval === 'blocked') {
     return false;
   }
+  const crew = await CrewConfigs.findOneAsync({
+    userId: session.userId,
+    agent,
+    enabled: true,
+    status: { $ne: 'archived' },
+  }, { fields: { _id: 1 } });
+  if (!crew) return false;
   return 'ask';
 }
 
@@ -1741,7 +2158,7 @@ function catalogToolDoc(userId, values) {
 }
 
 async function writeCodeToolCatalog(userId, crew, skills) {
-  const enabled = crew.filter((config) => config.enabled);
+  const enabled = crew.filter((config) => config.enabled && config.status !== 'archived');
   const byCapability = (name) => enabled
     .filter((config) => config.capabilities?.[name])
     .map((config) => config.agent);
@@ -1954,6 +2371,127 @@ async function writeCodeToolCatalog(userId, crew, skills) {
     },
   );
 
+  const learningAssignments = enabled.map((config) => ({
+    agent: config.agent,
+    ...crewExperienceConfig(config.experience),
+    practice: crewPracticeConfig(config.practice),
+  }));
+  const searchAssignments = learningAssignments.filter(
+    (assignment) => assignment.recall && assignment.recent > 0,
+  );
+  const proposalAssignments = learningAssignments.filter((assignment) => assignment.record);
+  const practiceAssignments = learningAssignments.filter((assignment) => (
+    assignment.practice.acquire && assignment.recall && assignment.recent > 0
+  ));
+  const learningScopeLabel = (scope) => ({
+    identity: 'Agent identity', owner: 'Workspace', session: 'Chat',
+  })[scope] ?? 'Workspace';
+  const proposalScopes = [...new Set(
+    proposalAssignments.map((assignment) => learningScopeLabel(assignment.scope)),
+  )];
+  const approvalSummary = (assignments, select) => {
+    const automatic = assignments.filter((assignment) => select(assignment) === 'auto').length;
+    const reviewed = assignments.length - automatic;
+    return [
+      reviewed ? `${reviewed} review first` : null,
+      automatic ? `${automatic} automatic` : null,
+    ].filter(Boolean).join(' · ');
+  };
+  const catalogApproval = (assignments, select) => {
+    const modes = new Set(assignments.map(select));
+    return modes.size > 1 ? 'conditional' : modes.has('auto') ? 'auto' : 'ask';
+  };
+  const learningAvailability = 'Available in durable root turns, delegated child turns, and ephemeral Agent.ask turns through a per-trigger Memory Frame. Agent.ask erases its throwaway Frame after completion.';
+  const learningMetadata = (assignments) => ({
+    category: 'learning',
+    origin: 'framework-built-in',
+    runtimeKind: 'inline',
+    accessMode: 'memory-frame',
+    availabilityNote: learningAvailability,
+    learningAssignments: assignments,
+    assignmentSummary: `${assignments.length} enabled agent${assignments.length === 1 ? '' : 's'}`,
+  });
+  addFramework(
+    EXPERIENCE_SEARCH_TOOL_NAME,
+    EXPERIENCE_SEARCH_TOOL_NAME,
+    'Search experience',
+    'Recall active experiential evidence frozen into the current Agent Memory Frame.',
+    searchAssignments.map((assignment) => assignment.agent),
+    'auto',
+    {
+      type: 'object',
+      properties: {
+        query: { type: 'string', maxLength: 512 },
+        limit: { type: 'integer', minimum: 1, maximum: EXPERIENCE_RECALL_MAX },
+      },
+      required: ['query'],
+      additionalProperties: false,
+    },
+    { ...learningMetadata(searchAssignments), approvalSummary: 'Auto' },
+  );
+  addFramework(
+    EXPERIENCE_PROPOSE_TOOL_NAME,
+    EXPERIENCE_PROPOSE_TOOL_NAME,
+    'Propose experience',
+    'Propose durable experiential evidence from an expectation/observation difference.',
+    proposalAssignments.map((assignment) => assignment.agent),
+    catalogApproval(proposalAssignments, (assignment) => assignment.approval),
+    {
+      type: 'object',
+      properties: {
+        expectationBasis: {
+          type: 'string', enum: ['explicit', 'inferred', 'retrospective'],
+        },
+        expected: { type: 'string', maxLength: 2_000 },
+        observed: { type: 'string', maxLength: 2_000 },
+        difference: { type: 'string', maxLength: 2_000 },
+        lesson: { type: 'string', maxLength: 2_000 },
+        context: { type: 'string', maxLength: 256 },
+        confidence: { type: 'number', minimum: 0, maximum: 1 },
+      },
+      required: [
+        'expectationBasis', 'expected', 'observed', 'difference', 'lesson',
+        'context', 'confidence',
+      ],
+      additionalProperties: false,
+    },
+    {
+      ...learningMetadata(proposalAssignments),
+      approvalSummary: `${approvalSummary(
+        proposalAssignments, (assignment) => assignment.approval,
+      )} · ${proposalScopes.join(' / ')} scope · survives chat deletion`,
+    },
+  );
+  addFramework(
+    PRACTICE_PROPOSE_TOOL_NAME,
+    PRACTICE_PROPOSE_TOOL_NAME,
+    'Propose practice',
+    'Create an evidence-linked Practice candidate; configured policy may activate it as a trial.',
+    practiceAssignments.map((assignment) => assignment.agent),
+    'auto',
+    {
+      type: 'object',
+      properties: {
+        key: { type: 'string', maxLength: 128 },
+        trigger: { type: 'string', maxLength: 2_000 },
+        guidance: { type: 'string', maxLength: 2_000 },
+        context: { type: 'string', maxLength: 256 },
+        evidenceIds: {
+          type: 'array', minItems: 1, maxItems: 50, uniqueItems: true,
+          items: { type: 'string', maxLength: 256 },
+        },
+      },
+      required: ['key', 'trigger', 'guidance', 'context', 'evidenceIds'],
+      additionalProperties: false,
+    },
+    {
+      ...learningMetadata(practiceAssignments),
+      approvalSummary: `Candidate creation: Auto · validation: ${approvalSummary(
+        practiceAssignments, (assignment) => assignment.practice.approval,
+      ) || 'Review first'} · hardening: Review required`,
+    },
+  );
+
   const desiredIds = rows.map((row) => row._id);
   await Promise.all(rows.map((row) => {
     const { _id, ...fields } = row;
@@ -2047,7 +2585,7 @@ async function storeMcpToolCatalog(config, tools, status = 'ready') {
   }
 }
 
-async function rebuildMcpToolAssignments(userId) {
+async function rebuildMcpToolAssignments(userId, { reconcileArchives = true } = {}) {
   runtimeMcpToolsByAgent.clear();
   const configs = await McpConfigs.find({
     userId, enabled: true, trusted: true, status: 'ready', approval: { $ne: 'blocked' },
@@ -2073,7 +2611,7 @@ async function rebuildMcpToolAssignments(userId) {
       runtimeMcpToolsByAgent.set(agent, specs);
     }
   }
-  return ensureCrewConfigs(userId);
+  return ensureCrewConfigs(userId, { reconcileArchives });
 }
 
 async function setMcpRuntimeStatus(config, values) {
@@ -2249,6 +2787,74 @@ function normalizeCrewPatch(current, patch, availableModelIds) {
       throw new Meteor.Error(error.code ?? 'model-unavailable', error.message);
     }
   }
+  if (patch.flexibility !== undefined
+    && (!Number.isSafeInteger(patch.flexibility)
+      || patch.flexibility < 0 || patch.flexibility > 1000)) {
+    throw new Meteor.Error('invalid-crew', 'Practice flexibility must be an integer from 0 to 1000.');
+  }
+  if (patch.experience !== undefined) {
+    assertOnlyKeys(
+      patch.experience, ['record', 'recall', 'recent', 'scope', 'approval'], 'invalid-crew',
+    );
+    if (patch.experience.record !== undefined
+      && typeof patch.experience.record !== 'boolean') {
+      throw new Meteor.Error('invalid-crew', 'Experience recording must be true or false.');
+    }
+    if (patch.experience.recall !== undefined
+      && typeof patch.experience.recall !== 'boolean') {
+      throw new Meteor.Error('invalid-crew', 'Experience recall must be true or false.');
+    }
+    if (patch.experience.recent !== undefined
+      && (!Number.isSafeInteger(patch.experience.recent)
+        || patch.experience.recent < 0 || patch.experience.recent > EXPERIENCE_RECALL_MAX)) {
+      throw new Meteor.Error(
+        'invalid-crew', `Experience recall limit must be 0 to ${EXPERIENCE_RECALL_MAX}.`,
+      );
+    }
+    if (patch.experience.scope !== undefined
+      && !EXPERIENCE_SCOPES.has(patch.experience.scope)) {
+      throw new Meteor.Error('invalid-crew', 'Experience scope is invalid.');
+    }
+    if (patch.experience.approval !== undefined
+      && !LEARNING_APPROVALS.has(patch.experience.approval)) {
+      throw new Meteor.Error('invalid-crew', 'Experience approval policy is invalid.');
+    }
+  }
+  if (patch.practice !== undefined) {
+    assertOnlyKeys(
+      patch.practice,
+      ['acquire', 'approval', 'allowScopedEvidencePromotion'],
+      'invalid-crew',
+    );
+    if (patch.practice.acquire !== undefined
+      && typeof patch.practice.acquire !== 'boolean') {
+      throw new Meteor.Error('invalid-crew', 'Practice acquisition must be true or false.');
+    }
+    if (patch.practice.approval !== undefined
+      && !LEARNING_APPROVALS.has(patch.practice.approval)) {
+      throw new Meteor.Error('invalid-crew', 'Practice approval policy is invalid.');
+    }
+    if (patch.practice.allowScopedEvidencePromotion !== undefined
+      && typeof patch.practice.allowScopedEvidencePromotion !== 'boolean') {
+      throw new Meteor.Error(
+        'invalid-crew', 'Scoped Experience promotion must be true or false.',
+      );
+    }
+  }
+  const requestedExperience = {
+    ...crewExperienceConfig(current.experience),
+    ...(patch.experience ?? {}),
+  };
+  if (requestedExperience.recall === true && requestedExperience.recent < 1) {
+    throw new Meteor.Error(
+      'invalid-crew', 'Experience recall limit must be at least 1 when recall is enabled.',
+    );
+  }
+  const experience = crewExperienceConfig(requestedExperience);
+  const practice = crewPracticeConfig({
+    ...crewPracticeConfig(current.practice),
+    ...(patch.practice ?? {}),
+  });
   return {
     displayName: cleanCrewText(patch.displayName, 'Name', 40, current.displayName),
     role: cleanCrewText(patch.role, 'Role', 60, current.role),
@@ -2257,6 +2863,9 @@ function normalizeCrewPatch(current, patch, availableModelIds) {
     instructions: cleanCrewText(patch.instructions, 'Instructions', 4000, current.instructions),
     model: requestedModel,
     enabled: patch.enabled ?? current.enabled,
+    flexibility: patch.flexibility ?? current.flexibility ?? DEFAULT_CREW_FLEXIBILITY,
+    experience,
+    practice,
     capabilities,
     budget: {
       turns: Math.round(crewNumber(patch.budget?.turns, 'Turn budget', current.budget?.turns ?? 24, 1, 200)),
@@ -2371,7 +2980,9 @@ async function materializeMissionAgentSelection(userId, sessionId) {
   if (Array.isArray(mission.agents)) return mission;
   const configs = await ensureCrewConfigs(userId);
   const agents = configs
-    .filter((config) => config.agent !== 'orchestrator' && config.enabled)
+    .filter((config) => config.agent !== 'orchestrator'
+      && config.enabled
+      && config.status !== 'archived')
     .map((config) => config.agent);
   await MissionConfigs.updateAsync(
     { _id: sessionId, userId, agents: { $exists: false } },
@@ -2436,27 +3047,128 @@ async function rootMissionSession(sessionId) {
   return session?.agent === 'orchestrator' ? session : null;
 }
 
-/** Runtime authorization for process-wide subagent tool definitions. */
-export async function missionAllowsAgent(context, agent) {
+/** Resolve the current durable Agent/Mission authority behind a process-wide definition. */
+async function authorizedMissionAgent(context, agent) {
   const root = await rootMissionSession(context.sessionId);
-  if (!root || root.userId !== context.userId || root.erasingAt) return false;
+  if (!root || root.userId !== context.userId || root.erasingAt) return null;
+  const config = await CrewConfigs.findOneAsync({
+    userId: root.userId,
+    agent,
+    enabled: true,
+    status: { $ne: 'archived' },
+  });
+  if (!config) return null;
+
+  // A Mission's configurable Crew contains specialists; Atlas is the root
+  // participant and remains authorized by the active primary Crew row.
+  if (agent === 'orchestrator') return { root, config };
+
   const mission = await MissionConfigs.findOneAsync(
     { _id: root._id, userId: root.userId }, { fields: { agents: 1 } },
   );
   // An explicit Mission selection is the authorization source. Consult it
   // before the live roster so a post-CAS reconciliation failure can never
   // leave a removed process-wide delegation tool callable.
-  if (Array.isArray(mission?.agents) && !mission.agents.includes(agent)) return false;
+  if (Array.isArray(mission?.agents) && !mission.agents.includes(agent)) return null;
   if (Array.isArray(root.participants)) {
     return root.participants.some(
       (participant) => participant.kind === 'model' && participant.agent === agent,
-    );
+    ) ? { root, config } : null;
   }
-  if (Array.isArray(mission?.agents)) return mission.agents.includes(agent);
-  return !!await CrewConfigs.findOneAsync({ userId: root.userId, agent, enabled: true });
+  if (Array.isArray(mission?.agents) && !mission.agents.includes(agent)) return null;
+  return { root, config };
 }
 
-export async function requireActiveMissionExecution(sessionId) {
+/** Runtime authorization for process-wide subagent tool definitions. */
+export async function missionAllowsAgent(context, agent) {
+  return !!await authorizedMissionAgent(context, agent);
+}
+
+/**
+ * Final, non-overridable Tool entitlement fence for Constellation.
+ *
+ * Agent definitions and prepared Tool runtimes are process/Turn snapshots,
+ * while control-panel policy is live. Read the authoritative rows again so a
+ * removal that lands during generation or approval wait takes effect before
+ * any consequential implementation starts.
+ */
+export async function configuredToolEntitlement(tool, context, agent) {
+  const authority = await authorizedMissionAgent(context, agent);
+  if (!authority) return false;
+  const { root, config } = authority;
+
+  if (tool === 'inspect_workspace') return config.capabilities?.inspect === true;
+  if (tool === 'publish_brief') return config.capabilities?.publish === true;
+
+  if (MEMORY_TOOL_NAMES.includes(tool)) {
+    if (config.capabilities?.memory === true) return true;
+    if (agent === 'orchestrator') return false;
+    const primary = await CrewConfigs.findOneAsync({
+      userId: root.userId,
+      agent: 'orchestrator',
+      enabled: true,
+      status: { $ne: 'archived' },
+      'capabilities.memory': true,
+    }, { fields: { _id: 1 } });
+    return !!primary;
+  }
+
+  const experience = crewExperienceConfig(config.experience);
+  if (tool === EXPERIENCE_PROPOSE_TOOL_NAME) return experience.record;
+  if (tool === EXPERIENCE_SEARCH_TOOL_NAME) {
+    return experience.recall && experience.recent > 0;
+  }
+  if (tool === PRACTICE_PROPOSE_TOOL_NAME) {
+    const practice = crewPracticeConfig(config.practice);
+    return practice.acquire && experience.recall && experience.recent > 0;
+  }
+
+  if (tool === SKILL_TOOL_NAME) {
+    const skillName = typeof context.args?.name === 'string' ? context.args.name : '';
+    if (!skillName) return false;
+    return !!await SkillConfigs.findOneAsync({
+      userId: root.userId,
+      slug: skillName,
+      enabled: true,
+      agents: agent,
+    }, { fields: { _id: 1 } });
+  }
+
+  // Atlas' delegation Tool is named after its target Agent. The target's own
+  // Mission membership and lifecycle, rather than Atlas' broad authority,
+  // determine whether a child may be born.
+  if (agent === 'orchestrator') {
+    const target = await CrewConfigs.findOneAsync(
+      { userId: root.userId, agent: tool, primary: { $ne: true } },
+      { fields: { _id: 1 } },
+    );
+    if (target) return missionAllowsAgent(context, tool);
+  }
+
+  // MCP aliases are catalog-backed, but both the alias row and its current
+  // server configuration must agree. This also revokes one selected Tool from
+  // an already-prepared runtime without disabling the whole server.
+  const catalog = await ToolCatalog.findOneAsync({
+    userId: root.userId,
+    name: tool,
+    source: { $in: ['app-mcp', 'workspace-mcp'] },
+    serverId: { $exists: true },
+  }, { fields: { serverId: 1, remoteName: 1 } });
+  if (!catalog) return false;
+  const mcp = await McpConfigs.findOneAsync({
+    _id: catalog.serverId,
+    userId: root.userId,
+    enabled: true,
+    trusted: true,
+    status: 'ready',
+    approval: { $ne: 'blocked' },
+    agents: agent,
+  }, { fields: { toolMode: 1, selectedTools: 1 } });
+  if (!mcp) return false;
+  return mcp.toolMode !== 'selected' || mcp.selectedTools?.includes(catalog.remoteName);
+}
+
+export async function requireActiveMissionExecution(sessionId, agent) {
   const root = await rootMissionSession(sessionId);
   if (!root) return;
   // `Agent.ask()` uses an intentionally ephemeral root and has no Mission
@@ -2468,6 +3180,14 @@ export async function requireActiveMissionExecution(sessionId) {
     throw new Meteor.Error(
       'mission-inactive',
       `Mission is ${mission.status}. Activate it before running work.`,
+    );
+  }
+  if (agent && !await missionAllowsAgent(
+    { userId: root.userId, sessionId }, agent,
+  )) {
+    throw new Meteor.Error(
+      'agent-unavailable',
+      'This Agent is no longer active on the Mission; provider work was not started.',
     );
   }
 }
@@ -2689,7 +3409,7 @@ async function pulseInput(userId, current, patch) {
   }
   const agent = cleanConfigText(patch.agent, 'Agent', 80, 'invalid-pulse', current?.agent);
   const agentConfig = await CrewConfigs.findOneAsync({ userId, agent });
-  if (!agentConfig || !agentConfig.enabled) {
+  if (!agentConfig || !agentConfig.enabled || agentConfig.status === 'archived') {
     throw new Meteor.Error('invalid-pulse', 'Select an active crew agent.');
   }
   const sessionId = cleanConfigText(
@@ -2741,7 +3461,8 @@ async function skillInput(userId, current, patch) {
   }
   const agents = [...new Set(requestedAgents)];
   const ownedAgents = await CrewConfigs.find(
-    { userId, agent: { $in: agents } }, { fields: { agent: 1 } },
+    { userId, agent: { $in: agents }, status: { $ne: 'archived' } },
+    { fields: { agent: 1 } },
   ).fetchAsync();
   if (ownedAgents.length !== agents.length) {
     throw new Meteor.Error('invalid-skill', 'One or more assigned agents no longer exist.');
@@ -2782,7 +3503,10 @@ async function dispatchPulse(pulse, scheduledFor, manual = false) {
     ? await ensureMissionConfig(pulse.userId, session)
     : null;
   const agent = await CrewConfigs.findOneAsync({
-    userId: pulse.userId, agent: pulse.agent, enabled: true,
+    userId: pulse.userId,
+    agent: pulse.agent,
+    enabled: true,
+    status: { $ne: 'archived' },
   });
   if (!session || !agent || mission?.status !== 'active') {
     const reason = !session
@@ -3225,6 +3949,29 @@ function withMissionCrewMutation(sessionId, operation) {
   });
 }
 
+function withCrewConfigMutation(userId, configId, operation) {
+  const key = `${userId}:${configId}`;
+  const previous = crewConfigMutationLocks.get(key) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(operation);
+  const settled = run.then(() => undefined, () => undefined);
+  crewConfigMutationLocks.set(key, settled);
+  return run.finally(() => {
+    if (crewConfigMutationLocks.get(key) === settled) crewConfigMutationLocks.delete(key);
+  });
+}
+
+function withWorkspaceConfigMutation(userId, operation) {
+  const previous = workspaceConfigMutationLocks.get(userId) ?? Promise.resolve();
+  const run = previous.catch(() => undefined).then(operation);
+  const settled = run.then(() => undefined, () => undefined);
+  workspaceConfigMutationLocks.set(userId, settled);
+  return run.finally(() => {
+    if (workspaceConfigMutationLocks.get(userId) === settled) {
+      workspaceConfigMutationLocks.delete(userId);
+    }
+  });
+}
+
 function missionCrewStringSet(value, field, maxLength) {
   if (!Array.isArray(value)) {
     throw new Meteor.Error('invalid-mission-crew', `${field} must be a list.`);
@@ -3265,7 +4012,9 @@ async function validateMissionCrewTarget(userId, sessionId, patch) {
 
   const configs = await ensureCrewConfigs(userId);
   const enabledSpecialists = configs.filter(
-    (config) => config.agent !== 'orchestrator' && config.enabled,
+    (config) => config.agent !== 'orchestrator'
+      && config.enabled
+      && config.status !== 'archived',
   );
   const enabledByAgent = new Map(enabledSpecialists.map((config) => [config.agent, config]));
   const invalidAgent = requestedAgents.find((agent) => !enabledByAgent.has(agent));
@@ -3427,6 +4176,7 @@ async function reconcileConfiguredMissionCrew(userId, sessionId, preparedConfigs
   const selectedAgents = Array.isArray(mission.agents) ? new Set(mission.agents) : null;
   const effectiveAgents = configs.filter((config) => config.agent !== 'orchestrator'
       && config.enabled
+      && config.status !== 'archived'
       && (!selectedAgents || selectedAgents.has(config.agent)))
     .map((config) => config.agent);
   return reconcileMissionCrewTarget(userId, sessionId, {
@@ -3441,6 +4191,115 @@ async function reconcileConfiguredMissionCrew(userId, sessionId, preparedConfigs
 Meteor.publish('constellation.crew', function publishCrew() {
   if (!this.userId) return this.ready();
   return CrewConfigs.find({ userId: this.userId }, { fields: { userId: 0 } });
+});
+
+Meteor.publish('constellation.learning', async function publishLearning() {
+  if (!this.userId) return this.ready();
+  if (!await WorkspaceState.findOneAsync(
+    { _id: 'local', ownerUserId: this.userId }, { fields: { _id: 1 } },
+  )) return this.ready();
+  const views = [
+    ['agent_identities', 'identities', {
+      fields: {
+        generation: 1, experienceSeq: 1, currentName: 1, aliases: 1,
+        displayName: 1, lifecycle: 1, constitutionVersionId: 1,
+        flexibility: 1, createdAt: 1, updatedAt: 1,
+      },
+    }],
+    ['agent_constitutions', 'constitutions', {
+      fields: {
+        agentId: 1, revision: 1, content: 1, reason: 1, digest: 1,
+        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1, createdAt: 1,
+      },
+      sort: { revision: -1 },
+      limit: 200,
+    }],
+    ['agent_experiences', 'experiences', {
+      fields: {
+        agentId: 1, sequence: 1, expectationBasis: 1,
+        expected: 1, observed: 1, difference: 1,
+        lesson: 1, context: 1, confidence: 1, status: 1,
+        audience: 1, admission: 1,
+        'review.at': 1, 'review.reason': 1,
+        'review.source.kind': 1, 'review.source.actorId': 1,
+        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1,
+        frameId: 1, createdAt: 1, retractedAt: 1, retractionReason: 1,
+      },
+      sort: { sequence: -1 },
+      limit: 500,
+    }],
+    ['agent_practices', 'practices', {
+      fields: {
+        practiceId: 1, agentId: 1, key: 1, revision: 1, trigger: 1,
+        guidance: 1, context: 1, evidenceIds: 1, status: 1,
+        frameId: 1, validationAdmission: 1,
+        'source.kind': 1, 'source.sessionId': 1, 'source.triggerSeq': 1,
+        'transitionSource.kind': 1, 'transitionSource.actorId': 1,
+        'review.at': 1, 'review.reason': 1,
+        'review.source.kind': 1, 'review.source.actorId': 1,
+        createdAt: 1, updatedAt: 1, transitionReason: 1, validatedAt: 1,
+        validationWatermark: 1, hardenedAt: 1, hardenedEvidenceId: 1,
+        retiredAt: 1, rejectedAt: 1,
+      },
+      sort: { updatedAt: -1 },
+      limit: 500,
+    }],
+    ['agent_memory_frames', 'frames', {
+      fields: {
+        agentId: 1, sessionId: 1, triggerSeq: 1, digest: 1, createdAt: 1,
+        context: 1, audience: 1, protectedPromptVersion: 1, protectedPromptDigest: 1,
+        learningPolicy: 1,
+        'constitution.id': 1, 'constitution.revision': 1, 'constitution.digest': 1,
+        'practices.id': 1, 'practices.practiceId': 1, 'practices.revision': 1,
+        'practices.status': 1, 'practices.digest': 1,
+        'experiences.id': 1, 'experiences.digest': 1,
+        'factMemory.promptDigest': 1, 'factMemory.evidence.id': 1,
+        'factMemory.evidence.scope': 1, 'factMemory.evidence.digest': 1,
+      },
+      sort: { createdAt: -1 },
+      limit: 100,
+    }],
+  ];
+  let stopped = false;
+  const handles = [];
+  const started = new Map();
+  this.onStop(() => {
+    stopped = true;
+    for (const handle of handles) handle.stop();
+  });
+  const startAgent = (agentId) => {
+    if (started.has(agentId)) return started.get(agentId);
+    const pending = Promise.all(views.map(async ([collectionName, reader, options]) => {
+      const handle = await Agent.learning.read[reader]([agentId], options).observeChangesAsync({
+        added: (id, fields) => { if (!stopped) this.added(collectionName, id, fields); },
+        changed: (id, fields) => { if (!stopped) this.changed(collectionName, id, fields); },
+        removed: (id) => { if (!stopped) this.removed(collectionName, id); },
+      });
+      if (stopped) handle.stop();
+      else handles.push(handle);
+    }));
+    started.set(agentId, pending);
+    return pending;
+  };
+  const initialCrew = await CrewConfigs.find(
+    { userId: this.userId }, { fields: { _id: 1 } },
+  ).fetchAsync();
+  await Promise.all(initialCrew.map((row) => startAgent(row._id)));
+  const crewHandle = await CrewConfigs.find(
+    { userId: this.userId }, { fields: { _id: 1 } },
+  ).observeChangesAsync({
+    added: (id) => {
+      void startAgent(id).catch(() => {
+        if (!stopped) this.error(new Meteor.Error(
+          'learning-unavailable', 'Agent learning is temporarily unavailable.',
+        ));
+      });
+    },
+  });
+  if (stopped) crewHandle.stop();
+  else handles.push(crewHandle);
+  if (!stopped) this.ready();
+  return undefined;
 });
 
 Meteor.publish('constellation.modelCatalog', async function publishModelCatalog() {
@@ -3664,8 +4523,130 @@ DDPRateLimiter.addRule(
 );
 
 Meteor.methods({
+  async 'constellation.constitutionRevise'(agentId, expectedGeneration, body, reason) {
+    check(agentId, String);
+    check(expectedGeneration, Number);
+    check(body, String);
+    check(reason, String);
+    await claimWorkspace(this.userId);
+    await ownedLearningIdentity(this.userId, agentId, { active: true });
+    try {
+      return await Agent.learning.reviseConstitution(
+        agentId,
+        expectedGeneration,
+        body,
+        reason,
+        learningSource('constitution-revise', agentId, { expectedGeneration, body, reason }),
+      );
+    } catch (error) {
+      if (String(error?.message ?? error).includes('identity-generation-conflict')) {
+        throw new Meteor.Error(
+          'identity-generation-conflict',
+          'The Constitution changed after this draft started. Rebase it onto the latest version.',
+        );
+      }
+      throw error;
+    }
+  },
+
+  async 'constellation.experienceRetract'(agentId, experienceId, reason) {
+    check(agentId, String);
+    check(experienceId, String);
+    check(reason, String);
+    await claimWorkspace(this.userId);
+    await ownedLearningIdentity(this.userId, agentId, { active: true });
+    return Agent.learning.retractExperience(
+      agentId,
+      experienceId,
+      reason,
+      learningSource('experience-retract', agentId, { experienceId, reason }),
+    );
+  },
+
+  async 'constellation.learningReview'(agentId, target, targetId) {
+    check(agentId, String);
+    check(target, String);
+    check(targetId, String);
+    if (!['experience', 'practice'].includes(target)) {
+      throw new Meteor.Error('invalid-learning-review', 'Unknown learning review target.');
+    }
+    await claimWorkspace(this.userId);
+    await ownedLearningIdentity(this.userId, agentId, { active: true });
+    return Agent.learning.review({
+      agentId,
+      target,
+      id: targetId,
+      source: {
+        ...learningSource('post-admission-review', agentId, { target, targetId }),
+        actorId: this.userId,
+      },
+    });
+  },
+
+  async 'constellation.practicePropose'(agentId, proposal) {
+    check(agentId, String);
+    check(proposal, Object);
+    if (proposal.commandId !== undefined) check(proposal.commandId, String);
+    await claimWorkspace(this.userId);
+    await ownedLearningIdentity(this.userId, agentId, { active: true });
+    return Agent.learning.proposePractice({
+      agentId,
+      key: proposal.key,
+      trigger: proposal.trigger,
+      guidance: proposal.guidance,
+      context: proposal.context,
+      evidenceIds: proposal.evidenceIds,
+      source: learningSource('practice-propose', agentId, {
+        // Distinguish a deliberate later proposal with identical content from
+        // transparent DDP replay of the original method invocation.
+        commandId: proposal.commandId,
+        key: proposal.key,
+        trigger: proposal.trigger,
+        guidance: proposal.guidance,
+        context: proposal.context,
+        evidenceIds: proposal.evidenceIds,
+      }),
+    });
+  },
+
+  async 'constellation.practiceTransition'(
+    agentId, practiceId, status, reason, hardeningEvidenceId,
+  ) {
+    check(agentId, String);
+    check(practiceId, String);
+    check(status, String);
+    check(reason, String);
+    if (hardeningEvidenceId !== undefined) check(hardeningEvidenceId, String);
+    if (status === 'hardened' && !hardeningEvidenceId?.trim()) {
+      throw new Meteor.Error(
+        'invalid-practice-transition',
+        'Select the exact later Experience used to harden this Practice.',
+      );
+    }
+    if (status !== 'hardened' && hardeningEvidenceId !== undefined) {
+      throw new Meteor.Error(
+        'invalid-practice-transition',
+        'Hardening evidence is accepted only when hardening a Practice.',
+      );
+    }
+    await claimWorkspace(this.userId);
+    await ownedLearningIdentity(this.userId, agentId, { active: true });
+    const source = learningSource('practice-transition', agentId, {
+      practiceId, status, reason,
+      ...(status === 'hardened' ? { hardeningEvidenceId } : {}),
+    });
+    if (status === 'hardened') {
+      return Agent.learning.transitionPractice(
+        agentId, practiceId, status, reason, source, hardeningEvidenceId,
+      );
+    }
+    return Agent.learning.transitionPractice(agentId, practiceId, status, reason, source);
+  },
+
   async 'constellation.bootstrap'() {
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const crew = await ensureCrewConfigs(this.userId);
     const modelCatalog = await modelCatalogView(this.userId);
     const sessions = await AgentSessions.find(
@@ -3681,7 +4662,9 @@ Meteor.methods({
       live,
       model: modelCatalog.defaultModel,
       channels: channels.filter((row) => row.status === 'active').map((row) => row.kind),
-      agents: crew.filter((row) => row.enabled).map((row) => row.agent),
+      agents: crew.filter(
+        (row) => row.enabled && row.status !== 'archived',
+      ).map((row) => row.agent),
       release: '0.2.1-rc.1',
       scheduler: true,
       secureCredentials: !!configKeyBytes,
@@ -3690,16 +4673,20 @@ Meteor.methods({
         ready: mcp.filter((row) => row.status === 'ready').length,
       },
     };
+    });
   },
 
   async 'constellation.prepareSession'(sessionId) {
     check(sessionId, String);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const session = await AgentSessions.findOneAsync({ _id: sessionId, agent: 'orchestrator', userId: this.userId });
     if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
     await ensureMissionConfig(this.userId, session);
     await ensurePulseConfigs(this.userId, sessionId);
     return reconcileConfiguredMissionCrew(this.userId, sessionId);
+    });
   },
 
   async 'constellation.missionSave'(sessionId, expectedRevision, patch) {
@@ -3707,6 +4694,8 @@ Meteor.methods({
     check(expectedRevision, Number);
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const session = await AgentSessions.findOneAsync({
       _id: sessionId, userId: this.userId, agent: 'orchestrator',
     });
@@ -3774,6 +4763,7 @@ Meteor.methods({
     return MissionConfigs.findOneAsync(
       { _id: sessionId, userId: this.userId }, { fields: { userId: 0 } },
     );
+    });
   },
 
   async 'constellation.missionCrewSave'(sessionId, expectedMissionRevision, patch) {
@@ -3785,7 +4775,7 @@ Meteor.methods({
       throw new Meteor.Error('invalid-mission-crew', 'Mission revision must be a positive integer.');
     }
     const userId = this.userId;
-    return withMissionCrewMutation(sessionId, async () => {
+    return withWorkspaceConfigMutation(userId, () => withMissionCrewMutation(sessionId, async () => {
       const session = await crewSession(userId, sessionId);
       const current = await ensureMissionConfig(userId, session);
       if (current.revision !== expectedMissionRevision) {
@@ -3828,7 +4818,7 @@ Meteor.methods({
         agentMode: Array.isArray(saved.agents) ? 'custom' : 'inherit',
         participation: await missionParticipationView(userId, sessionId),
       };
-    });
+    }));
   },
 
   async 'constellation.workspaceMemberCreate'(patch) {
@@ -4075,11 +5065,18 @@ Meteor.methods({
     check(sessionId, String);
     check(agent, String);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     await crewSession(this.userId, sessionId);
     if (agent === 'orchestrator') {
       throw new Meteor.Error('primary-agent', 'Atlas is already required for every Mission.');
     }
-    const config = await CrewConfigs.findOneAsync({ userId: this.userId, agent, enabled: true });
+    const config = await CrewConfigs.findOneAsync({
+      userId: this.userId,
+      agent,
+      enabled: true,
+      status: { $ne: 'archived' },
+    });
     if (!config) throw new Meteor.Error('no-agent', 'Active Crew agent not found.');
     await materializeMissionAgentSelection(this.userId, sessionId);
     await MissionConfigs.updateAsync(
@@ -4092,12 +5089,15 @@ Meteor.methods({
     );
     await syncCrewSession(this.userId, sessionId);
     return missionParticipationView(this.userId, sessionId);
+    });
   },
 
   async 'constellation.missionAgentRemove'(sessionId, agent) {
     check(sessionId, String);
     check(agent, String);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     await crewSession(this.userId, sessionId);
     if (agent === 'orchestrator') {
       throw new Meteor.Error('primary-agent', 'Atlas is required for every Mission.');
@@ -4116,15 +5116,19 @@ Meteor.methods({
     );
     await syncCrewSession(this.userId, sessionId);
     return missionParticipationView(this.userId, sessionId);
+    });
   },
 
   async 'constellation.crewCreate'(sessionId, patch) {
     check(sessionId, String);
     if (patch !== undefined) check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     await crewSession(this.userId, sessionId);
     const existing = await ensureCrewConfigs(this.userId);
-    if (existing.length >= 12) throw new Meteor.Error('crew-full', 'Crew limit reached.');
+    const activeCrew = existing.filter((row) => row.status !== 'archived');
+    if (activeCrew.length >= 12) throw new Meteor.Error('crew-full', 'Crew limit reached.');
     const token = Random.id(8).toLowerCase();
     const config = {
       userId: this.userId,
@@ -4135,21 +5139,32 @@ Meteor.methods({
       color: 'violet',
       enabled: true,
       order: (Math.max(0, ...existing.map((row) => row.order ?? 0)) + 10),
-      instructions: 'You are a specialist. Work only within the assigned scope, state assumptions, and return a concise recommendation with next actions.',
+      revision: 1,
+      status: 'available',
+      constitution: DEFAULT_AGENT_CONSTITUTION,
+      instructions: 'Work only within the assigned scope. State assumptions and return a concise recommendation with next actions.',
       model: 'default',
+      flexibility: DEFAULT_CREW_FLEXIBILITY,
+      experience: { ...DEFAULT_CREW_EXPERIENCE },
+      practice: { ...DEFAULT_CREW_PRACTICE },
       budget: { turns: 24, toolCalls: 8, spend: 1 },
       capabilities: { inspect: true, framing: false, memory: false, publish: false },
       createdAt: new Date(),
       updatedAt: new Date(),
     };
     const availableModelIds = modelIdsFromCatalog(await modelCatalogView(this.userId));
+    const normalized = normalizeCrewPatch(config, patch ?? {}, availableModelIds);
     const id = await CrewConfigs.insertAsync({
       ...config,
-      ...normalizeCrewPatch(config, patch ?? {}, availableModelIds),
+      ...normalized,
+      revision: 1,
+      status: normalized.enabled ? 'available' : 'unavailable',
+      constitution: config.constitution,
       createdAt: config.createdAt,
     });
     await syncCrewAcrossMissions(this.userId);
     return id;
+    });
   },
 
   async 'constellation.crewSave'(sessionId, configId, patch) {
@@ -4158,12 +5173,66 @@ Meteor.methods({
     check(patch, Object);
     await claimWorkspace(this.userId);
     await crewSession(this.userId, sessionId);
+    const userId = this.userId;
+    return withCrewConfigMutation(userId, configId, async () => {
+    await backfillCrewConfigs(this.userId);
     const current = await CrewConfigs.findOneAsync({ _id: configId, userId: this.userId });
     if (!current) throw new Meteor.Error('no-agent', 'Crew agent not found.');
+    if (current.status === 'archived' || current.archivedAt) {
+      throw new Meteor.Error('agent-archived', 'Restore this Agent before editing it.');
+    }
+    const { expectedRevision, ...mutablePatch } = patch;
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw new Meteor.Error('invalid-crew', 'Expected revision must be a positive integer.');
+    }
+    if (current.revision !== expectedRevision) {
+      throw new Meteor.Error('stale-agent', 'This Agent changed before the save started.');
+    }
     const availableModelIds = modelIdsFromCatalog(await modelCatalogView(this.userId));
-    const next = normalizeCrewPatch(current, patch, availableModelIds);
+    const next = normalizeCrewPatch(current, mutablePatch, availableModelIds);
     if (current.agent === 'orchestrator') next.enabled = true;
-    await CrewConfigs.updateAsync({ _id: configId, userId: this.userId }, { $set: next });
+    const [identity] = await Agent.learning.read.identities([current._id]).fetchAsync();
+    const committed = identity?.flexibility
+      ? identity.flexibility.capacity - identity.flexibility.available : 0;
+    if (next.flexibility < committed) {
+      throw new Meteor.Error(
+        'invalid-crew',
+        `Practice capacity cannot be lower than ${committed}; retire a hardened Practice first.`,
+      );
+    }
+    // Validate and apply Identity-bound fields before committing the Crew row.
+    // If the Crew CAS loses, reconcile back to the winning durable config so
+    // display name and flexibility cannot drift across the two collections.
+    try {
+      await syncCrewLearningIdentity({ ...current, ...next });
+    } catch (error) {
+      if (String(error?.message ?? error).includes('flexibility cannot fall below hardened cost')) {
+        throw new Meteor.Error(
+          'invalid-crew', 'Practice capacity is below the current hardened Practice count.',
+        );
+      }
+      throw error;
+    }
+    const saved = await CrewConfigs.updateAsync(
+      {
+        _id: configId,
+        userId: this.userId,
+        revision: expectedRevision,
+        status: { $ne: 'archived' },
+      },
+      {
+        $set: {
+          ...next,
+          status: next.enabled ? 'available' : 'unavailable',
+        },
+        $inc: { revision: 1 },
+      },
+    );
+    if (saved !== 1) {
+      const winner = await CrewConfigs.findOneAsync({ _id: configId, userId: this.userId });
+      if (winner) await syncCrewLearningIdentity(winner);
+      throw new Meteor.Error('stale-agent', 'This Agent changed before the save completed.');
+    }
     if (!next.enabled) {
       await PulseConfigs.updateAsync(
         { userId: this.userId, agent: current.agent, enabled: true },
@@ -4176,6 +5245,7 @@ Meteor.methods({
     }
     await syncCrewAcrossMissions(this.userId);
     return CrewConfigs.findOneAsync({ _id: configId, userId: this.userId }, { fields: { userId: 0 } });
+    });
   },
 
   async 'constellation.crewImpact'(configId) {
@@ -4184,31 +5254,80 @@ Meteor.methods({
     const config = await CrewConfigs.findOneAsync({ _id: configId, userId: this.userId });
     if (!config) throw new Meteor.Error('no-agent', 'Crew agent not found.');
     if (config.agent === 'orchestrator') {
-      throw new Meteor.Error('primary-agent', 'The primary agent cannot be removed.');
+      throw new Meteor.Error('primary-agent', 'The primary Agent cannot be archived.');
     }
-    return crewRemovalImpact(this.userId, config);
+    return crewArchiveImpact(this.userId, config);
   },
 
-  async 'constellation.crewRemove'(sessionId, configId, expectedAgent) {
+  async 'constellation.crewArchive'(
+    sessionId, configId, expectedAgent, expectedRevision, expectedImpactDigest,
+  ) {
     check(sessionId, String);
     check(configId, String);
-    if (expectedAgent !== undefined) check(expectedAgent, String);
+    check(expectedAgent, String);
+    check(expectedRevision, Number);
+    check(expectedImpactDigest, String);
     await claimWorkspace(this.userId);
     await crewSession(this.userId, sessionId);
-    const config = await CrewConfigs.findOneAsync({ _id: configId, userId: this.userId });
-    if (!config) throw new Meteor.Error('no-agent', 'Crew agent not found.');
-    if (config.agent === 'orchestrator') throw new Meteor.Error('primary-agent', 'The primary agent cannot be removed.');
-    if (expectedAgent !== undefined && config.agent !== expectedAgent) {
-      throw new Meteor.Error('stale-agent', 'Agent changed while the removal dialog was open.');
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, () => (
+      withCrewConfigMutation(userId, configId, () => archiveCrewConfig(
+        userId, configId, expectedAgent, expectedRevision, expectedImpactDigest,
+      ))
+    ));
+  },
+
+  async 'constellation.crewRestore'(configId, expectedRevision) {
+    check(configId, String);
+    if (expectedRevision === undefined) {
+      throw new Meteor.Error('invalid-crew', 'Restore requires the archived Agent revision.');
     }
-    const removed = await CrewConfigs.removeAsync({
-      _id: configId, userId: this.userId, agent: config.agent,
-    });
-    if (removed !== 1) throw new Meteor.Error('stale-agent', 'Agent changed or was already removed.');
-    // Removal does not resolve until every workspace reference and Mission
-    // roster reflects the authoritative crew deletion.
-    await finalizeCrewRemoval(this.userId, sessionId, config);
+    check(expectedRevision, Number);
+    await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, () => withCrewConfigMutation(
+      userId, configId, async () => {
+    await backfillCrewConfigs(this.userId);
+    const current = await CrewConfigs.findOneAsync({ _id: configId, userId: this.userId });
+    if (!current) throw new Meteor.Error('no-agent', 'Crew agent not found.');
+    if (current.status !== 'archived') {
+      throw new Meteor.Error('agent-not-archived', 'This Agent is not archived.');
+    }
+    if (current.archiveCleanupPending) {
+      throw new Meteor.Error(
+        'archive-cleanup-pending',
+        'This Agent is still finishing archival. Try restore again when cleanup completes.',
+      );
+    }
+    if (!Number.isSafeInteger(expectedRevision) || expectedRevision < 1) {
+      throw new Meteor.Error('invalid-crew', 'Expected revision must be a positive integer.');
+    }
+    const restored = await CrewConfigs.updateAsync(
+      {
+        _id: configId,
+        userId: this.userId,
+        status: 'archived',
+        revision: expectedRevision,
+      },
+      {
+        $set: {
+          enabled: false,
+          status: 'unavailable',
+          updatedAt: new Date(),
+        },
+        $unset: { archivedAt: '', archivedBy: '' },
+        $inc: { revision: 1 },
+      },
+    );
+    if (restored !== 1) {
+      throw new Meteor.Error('stale-agent', 'This Agent changed before it could be restored.');
+    }
+    // Restore only the identity. Prior Mission, Skill, MCP, Pulse, and Tool
+    // assignments remain detached until a person explicitly configures them.
+    await syncCrewAcrossMissions(this.userId);
     return true;
+      },
+    ));
   },
 
   async 'constellation.runHeartbeat'(sessionId) {
@@ -4228,6 +5347,8 @@ Meteor.methods({
   async 'constellation.pulseCreate'(patch) {
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const existing = await PulseConfigs.find({ userId: this.userId }).countAsync();
     if (existing >= 40) throw new Meteor.Error('pulse-limit', 'Pulse limit reached.');
     const next = await pulseInput(this.userId, null, patch);
@@ -4239,6 +5360,7 @@ Meteor.methods({
       revision: 1,
       createdAt: new Date(),
     });
+    });
   },
 
   async 'constellation.pulseSave'(pulseId, expectedRevision, patch) {
@@ -4246,6 +5368,8 @@ Meteor.methods({
     check(expectedRevision, Number);
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const current = await PulseConfigs.findOneAsync({ _id: pulseId, userId: this.userId });
     if (!current) throw new Meteor.Error('no-pulse', 'Pulse not found.');
     if (current.revision !== expectedRevision) {
@@ -4264,17 +5388,21 @@ Meteor.methods({
     );
     if (changed !== 1) throw new Meteor.Error('stale-pulse', 'Pulse changed in another window.');
     return true;
+    });
   },
 
   async 'constellation.pulseRemove'(pulseId, expectedRevision) {
     check(pulseId, String);
     check(expectedRevision, Number);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const removed = await PulseConfigs.removeAsync({
       _id: pulseId, userId: this.userId, revision: expectedRevision,
     });
     if (removed !== 1) throw new Meteor.Error('stale-pulse', 'Pulse changed or no longer exists.');
     return true;
+    });
   },
 
   async 'constellation.pulseRun'(pulseId) {
@@ -4288,6 +5416,8 @@ Meteor.methods({
   async 'constellation.skillCreate'(patch) {
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const existing = await SkillConfigs.find({ userId: this.userId }).countAsync();
     if (existing >= 60) throw new Meteor.Error('skill-limit', 'Skill limit reached.');
     const next = await skillInput(this.userId, null, patch);
@@ -4296,6 +5426,7 @@ Meteor.methods({
     });
     await ensureCrewConfigs(this.userId);
     return id;
+    });
   },
 
   async 'constellation.skillSave'(skillId, expectedRevision, patch) {
@@ -4303,6 +5434,8 @@ Meteor.methods({
     check(expectedRevision, Number);
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const current = await SkillConfigs.findOneAsync({ _id: skillId, userId: this.userId });
     if (!current) throw new Meteor.Error('no-skill', 'Skill not found.');
     if (current.revision !== expectedRevision) {
@@ -4316,18 +5449,22 @@ Meteor.methods({
     if (changed !== 1) throw new Meteor.Error('stale-skill', 'Skill changed in another window.');
     await ensureCrewConfigs(this.userId);
     return true;
+    });
   },
 
   async 'constellation.skillRemove'(skillId, expectedRevision) {
     check(skillId, String);
     check(expectedRevision, Number);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const removed = await SkillConfigs.removeAsync({
       _id: skillId, userId: this.userId, revision: expectedRevision,
     });
     if (removed !== 1) throw new Meteor.Error('stale-skill', 'Skill changed or no longer exists.');
     await ensureCrewConfigs(this.userId);
     return true;
+    });
   },
 
   async 'constellation.channelSave'(kind, expectedRevision, patch) {
@@ -4443,6 +5580,8 @@ Meteor.methods({
   async 'constellation.mcpCreate'(patch = {}) {
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     await ensureCrewConfigs(this.userId);
     const count = await McpConfigs.find({ userId: this.userId, managed: 'workspace' }).countAsync();
     if (count >= 20) throw new Meteor.Error('mcp-limit', 'MCP server limit reached.');
@@ -4471,6 +5610,7 @@ Meteor.methods({
     await reconcileMcpConfig(config);
     await rebuildMcpToolAssignments(this.userId);
     return publicMcpConfig(this.userId, id);
+    });
   },
 
   async 'constellation.mcpSave'(configId, expectedRevision, patch) {
@@ -4478,6 +5618,8 @@ Meteor.methods({
     check(expectedRevision, Number);
     check(patch, Object);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const current = await McpConfigs.findOneAsync({ _id: configId, userId: this.userId });
     if (!current) throw new Meteor.Error('no-mcp', 'MCP server not found.');
     if (current.locked || current.managed !== 'workspace') {
@@ -4506,12 +5648,15 @@ Meteor.methods({
     await reconcileMcpConfig(config);
     await rebuildMcpToolAssignments(this.userId);
     return publicMcpConfig(this.userId, configId);
+    });
   },
 
   async 'constellation.mcpRemove'(configId, expectedRevision) {
     check(configId, String);
     check(expectedRevision, Number);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const current = await McpConfigs.findOneAsync({ _id: configId, userId: this.userId });
     if (!current || current.revision !== expectedRevision) {
       throw new Meteor.Error('stale-mcp', 'MCP server changed or no longer exists.');
@@ -4531,11 +5676,14 @@ Meteor.methods({
     ]);
     await rebuildMcpToolAssignments(this.userId);
     return true;
+    });
   },
 
   async 'constellation.mcpTest'(configId) {
     check(configId, String);
     await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
     const config = await McpConfigs.findOneAsync({ _id: configId, userId: this.userId });
     if (!config) throw new Meteor.Error('no-mcp', 'MCP server not found.');
     if (!config.trusted) {
@@ -4549,6 +5697,7 @@ Meteor.methods({
       ...result,
       runtime: getMcpServerStatus(mcpRuntimeName(configId)),
     };
+    });
   },
 
   async 'constellation.renameSession'(sessionId, title) {
@@ -4604,6 +5753,24 @@ Meteor.methods({
     return previewVerdictToken(token);
   },
 });
+
+// Full-app concurrency tests need a deterministic disconnected runtime before
+// invoking bootstrap. Keep that synchronization seam out of production and
+// retain the same ownership check as every real MCP control.
+if (Meteor.isTest || Meteor.isAppTest) {
+  Meteor.methods({
+    async 'constellation.testMcpDisconnect'(configId) {
+      check(configId, String);
+      await claimWorkspace(this.userId);
+      const config = await McpConfigs.findOneAsync({
+        _id: configId, userId: this.userId, managed: 'workspace',
+      });
+      if (!config) throw new Meteor.Error('no-mcp', 'MCP server not found.');
+      await disconnectMcpServer(mcpRuntimeName(configId));
+      return getMcpServerStatus(mcpRuntimeName(configId));
+    },
+  });
+}
 
 Meteor.startup(async () => {
   await MissionConfigs.rawCollection().createIndex({ userId: 1, updatedAt: -1 });

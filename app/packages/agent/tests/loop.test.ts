@@ -1598,6 +1598,61 @@ describe('approval gates', () => {
     assert.equal(await AgentMessages.find({ sessionId: 's-gate', role: 'tool' }).countAsync(), 0);
   });
 
+  it('reclaims an ask if canUse is revoked across the atomic park write', async function () {
+    this.timeout(30000);
+    const { AgentSessions, AgentMessages } = await import('../common/collections');
+    const { runTurn } = await import('../server/loop');
+    const { mockProvider } = await import('../server/providers/mock');
+
+    await seed('s-gate-post-park-revoke', 'refund please');
+    let checks = 0;
+    const seenContexts: any[] = [];
+    let ran = false;
+    let providerCalls = 0;
+    await runTurn('s-gate-post-park-revoke', {
+      model: 'mock', system: '',
+      tools: [{
+        name: 'refund', description: 'x', gate: 'ask',
+        args: { type: 'object', properties: {} },
+        run: async () => { ran = true; return 'must not run'; },
+      }],
+      // Initial dispatch and pre-park checks pass. The post-commit check sees
+      // the lifecycle/entitlement fence that raced the pending write.
+      canUse: async (_name, ctx) => {
+        checks += 1;
+        seenContexts.push(ctx);
+        return checks < 3;
+      },
+      provider: mockProvider(() => {
+        providerCalls += 1;
+        return providerCalls === 1
+          ? { toolCalls: [{ id: 'post-park-call', name: 'refund', args: {} }] }
+          : { text: 'continued after refusal' };
+      }),
+    });
+
+    assert.equal(checks, 3, 'authorization is read once after the park commits');
+    assert.deepEqual(
+      seenContexts.map(({ args, toolCallId }) => ({ args, toolCallId })),
+      Array.from({ length: 3 }, () => ({ args: {}, toolCallId: 'post-park-call' })),
+      'every authorization boundary receives the exact call, including post-park',
+    );
+    assert.isFalse(ran);
+    const session = (await AgentSessions.findOneAsync('s-gate-post-park-revoke'))!;
+    assert.equal(session.phase, 'idle');
+    assert.isUndefined(session.pending, 'the raced approval request is reclaimed');
+    assert.equal(session.budgetSpent.toolCalls, 0, 'a reclaimed ask spends no tool budget');
+    const row = await AgentMessages.findOneAsync({
+      sessionId: 's-gate-post-park-revoke', role: 'tool', toolCallId: 'post-park-call',
+    } as any);
+    assert.equal(row?.error?.error, 'not-allowed');
+    assert.isDefined(await AgentMessages.findOneAsync({
+      sessionId: 's-gate-post-park-revoke',
+      role: 'assistant',
+      content: 'continued after refusal',
+    } as any));
+  });
+
   it('approve wakes the run, executes the parked tool, and continues the turn', async function () {
     this.timeout(30000);
     const { AgentSessions, AgentMessages } = await import('../common/collections');

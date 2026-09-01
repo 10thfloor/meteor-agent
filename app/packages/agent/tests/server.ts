@@ -28,5 +28,7 @@ import './media.test';
 import './downloads.test';
 import './multimodal.test';
 import './memory.test';
+import './learning.test';
+import './learning-loop.test';
 import './perf.test';
 import './integration.server';

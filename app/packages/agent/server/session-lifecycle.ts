@@ -6,11 +6,20 @@ import {
   ChannelBindings, ChannelVerdictTokens, DeliveryReceipts,
 } from './channels/collections';
 import { AttachmentDownloadTokens } from './downloads';
+import { AgentMemoryFrames } from './learning-collections';
 import { isRunning } from './turn-state';
-import { UserMessageReservations } from './transcript';
+import { discardTurn, locateBatch, UserMessageReservations } from './transcript';
 
 /** Outcome deliberately hides whether an id belonged to another owner/agent. */
 export type SessionErasure = 'erased' | 'absent';
+
+/** Result of fencing parked work for one Agent identity. The host must first
+ * make that Agent unavailable (for example by committing an archive status),
+ * so no fresh turn can create another park while this finite sweep runs. */
+export interface AbandonedAgentTurns {
+  sessions: number;
+  toolCalls: string[];
+}
 
 const QUIESCE_MS = 5_000;
 const POLL_MS = 25;
@@ -18,6 +27,99 @@ const POLL_MS = 25;
 const pause = (ms: number): Promise<void> => new Promise((resolve) => {
   setTimeout(resolve, ms);
 });
+
+/** Cancel every parked turn owned by one Agent for an exact Session owner.
+ *
+ * The Session fence lands before transcript cleanup. That ordering makes a
+ * racing approval lose its conditional write and revokes any resume Lease;
+ * should best-effort cleanup be interrupted, the ordinary unanswered-tool-use
+ * repair removes the now-unreferenced assistant batch before the next turn.
+ * Agent-owned learning is deliberately untouched.
+ *
+ * Host lifecycle primitive used after its own availability fence. It is
+ * exported for applications that archive Agent definitions outside the core. */
+export async function abandonPendingAgentTurns(
+  agent: string, userId: string | null,
+): Promise<AbandonedAgentTurns> {
+  const toolCalls: string[] = [];
+  const sessionIds = new Set<string>();
+  // Activation can change a phase between the read and the conditional fence.
+  // Once the host's availability fence is durable that race is finite, so
+  // repeat to a fixed point instead of silently declaring a missed candidate
+  // clean. A storage failure throws and leaves the host cleanup receipt set.
+  for (let pass = 0; pass < 40; pass += 1) {
+    // eslint-disable-next-line no-await-in-loop
+    const candidates = await AgentSessions.find({
+      userId,
+      'pending.agent': agent,
+      erasingAt: { $exists: false },
+      purgingAt: { $exists: false },
+    }, {
+      fields: { _id: 1, phase: 1, pending: 1 },
+      sort: { _id: 1 },
+    }).fetchAsync();
+    if (candidates.length === 0) {
+      return { sessions: sessionIds.size, toolCalls };
+    }
+    let progressed = false;
+
+    for (const candidate of candidates) {
+      const pending = candidate.pending;
+      if (!pending) continue;
+      const at = new Date();
+      // Include the observed phase and exact call identity. If activation or a
+      // replacement park wins first, the next fixed-point pass adopts it.
+      // eslint-disable-next-line no-await-in-loop
+      const before = await AgentSessions.rawCollection().findOneAndUpdate(
+        {
+          _id: candidate._id,
+          userId,
+          phase: candidate.phase,
+          'pending.agent': agent,
+          'pending.toolCallId': pending.toolCallId,
+          erasingAt: { $exists: false },
+          purgingAt: { $exists: false },
+        },
+        {
+          $set: {
+            ...(candidate.phase === 'stopped' ? {} : { phase: 'idle' }),
+            updatedAt: at,
+          },
+          $unset: { pending: '', lease: '' },
+        },
+        { returnDocument: 'before' },
+      ) as unknown as AgentSession | null;
+      if (!before?.pending) continue;
+
+      progressed = true;
+      sessionIds.add(before._id);
+      toolCalls.push(before.pending.toolCallId);
+      // eslint-disable-next-line no-await-in-loop
+      const messages = await AgentMessages.find(
+        { sessionId: before._id }, { sort: { seq: 1 } },
+      ).fetchAsync();
+      const batch = locateBatch(messages, before.pending.toolCallId);
+      if (batch) {
+        // eslint-disable-next-line no-await-in-loop
+        await discardTurn(
+          before._id,
+          batch.assistant._id,
+          batch.assistant.seq,
+          (batch.assistant.toolCalls ?? []).map((call) => call.id),
+          batch.windowEnd,
+        );
+      }
+    }
+    if (!progressed) {
+      // A resume already beyond its own atomic phase change is winding down.
+      // Give its revoked Lease a bounded opportunity to observe the host
+      // fence; never spin forever inside an archive command.
+      // eslint-disable-next-line no-await-in-loop
+      await pause(POLL_MS);
+    }
+  }
+  throw new Error('[10thfloor:agent] pending Agent turns did not quiesce');
+}
 
 /** Graph truth is `parent.sessionId`; `activeChild` is only a live hint. */
 async function sessionTree(rootId: string): Promise<AgentSession[]> {
@@ -107,8 +209,9 @@ async function claimPurge(ids: string[]): Promise<boolean> {
   return claimed.matchedCount === ids.length;
 }
 
-/** Idempotent, collection-local cascade. Account identity and Memory are not
- * Session-owned and are intentionally absent from this list. */
+/** Idempotent, collection-local cascade. Account identity, Fact Memory, and
+ * Agent-owned learning are intentionally absent; only the trigger-scoped
+ * Memory Frame follows its Session. */
 async function purge(rootId: string, rows: AgentSession[]): Promise<void> {
   const ids = rows.map((row) => row._id);
   const bindings = await ChannelBindings.find(
@@ -129,6 +232,11 @@ async function purge(rootId: string, rows: AgentSession[]): Promise<void> {
   await AgentMessages.removeAsync({ sessionId: { $in: ids } });
   await UserMessageReservations.removeAsync({ sessionId: { $in: ids } } as any);
   await AgentAttachments.removeAsync({ sessionId: { $in: ids } });
+  // A Memory Frame is the exact causal snapshot for one Session trigger. It
+  // follows Session erasure, unlike Agent-owned Identity, Constitution,
+  // Experience, and Practice records. Delete Frames before Session rows so a
+  // crash leaves the durable root fence available for an idempotent retry.
+  await AgentMemoryFrames.removeAsync({ sessionId: { $in: ids } });
 
   // Root last: a durable fence remains visible until every dependent store is
   // gone. Forks survive because lineage is not a parent relationship.

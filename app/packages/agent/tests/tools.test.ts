@@ -16,6 +16,24 @@ Meteor.methods({
   },
 });
 
+let finalAuthorizationAdoptedRan = false;
+Meteor.methods({
+  'test.finalAuthorizationAdopted'() {
+    finalAuthorizationAdoptedRan = true;
+    return 'must not run';
+  },
+});
+
+let coRegisteredAuthorizationRan = false;
+const coRegisteredAuthorization = Agent.method('test.coRegisteredAuthorization', {
+  description: 'Authorization boundary test',
+  args: { type: 'object', properties: {} },
+  run() {
+    coRegisteredAuthorizationRan = true;
+    return 'must not run';
+  },
+});
+
 /** Amounts the co-registered tool body actually saw, in call order. */
 const ran: number[] = [];
 
@@ -136,6 +154,138 @@ describe('tool dispatch', () => {
     }]);
     const r = await runTool(tool, { n: 5 }, { userId: 'u2', sessionId: 's1' });
     assert.equal(r.value, '5:u2');
+  });
+
+  it('re-authorizes after awaited argument validation before the tool body starts', async () => {
+    const {
+      resolveTools, runTool, setToolArgsValidator,
+    } = await import('../server/tools');
+    let allowed = true;
+    let ran = false;
+    const restore = setToolArgsValidator(async () => {
+      // Model a host lifecycle fence landing while a lazily loaded validator
+      // is awaited between dispatch preflight and the implementation body.
+      await Promise.resolve();
+      allowed = false;
+      return { ok: true };
+    });
+    try {
+      const [tool] = resolveTools([{
+        name: 'revoked-during-validation', description: 'x',
+        args: { type: 'object', properties: {} },
+        run: async () => { ran = true; return 'must not run'; },
+      }]);
+      const result = await runTool(
+        tool, {}, { userId: 'u2', sessionId: 's1' }, async () => allowed,
+      );
+      assert.isFalse(result.ok);
+      assert.equal(result.error?.error, 'not-allowed');
+      assert.isFalse(ran);
+    } finally {
+      restore();
+    }
+  });
+
+  it('prevalidates an adopted method before its final authorization boundary', async () => {
+    const {
+      resolveTools, runTool, setToolArgsValidator,
+    } = await import('../server/tools');
+    let allowed = true;
+    finalAuthorizationAdoptedRan = false;
+    const restore = setToolArgsValidator(async () => {
+      // Adopted methods validate again inside DDP, but authorization must not
+      // happen before the host-side checker has had a chance to await.
+      await Promise.resolve();
+      allowed = false;
+      return { ok: true };
+    });
+    try {
+      const [tool] = resolveTools([{
+        method: 'test.finalAuthorizationAdopted',
+        description: 'x',
+        args: { type: 'object', properties: {} },
+      }]);
+      const result = await runTool(
+        tool, {}, { userId: 'u2', sessionId: 's1' }, async () => allowed,
+      );
+      assert.isFalse(result.ok);
+      assert.equal(result.error?.error, 'not-allowed');
+      assert.isFalse(finalAuthorizationAdoptedRan);
+    } finally {
+      restore();
+    }
+  });
+
+  it('re-authorizes a co-registered method after its own awaited DDP validation', async () => {
+    const { resolveTools, runTool, setToolArgsValidator } = await import('../server/tools');
+    let allowed = true;
+    let validations = 0;
+    coRegisteredAuthorizationRan = false;
+    const restore = setToolArgsValidator(async () => {
+      validations += 1;
+      await Promise.resolve();
+      // First = host prevalidation. Second = Agent.method's DDP validation,
+      // after callAsync starts but before the co-registered implementation.
+      if (validations === 2) allowed = false;
+      return { ok: true };
+    });
+    try {
+      const [tool] = resolveTools([coRegisteredAuthorization]);
+      const result = await runTool(
+        tool, {}, { userId: 'u2', sessionId: 's1' }, async () => allowed,
+      );
+      assert.equal(validations, 2);
+      assert.isFalse(result.ok);
+      assert.equal(result.error?.error, 'not-allowed');
+      assert.isFalse(coRegisteredAuthorizationRan);
+    } finally {
+      restore();
+    }
+  });
+
+  it('does not start an inline tool after argument validation loses the worker lease', async function () {
+    this.timeout(30000);
+    const { AgentSessions } = await import('../common/collections');
+    const { mockProvider } = await import('../server/providers/mock');
+    const { runTurn } = await import('../server/loop');
+    const { setToolArgsValidator } = await import('../server/tools');
+    let ran = false;
+    let providerCalls = 0;
+    await seed('s-tool-lease-revoked', 'go');
+    const restore = setToolArgsValidator(async () => {
+      await AgentSessions.updateAsync('s-tool-lease-revoked', {
+        $set: {
+          lease: {
+            serverId: 'another-worker',
+            until: new Date(Date.now() + 60_000),
+          },
+        },
+      });
+      return { ok: true };
+    });
+    try {
+      await runTurn('s-tool-lease-revoked', {
+        model: 'mock', system: '',
+        tools: [{
+          name: 'lease_sensitive', description: 'x',
+          args: { type: 'object', properties: {} },
+          run: async () => { ran = true; return 'must not run'; },
+        }],
+        provider: mockProvider(() => {
+          providerCalls += 1;
+          return providerCalls === 1
+            ? { toolCalls: [{ id: 'lease-call', name: 'lease_sensitive', args: {} }] }
+            : { text: 'done' };
+        }),
+      });
+      assert.isFalse(ran, 'validation may not bridge a lost worker lease');
+      assert.equal(
+        (await AgentSessions.findOneAsync('s-tool-lease-revoked'))?.lease?.serverId,
+        'another-worker',
+      );
+    } finally {
+      restore();
+    }
   });
 
   it('converts a Meteor.Error into a structured tool error, not a throw', async () => {
@@ -651,10 +801,10 @@ describe('inline tool argument validation', () => {
     }
   });
 
-  it('leaves adopted tools to their own validation', async () => {
-    // `test.echo` declares an empty schema but reads `args.q`. An adopted tool
-    // is dispatched through its method, whose own check() (or co-registered
-    // validation) is the guard — the harness must not second-guess it here.
+  it('preserves an adopted method\'s own validation semantics after host prevalidation', async () => {
+    // `test.echo` declares an empty host schema but reads `args.q`. The host
+    // prevalidation therefore accepts it, then dispatch still goes through the
+    // method and whatever checks that method itself owns.
     const { resolveTools, runTool } = await import('../server/tools');
     const [tool] = resolveTools(['test.echo']);
     const r = await runTool(tool, { q: 'hi' }, { userId: 'u3', sessionId: 's1' });

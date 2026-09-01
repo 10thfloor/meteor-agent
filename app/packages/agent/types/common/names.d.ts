@@ -11,6 +11,12 @@ export declare const NAMES: {
     readonly attachments: 'agent_attachments';
     readonly attachmentTokens: 'agent_attachment_tokens';
     readonly memories: 'agent_memories';
+    readonly identities: 'agent_identities';
+    readonly constitutions: 'agent_constitutions';
+    readonly experiences: 'agent_experiences';
+    readonly practices: 'agent_practices';
+    readonly memoryFrames: 'agent_memory_frames';
+    readonly learningEvents: 'agent_learning_events';
     readonly pubSession: 'agent.session';
     readonly pubSessions: 'agent.sessions';
     readonly mStart: 'agent.start';

@@ -22,7 +22,14 @@ export interface ToolContext {
     sessionId: string;
     /** Set by loop dispatch; optional for direct `runTool` callers. */
     toolCallId?: string;
+    /** Committed assistant Message that contains this Tool call. Set by loop
+     * dispatch so built-in provenance never depends on model arguments. */
+    assistantMessageId?: string;
     agent?: string;
+    /** Stable Agent Identity and its frozen Turn frame. Built-in learning Tools
+     * require both and never accept either from model arguments. */
+    agentId?: string;
+    memoryFrameId?: string;
     /** Present only when `runAs` replaced `userId`; the real caller. */
     callerUserId?: string | null;
     /** Whether the provider supports image input (§9); `read_attachment` gates on it. */
@@ -264,7 +271,7 @@ export interface AgentMethodOptions {
  *  minimal checker silently does NOT enforce, or null. */
 export declare function unenforceableKeyword(schema: unknown): string | null;
 export declare function defineAgentMethod(name: string, options: AgentMethodOptions): AdoptedTool;
-export declare function runTool(tool: ResolvedTool, args: unknown, ctx: ToolContext): Promise<ToolResult>;
+export declare function runTool(tool: ResolvedTool, args: unknown, ctx: ToolContext, authorize?: () => boolean | Promise<boolean>): Promise<ToolResult>;
 /** Underscored (not dotted) because provider tool-name grammars reject dots. */
 export declare const MEMORY_TOOL_NAMES: readonly ['memory_save', 'memory_search', 'memory_forget'];
 /** Reserve the three names against an agent's OWN tools at define() time, the

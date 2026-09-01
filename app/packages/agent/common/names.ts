@@ -15,6 +15,14 @@ export const NAMES = {
   attachmentTokens: 'agent_attachment_tokens',
   // Memory (memory spec): durable recall about people and about the work.
   memories: 'agent_memories',
+  // Agent Experience architecture: stable identity, immutable learning, and
+  // deterministic per-trigger causal frames. Fact Memory remains separate.
+  identities: 'agent_identities',
+  constitutions: 'agent_constitutions',
+  experiences: 'agent_experiences',
+  practices: 'agent_practices',
+  memoryFrames: 'agent_memory_frames',
+  learningEvents: 'agent_learning_events',
   pubSession: 'agent.session',
   pubSessions: 'agent.sessions',
   mStart: 'agent.start',

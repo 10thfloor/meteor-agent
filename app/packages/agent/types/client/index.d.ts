@@ -1,4 +1,5 @@
 export * from '../common/types';
+export * from '../common/learning';
 export { NAMES } from '../common/names';
 export { mergeView } from '../common/merge';
 export { Agent, Agent as ClientAgent } from './agent';

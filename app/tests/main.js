@@ -4,6 +4,7 @@ import {
   AgentSessions,
   ChannelBindings,
   loadPiAi,
+  EXPERIENCE_RECALL_MAX,
   MEMORY_TEXT_MAX,
 } from "meteor/10thfloor:agent";
 import { Mongo } from "meteor/mongo";
@@ -30,6 +31,8 @@ import {
 const sorted = (values) => [...values].sort((left, right) => left - right);
 
 const MCP_TEST_SERVER = "let b='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);if(q.id===undefined)continue;let r={};if(q.method==='initialize')r={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'test',version:'1'}};else if(q.method==='tools/list')r={tools:[{name:'runtime_status',description:'Runtime status',inputSchema:{type:'object',properties:{}}},{name:'format_checklist',description:'Format checklist',inputSchema:{$schema:'https://json-schema.org/draft/2020-12/schema',type:'object','catalog.detail':true,properties:{title:{type:'string'},items:{type:'array',items:{type:'string'}}},required:['title','items']}}]};else if(q.method==='tools/call')r={content:[{type:'text',text:'ok'}]};process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:r})+'\\n')}});";
+
+const MCP_DELAYED_EPHEMERAL_SERVER = "let b='';process.stdin.setEncoding('utf8');process.stdin.on('data',c=>{b+=c;let i;while((i=b.indexOf('\\n'))>=0){const l=b.slice(0,i);b=b.slice(i+1);if(!l)continue;const q=JSON.parse(l);if(q.id===undefined)continue;let r={};if(q.method==='initialize')r={protocolVersion:'2025-03-26',capabilities:{tools:{}},serverInfo:{name:'delayed-test',version:'1'}};else if(q.method==='tools/list')r={tools:[{name:'delayed_status',description:'Delayed status',inputSchema:{type:'object',properties:{}}}]};setTimeout(()=>{process.stdout.write(JSON.stringify({jsonrpc:'2.0',id:q.id,result:r})+'\\n');if(q.method==='tools/list')setTimeout(()=>process.exit(0),25)},300)}});";
 
 async function waitUntil(predicate, message, timeout = 10_000) {
   const deadline = Date.now() + timeout;
@@ -400,6 +403,7 @@ if (Meteor.isServer) {
       const destinationSecret = `destination-${Random.id()}`;
       const now = new Date();
       const bindingId = `slack:${conversationRef}`;
+      const crewConfigId = `participation-crew-${Random.id()}`;
       const privateMember = {
         _id: memberId,
         userId: ownerId,
@@ -417,6 +421,15 @@ if (Meteor.isServer) {
 
       try {
         await runtime.WorkspaceMembers.insertAsync(privateMember);
+        await runtime.CrewConfigs.insertAsync({
+          _id: crewConfigId,
+          userId: ownerId,
+          agent: "researcher",
+          enabled: true,
+          status: "active",
+          createdAt: now,
+          updatedAt: now,
+        });
         await AgentSessions.insertAsync({
           _id: sessionId,
           agent: "orchestrator",
@@ -523,6 +536,7 @@ if (Meteor.isServer) {
       } finally {
         await ChannelBindings.removeAsync(bindingId);
         await runtime.WorkspaceMembers.removeAsync(memberId);
+        await runtime.CrewConfigs.removeAsync(crewConfigId);
         await AgentSessions.removeAsync(sessionId);
       }
     });
@@ -552,6 +566,167 @@ if (Meteor.isServer) {
             _id: "local", ownerUserId: workspace.ownerUserId,
           });
         }
+      }
+    });
+
+    it("rechecks each live Tool entitlement instead of trusting a prepared runtime", async function () {
+      const userId = `entitlement-owner-${Random.id()}`;
+      const sessionId = `entitlement-session-${Random.id()}`;
+      const configId = `entitlement-agent-${Random.id()}`;
+      const skillId = `entitlement-skill-${Random.id()}`;
+      const mcpId = `entitlement-mcp-${Random.id()}`;
+      const catalogId = `entitlement-catalog-${Random.id()}`;
+      const mcpAlias = `mcp_entitlement_${Random.id(8)}`;
+      const now = new Date();
+      const context = { userId, sessionId, toolCallId: 'call-1' };
+
+      try {
+        await runtime.CrewConfigs.insertAsync({
+          _id: configId,
+          userId,
+          agent: "orchestrator",
+          primary: true,
+          enabled: true,
+          status: "available",
+          capabilities: { inspect: true, memory: true, publish: false },
+          experience: {
+            record: true, recall: true, recent: 3, scope: "owner", approval: "ask",
+          },
+          practice: {
+            acquire: false, approval: "ask", allowScopedEvidencePromotion: false,
+          },
+          createdAt: now,
+          updatedAt: now,
+        });
+        await AgentSessions.insertAsync({
+          _id: sessionId,
+          agent: "orchestrator",
+          userId,
+          phase: "idle",
+          model: "mock",
+          nextSeq: 0,
+          usage: { input: 0, output: 0, cost: 0 },
+          createdAt: now,
+          updatedAt: now,
+        });
+        await runtime.SkillConfigs.insertAsync({
+          _id: skillId,
+          userId,
+          name: "Entitlement skill",
+          slug: "entitlement-skill",
+          description: "Test exact live Skill access.",
+          content: "Test instructions.",
+          agents: ["orchestrator"],
+          enabled: true,
+          createdAt: now,
+          updatedAt: now,
+        });
+        await runtime.McpConfigs.insertAsync({
+          _id: mcpId,
+          userId,
+          enabled: true,
+          trusted: true,
+          status: "ready",
+          approval: "ask",
+          agents: ["orchestrator"],
+          toolMode: "selected",
+          selectedTools: ["runtime_status"],
+          createdAt: now,
+          updatedAt: now,
+        });
+        await runtime.ToolCatalog.insertAsync({
+          _id: catalogId,
+          userId,
+          source: "workspace-mcp",
+          name: mcpAlias,
+          serverId: mcpId,
+          remoteName: "runtime_status",
+          createdAt: now,
+          updatedAt: now,
+        });
+
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "inspect_workspace", context, "orchestrator",
+        ));
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "publish_brief", context, "orchestrator",
+        ));
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "memory_save", context, "orchestrator",
+        ));
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "experience_propose", context, "orchestrator",
+        ));
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "experience_search", context, "orchestrator",
+        ));
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "practice_propose", context, "orchestrator",
+        ));
+        await runtime.CrewConfigs.updateAsync(configId, { $set: {
+          practice: {
+            acquire: true, approval: "auto", allowScopedEvidencePromotion: false,
+          },
+        } });
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "practice_propose", context, "orchestrator",
+        ));
+        await runtime.CrewConfigs.updateAsync(configId, { $set: {
+          "practice.acquire": false,
+        } });
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "practice_propose", context, "orchestrator",
+        ));
+        await runtime.CrewConfigs.updateAsync(configId, { $set: {
+          "practice.acquire": true,
+        } });
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          "skill", { ...context, args: { name: "entitlement-skill" } }, "orchestrator",
+        ));
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "skill", { ...context, args: { name: "another-skill" } }, "orchestrator",
+        ));
+        assert.isTrue(await runtime.configuredToolEntitlement(
+          mcpAlias, context, "orchestrator",
+        ));
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "unregistered_tool", context, "orchestrator",
+        ));
+
+        await runtime.CrewConfigs.updateAsync(configId, { $set: {
+          capabilities: { inspect: false, memory: false, publish: false },
+          experience: {
+            record: false, recall: false, recent: 3, scope: "owner", approval: "ask",
+          },
+        } });
+        await runtime.SkillConfigs.updateAsync(skillId, { $set: { enabled: false } });
+        await runtime.McpConfigs.updateAsync(mcpId, { $set: { selectedTools: [] } });
+
+        for (const tool of [
+          "inspect_workspace", "memory_save", "experience_propose", "experience_search",
+          "practice_propose",
+        ]) {
+          assert.isFalse(await runtime.configuredToolEntitlement(tool, context, "orchestrator"));
+        }
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "skill", { ...context, args: { name: "entitlement-skill" } }, "orchestrator",
+        ));
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          mcpAlias, context, "orchestrator",
+        ));
+
+        await runtime.CrewConfigs.updateAsync(configId, {
+          $set: { status: "archived", enabled: false },
+        });
+        assert.isFalse(await runtime.configuredToolEntitlement(
+          "inspect_workspace", context, "orchestrator",
+        ));
+      } finally {
+        await runtime.ToolCatalog.removeAsync(catalogId);
+        await runtime.McpConfigs.removeAsync(mcpId);
+        await runtime.SkillConfigs.removeAsync(skillId);
+        await runtime.CrewConfigs.removeAsync(configId);
+        await AgentSessions.removeAsync(sessionId);
       }
     });
 
@@ -1176,6 +1351,483 @@ if (Meteor.isClient) {
       await Meteor.callAsync("constellation.bootstrap");
     });
 
+    it("exposes truthful Agent learning controls and recovery actions", function () {
+      assert.strictEqual(document.getElementById("crew-experience-recent")?.min, "1");
+      for (const id of [
+        "crew-experience-automatic",
+        "crew-practice-acquire",
+        "crew-practice-automatic",
+        "crew-practice-scoped-promotion",
+      ]) {
+        const control = document.getElementById(id);
+        assert.instanceOf(control, HTMLInputElement, `${id} should be a form control`);
+        assert.strictEqual(control.type, "checkbox");
+      }
+      assert.strictEqual(
+        document.getElementById("crew-experience-automatic")?.getAttribute("aria-describedby"),
+        "crew-experience-automatic-hint",
+      );
+      assert.strictEqual(
+        document.getElementById("crew-practice-automatic")?.getAttribute("aria-describedby"),
+        "crew-practice-automatic-hint",
+      );
+      assert.strictEqual(
+        document.getElementById("crew-practice-scoped-promotion")?.getAttribute("aria-describedby"),
+        "crew-practice-scoped-promotion-hint",
+      );
+      assert.strictEqual(
+        document.getElementById("experience-learning-settings")?.getAttribute("aria-labelledby"),
+        "experience-learning-settings-title",
+      );
+      assert.strictEqual(
+        document.getElementById("practice-learning-settings")?.getAttribute("aria-labelledby"),
+        "practice-learning-settings-title",
+      );
+      assert.include(
+        document.getElementById("crew-learning-next-turn-note")?.textContent ?? "",
+        "next turn",
+      );
+      assert.ok(document.getElementById("agent-detail-tab-frames"));
+      assert.ok(document.getElementById("restore-crew-agent-learning"));
+      assert.ok(document.getElementById("experience-policy-badge"));
+      assert.ok(document.getElementById("practice-policy-badge"));
+      assert.strictEqual(
+        document.querySelector('[data-learning-configure="experience"]')?.getAttribute("aria-label"),
+        "Configure Experience learning",
+      );
+      assert.strictEqual(
+        document.getElementById("reviews-list")?.getAttribute("aria-live"),
+        "polite",
+      );
+      assert.strictEqual(document.getElementById("reviews-list")?.getAttribute("role"), "list");
+      assert.strictEqual(document.getElementById("reviews-recent-list")?.getAttribute("role"), "list");
+      assert.strictEqual(
+        document.getElementById("reviews-needs-title")?.textContent,
+        "Needs attention",
+      );
+      assert.strictEqual(
+        document.getElementById("reviews-recent-title")?.textContent,
+        "Recent learning",
+      );
+      assert.strictEqual(
+        document.getElementById("open-learning-reviews")?.getAttribute("aria-controls"),
+        "crew-dialog",
+      );
+      assert.strictEqual(
+        document.querySelector('[data-command="reviews"]')?.textContent.includes("Learning reviews"),
+        true,
+      );
+      assert.strictEqual(
+        document.getElementById("memory-frame-list")?.getAttribute("aria-live"),
+        "polite",
+      );
+      assert.strictEqual(
+        document.getElementById("agent-learning-error")?.getAttribute("role"),
+        "alert",
+      );
+      assert.strictEqual(
+        document.getElementById("agent-learning-error-action")?.type,
+        "button",
+      );
+      assert.include(
+        document.getElementById("practice-scope-note")?.textContent ?? "",
+        "Agent-identity-wide",
+      );
+      assert.include(
+        document.getElementById("agent-experience-stat")?.nextElementSibling?.textContent ?? "",
+        "Experience active",
+      );
+      assert.strictEqual(
+        document.getElementById("crew-settings-list")?.getAttribute("role"),
+        "listbox",
+      );
+      assert.strictEqual(
+        document.getElementById("crew-new-agent")?.getAttribute("aria-controls"),
+        "crew-form",
+      );
+      assert.isNull(
+        document.getElementById("add-crew-agent"),
+        "Directory should expose one unambiguous add-Agent action",
+      );
+      assert.strictEqual(
+        document.getElementById("mission-more-trigger")?.getAttribute("aria-haspopup"),
+        "menu",
+      );
+      assert.include(document.getElementById("compact-mission")?.textContent ?? "", "Reduce context");
+      assert.strictEqual(document.getElementById("constitution-compose")?.tagName, "DETAILS");
+      assert.strictEqual(document.getElementById("practice-compose")?.tagName, "DETAILS");
+      assert.ok(document.getElementById("constitution-draft-state"));
+      assert.ok(document.getElementById("practice-draft-state"));
+      assert.strictEqual(document.getElementById("pulse-schedule-preview")?.getAttribute("role"), "status");
+      assert.strictEqual(
+        document.getElementById("toast-region")?.getAttribute("popover"),
+        "manual",
+        "toasts need their own browser top-layer host",
+      );
+      const missionApprovalCopy = document.getElementById("mission-config-approvals")
+        ?.closest("label")?.textContent ?? "";
+      assert.include(missionApprovalCopy, "Require approval for mission-controlled actions");
+      assert.include(missionApprovalCopy, "Other tool approval policies stay unchanged");
+      assert.notMatch(missionApprovalCopy, /Atlas|Publish brief/i);
+    });
+
+    it("routes Memory and local account controls to existing workspace surfaces", async function () {
+      await waitUntil(
+        () => document.getElementById("app-frame")?.dataset.startupState === "ready",
+        "Constellation client did not finish startup",
+      );
+      const shell = document.getElementById("workspace-shell");
+      const crewDialog = document.getElementById("crew-dialog");
+      const accountDialog = document.getElementById("account-dialog");
+      document.querySelector('[data-view="memory"]').click();
+      assert.strictEqual(shell.dataset.currentView, "memory");
+      assert.strictEqual(
+        document.getElementById("memory-hub-nav")?.getAttribute("aria-label"),
+        "Memory sections",
+      );
+      assert.strictEqual(
+        document.getElementById("memory-facts-current")?.getAttribute("aria-current"),
+        "page",
+      );
+      assert.match(document.getElementById("memory-reviews-count")?.textContent ?? "", /^(—|\d+)$/);
+
+      document.getElementById("memory-open-agent-learning").click();
+      await waitUntil(() => crewDialog.open, "Agent learning did not open the Directory");
+      assert.strictEqual(
+        document.getElementById("crew-directory-tab-agents")?.getAttribute("aria-selected"),
+        "true",
+      );
+      assert.strictEqual(
+        document.getElementById("agent-detail-tab-experience")?.getAttribute("aria-selected"),
+        "true",
+      );
+      document.getElementById("close-crew-dialog").click();
+      await waitUntil(() => !crewDialog.open, "Directory did not close");
+
+      document.getElementById("memory-open-reviews").click();
+      await waitUntil(() => crewDialog.open, "Memory Reviews did not open the Directory");
+      assert.strictEqual(
+        document.getElementById("crew-directory-tab-reviews")?.getAttribute("aria-selected"),
+        "true",
+      );
+      document.getElementById("close-crew-dialog").click();
+      await waitUntil(() => !crewDialog.open, "Reviews did not close");
+
+      const profile = document.getElementById("profile-button");
+      assert.strictEqual(profile.getAttribute("aria-haspopup"), "dialog");
+      assert.strictEqual(profile.getAttribute("aria-controls"), "account-dialog");
+      profile.click();
+      await waitUntil(() => accountDialog.open, "Local workspace details did not open");
+      assert.include(accountDialog.textContent, "Workspace owner");
+      assert.include(accountDialog.textContent, "This local workspace");
+      assert.include(accountDialog.textContent, document.getElementById("runtime-label").textContent);
+      assert.strictEqual(accountDialog.querySelectorAll('input[type="password"]').length, 0);
+
+      document.getElementById("account-open-channels").click();
+      assert.isFalse(accountDialog.open);
+      assert.strictEqual(shell.dataset.currentView, "channels");
+
+      profile.click();
+      await waitUntil(() => accountDialog.open, "Local workspace details did not reopen");
+      document.getElementById("account-open-directory").click();
+      await waitUntil(() => crewDialog.open, "Account Directory action did not open");
+      assert.strictEqual(
+        document.getElementById("crew-directory-tab-people")?.getAttribute("aria-selected"),
+        "true",
+      );
+      document.getElementById("close-crew-dialog").click();
+      document.querySelector('[data-view="missions"]').click();
+    });
+
+    it("exposes consistent dirty-state status for configuration editors", function () {
+      for (const id of [
+        "mission-form-status",
+        "pulse-form-status",
+        "skill-form-status",
+        "mcp-form-status",
+        "channel-form-status",
+      ]) {
+        const status = document.getElementById(id);
+        assert.instanceOf(status, HTMLElement, `${id} should be visible editor status`);
+        assert.strictEqual(status.getAttribute("role"), "status");
+        assert.strictEqual(status.getAttribute("aria-live"), "polite");
+      }
+    });
+
+    it("creates an MCP server with Save & test and exposes tool selection in place", async function () {
+      const mcp = Mongo.getCollection("constellation_mcp_configs");
+      const dialog = document.getElementById("mcp-dialog");
+      const form = document.getElementById("mcp-form");
+      const submit = document.getElementById("mcp-submit");
+      let configId = null;
+      try {
+        await waitUntil(
+          () => document.getElementById("app-frame")?.dataset.startupState === "ready",
+          "Constellation client did not finish startup",
+        );
+        document.getElementById("add-mcp-server").click();
+        await waitUntil(() => dialog.open, "MCP editor did not open");
+        assert.strictEqual(submit.textContent, "Save & test");
+        assert.isTrue(document.getElementById("mcp-trust-local").required);
+        assert.isTrue(document.getElementById("mcp-test-discover").disabled);
+
+        const setValue = (id, value) => {
+          const control = document.getElementById(id);
+          control.value = value;
+          control.dispatchEvent(new Event("input", { bubbles: true }));
+        };
+        setValue("mcp-name", `MCP setup flow ${Random.id(6)}`);
+        setValue("mcp-command", "node");
+        for (const argument of ["-e", MCP_TEST_SERVER]) {
+          document.getElementById("add-mcp-arg").click();
+          const rows = document.querySelectorAll('#mcp-args-rows [name="mcpArg"]');
+          const input = rows[rows.length - 1];
+          input.value = argument;
+          input.dispatchEvent(new Event("input", { bubbles: true }));
+        }
+        const trust = document.getElementById("mcp-trust-local");
+        trust.checked = true;
+        trust.dispatchEvent(new Event("change", { bubbles: true }));
+        const enabled = document.getElementById("mcp-enabled");
+        enabled.checked = true;
+        enabled.dispatchEvent(new Event("change", { bubbles: true }));
+        assert.isFalse(submit.disabled);
+
+        submit.click();
+        await waitUntil(
+          () => document.getElementById("mcp-server-id").value
+            && document.querySelectorAll("#mcp-tool-options input").length === 2
+            && !form.inert,
+          "Save & test did not expose discovered MCP tools",
+          15_000,
+        );
+        configId = document.getElementById("mcp-server-id").value;
+        await waitUntil(() => mcp.findOne(configId), "Created MCP server did not publish");
+        assert.isTrue(dialog.open, "Save & test should keep the editor open");
+        await waitUntil(
+          () => document.getElementById("toast-region").matches(":popover-open")
+            && document.getElementById("toast-region").textContent.includes("tools discovered")
+            && document.getElementById("toast-region").parentElement === dialog,
+          "MCP result toast did not enter the top layer above its open dialog",
+        );
+        assert.isFalse(mcp.findOne(configId).enabled, "initial creation must stay disabled");
+        assert.isTrue(enabled.checked, "the requested enable step should remain visible");
+        assert.strictEqual(submit.textContent, "Enable server");
+        assert.strictEqual(form.dataset.dirty, "true");
+        assert.strictEqual(
+          form.querySelector('[data-error-code="mcp-no-selected-tools"]')?.textContent.includes(
+            "Choose at least one discovered tool",
+          ),
+          true,
+        );
+
+        const runtimeTool = [...document.querySelectorAll("#mcp-tool-options input")]
+          .find((input) => input.value === "runtime_status");
+        assert.ok(runtimeTool, "runtime_status should be selectable without reopening the editor");
+        runtimeTool.checked = true;
+        runtimeTool.dispatchEvent(new Event("change", { bubbles: true }));
+        assert.notExists(form.querySelector('[data-error-code="mcp-no-selected-tools"]'));
+        assert.isFalse(submit.disabled);
+
+        submit.click();
+        await waitUntil(() => !dialog.open, "Enable server did not finish");
+        await waitUntil(
+          () => mcp.findOne(configId)?.enabled === true,
+          "Selected MCP server was not enabled",
+        );
+        assert.deepEqual(mcp.findOne(configId).selectedTools, ["runtime_status"]);
+      } finally {
+        if (dialog.open) dialog.close();
+        const current = configId && mcp.findOne(configId);
+        if (current) await Meteor.callAsync("constellation.mcpRemove", configId, current.revision);
+      }
+    });
+
+    it("keeps an MCP draft and guarded baseline after discovery fails", async function () {
+      const mcp = Mongo.getCollection("constellation_mcp_configs");
+      const dialog = document.getElementById("mcp-dialog");
+      const form = document.getElementById("mcp-form");
+      const submit = document.getElementById("mcp-submit");
+      const nameValue = `Unavailable MCP ${Random.id(6)}`;
+      const commandValue = `constellation-missing-command-${Random.id(6)}`;
+      let configId = null;
+      try {
+        document.getElementById("add-mcp-server").click();
+        await waitUntil(() => dialog.open, "MCP editor did not reopen");
+        const name = document.getElementById("mcp-name");
+        const command = document.getElementById("mcp-command");
+        name.value = nameValue;
+        name.dispatchEvent(new Event("input", { bubbles: true }));
+        command.value = commandValue;
+        command.dispatchEvent(new Event("input", { bubbles: true }));
+        const timeout = document.getElementById("mcp-timeout-ms");
+        timeout.value = "500";
+        timeout.dispatchEvent(new Event("input", { bubbles: true }));
+        const trust = document.getElementById("mcp-trust-local");
+        trust.checked = true;
+        trust.dispatchEvent(new Event("change", { bubbles: true }));
+
+        submit.click();
+        await waitUntil(
+          () => document.getElementById("mcp-server-id").value
+            && document.getElementById("mcp-dialog-runtime-status").textContent.includes("Unavailable")
+            && !form.inert,
+          "Failed MCP discovery did not return control to the editor",
+          15_000,
+        );
+        configId = document.getElementById("mcp-server-id").value;
+        await waitUntil(() => mcp.findOne(configId), "Failed-test MCP server did not publish");
+        assert.isTrue(dialog.open);
+        assert.strictEqual(name.value, nameValue);
+        assert.strictEqual(command.value, commandValue);
+        assert.strictEqual(timeout.value, "500");
+        assert.strictEqual(submit.textContent, "Save server");
+        assert.strictEqual(form.dataset.dirty, "false");
+        assert.strictEqual(document.getElementById("mcp-form-status").textContent, "Saved");
+        assert.strictEqual(mcp.findOne(configId).revision, 1);
+        assert.isFalse(mcp.findOne(configId).enabled);
+        assert.ok(form.querySelector(":scope > .form-inline-error"));
+      } finally {
+        if (dialog.open) dialog.close();
+        const current = configId && mcp.findOne(configId);
+        if (current) await Meteor.callAsync("constellation.mcpRemove", configId, current.revision);
+      }
+    });
+
+    it("keeps an unsaved editor open until discard is confirmed", async function () {
+      const dialog = document.getElementById("pulse-dialog");
+      const form = document.getElementById("pulse-form");
+      const name = document.getElementById("pulse-name");
+      const status = document.getElementById("pulse-form-status");
+      const cancel = document.getElementById("cancel-pulse-edit");
+      const submit = form.querySelector('[type="submit"]');
+      const originalConfirm = window.confirm;
+      const decisions = [false, false, true];
+      let confirmations = 0;
+      window.confirm = () => {
+        confirmations += 1;
+        return decisions.shift();
+      };
+      try {
+        await waitUntil(
+          () => document.getElementById("app-frame")?.dataset.startupState === "ready",
+          "Constellation client did not finish startup",
+        );
+        document.getElementById("add-pulse").click();
+        await waitUntil(() => dialog.open, "Pulse editor did not open");
+        assert.isTrue(submit.disabled, "an unchanged editor should not offer a no-op save");
+
+        name.value = "Unsaved guard test";
+        name.dispatchEvent(new Event("input", { bubbles: true }));
+        assert.strictEqual(form.dataset.dirty, "true");
+        assert.strictEqual(status.textContent, "Unsaved changes");
+        assert.strictEqual(cancel.textContent, "Discard changes");
+        assert.isFalse(submit.disabled);
+
+        document.getElementById("close-pulse-dialog").click();
+        assert.isTrue(dialog.open, "Close should preserve a draft when discard is declined");
+        assert.strictEqual(name.value, "Unsaved guard test");
+
+        dialog.dispatchEvent(new Event("cancel", { cancelable: true }));
+        assert.isTrue(dialog.open, "Escape should preserve a draft when discard is declined");
+
+        cancel.click();
+        assert.isFalse(dialog.open, "Cancel should close after discard is confirmed");
+        assert.strictEqual(confirmations, 3);
+      } finally {
+        window.confirm = originalConfirm;
+        if (dialog.open) dialog.close();
+      }
+    });
+
+    it("keeps Crew save actions visible on Learning tabs and guards Archive", async function () {
+      const crew = Mongo.getCollection("constellation_crew_configs");
+      const dialog = document.getElementById("crew-dialog");
+      const originalConfirm = window.confirm;
+      window.confirm = () => false;
+      try {
+        document.getElementById("configure-crew").click();
+        await waitUntil(() => dialog.open, "Crew editor did not open");
+        const config = crew.find({ agent: { $ne: "orchestrator" }, status: { $ne: "archived" } })
+          .fetch()[0];
+        assert.ok(config, "a configurable workspace Agent should be available");
+        const row = [...document.querySelectorAll(".crew-settings-row")]
+          .find((candidate) => candidate.dataset.configId === config._id);
+        assert.ok(row, "the configurable Agent should be listed");
+        row.click();
+
+        const name = document.getElementById("crew-name");
+        name.value = `${name.value} draft`;
+        name.dispatchEvent(new Event("input", { bubbles: true }));
+        assert.strictEqual(document.getElementById("crew-edit-state").textContent, "Unsaved changes");
+
+        document.getElementById("agent-detail-tab-experience").click();
+        assert.isFalse(
+          document.getElementById("crew-form-actions").hidden,
+          "save and discard should remain visible while Profile changes are pending",
+        );
+        assert.isFalse(document.querySelector('#crew-form [type="submit"]').disabled);
+
+        document.getElementById("archive-crew-agent").click();
+        assert.isFalse(
+          document.getElementById("crew-archive-dialog").open,
+          "Archive impact should not replace an unconfirmed draft",
+        );
+        assert.strictEqual(name.value, `${config.displayName} draft`);
+      } finally {
+        window.confirm = () => true;
+        if (dialog.open) document.getElementById("cancel-crew-edit").click();
+        window.confirm = originalConfirm;
+      }
+    });
+
+    it("owner-gates Agent learning mutations to Crew identities", async function () {
+      let error;
+      try {
+        await Meteor.callAsync(
+          "constellation.constitutionRevise",
+          "not-a-workspace-agent",
+          1,
+          "Untrusted constitution",
+          "Authorization test",
+        );
+      } catch (caught) {
+        error = caught;
+      }
+      assert.strictEqual(error?.error, "not-authorized");
+    });
+
+    it("requires hardening evidence only for the harden transition", async function () {
+      let missingEvidence;
+      try {
+        await Meteor.callAsync(
+          "constellation.practiceTransition",
+          "input-contract-agent",
+          "input-contract-practice",
+          "hardened",
+          "Exercise the hardening evidence contract.",
+        );
+      } catch (error) {
+        missingEvidence = error;
+      }
+      assert.strictEqual(missingEvidence?.error, "invalid-practice-transition");
+
+      let misplacedEvidence;
+      try {
+        await Meteor.callAsync(
+          "constellation.practiceTransition",
+          "input-contract-agent",
+          "input-contract-practice",
+          "rejected",
+          "Exercise the non-hardening evidence contract.",
+          "unexpected-experience",
+        );
+      } catch (error) {
+        misplacedEvidence = error;
+      }
+      assert.strictEqual(misplacedEvidence?.error, "invalid-practice-transition");
+    });
+
     it("persists versioned Mission configuration and synchronizes the session title", async function () {
       const workspace = new Agent("orchestrator");
       const sessionId = await workspace.start({ title: "Mission config test" });
@@ -1327,9 +1979,9 @@ if (Meteor.isClient) {
       await waitUntil(
         () => workspace.messages(sessionId).fetch().some(
           (message) => message.role === "tool"
-            && message.error?.error === "denied-by-gate",
+            && message.error?.error === "not-allowed",
         ),
-        "A removed Mission agent remained callable through its delegation tool",
+        "The final entitlement fence did not refuse a removed Mission agent",
       );
       await waitUntil(
         () => AgentSessions.findOne(sessionId)?.phase === "idle",
@@ -1959,15 +2611,174 @@ if (Meteor.isClient) {
       assert.strictEqual(await Meteor.callAsync("constellation.skillRemove", id, 2), true);
     });
 
-    it("publishes effective framework tools and keeps access reactive", async function () {
+    it("defaults learning governance and persists its automatic policies independently", async function () {
       const catalog = Mongo.getCollection("constellation_tool_catalog");
       const crew = Mongo.getCollection("constellation_crew_configs");
       assert.ok(catalog, "the client Tool Catalog collection should be registered");
       assert.ok(crew, "the client Crew collection should be registered");
       const catalogSubscription = Meteor.subscribe("constellation.toolCatalog");
       const crewSubscription = Meteor.subscribe("constellation.crew");
+      const workspace = new Agent("orchestrator");
+      let sessionId;
+      let configId;
+      try {
+        await waitUntil(
+          () => catalogSubscription.ready() && crewSubscription.ready(),
+          "Learning governance subscriptions did not become ready",
+        );
+        sessionId = await workspace.start({ title: "Learning governance policy test" });
+        await Meteor.callAsync("constellation.prepareSession", sessionId);
+        configId = await Meteor.callAsync("constellation.crewCreate", sessionId);
+        await waitUntil(() => crew.findOne(configId), "Governed Agent did not reach the Crew");
+        const created = crew.findOne(configId);
+        const agent = created.agent;
+        assert.deepEqual(created.experience, {
+          record: true,
+          recall: true,
+          recent: 4,
+          scope: "owner",
+          approval: "ask",
+        });
+        assert.deepEqual(created.practice, {
+          acquire: false,
+          approval: "ask",
+          allowScopedEvidencePromotion: false,
+        });
+        await waitUntil(
+          () => catalog.findOne({ source: "framework", name: "experience_propose" })
+            ?.learningAssignments?.some((assignment) => assignment.agent === agent),
+          "Default Experience policy did not reach the Tool Catalog",
+        );
+        assert.deepInclude(
+          catalog.findOne({ source: "framework", name: "experience_propose" })
+            .learningAssignments.find((assignment) => assignment.agent === agent),
+          { agent, approval: "ask" },
+        );
+        assert.notInclude(
+          catalog.findOne({ source: "framework", name: "practice_propose" })?.agents ?? [],
+          agent,
+        );
+
+        await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+          expectedRevision: created.revision,
+          experience: { approval: "auto" },
+        });
+        await waitUntil(
+          () => crew.findOne(configId)?.experience?.approval === "auto"
+            && catalog.findOne({ source: "framework", name: "experience_propose" })
+              ?.learningAssignments?.some((assignment) => (
+                assignment.agent === agent && assignment.approval === "auto"
+              )),
+          "Automatic Experience policy did not reach Crew and Tool Catalog",
+        );
+        const experienceAutomatic = crew.findOne(configId);
+        assert.deepEqual(experienceAutomatic.practice, {
+          acquire: false,
+          approval: "ask",
+          allowScopedEvidencePromotion: false,
+        });
+        assert.strictEqual(
+          catalog.findOne({ source: "framework", name: "experience_propose" }).approval,
+          "conditional",
+        );
+
+        await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+          expectedRevision: experienceAutomatic.revision,
+          practice: {
+            acquire: true,
+            approval: "auto",
+            allowScopedEvidencePromotion: true,
+          },
+        });
+        await waitUntil(
+          () => crew.findOne(configId)?.practice?.approval === "auto"
+            && catalog.findOne({ source: "framework", name: "practice_propose" })
+              ?.learningAssignments?.some((assignment) => (
+                assignment.agent === agent
+                && assignment.practice?.approval === "auto"
+                && assignment.practice?.allowScopedEvidencePromotion === true
+              )),
+          "Automatic Practice policy did not reach Crew and Tool Catalog",
+        );
+        const practiceAutomatic = crew.findOne(configId);
+        assert.strictEqual(practiceAutomatic.experience.approval, "auto");
+        assert.deepEqual(practiceAutomatic.practice, {
+          acquire: true,
+          approval: "auto",
+          allowScopedEvidencePromotion: true,
+        });
+        assert.include(
+          catalog.findOne({ source: "framework", name: "practice_propose" }).agents,
+          agent,
+        );
+      } finally {
+        const standing = configId ? crew.findOne(configId) : null;
+        if (standing && standing.status !== "archived" && sessionId) {
+          const impact = await Meteor.callAsync("constellation.crewImpact", configId);
+          await Meteor.callAsync(
+            "constellation.crewArchive",
+            sessionId,
+            configId,
+            impact.agent,
+            impact.configRevision,
+            impact.digest,
+          );
+        }
+        if (sessionId) workspace.stop(sessionId);
+        crewSubscription.stop();
+        catalogSubscription.stop();
+      }
+    });
+
+    it("rejects invalid learning approval policies without changing Crew state", async function () {
+      const crew = Mongo.getCollection("constellation_crew_configs");
+      assert.ok(crew, "the client Crew collection should be registered");
+      const subscription = Meteor.subscribe("constellation.crew");
+      const workspace = new Agent("orchestrator");
+      let sessionId;
+      try {
+        await waitUntil(() => subscription.ready(), "Crew subscription did not become ready");
+        sessionId = await workspace.start({ title: "Learning governance validation test" });
+        await Meteor.callAsync("constellation.prepareSession", sessionId);
+        const primary = crew.findOne({ agent: "orchestrator" });
+        assert.ok(primary, "the primary Agent configuration should be published");
+        for (const patch of [
+          { experience: { approval: "sometimes" } },
+          { practice: { approval: "review" } },
+        ]) {
+          let rejected;
+          try {
+            await Meteor.callAsync("constellation.crewSave", sessionId, primary._id, {
+              expectedRevision: primary.revision,
+              ...patch,
+            });
+          } catch (error) {
+            rejected = error;
+          }
+          assert.strictEqual(rejected?.error, "invalid-crew");
+        }
+        assert.strictEqual(crew.findOne(primary._id).revision, primary.revision);
+        assert.strictEqual(crew.findOne(primary._id).experience.approval, "ask");
+        assert.strictEqual(crew.findOne(primary._id).practice.approval, "ask");
+      } finally {
+        if (sessionId) workspace.stop(sessionId);
+        subscription.stop();
+      }
+    });
+
+    it("publishes effective framework tools and keeps access reactive", async function () {
+      const catalog = Mongo.getCollection("constellation_tool_catalog");
+      const crew = Mongo.getCollection("constellation_crew_configs");
+      const identities = Mongo.getCollection("agent_identities");
+      assert.ok(catalog, "the client Tool Catalog collection should be registered");
+      assert.ok(crew, "the client Crew collection should be registered");
+      assert.ok(identities, "the client Agent Identity collection should be registered");
+      const catalogSubscription = Meteor.subscribe("constellation.toolCatalog");
+      const crewSubscription = Meteor.subscribe("constellation.crew");
+      const learningSubscription = Meteor.subscribe("constellation.learning");
       await waitUntil(
-        () => catalogSubscription.ready() && crewSubscription.ready(),
+        () => catalogSubscription.ready() && crewSubscription.ready()
+          && learningSubscription.ready(),
         "Framework Tool Catalog subscriptions did not become ready",
       );
       await waitUntil(
@@ -2023,6 +2834,36 @@ if (Meteor.isClient) {
           .inputSchema.properties.text.maxLength,
         MEMORY_TEXT_MAX,
       );
+      const learning = catalog.find({ source: "framework", category: "learning" }).fetch();
+      assert.sameMembers(
+        learning.map((tool) => tool.name),
+        ["experience_search", "experience_propose"],
+      );
+      for (const tool of learning) {
+        assert.sameMembers(tool.agents, ["orchestrator", "researcher", "operator", "critic"]);
+        assert.strictEqual(tool.accessMode, "memory-frame");
+        assert.include(tool.availabilityNote, "delegated child turns");
+        assert.include(tool.availabilityNote, "Agent.ask turns");
+        assert.include(tool.availabilityNote, "erases its throwaway Frame");
+        assert.isTrue(tool.learningAssignments.every((assignment) => assignment.scope === "owner"));
+      }
+      assert.strictEqual(
+        catalog.findOne({ source: "framework", name: "experience_search" }).approval,
+        "auto",
+      );
+      assert.strictEqual(
+        catalog.findOne({ source: "framework", name: "experience_search" })
+          .inputSchema.properties.limit.maximum,
+        EXPERIENCE_RECALL_MAX,
+      );
+      assert.strictEqual(
+        catalog.findOne({ source: "framework", name: "experience_propose" }).approval,
+        "ask",
+      );
+      assert.include(
+        catalog.findOne({ source: "framework", name: "experience_propose" }).approvalSummary,
+        "survives chat deletion",
+      );
       assert.notOk(catalog.findOne({ source: "framework", name: "read_attachment" }));
 
       const workspace = new Agent("orchestrator");
@@ -2041,11 +2882,94 @@ if (Meteor.isClient) {
           ?.agents?.includes(agent),
         "Primary memory access was not inherited by the addressed root agent",
       );
+      await waitUntil(
+        () => catalog.findOne({ source: "framework", name: "experience_search" })
+          ?.agents?.includes(agent),
+        "New Agent learning access did not reach the framework catalog",
+      );
       assert.deepInclude(
         catalog.findOne({ source: "framework", name: "memory_search" })
           .memoryAssignments.find((assignment) => assignment.agent === agent),
         { agent, access: "inherited" },
       );
+      let missingRevision;
+      try {
+        await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+          experience: { record: false },
+        });
+      } catch (error) {
+        missingRevision = error;
+      }
+      assert.strictEqual(missingRevision?.error, "invalid-crew");
+      const learningRevision = crew.findOne(configId).revision;
+      let invalidRecall;
+      try {
+        await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+          expectedRevision: learningRevision,
+          experience: { recall: true, recent: 0 },
+        });
+      } catch (error) {
+        invalidRecall = error;
+      }
+      assert.strictEqual(invalidRecall?.error, "invalid-crew");
+      assert.include(invalidRecall?.reason ?? invalidRecall?.message, "at least 1");
+      assert.strictEqual(crew.findOne(configId).revision, learningRevision);
+      await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+        expectedRevision: learningRevision,
+        flexibility: 5,
+        experience: { record: false, recall: true, recent: 2, scope: "session" },
+      });
+      await waitUntil(
+        () => !catalog.findOne({ source: "framework", name: "experience_propose" })
+          ?.agents?.includes(agent)
+          && catalog.findOne({ source: "framework", name: "experience_search" })
+            ?.learningAssignments?.some((assignment) => assignment.agent === agent
+              && assignment.scope === "session" && assignment.recent === 2),
+        "Agent learning configuration did not reach the effective Tool Catalog",
+      );
+      assert.deepInclude(crew.findOne(configId).experience, {
+        record: false, recall: true, recent: 2, scope: "session",
+      });
+      await waitUntil(
+        () => identities.findOne(configId)?.flexibility?.capacity === 5,
+        "Agent Practice capacity did not reach its durable Identity",
+      );
+      const constitutionGeneration = identities.findOne(configId).generation;
+      await Meteor.callAsync(
+        "constellation.constitutionRevise",
+        configId,
+        constitutionGeneration,
+        "Verify durable evidence before making a final claim.",
+        "Exercise optimistic Constitution editing.",
+      );
+      let constitutionConflict;
+      try {
+        await Meteor.callAsync(
+          "constellation.constitutionRevise",
+          configId,
+          constitutionGeneration,
+          "This stale draft must not overwrite the current Constitution.",
+          "Exercise conflict recovery.",
+        );
+      } catch (error) {
+        constitutionConflict = error;
+      }
+      assert.strictEqual(constitutionConflict?.error, "identity-generation-conflict");
+      assert.include(constitutionConflict?.reason ?? constitutionConflict?.message, "Rebase");
+      let staleSave;
+      try {
+        await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+          expectedRevision: learningRevision,
+          displayName: "Stale identity overwrite",
+          flexibility: 8,
+        });
+      } catch (error) {
+        staleSave = error;
+      }
+      assert.strictEqual(staleSave?.error, "stale-agent");
+      assert.notStrictEqual(crew.findOne(configId).displayName, "Stale identity overwrite");
+      assert.notStrictEqual(identities.findOne(configId).displayName, "Stale identity overwrite");
+      assert.strictEqual(identities.findOne(configId).flexibility.capacity, 5);
 
       const [skillId, companionSkillId] = await Promise.all([
         Meteor.callAsync("constellation.skillCreate", {
@@ -2076,9 +3000,11 @@ if (Meteor.isClient) {
 
       const primaryConfig = crew.findOne({ agent: "orchestrator" });
       await Meteor.callAsync("constellation.crewSave", sessionId, primaryConfig._id, {
+        expectedRevision: primaryConfig.revision,
         capabilities: { memory: false },
       });
       await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+        expectedRevision: crew.findOne(configId).revision,
         capabilities: { memory: true },
       });
       await waitUntil(
@@ -2091,6 +3017,7 @@ if (Meteor.isClient) {
       assert.notProperty(specialistMemory, "inheritedFrom");
       assert.deepInclude(specialistMemory.memoryAssignments[0], { agent, access: "configured" });
       await Meteor.callAsync("constellation.crewSave", sessionId, primaryConfig._id, {
+        expectedRevision: crew.findOne(primaryConfig._id).revision,
         capabilities: { memory: true },
       });
       await waitUntil(
@@ -2099,11 +3026,15 @@ if (Meteor.isClient) {
         "Restored primary memory did not restore inherited root access",
       );
 
-      await Meteor.callAsync("constellation.crewSave", sessionId, configId, { enabled: false });
+      await Meteor.callAsync("constellation.crewSave", sessionId, configId, {
+        expectedRevision: crew.findOne(configId).revision,
+        enabled: false,
+      });
       await waitUntil(
         () => !catalog.findOne(delegationId)
           && !catalog.findOne({ source: "framework", name: "skill" })?.agents?.includes(agent)
-          && !catalog.findOne({ source: "framework", name: "memory_search" })?.agents?.includes(agent),
+          && !catalog.findOne({ source: "framework", name: "memory_search" })?.agents?.includes(agent)
+          && !catalog.findOne({ source: "framework", name: "experience_search" })?.agents?.includes(agent),
         "Disabling the agent did not remove effective framework access",
       );
 
@@ -2114,26 +3045,32 @@ if (Meteor.isClient) {
         ]),
         [true, true],
       );
-      assert.strictEqual(
-        await Meteor.callAsync("constellation.crewRemove", sessionId, configId), true,
-      );
+      const archiveImpact = await Meteor.callAsync("constellation.crewImpact", configId);
+      assert.strictEqual(await Meteor.callAsync(
+        "constellation.crewArchive", sessionId, configId, archiveImpact.agent,
+        archiveImpact.configRevision, archiveImpact.digest,
+      ), true);
       workspace.stop(sessionId);
       crewSubscription.stop();
       catalogSubscription.stop();
+      learningSubscription.stop();
     });
 
-    it("removes a crew agent promptly from its config and every Mission roster", async function () {
+    it("archives a crew agent, preserves its identity, and removes it from future work", async function () {
       const crew = Mongo.getCollection("constellation_crew_configs");
       const skills = Mongo.getCollection("constellation_skills");
       const pulses = Mongo.getCollection("constellation_pulses");
       const mcp = Mongo.getCollection("constellation_mcp_configs");
+      const identities = Mongo.getCollection("agent_identities");
       assert.ok(crew, "the client Crew collection should be registered");
+      assert.ok(identities, "the client Agent Identity collection should be registered");
       const crewSubscription = Meteor.subscribe("constellation.crew");
+      const learningSubscription = Meteor.subscribe("constellation.learning");
       const skillSubscription = Meteor.subscribe("constellation.skills");
       const pulseSubscription = Meteor.subscribe("constellation.pulses");
       const mcpSubscription = Meteor.subscribe("constellation.mcp");
       await waitUntil(
-        () => crewSubscription.ready() && skillSubscription.ready()
+        () => crewSubscription.ready() && learningSubscription.ready() && skillSubscription.ready()
           && pulseSubscription.ready() && mcpSubscription.ready(),
         "Crew impact subscriptions did not become ready",
       );
@@ -2157,11 +3094,16 @@ if (Meteor.isClient) {
       await waitUntil(() => crew.findOne(configId), "Created crew agent did not reach the client");
       const agent = crew.findOne(configId).agent;
       await waitUntil(
+        () => identities.findOne(configId)?.lifecycle === "active",
+        "Created Crew config did not acquire a published active Agent Identity",
+      );
+      await waitUntil(
         () => [firstId, secondId].every((sessionId) => AgentSessions.findOne(sessionId)
           ?.participants?.some((participant) => participant.agent === agent)),
         "Workspace crew creation did not update every Mission roster",
       );
       await Meteor.callAsync("constellation.crewSave", firstId, configId, {
+        expectedRevision: crew.findOne(configId).revision,
         displayName: "Renamed workspace specialist",
       });
       await waitUntil(
@@ -2195,7 +3137,7 @@ if (Meteor.isClient) {
         trusted: false,
       });
       const mcpId = mcpCreated._id;
-      const impact = await Meteor.callAsync("constellation.crewImpact", configId);
+      let impact = await Meteor.callAsync("constellation.crewImpact", configId);
       assert.deepInclude(impact, {
         configId,
         agent,
@@ -2213,34 +3155,135 @@ if (Meteor.isClient) {
         missionId: firstId,
       });
 
-      let staleRemoval;
+      let staleArchive;
       try {
-        await Meteor.callAsync("constellation.crewRemove", firstId, configId, "different-agent");
+        await Meteor.callAsync(
+          "constellation.crewArchive", firstId, configId, "different-agent",
+          impact.configRevision, impact.digest,
+        );
       } catch (error) {
-        staleRemoval = error;
+        staleArchive = error;
       }
-      assert.strictEqual(staleRemoval?.error, "stale-agent");
-      assert.ok(crew.findOne(configId), "A stale removal target must not delete the agent");
+      assert.strictEqual(staleArchive?.error, "stale-agent");
+      assert.ok(crew.findOne(configId), "A stale archive target must not change the agent");
 
-      const removed = await Promise.race([
-        Meteor.callAsync("constellation.crewRemove", firstId, configId, agent),
-        new Promise((_, reject) => setTimeout(
-          () => reject(new Error("Crew removal did not settle within five seconds")), 5_000,
-        )),
+      await Meteor.callAsync(
+        "constellation.skillSave", skillId, skills.findOne(skillId).revision,
+        { description: "Updated after the archive impact was reviewed." },
+      );
+      let staleImpact;
+      try {
+        await Meteor.callAsync(
+          "constellation.crewArchive", firstId, configId, agent,
+          impact.configRevision, impact.digest,
+        );
+      } catch (error) {
+        staleImpact = error;
+      }
+      assert.strictEqual(staleImpact?.error, "stale-impact");
+      assert.notStrictEqual(crew.findOne(configId)?.status, "archived");
+      impact = await Meteor.callAsync("constellation.crewImpact", configId);
+
+      const [archiveRace, skillRace] = await Promise.allSettled([
+        Promise.race([
+          Meteor.callAsync(
+            "constellation.crewArchive", firstId, configId, agent,
+            impact.configRevision, impact.digest,
+          ),
+          new Promise((_, reject) => setTimeout(
+            () => reject(new Error("Crew archive did not settle within five seconds")), 5_000,
+          )),
+        ]),
+        Meteor.callAsync(
+          "constellation.skillSave", skillId, skills.findOne(skillId).revision,
+          { description: "Concurrent with archive confirmation." },
+        ),
       ]);
-      assert.strictEqual(removed, true);
-      await waitUntil(() => !crew.findOne(configId), "Removed crew config remained visible");
+      let archived;
+      if (archiveRace.status === "fulfilled") {
+        archived = archiveRace.value;
+        assert.strictEqual(
+          skillRace.status, "rejected",
+          "an assignment mutation queued after the archive fence must not commit",
+        );
+      } else {
+        assert.strictEqual(archiveRace.reason?.error, "stale-impact");
+        assert.strictEqual(
+          skillRace.status, "fulfilled",
+          "an assignment mutation that wins first must invalidate the archive receipt",
+        );
+        impact = await Meteor.callAsync("constellation.crewImpact", configId);
+        archived = await Meteor.callAsync(
+          "constellation.crewArchive", firstId, configId, agent,
+          impact.configRevision, impact.digest,
+        );
+      }
+      assert.strictEqual(archived, true);
+      await waitUntil(
+        () => crew.findOne(configId)?.status === "archived",
+        "Archived Agent identity did not remain available for history and restore",
+      );
+      assert.strictEqual(crew.findOne(configId).agent, agent);
+      assert.strictEqual(crew.findOne(configId).enabled, false);
+      assert.ok(crew.findOne(configId).archivedAt);
+      assert.notProperty(
+        crew.findOne(configId), "archiveCleanupPending",
+        "archive must not report completion while durable cleanup remains pending",
+      );
+      await waitUntil(
+        () => identities.findOne(configId)?.lifecycle === "archived",
+        "Crew archival did not fence the package Agent Identity",
+      );
       await waitUntil(
         () => [firstId, secondId].every((sessionId) => !AgentSessions.findOne(sessionId)
           ?.participants?.some((participant) => participant.agent === agent)),
-        "Removed crew agent remained in a Mission roster",
+        "Archived crew agent remained in a Mission roster",
       );
       await waitUntil(
         () => !skills.findOne(skillId)?.agents?.includes(agent)
           && !mcp.findOne(mcpId)?.agents?.includes(agent)
           && pulses.findOne(pulseId)?.agent === "orchestrator"
           && pulses.findOne(pulseId)?.enabled === false,
-        "Crew removal references did not settle before the method returned",
+        "Crew archive references did not settle before the method returned",
+      );
+
+      assert.strictEqual(
+        await Meteor.callAsync(
+          "constellation.crewArchive", firstId, configId, agent,
+          impact.configRevision, impact.digest,
+        ), true,
+        "retrying a completed archive should adopt the durable result",
+      );
+
+      const archivedRevision = crew.findOne(configId).revision;
+      let missingRestoreRevision;
+      try {
+        await Meteor.callAsync("constellation.crewRestore", configId);
+      } catch (error) {
+        missingRestoreRevision = error;
+      }
+      assert.strictEqual(missingRestoreRevision?.error, "invalid-crew");
+      let staleRestore;
+      try {
+        await Meteor.callAsync("constellation.crewRestore", configId, archivedRevision - 1);
+      } catch (error) {
+        staleRestore = error;
+      }
+      assert.strictEqual(staleRestore?.error, "stale-agent");
+      assert.strictEqual(crew.findOne(configId).status, "archived");
+      assert.strictEqual(
+        await Meteor.callAsync("constellation.crewRestore", configId, archivedRevision), true,
+      );
+      await waitUntil(
+        () => crew.findOne(configId)?.status === "unavailable",
+        "Restored Agent did not return with the same identity",
+      );
+      assert.strictEqual(crew.findOne(configId).agent, agent);
+      assert.strictEqual(crew.findOne(configId).enabled, false,
+        "restore must not silently reassign the Agent to work");
+      await waitUntil(
+        () => identities.findOne(configId)?.lifecycle === "active",
+        "Crew restore did not reactivate the same package Agent Identity",
       );
 
       await Meteor.callAsync("constellation.skillRemove", skillId, skills.findOne(skillId).revision);
@@ -2250,6 +3293,7 @@ if (Meteor.isClient) {
       firstView.stop(firstId);
       secondView.stop(secondId);
       crewSubscription.stop();
+      learningSubscription.stop();
       skillSubscription.stop();
       pulseSubscription.stop();
       mcpSubscription.stop();
@@ -2296,6 +3340,19 @@ if (Meteor.isClient) {
       try {
         await Meteor.callAsync(
           "constellation.mcpSave", created._id, 1, { env: { NODE_OPTIONS: "--inspect" } },
+        );
+      } catch (caught) {
+        error = caught;
+      }
+      assert.strictEqual(error?.error, "invalid-mcp");
+
+      error = undefined;
+      try {
+        await Meteor.callAsync(
+          "constellation.mcpSave",
+          created._id,
+          1,
+          { enabled: true, trusted: true, toolMode: "selected", selectedTools: [] },
         );
       } catch (caught) {
         error = caught;
@@ -2422,6 +3479,137 @@ if (Meteor.isClient) {
         await Meteor.callAsync("constellation.mcpRemove", created._id, 4), true,
       );
       catalogSubscription.stop();
+    });
+
+    it("serializes MCP testing and bootstrap reconciliation against removal", async function () {
+      const catalog = Mongo.getCollection("constellation_tool_catalog");
+      const mcp = Mongo.getCollection("constellation_mcp_configs");
+      const crew = Mongo.getCollection("constellation_crew_configs");
+      assert.ok(catalog, "the client Tool Catalog collection should be registered");
+      assert.ok(mcp, "the client MCP configuration collection should be registered");
+      assert.ok(crew, "the client Crew configuration collection should be registered");
+      const catalogSubscription = Meteor.subscribe("constellation.toolCatalog");
+      const mcpSubscription = Meteor.subscribe("constellation.mcp");
+      const crewSubscription = Meteor.subscribe("constellation.crew");
+      await waitUntil(
+        () => catalogSubscription.ready() && mcpSubscription.ready() && crewSubscription.ready(),
+        "MCP concurrency subscriptions did not become ready",
+      );
+
+      const testing = await Meteor.callAsync("constellation.mcpCreate", {
+        name: "MCP test removal serialization",
+        command: "node",
+        args: ["-e", MCP_DELAYED_EPHEMERAL_SERVER],
+        agents: ["orchestrator"],
+        enabled: false,
+        trusted: true,
+        timeoutMs: 5_000,
+      });
+      const testPromise = Meteor.callAsync("constellation.mcpTest", testing._id);
+      await waitUntil(
+        () => mcp.findOne(testing._id)?.status === "connecting",
+        "MCP test did not enter its observable reconciliation window",
+      );
+      const removeDuringTest = Meteor.callAsync(
+        "constellation.mcpRemove", testing._id, testing.revision,
+      );
+      const [testResult, testRemoval] = await Promise.all([testPromise, removeDuringTest]);
+      assert.strictEqual(testResult.ok, true, testResult.reason);
+      assert.strictEqual(testRemoval, true);
+      await waitUntil(
+        () => !mcp.findOne(testing._id)
+          && catalog.find({ serverId: testing._id }).count() === 0,
+        "MCP testing replayed state after the serialized removal",
+      );
+
+      const workspace = new Agent("orchestrator");
+      const sessionId = await workspace.start({ title: "MCP test archive serialization" });
+      await Meteor.callAsync("constellation.prepareSession", sessionId);
+      const configId = await Meteor.callAsync("constellation.crewCreate", sessionId, {
+        displayName: "MCP archive race specialist",
+      });
+      await waitUntil(() => crew.findOne(configId), "MCP archive race Agent did not arrive");
+      const agent = crew.findOne(configId).agent;
+      const archiveTesting = await Meteor.callAsync("constellation.mcpCreate", {
+        name: "MCP test archive serialization",
+        command: "node",
+        args: ["-e", MCP_DELAYED_EPHEMERAL_SERVER],
+        agents: [agent],
+        enabled: false,
+        trusted: true,
+        timeoutMs: 5_000,
+      });
+      const completionOrder = [];
+      const testBeforeArchive = Meteor.callAsync("constellation.mcpTest", archiveTesting._id)
+        .then((result) => {
+          completionOrder.push("test");
+          return result;
+        });
+      await waitUntil(
+        () => mcp.findOne(archiveTesting._id)?.status === "connecting",
+        "MCP archive test did not enter its observable reconciliation window",
+      );
+      const impact = await Meteor.callAsync("constellation.crewImpact", configId);
+      const archiveDuringTest = Meteor.callAsync(
+        "constellation.crewArchive", sessionId, configId, agent,
+        impact.configRevision, impact.digest,
+      ).then((result) => {
+        completionOrder.push("archive");
+        return result;
+      });
+      const [archiveTestResult, archiveResult] = await Promise.all([
+        testBeforeArchive, archiveDuringTest,
+      ]);
+      assert.strictEqual(archiveTestResult.ok, true, archiveTestResult.reason);
+      assert.strictEqual(archiveResult, true);
+      assert.deepEqual(completionOrder, ["test", "archive"]);
+      await waitUntil(
+        () => !mcp.findOne(archiveTesting._id)?.agents?.includes(agent)
+          && catalog.find({ serverId: archiveTesting._id }).fetch()
+            .every((tool) => !tool.agents?.includes(agent)),
+        "MCP testing restored access after the serialized Agent archive",
+      );
+      await Meteor.callAsync(
+        "constellation.mcpRemove", archiveTesting._id, mcp.findOne(archiveTesting._id).revision,
+      );
+      workspace.stop(sessionId);
+
+      const bootstrapping = await Meteor.callAsync("constellation.mcpCreate", {
+        name: "MCP bootstrap removal serialization",
+        command: "node",
+        args: ["-e", MCP_DELAYED_EPHEMERAL_SERVER],
+        agents: ["orchestrator"],
+        enabled: true,
+        trusted: true,
+        timeoutMs: 5_000,
+        cooldownMs: 0,
+      });
+      assert.deepInclude(
+        await Meteor.callAsync("constellation.testMcpDisconnect", bootstrapping._id),
+        { registered: true, state: "disconnected" },
+      );
+      const bootstrapPromise = Meteor.callAsync("constellation.bootstrap");
+      await waitUntil(
+        () => mcp.findOne(bootstrapping._id)?.status === "connecting",
+        "Bootstrap did not enter its observable MCP reconciliation window",
+      );
+      const removeDuringBootstrap = Meteor.callAsync(
+        "constellation.mcpRemove", bootstrapping._id, bootstrapping.revision,
+      );
+      const [bootstrapResult, bootstrapRemoval] = await Promise.all([
+        bootstrapPromise, removeDuringBootstrap,
+      ]);
+      assert.isObject(bootstrapResult);
+      assert.strictEqual(bootstrapRemoval, true);
+      await waitUntil(
+        () => !mcp.findOne(bootstrapping._id)
+          && catalog.find({ serverId: bootstrapping._id }).count() === 0,
+        "Bootstrap replayed MCP state after the serialized removal",
+      );
+
+      catalogSubscription.stop();
+      mcpSubscription.stop();
+      crewSubscription.stop();
     });
 
     it("updates safe Channel fields and explicitly clears credentials", async function () {

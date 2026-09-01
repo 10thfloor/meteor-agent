@@ -35,6 +35,6 @@ export interface SubagentDispatch {
 type RunTurn = (sessionId: string, config: RunConfig) => Promise<void>;
 /** Run a named agent as a child session. Persists (unlike ask) so it can
  *  stream and accept approvals independently. */
-export declare function runSubagent(tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn): Promise<SubagentDispatch>;
+export declare function runSubagent(tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn, authorize?: () => boolean | Promise<boolean>): Promise<SubagentDispatch>;
 export {};
 //# sourceMappingURL=subagent.d.ts.map

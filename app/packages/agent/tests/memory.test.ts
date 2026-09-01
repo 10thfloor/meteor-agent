@@ -170,6 +170,25 @@ describe('memory — the store', () => {
     assert.equal(await AgentMemories.find({} as any).countAsync(), 1);
   });
 
+  it("forget cannot remove another agent's private per-user fact", async () => {
+    const { saveMemory, forgetMemory } = await import('../server/memory');
+    const { AgentMemories } = await import('../common/collections');
+    const agentMemory = {
+      ...CONFIG,
+      scopes: ['user', 'agent', 'app'] as Array<'user' | 'agent' | 'app'>,
+    };
+    const saved = await saveMemory(
+      { text: 'private working preference', scope: 'agent' },
+      { by: 'm:alpha', userId: 'u1', agent: 'alpha', config: agentMemory },
+    );
+    assert.isTrue(saved.ok);
+    const other = await forgetMemory((saved as any).id, {
+      userId: 'u1', agent: 'beta', allowApp: true,
+    });
+    assert.deepEqual(other, { ok: true, forgotten: false });
+    assert.isDefined(await AgentMemories.findOneAsync((saved as any).id));
+  });
+
   it('refuses to forget an app row when allowApp is false (the DDP posture)', async () => {
     const { saveMemory, forgetMemory } = await import('../server/memory');
     const app = await saveMemory(
@@ -789,7 +808,7 @@ describe('memory — inside a turn', () => {
     );
   });
 
-  it('gives a SUBAGENT CHILD no memory at all (decision 20)', async function () {
+  it('gives a SUBAGENT CHILD no Fact Memory (decision 20)', async function () {
     this.timeout(30000);
     const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
     const { runTurn } = await import('../server/loop');
@@ -813,7 +832,7 @@ describe('memory — inside a turn', () => {
       { by: 'm:mem-child', userId: 'u1', agent: 'mem-child', config: CONFIG },
     );
     // A child session — its transcript folds back into the parent, which is
-    // the memory-bearing conversation.
+    // the Fact-Memory-bearing conversation.
     await seed('mt-child', 'mem-child', 'do the thing', {
       parent: { sessionId: 'p1', toolCallId: 't1', agent: 'mem-child' },
     });
@@ -825,7 +844,7 @@ describe('memory — inside a turn', () => {
       'a child must not be able to write the parent memory');
   });
 
-  it('gives an EPHEMERAL (Agent.ask) session no memory either', async function () {
+  it('gives an EPHEMERAL (Agent.ask) session no Fact Memory either', async function () {
     this.timeout(30000);
     const { defineAgent, getAgent, buildRunConfig } = await import('../server/registry');
     const { runTurn } = await import('../server/loop');
