@@ -1775,8 +1775,11 @@ describe('approval gates', () => {
     await approve.call({ userId: 'u1' }, 'gate-approve', 's-approve');
 
     await waitFor(
+      // Phase belongs in the condition: the final commit lands a beat before
+      // the wind-down idles the phase, and sampling between them is a race.
       async () => (await AgentMessages
-        .find({ sessionId: 's-approve', role: 'assistant' }).countAsync()) === 2,
+        .find({ sessionId: 's-approve', role: 'assistant' }).countAsync()) === 2
+        && (await AgentSessions.findOneAsync('s-approve'))?.phase === 'idle',
       'the resumed turn to produce a final assistant reply',
     );
 
@@ -2258,9 +2261,11 @@ describe('approval gates', () => {
     await deny.call({ userId: 'u1' }, 'gate-stop', 's-park-stop', 'not this time');
 
     await waitFor(
+      // Phase belongs in the condition: the final commit lands a beat before
+      // the wind-down idles the phase, and sampling between them is a race.
       async () => !!(await AgentMessages.findOneAsync({
         sessionId: 's-park-stop', role: 'assistant', content: 'all done',
-      } as any)),
+      } as any)) && (await AgentSessions.findOneAsync('s-park-stop'))?.phase === 'idle',
       'the denied parked turn to finish',
     );
 
