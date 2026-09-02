@@ -1,0 +1,57 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 330" font-family="IBM Plex Sans, Helvetica, Arial, sans-serif" font-size="12" role="img" aria-label="The park is a phase: a streaming turn hits an ask-gated tool, writes a pending marker and phase awaiting, releases its lease and exits; the process may die; a verdict is a method write from any surface; activation resumes the turn, which finds the marker and runs the approved call.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#1f2a26"/>
+    </marker>
+  </defs>
+  <g stroke="#1f2a26" fill="none" stroke-width="1.4">
+    <rect x="20" y="60" width="96" height="44" rx="22"/>
+    <rect x="160" y="60" width="120" height="44" rx="22"/>
+    <rect x="330" y="40" width="220" height="84" rx="8" stroke="#c98a2e" stroke-width="2"/>
+    <rect x="610" y="60" width="150" height="44" rx="22"/>
+    <rect x="800" y="60" width="140" height="44" rx="22"/>
+    <!-- pending marker doc -->
+    <rect x="330" y="176" width="220" height="118" rx="6" stroke-dasharray="4 3"/>
+    <!-- verdict sources -->
+    <rect x="610" y="176" width="150" height="118" rx="6" stroke-dasharray="4 3"/>
+  </g>
+  <g fill="#1f2a26">
+    <text x="68" y="87" text-anchor="middle" font-weight="600">idle</text>
+    <text x="220" y="87" text-anchor="middle" font-weight="600">streaming</text>
+    <text x="440" y="66" text-anchor="middle" font-weight="600" fill="#c98a2e">awaiting</text>
+    <text x="440" y="86" text-anchor="middle">phase written, lease released</text>
+    <text x="440" y="104" text-anchor="middle" font-size="11" fill="#5d6a65">the turn exits — nothing in memory</text>
+    <text x="685" y="87" text-anchor="middle" font-weight="600">calling</text>
+    <text x="870" y="87" text-anchor="middle" font-weight="600">streaming → idle</text>
+    <text x="440" y="198" text-anchor="middle" font-weight="600">session.pending</text>
+    <text x="344" y="220" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">toolCallId, name, args</text>
+    <text x="344" y="238" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">display  ← the tool's describe()</text>
+    <text x="344" y="256" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">agent, agentId, memoryFrameId</text>
+    <text x="344" y="274" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">verdict, by  ← written later</text>
+    <text x="685" y="198" text-anchor="middle" font-weight="600">the verdict</text>
+    <text x="685" y="220" text-anchor="middle" font-size="11">agent.approve / agent.deny</text>
+    <text x="685" y="238" text-anchor="middle" font-size="11">with the exact toolCallId</text>
+    <text x="685" y="262" text-anchor="middle" font-size="11" fill="#5d6a65">web · Slack · Telegram</text>
+    <text x="685" y="278" text-anchor="middle" font-size="11" fill="#5d6a65">WhatsApp · SMS · email</text>
+  </g>
+  <g stroke="#1f2a26" fill="none" stroke-width="1.4" marker-end="url(#a)">
+    <path d="M116 82H158"/>
+    <path d="M280 82H328"/>
+    <path d="M550 82H608"/>
+    <path d="M760 82H798"/>
+    <path d="M685 176V106"/>
+    <path d="M440 176V126"/>
+  </g>
+  <g fill="#1f2a26" font-size="11">
+    <text x="137" y="76" text-anchor="middle">send</text>
+    <text x="304" y="54" text-anchor="middle">gate: 'ask'</text>
+    <text x="579" y="76" text-anchor="middle">resume</text>
+    <text x="779" y="76" text-anchor="middle">result</text>
+    <text x="702" y="145" text-anchor="start" fill="#5d6a65">method write → activation</text>
+    <text x="456" y="150" text-anchor="start" fill="#5d6a65">one durable document</text>
+  </g>
+  <g fill="#c98a2e" font-size="11">
+    <text x="440" y="318" text-anchor="middle">the process may die anywhere along here · a deploy may happen · three days may pass</text>
+  </g>
+  <path d="M170 306H760" stroke="#c98a2e" stroke-width="1.2" stroke-dasharray="2 3" fill="none"/>
+</svg>
