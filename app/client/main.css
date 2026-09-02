@@ -339,20 +339,6 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .crew-card[data-accent="red"] { --crew-accent: #e0786d; }
 .crew-card[data-accent="violet"] { --crew-accent: #ae91dc; }
 .crew-card[data-accent="steel"] { --crew-accent: #a7afaa; }
-.crew-card::before {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: 0;
-  top: 8px;
-  bottom: 8px;
-  width: 2px;
-  border-radius: 0 2px 2px 0;
-  background: var(--crew-accent);
-  opacity: 0;
-  transform: scaleY(.35);
-  transition: opacity .16s ease, transform .16s ease;
-}
 .crew-card > * { position: relative; z-index: 1; }
 .crew-card[data-configurable="true"]:hover {
   transform: translateX(2px);
@@ -362,7 +348,6 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 }
 .crew-card[data-configurable="true"]:focus-visible::before,
 .crew-card.active::before,
-.crew-card:not([data-agent-state="ready"])::before { opacity: .8; transform: scaleY(1); }
 .crew-card[data-configurable="true"]:focus-visible {
   outline: 0;
   border-color: color-mix(in srgb,var(--crew-accent) 64%,var(--line));
@@ -1483,7 +1468,6 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
   .crew-card[data-configurable="true"]:active,
   .crew-card:hover .crew-avatar,
   .crew-card:focus-visible .crew-avatar,
-  .crew-card::before,
   .crew-disclosure { transform:none !important; }
   .work-state-visual,.work-state-visual i,.work-state-visual::before,.work-state-visual::after,.crew-avatar i,
   .activity-state-visual,.activity-state-visual::before,.activity-state-visual::after,

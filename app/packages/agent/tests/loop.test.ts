@@ -1303,8 +1303,12 @@ describe('turn loop', () => {
     await send.call({ userId: 'u1' }, 'recover', 's-error-clear', 'try again');
 
     await waitFor(
+      // Phase belongs in the condition: the reply commits a beat before the
+      // wind-down idles the phase, and sampling between them is a race. A
+      // phase stuck at 'error' still fails here, by timeout, with this message.
       async () => (await AgentMessages
-        .find({ sessionId: 's-error-clear', role: 'assistant' }).countAsync()) === 1,
+        .find({ sessionId: 's-error-clear', role: 'assistant' }).countAsync()) === 1
+        && (await AgentSessions.findOneAsync('s-error-clear'))?.phase === 'idle',
       'the deferred turn to answer the send that cleared the error',
     );
 
