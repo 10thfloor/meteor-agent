@@ -719,9 +719,14 @@ describe('participants', () => {
       await seedRostered('pl2', 'pp-ping', 'u1', [model('pp-pong')]);
       await sendToSession('pp-ping', 'pl2', 'go', 'u1');
 
-      await waitFor(async () => !!(await AgentMessages.findOneAsync({
-        sessionId: 'pl2', role: 'note', kind: 'budget',
-      })), 'the relay-cap note');
+      await waitFor(
+        // Phase belongs in the condition: the final commit lands a beat before
+        // the wind-down idles the phase, and sampling between them is a race.
+        async () => !!(await AgentMessages.findOneAsync({
+          sessionId: 'pl2', role: 'note', kind: 'budget',
+        })) && (await AgentSessions.findOneAsync('pl2'))?.phase === 'idle',
+        'the relay-cap note',
+      );
       // Settle: nothing further may schedule.
       await new Promise((r) => { setTimeout(r, 400); });
 
