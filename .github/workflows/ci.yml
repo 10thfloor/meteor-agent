@@ -37,7 +37,14 @@ jobs:
 
       - name: Audit production dependencies
         working-directory: app
-        run: meteor npm audit --omit=dev --audit-level=moderate
+        # `high`, not `moderate`: meteor-node-stubs BUNDLES its polyfill
+        # dependencies inside its tarball, so the `qs` copy nested under it
+        # cannot be moved by `npm audit fix` or an `overrides` entry — only
+        # by an upstream release. Its open advisories are moderate and reach
+        # a browser-side querystring polyfill. Everything npm can actually
+        # resolve is held at zero; drop back to `moderate` once
+        # meteor-node-stubs ships a qs >= 6.16.
+        run: meteor npm audit --omit=dev --audit-level=high
 
       - name: Type-check the package
         working-directory: app
