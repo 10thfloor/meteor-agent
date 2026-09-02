@@ -5,15 +5,15 @@
 streaming, tools, authorization, and recovery are built from the primitives
 your Meteor app already uses—without a second realtime stack.
 
-[v0.2.0](https://github.com/10thfloor/meteor-agent/tree/v0.2.0) ·
+[v0.3.0](https://github.com/10thfloor/meteor-agent/tree/v0.3.0) ·
 [CI](https://github.com/10thfloor/meteor-agent/actions/workflows/ci.yml) ·
 Meteor 3.5+ · [MIT](LICENSE)
 
 [Constellation](#constellation) ·
 [Quick start](#quick-start) · [Why Meteor?](#why-this-exists) ·
 [Tools](#tools--five-kinds) · [Durability](#durability) ·
-[Learning](#agent-identity-and-experience) · [Channels](#channels) ·
-[API reference](app/packages/agent/README.md)
+[Memory](#fact-memory) · [Learning](#agent-identity-and-experience) ·
+[Channels](#channels) · [API reference](app/packages/agent/README.md)
 
 ## Constellation
 
@@ -49,6 +49,8 @@ Every piece of it maps to a Meteor primitive:
 | Tools | Meteor methods or server functions |
 | Identity and authorization | `this.userId` + publications |
 | Crash recovery | Leases + observers on every app server |
+| Fact memory | Mongo collection + `$vectorSearch`, published to the user |
+| Learning | Governed collections behind a publication and methods you write |
 
 If you know Meteor, most of the system is already familiar. `meteor-agent`
 supplies the durable model loop and keeps the rest native.
@@ -92,7 +94,7 @@ JavaScript, and needs no client-side AI library.
 ### Run the demo
 
 ```bash
-git clone --branch v0.2.0 --depth 1 https://github.com/10thfloor/meteor-agent
+git clone --branch v0.3.0 --depth 1 https://github.com/10thfloor/meteor-agent
 cd meteor-agent/app
 meteor npm ci
 meteor run --port 3400
@@ -109,10 +111,10 @@ The packages are not yet on Atmosphere. From your Meteor app's root, vendor the
 tagged core package at `packages/agent`, then install it normally:
 
 ```bash
-git clone --branch v0.2.0 --depth 1 \
-  https://github.com/10thfloor/meteor-agent ../meteor-agent-v0.2.0
+git clone --branch v0.3.0 --depth 1 \
+  https://github.com/10thfloor/meteor-agent ../meteor-agent-v0.3.0
 mkdir -p packages
-cp -R ../meteor-agent-v0.2.0/app/packages/agent packages/agent
+cp -R ../meteor-agent-v0.3.0/app/packages/agent packages/agent
 
 meteor add 10thfloor:agent
 meteor npm install --save @earendil-works/pi-ai typebox
@@ -817,9 +819,12 @@ reference — config surface, tools, budgets, gates, subagents, MCP, skills,
 hooks, theming, channels, and the operational notes that matter in production.
 **[by-example.md](docs/by-example.md)** covers the same ground as working
 code — including a failure drill that kills the server mid-stream and watches
-the transcript put itself back together. Historical architectural decisions
-live in **[docs/superpowers/specs/](docs/superpowers/specs/)**; source and tests
-are authoritative where an older record describes an earlier release.
+the transcript put itself back together. **[The Other Half of an
+Agent](docs/blog/2026-09-the-other-half-of-an-agent.md)** is the long-form
+account of how the durable half and the memory half hang together. Historical
+architectural decisions live in
+**[docs/superpowers/specs/](docs/superpowers/specs/)**; source and tests are
+authoritative where an older record describes an earlier release.
 
 ## Requirements
 
@@ -876,7 +881,7 @@ Development workflow, the test command, and the npm-dependency policy are in
 ## Status
 
 The current public source release is
-[`v0.2.0`](https://github.com/10thfloor/meteor-agent/tree/v0.2.0). Until the
+[`v0.3.0`](https://github.com/10thfloor/meteor-agent/tree/v0.3.0). Until the
 Atmosphere packages are published, vendor the package directories from this
 repository as described above. CI type-checks source and published
 declarations, runs the core and all five channel suites, audits production

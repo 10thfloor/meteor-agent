@@ -1,6 +1,6 @@
 Package.describe({
   name: '10thfloor:agent-channel-email',
-  version: '0.2.1-rc.1',
+  version: '0.3.0',
   summary: 'Email channel for 10thfloor:agent (Postmark) — one lens, one transport, one profile',
   git: 'https://github.com/10thfloor/meteor-agent.git',
   documentation: 'README.md',
@@ -9,7 +9,7 @@ Package.describe({
 Package.onUse((api) => {
   api.versionsFrom('3.5');
   api.use(['ecmascript', 'typescript'], 'server');
-  api.use('10thfloor:agent@0.2.1-rc.1', 'server');
+  api.use('10thfloor:agent@0.3.0', 'server');
   api.mainModule('server/index.ts', 'server');
 });
 
