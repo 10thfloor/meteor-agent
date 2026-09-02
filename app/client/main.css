@@ -339,20 +339,6 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .crew-card[data-accent="red"] { --crew-accent: #e0786d; }
 .crew-card[data-accent="violet"] { --crew-accent: #ae91dc; }
 .crew-card[data-accent="steel"] { --crew-accent: #a7afaa; }
-.crew-card::before {
-  content: "";
-  position: absolute;
-  z-index: 0;
-  left: 0;
-  top: 8px;
-  bottom: 8px;
-  width: 2px;
-  border-radius: 0 2px 2px 0;
-  background: var(--crew-accent);
-  opacity: 0;
-  transform: scaleY(.35);
-  transition: opacity .16s ease, transform .16s ease;
-}
 .crew-card > * { position: relative; z-index: 1; }
 .crew-card[data-configurable="true"]:hover {
   transform: translateX(2px);
@@ -362,7 +348,6 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 }
 .crew-card[data-configurable="true"]:focus-visible::before,
 .crew-card.active::before,
-.crew-card:not([data-agent-state="ready"])::before { opacity: .8; transform: scaleY(1); }
 .crew-card[data-configurable="true"]:focus-visible {
   outline: 0;
   border-color: color-mix(in srgb,var(--crew-accent) 64%,var(--line));
@@ -406,26 +391,28 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .crew-card:hover .crew-copy strong,.crew-card:focus-visible .crew-copy strong { color: #f0f2ed; }
 .crew-card:hover .crew-copy span,.crew-card:focus-visible .crew-copy span { color: #8b918b; }
 .crew-state {
-  max-width: 82px;
-  min-height: 18px;
-  display: inline-flex;
-  align-items: center;
-  padding: 0 6px;
-  overflow: hidden;
+  flex: none;
+  width: 20px;
+  height: 20px;
+  display: grid;
+  place-items: center;
   border: 1px solid transparent;
   border-radius: 999px;
-  color: #858c86;
-  font-size: 7px;
-  font-weight: 700;
-  line-height: 1;
-  text-transform: uppercase;
-  text-overflow: ellipsis;
-  white-space: nowrap;
-  letter-spacing: .09em;
+  color: #6f766f;
   transition: color .16s ease, border-color .16s ease, background .16s ease;
 }
+.crew-state svg { width: 13px; height: 13px; stroke-width: 1.8; }
+.crew-state[data-agent-state="thinking"] svg { stroke-width: 3; }
 .crew-card:hover .crew-state,.crew-card:focus-visible .crew-state { border-color: var(--line); background: rgba(255,255,255,.025); color: #8c928c; }
 .crew-card.active .crew-state,.crew-card:not([data-agent-state="ready"]) .crew-state { border-color: color-mix(in srgb,var(--crew-state-color) 22%,transparent); background: color-mix(in srgb,var(--crew-state-color) 8%,transparent); color: var(--crew-state-color); }
+@media (prefers-reduced-motion: no-preference) {
+  .crew-state[data-agent-state="working"] svg,.crew-state[data-agent-state="loading"] svg { animation: crew-state-spin 1.1s linear infinite; }
+  .crew-state[data-agent-state="thinking"] svg { animation: crew-state-pulse 1.4s ease-in-out infinite; }
+  .crew-state[data-agent-state="waiting"] { animation: crew-state-beckon 2.2s ease-in-out infinite; }
+}
+@keyframes crew-state-spin { to { transform: rotate(360deg); } }
+@keyframes crew-state-pulse { 50% { opacity: .35; } }
+@keyframes crew-state-beckon { 50% { box-shadow: 0 0 0 4px color-mix(in srgb,var(--crew-state-color) 18%,transparent); } }
 .crew-disclosure { display: grid; place-items: center; color: color-mix(in srgb,var(--crew-accent) 70%,#777d77); font-size: 14px; font-weight: 350; line-height: 1; opacity: 0; transform: translateX(-4px); transition: opacity .16s ease, transform .16s ease; }
 .crew-card:hover .crew-disclosure,.crew-card:focus-visible .crew-disclosure { opacity: 1; transform: translateX(0); }
 .mission-health .section-heading > span:last-child { color: var(--green); letter-spacing: .04em; text-transform: none; }
@@ -1481,7 +1468,6 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
   .crew-card[data-configurable="true"]:active,
   .crew-card:hover .crew-avatar,
   .crew-card:focus-visible .crew-avatar,
-  .crew-card::before,
   .crew-disclosure { transform:none !important; }
   .work-state-visual,.work-state-visual i,.work-state-visual::before,.work-state-visual::after,.crew-avatar i,
   .activity-state-visual,.activity-state-visual::before,.activity-state-visual::after,
