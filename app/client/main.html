@@ -81,8 +81,8 @@
         <div class="sidebar-foot">
           <div class="continuity-card">
             <div class="continuity-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
-            <div><strong>Resume this mission</strong><span id="continuity-state">Enabled</span></div>
-            <button type="button" id="configure-continuity" aria-label="Configure mission resume" data-loading="false">→</button>
+            <div><strong>Reopens on restart</strong><span id="continuity-state">On</span></div>
+            <button type="button" id="configure-continuity" aria-label="Mission settings" data-loading="false">Settings</button>
           </div>
         </div>
       </aside>
@@ -194,7 +194,7 @@
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
                   <section class="inspector-section">
-                    <div class="section-heading"><span>MISSION CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention">Reviews <b id="mission-reviews-count">0</b></button><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button></span></div>
+                    <div class="section-heading"><span>CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention">Reviews <b id="mission-reviews-count">0</b></button><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Edit crew</button></span></div>
                     <div class="crew-subsection">
                       <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
                       <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
@@ -217,9 +217,9 @@
                     <p id="budget-copy">0 / 40 tool calls</p>
                   </section>
                   <section class="inspector-section">
-                    <div class="section-heading"><span>CHANNEL CONVERSATIONS</span><button type="button" data-view-link="channels">Channel settings</button></div>
+                    <div class="section-heading"><span>CHANNELS</span><button type="button" data-view-link="channels">Channel settings</button></div>
                     <div class="surface-list compact" id="mission-surface-list" role="list" aria-label="Channel conversations on this Mission"></div>
-                    <p class="compact-empty" id="mission-surface-empty">None · Missions started from a Channel appear here</p>
+                    <p class="compact-empty" id="mission-surface-empty">None yet — channel missions land here.</p>
                   </section>
                 </div>
                 <div class="inspector-tab-panel" id="inspector-panel-activity" data-inspector-panel="activity" role="tabpanel" aria-labelledby="inspector-tab-activity" hidden>
