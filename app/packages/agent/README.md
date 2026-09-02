@@ -2412,6 +2412,56 @@ that the row contains the declared `toolCallId`. An exact replay can still adopt
 its durable Experience after Session erasure; a new record cannot rely on
 invented transcript provenance.
 
+### Host publication and mutations
+
+`Agent.learning` is the privileged server surface. The host-facing layer — the
+part every app that shows learning to people would otherwise copy — ships in
+the package too:
+
+```ts
+import {
+  createLearningPublisher, LEARNING_PUBLICATION_VIEWS, hostLearningSource,
+  governedConstitutionRevise, governedExperienceRetract, governedLearningReview,
+  governedPracticePropose, governedPracticeTransition,
+  assertLearningReviewTarget, assertPracticeTransitionEvidence,
+} from 'meteor/10thfloor:agent';
+```
+
+**Publishing.** `createLearningPublisher(this)` inside a `Meteor.publish`
+streams the reviewed views for the Agent identities the host names —
+identities, constitutions, experiences, practices, and frames — each through
+the field allowlist in `LEARNING_PUBLICATION_VIEWS`, so provenance internals
+such as `source.key` never leave the server. `publisher.addAgent(agentId)` is
+idempotent per id and rejects when learning is unavailable; the publisher owns
+observer lifecycle, so a stopped subscription never receives another callback.
+The host keeps authorization and the reactive choice of which agentIds this
+subscriber may see. Rows arrive in the client collections named by `NAMES`.
+
+**Mutating.** Each `governed*` function is the body of a host method. It
+re-validates its inputs (`invalid-args`, `invalid-learning-review`,
+`invalid-practice-transition`), derives an idempotent `LearningSource` from
+`(namespace, action, agentId, command)` through `hostLearningSource` so a DDP
+replay adopts its first result instead of repeating it, calls the Learning
+Module, and passes its refusals through as structured `Meteor.Error` codes:
+`learning-review-backlog-full`, `practice-candidate-limit`,
+`practice-live-revision`, `practice-review-backlog-full`, and
+`identity-generation-conflict` (a Constitution draft against a stale
+generation — rebase it). The host does exactly two things in front of them:
+`check()` the arguments and authorize the caller.
+
+| Function | Governs |
+| --- | --- |
+| `governedConstitutionRevise(ns, agentId, expectedGeneration, body, reason)` | a new immutable Constitution revision |
+| `governedExperienceRetract(ns, agentId, experienceId, reason)` | retracting an Experience |
+| `governedLearningReview(ns, agentId, 'experience' \| 'practice', id, actorId)` | acknowledging an automatically admitted record |
+| `governedPracticePropose(ns, agentId, { key, trigger, guidance, context, evidenceIds, commandId? })` | a human-authored Practice candidate |
+| `governedPracticeTransition(ns, agentId, practiceId, status, reason, hardeningEvidenceId?)` | validate, harden, retire, or reject |
+
+`ns` is the host's stable namespace for idempotency keys; two hosts sharing a
+database must not share one. Constellation's `app/server/main.js` is the
+reference wiring: one publication gated on workspace ownership, five methods
+that `check()`, authorize, and delegate.
+
 ### Archive, Session erasure, and audit
 
 Agent archival preserves Identity, Constitution, Experience, Practice, and
