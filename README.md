@@ -494,11 +494,60 @@ Session erasure deletes its Frames but retains Agent-owned Constitution,
 Experience, and Practice. Archiving an Agent preserves that identity history
 while blocking new work.
 
-The package's `Agent.learning` Interface is server-only. Constellation layers a
-filtered owner-authorized publication, mutation methods, Agent learning tabs,
-and a Reviews queue on top. See the
-[primer](docs/agent-experience-primer.md) and
-[ADR 0001](docs/adr/0001-agent-experience-memory.md) and
+### The app's interface
+
+All of this ships in the package — Constellation is a consumer of it, not the
+home of it. The interface is the Meteor one: configuration on the Agent, a
+publication you write, methods you write, and client collections.
+
+```ts
+// server — you decide WHO may see WHICH agents; the package owns the reviewed
+// field allowlists, observer lifecycle, idempotency, and the refusal codes.
+import {
+  Agent, createLearningPublisher, governedLearningReview, assertLearningReviewTarget,
+} from 'meteor/10thfloor:agent';
+
+Meteor.publish('team.learning', async function () {
+  if (!this.userId) return this.ready();
+  const publisher = createLearningPublisher(this);
+  for (const agentId of await agentIdsOwnedBy(this.userId)) await publisher.addAgent(agentId);
+  this.ready();
+});
+
+Meteor.methods({
+  async 'team.learningReview'(agentId, target, targetId) {
+    check(agentId, String); check(target, String); check(targetId, String);
+    assertLearningReviewTarget(target);
+    await assertOwnsAgent(this.userId, agentId);       // your authorization, your rules
+    return governedLearningReview('team', agentId, target, targetId, this.userId);
+  },
+});
+
+// Privileged server access, when the host itself is the actor:
+await Agent.memory.save(userId, { text: 'prefers email', scope: 'user' });
+await Agent.learning.review({ agentId, target: 'experience', id, source });
+```
+
+```ts
+// client — reviewed rows are ordinary client collections
+const AgentExperiences = new Mongo.Collection('agent_experiences');
+const AgentPractices = new Mongo.Collection('agent_practices');
+Meteor.subscribe('team.learning');
+Meteor.subscribe('agent.memories');                           // Fact Memory, built in
+AgentExperiences.find({ agentId, admission: 'automatic', review: { $exists: false } });
+await Meteor.callAsync('team.learningReview', agentId, 'experience', experienceId);
+await Meteor.callAsync('agent.memoryForget', { id });         // Fact Memory, built in
+```
+
+Fact Memory arrives with its publication and methods already registered
+(`agent.memories`, `agent.memorySave`, `agent.memorySearch`,
+`agent.memoryForget`). Learning deliberately registers neither: which people
+may see which Agents is the application's decision, so the package hands you
+the two halves that are not — the publisher and the governed mutations — and
+the [package README](app/packages/agent/README.md#host-publication-and-mutations)
+lists all five. Constellation's `app/server/main.js` is the reference wiring.
+See the [primer](docs/agent-experience-primer.md),
+[ADR 0001](docs/adr/0001-agent-experience-memory.md), and
 [ADR 0002](docs/adr/0002-automatic-learning-governance.md).
 
 ## Hooks
