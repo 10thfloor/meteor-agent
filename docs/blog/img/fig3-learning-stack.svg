@@ -1,0 +1,91 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" font-family="IBM Plex Sans, Helvetica, Arial, sans-serif" font-size="12" role="img" aria-label="The learning stack: fact memory, experiences, practices and constitution are four stores of four logical types; proposals pass upward through review gates; hardening spends flexibility; every turn freezes a Memory Frame from the stack, renders it into a protected prompt block, audits each provider request digest, and later proposals cite the frame they formed under.">
+  <defs>
+    <marker id="a" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#1f2a26"/>
+    </marker>
+    <marker id="aa" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0 0L10 5L0 10z" fill="#c98a2e"/>
+    </marker>
+  </defs>
+  <!-- layers -->
+  <g stroke="#1f2a26" fill="none" stroke-width="1.4">
+    <rect x="40" y="40" width="540" height="88" rx="6"/>
+    <rect x="40" y="152" width="540" height="112" rx="6"/>
+    <rect x="40" y="288" width="540" height="100" rx="6"/>
+    <rect x="40" y="412" width="540" height="88" rx="6"/>
+    <!-- the frame -->
+    <rect x="660" y="152" width="270" height="236" rx="8" stroke="#c98a2e" stroke-width="2"/>
+  </g>
+  <!-- layer copy -->
+  <g fill="#1f2a26">
+    <text x="56" y="62" font-weight="600">Constitution</text>
+    <text x="56" y="82">who the agent says it is · immutable revisions</text>
+    <text x="56" y="100" font-size="11" fill="#5d6a65">generation counter → a stale draft must rebase</text>
+    <text x="56" y="174" font-weight="600">Practices</text>
+    <text x="56" y="194">When ⟨trigger⟩ Then ⟨guidance⟩ · cites experiences as evidence</text>
+    <text x="56" y="212" font-size="11" fill="#5d6a65">candidate → validated → hardened (−1 flexibility) → retired (+1)</text>
+    <text x="56" y="310" font-weight="600">Experiences</text>
+    <text x="56" y="330">expected · observed · difference · lesson</text>
+    <text x="56" y="348" font-size="11" fill="#5d6a65">the difference is the datum · admission ask | auto</text>
+    <text x="56" y="366" font-size="11" fill="#5d6a65">auto backlog: 100 unreviewed, then refuse</text>
+    <text x="56" y="434" font-weight="600">Fact memory</text>
+    <text x="56" y="454">memory_save · memory_search · memory_forget</text>
+    <text x="56" y="472" font-size="11" fill="#5d6a65">scopes user | agent | app · 5 pinned + 10 recent in every prompt</text>
+  </g>
+  <!-- logical-type tags -->
+  <g fill="#5d6a65" font-size="11" font-family="IBM Plex Mono, Menlo, monospace">
+    <text x="566" y="62" text-anchor="end">self-description</text>
+    <text x="566" y="174" text-anchor="end">Learning II · habits</text>
+    <text x="566" y="310" text-anchor="end">Learning I · corrections</text>
+    <text x="566" y="434" text-anchor="end">Learning 0 · recall</text>
+  </g>
+  <!-- flexibility budget, inside the practices layer -->
+  <g>
+    <text x="56" y="245" font-size="11" fill="#1f2a26">flexibility</text>
+    <rect x="118" y="235" width="34" height="12" fill="#c98a2e" stroke="#1f2a26" stroke-width="1"/>
+    <rect x="156" y="235" width="34" height="12" fill="none" stroke="#1f2a26" stroke-width="1"/>
+    <rect x="194" y="235" width="34" height="12" fill="none" stroke="#1f2a26" stroke-width="1"/>
+    <text x="236" y="245" font-size="11" fill="#5d6a65">1 of 3 spent — how set in its ways an agent may become</text>
+  </g>
+  <!-- review gates, in the gaps between layers -->
+  <g stroke="#1f2a26" fill="#fff" stroke-width="1.4">
+    <path d="M310 264l10 12-10 12-10-12z"/>
+    <path d="M310 128l10 12-10 12-10-12z"/>
+  </g>
+  <g fill="#1f2a26" font-size="11">
+    <text x="326" y="280">review — human, or auto within the backlog</text>
+    <text x="326" y="144">validate, then harden — human or auto</text>
+    <text x="294" y="280" text-anchor="end" fill="#5d6a65">experience_propose ↑</text>
+    <text x="294" y="144" text-anchor="end" fill="#5d6a65">practice_propose ↑</text>
+  </g>
+  <!-- the frame -->
+  <g fill="#1f2a26">
+    <text x="795" y="178" text-anchor="middle" font-weight="600" fill="#c98a2e">Memory Frame</text>
+    <text x="795" y="198" text-anchor="middle" font-size="11">one per trigger · session : agent : seq</text>
+    <text x="676" y="224" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">constitution digest</text>
+    <text x="676" y="242" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">practices in force</text>
+    <text x="676" y="260" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">experiences recalled (4)</text>
+    <text x="676" y="278" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">fact evidence { id, digest }</text>
+    <text x="676" y="296" font-family="IBM Plex Mono, Menlo, monospace" font-size="11">learning policy</text>
+    <text x="795" y="326" text-anchor="middle" font-size="11">→ protected block in the system prompt</text>
+    <text x="795" y="344" text-anchor="middle" font-size="11" fill="#5d6a65">its markers are scrubbed everywhere else</text>
+    <text x="795" y="368" text-anchor="middle" font-size="11">→ every provider request digest audited</text>
+  </g>
+  <!-- freeze lanes: each layer into its row of the frame -->
+  <g stroke="#c98a2e" fill="none" stroke-width="1.6" marker-end="url(#aa)">
+    <path d="M580 84H640V220H658"/>
+    <path d="M580 208H620V238H658"/>
+    <path d="M580 338H630V256H658"/>
+    <path d="M580 456H645V274H658"/>
+  </g>
+  <g fill="#c98a2e" font-size="11">
+    <text x="634" y="76" text-anchor="end">freeze, per turn</text>
+  </g>
+  <!-- provenance: a later proposal cites the frame -->
+  <g stroke="#1f2a26" fill="none" stroke-width="1.2" stroke-dasharray="4 3" marker-end="url(#a)">
+    <path d="M795 388V400H300V389"/>
+  </g>
+  <g fill="#5d6a65" font-size="11">
+    <text x="795" y="414" text-anchor="middle">a later proposal cites the frame it formed under</text>
+  </g>
+</svg>
