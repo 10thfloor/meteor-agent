@@ -999,10 +999,7 @@ function renderCrew(
     const role = document.createElement('span');
     role.textContent = detail;
     copy.append(name, role);
-    const state = document.createElement('span');
-    state.className = 'crew-state';
-    state.dataset.agentState = agentState;
-    state.textContent = stateLabel;
+    const state = crewStateGlyph(agentState, stateLabel);
     const disclosure = document.createElement('span');
     disclosure.className = 'crew-disclosure';
     disclosure.setAttribute('aria-hidden', 'true');
@@ -1012,6 +1009,46 @@ function renderCrew(
   }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
   $('crew-count').textContent = String(definitions.length);
+}
+
+// Crew rows are too narrow for the state as words ("APPROVAL NEEDED" clipped
+// to "APPROVAL N"); the mission header keeps the text pill. One glyph per
+// runtime state, drawn on the rail icons' 24-grid so they read as one family.
+const RING = ['circle', { cx: '12', cy: '12', r: '8.25' }];
+const SPINNER = ['path', { d: 'M20.25 12A8.25 8.25 0 1 1 12 3.75' }];
+const CREW_STATE_GLYPHS = {
+  ready: [RING, ['path', { d: 'm8.7 12.3 2.1 2.1 4.5-4.7' }]],
+  waiting: [RING, ['path', { d: 'M12 7.75v5' }], ['path', { d: 'M12 16.1h.01' }]],
+  working: [SPINNER],
+  loading: [SPINNER],
+  thinking: [['path', { d: 'M6.5 12h.01M12 12h.01M17.5 12h.01' }]],
+  retrying: [['path', { d: 'M19.5 12a7.5 7.5 0 1 1-2.2-5.3' }], ['path', { d: 'M19.5 4.5v4.2h-4.2' }]],
+  error: [RING, ['path', { d: 'm9.4 9.4 5.2 5.2M14.6 9.4l-5.2 5.2' }]],
+  stopped: [RING, ['rect', { x: '9.25', y: '9.25', width: '5.5', height: '5.5', rx: '1' }]],
+  paused: [RING, ['path', { d: 'M10 9v6M14 9v6' }]],
+  completed: [['path', { d: 'M5.5 12.5 9.8 16.8 18.5 7.8' }]],
+};
+
+function crewStateGlyph(agentState, label) {
+  const state = document.createElement('span');
+  state.className = 'crew-state';
+  state.dataset.agentState = agentState;
+  state.title = label;
+  const svgNs = 'http://www.w3.org/2000/svg';
+  const svg = document.createElementNS(svgNs, 'svg');
+  svg.setAttribute('viewBox', '0 0 24 24');
+  svg.setAttribute('aria-hidden', 'true');
+  const shapes = CREW_STATE_GLYPHS[agentState] ?? [['circle', { cx: '12', cy: '12', r: '2.4' }]];
+  for (const [tag, attrs] of shapes) {
+    const node = document.createElementNS(svgNs, tag);
+    for (const [key, value] of Object.entries(attrs)) node.setAttribute(key, value);
+    svg.append(node);
+  }
+  const text = document.createElement('span');
+  text.className = 'sr-only';
+  text.textContent = label;
+  state.append(svg, text);
+  return state;
 }
 
 function crewConfigArchived(config) {
