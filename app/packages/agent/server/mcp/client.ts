@@ -225,7 +225,7 @@ const defaultFactory: McpClientFactory = async (_name, def) => {
     ...(def.env ? { env: { ...baseEnv, ...def.env } } : {}),
   });
   const client = new ClientCtor(
-    { name: '10thfloor:agent', version: '0.2.1-rc.1' }, { capabilities: {} },
+    { name: '10thfloor:agent', version: '0.3.0' }, { capabilities: {} },
   );
   await client.connect(transport);
   return {

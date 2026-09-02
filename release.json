@@ -1,6 +1,6 @@
 {
-  "packageVersion": "0.2.1-rc.1",
-  "stableTag": "v0.2.0",
+  "packageVersion": "0.3.0",
+  "stableTag": "v0.3.0",
   "packages": [
     { "name": "10thfloor:agent", "directory": "agent", "role": "core" },
     { "name": "10thfloor:agent-channel-slack", "directory": "agent-channel-slack", "role": "channel" },
