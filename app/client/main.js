@@ -4437,7 +4437,9 @@ function renderMissionState() {
   $('mission-title').textContent = title;
   $('mission-slug').textContent = title.toUpperCase().slice(0, 34);
   $('configure-mission').disabled = !config;
-  $('continuity-state').textContent = config?.continuity === false ? 'Disabled' : 'Enabled';
+  $('continuity-state').textContent = config?.continuity === false
+    ? 'Off'
+    : 'On · comes back as your last mission';
   $('mission-empty').classList.toggle('hidden', messages.length > 0);
   $('turn-counter').textContent = `${session?.budgetSpent?.turns ?? 0} turn${(session?.budgetSpent?.turns ?? 0) === 1 ? '' : 's'}`;
   const verbosity = config?.debugTraces ? 'debug' : 'clean';

@@ -138,7 +138,9 @@ kbd { font: inherit; }
 .mission-row-copy span { display: block; margin-top: 4px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: #707670; font-size: 8px; }
 .mission-row time { color: #5d625e; font-size: 7px; padding-top: 3px; }
 .sidebar-foot { padding: 11px; border-top: 1px solid var(--line); }
-.continuity-card { min-height: 58px; display: grid; grid-template-columns: 30px 1fr 20px; align-items: center; gap: 8px; background: #111412; border: 1px solid var(--line); border-radius: 9px; padding: 8px; }
+.continuity-card { min-height: 58px; display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 8px; background: #111412; border: 1px solid var(--line); border-radius: 9px; padding: 8px; }
+#configure-continuity { min-height: 22px; display: inline-flex; align-items: center; padding: 0 8px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: #8f948f; font-size: 8px; font-weight: 650; letter-spacing: .06em; white-space: nowrap; cursor: pointer; transition: color .16s ease, border-color .16s ease, background .16s ease; }
+#configure-continuity:hover { color: #d1d5ce; border-color: var(--line-strong); background: rgba(255,255,255,.035); }
 .continuity-orbit { width: 26px; height: 26px; border: 1px solid rgba(118,169,233,.2); border-radius: 50%; position: relative; }
 .continuity-orbit::after { content: ""; position: absolute; width: 6px; height: 6px; background: var(--blue); border-radius: 50%; left: 9px; top: 9px; box-shadow: 0 0 9px rgba(118,169,233,.4); }
 .continuity-orbit span { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #607692; }
@@ -301,12 +303,13 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .inspector-scroll { flex: 1; overflow-y: auto; scrollbar-width: thin; scrollbar-color: #303431 transparent; }
 .inspector-tab-panel { display: none; }.inspector-tab-panel.active { display: block; }
 .inspector-section { padding: 17px 15px; border-bottom: 1px solid var(--line); }
-.section-heading { margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; color: #656b66; font-size: 7px; font-weight: 730; letter-spacing: .13em; }
-.section-heading button { border: 0; border-radius: 5px; background: transparent; color: #8f948f; font-size: 7px; cursor: pointer; transition: color .16s ease, background .16s ease; }
-.section-heading button:hover { color: #d1d5ce; background: rgba(255,255,255,.035); }
+.section-heading { margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #656b66; font-size: 7px; font-weight: 730; letter-spacing: .13em; }
+.section-heading > span:first-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.section-heading button { flex: none; min-height: 22px; display: inline-flex; align-items: center; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: #8f948f; font-size: 8px; font-weight: 650; letter-spacing: .03em; white-space: nowrap; cursor: pointer; transition: color .16s ease, background .16s ease, border-color .16s ease; }
+.section-heading button:hover { color: #d1d5ce; border-color: var(--line-strong); background: rgba(255,255,255,.035); }
 .section-heading button:focus-visible { outline: 1px solid rgba(240,163,90,.68); outline-offset: 2px; color: #e2e5df; }
 .mini-count { min-width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: #8d928d; }
-.section-heading-actions { display:flex; align-items:center; gap:6px; }
+.section-heading-actions { flex: none; display:flex; align-items:center; gap:4px; }
 .section-heading-actions #open-learning-reviews { min-height:24px; display:inline-flex; align-items:center; gap:5px; padding:0 6px; border:1px solid var(--line); }
 .section-heading-actions #open-learning-reviews b { min-width:17px; height:17px; display:grid; place-items:center; border-radius:5px; background:rgba(240,163,90,.08); color:var(--signal-bright); font-size:10px; font-weight:680; }
 .crew-list { display: flex; flex-direction: column; gap: 3px; }
