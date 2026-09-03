@@ -848,7 +848,12 @@ function renderMissionCollaboration(view = missionParticipation()) {
     (participant) => participant.kind !== 'agent' || knownAgents.has(participant.agent),
   );
   const people = participants.filter((participant) => participant.kind === 'human');
-  const agents = participants.filter((participant) => participant.kind === 'agent');
+  // Roster order everywhere: the header stack and the inspector list must
+  // name the same agents in the same order, or the two read as different crews.
+  const rosterOrder = new Map(crewDefinitions().map((definition, index) => [definition.agent, index]));
+  const agents = participants
+    .filter((participant) => participant.kind === 'agent')
+    .sort((left, right) => (rosterOrder.get(left.agent) ?? 99) - (rosterOrder.get(right.agent) ?? 99));
   const surfaces = view?.surfaces ?? [];
   updateChatModeHint();
   const stack = $('mission-participant-stack');
@@ -1009,6 +1014,13 @@ function renderCrew(
   }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
   $('crew-count').textContent = String(definitions.length);
+  // Say which crew this is. 'inherit' follows the workspace roster; 'custom'
+  // is this mission's own subset — the distinction the two levels turn on.
+  const specialistsOnRoster = specialistDefinitions().length;
+  const specialistsHere = definitions.length - 1;
+  $('crew-mode-hint').textContent = (config?.agentMode ?? 'inherit') === 'inherit'
+    ? '· follows the workspace roster'
+    : `· ${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`;
 }
 
 // Crew rows are too narrow for the state as words ("APPROVAL NEEDED" clipped
@@ -4437,9 +4449,14 @@ function renderMissionState() {
   $('mission-title').textContent = title;
   $('mission-slug').textContent = title.toUpperCase().slice(0, 34);
   $('configure-mission').disabled = !config;
-  $('continuity-state').textContent = config?.continuity === false
-    ? 'Off'
-    : 'On · comes back as your last mission';
+  const continuityOn = config?.continuity !== false;
+  const completed = config?.status === 'completed';
+  $('continuity-state').textContent = completed
+    ? 'Completed missions stay closed'
+    : (continuityOn ? 'On · comes back as your last mission' : 'Off');
+  const toggle = $('continuity-toggle');
+  if (toggle && !toggle.disabled) toggle.checked = continuityOn && !completed;
+  if (toggle) toggle.disabled = completed || toggle.dataset.saving === 'true';
   $('mission-empty').classList.toggle('hidden', messages.length > 0);
   $('turn-counter').textContent = `${session?.budgetSpent?.turns ?? 0} turn${(session?.budgetSpent?.turns ?? 0) === 1 ? '' : 's'}`;
   const verbosity = config?.debugTraces ? 'debug' : 'clean';
@@ -4739,8 +4756,26 @@ function wireMissionSettings() {
   $('configure-mission').addEventListener('click', (event) => {
     void withControlBusy(event.currentTarget, 'Loading', openMissionSettings);
   });
-  $('configure-continuity').addEventListener('click', (event) => {
-    void withControlBusy(event.currentTarget, 'Loading', openMissionSettings);
+  $('continuity-toggle').addEventListener('change', async (event) => {
+    const toggle = event.currentTarget;
+    const sessionId = currentSessionId;
+    const enabled = toggle.checked;
+    if (!sessionId) return;
+    // The reactive render re-syncs this control from config; the flag keeps
+    // it from re-enabling (or reverting) the switch while the save is in flight.
+    toggle.dataset.saving = 'true';
+    toggle.disabled = true;
+    try {
+      const saved = await Meteor.callAsync('constellation.missionContinuitySet', sessionId, enabled);
+      persistResumableMission(sessionId, saved);
+      sessionChanged.changed();
+    } catch (error) {
+      toggle.checked = !enabled;
+      toast(messageOf(error), 'error');
+    } finally {
+      delete toggle.dataset.saving;
+      toggle.disabled = false;
+    }
   });
   $('mission-dialog').addEventListener('close', () => {
     editingMissionSessionId = null;

@@ -4634,6 +4634,31 @@ Meteor.methods({
     });
   },
 
+  // Continuity is a preference about the NEXT launch, not this run, so it
+  // needs neither the settings dialog's revision handshake nor the
+  // mission-busy fence that guards execution-affecting config.
+  async 'constellation.missionContinuitySet'(sessionId, enabled) {
+    check(sessionId, String);
+    check(enabled, Boolean);
+    await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
+      const session = await AgentSessions.findOneAsync({
+        _id: sessionId, userId, agent: 'orchestrator',
+      });
+      if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
+      const current = await ensureMissionConfig(userId, session);
+      if (current.status === 'completed') {
+        throw new Meteor.Error('mission-completed', 'A completed mission does not reopen.');
+      }
+      await MissionConfigs.updateAsync(
+        { _id: sessionId, userId },
+        { $set: { continuity: enabled }, $inc: { revision: 1 } },
+      );
+      return MissionConfigs.findOneAsync({ _id: sessionId, userId });
+    });
+  },
+
   async 'constellation.missionCrewSave'(sessionId, expectedMissionRevision, patch) {
     check(sessionId, String);
     check(expectedMissionRevision, Number);
