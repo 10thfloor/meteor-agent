@@ -523,7 +523,10 @@
         </fieldset>
       </div>
       <footer class="settings-form-actions">
-        <button id="archive-mission" class="danger-button" type="button" data-loading="false" data-loading-label="Saving">Complete mission</button>
+        <div class="mission-lifecycle-actions">
+          <button id="complete-mission" class="danger-button" type="button" data-loading="false" data-loading-label="Saving">Complete mission</button>
+          <button id="archive-mission" class="secondary-action" type="button" data-loading="false" data-loading-label="Archiving">Archive mission</button>
+        </div>
         <span class="form-action-context"><span id="mission-complete-effect" class="mission-destructive-hint">Stops work, pauses linked Pulses, and disables resume.</span><span class="form-save-status" id="mission-form-status" role="status" aria-live="polite">Saved</span></span>
         <button id="cancel-mission-edit" class="secondary-action" type="button">Cancel</button>
         <button class="primary-action" type="submit" data-loading="false" data-loading-label="Saving">Save mission</button>

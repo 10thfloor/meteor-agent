@@ -409,7 +409,24 @@ function missionParticipation(sessionId = currentSessionId) {
   return sessionId ? MissionParticipation.findOne(sessionId) : null;
 }
 
-function missionLifecycleState(runtimeState, config) {
+// Archived is shelved, not a lifecycle state: the package's `archived` stamp
+// takes a Mission off the main list, and the server keeps every shelved
+// Mission completed. The list shows unshelved Missions; the Archived section
+// below it shows the rest, most recently shelved first.
+function missionArchived(session) {
+  return Boolean(session?.archived);
+}
+
+function listedMissions() {
+  return workspace.sessions({ archived: { $exists: false } }).fetch();
+}
+
+function archivedMissions() {
+  return workspace.sessions({ archived: { $exists: true } }).fetch()
+    .sort((left, right) => (right.archived?.getTime?.() ?? 0) - (left.archived?.getTime?.() ?? 0));
+}
+
+function missionLifecycleState(runtimeState, config, session = null) {
   if (!config || config.status === 'active') return runtimeState;
   if (config.status === 'paused') {
     return {
@@ -422,13 +439,14 @@ function missionLifecycleState(runtimeState, config) {
     };
   }
   if (config.status === 'completed') {
+    const word = missionArchived(session) ? 'archived' : 'completed';
     return {
       ...runtimeState,
       key: 'completed',
-      label: 'Completed',
+      label: missionArchived(session) ? 'Archived' : 'Completed',
       detail: runtimeState.key === 'ready' || runtimeState.key === 'stopped'
-        ? 'Mission completed'
-        : `Mission completed · ${runtimeState.detail}`,
+        ? `Mission ${word}`
+        : `Mission ${word} · ${runtimeState.detail}`,
     };
   }
   return runtimeState;
@@ -604,68 +622,148 @@ function currentMissionMessages() {
     : [];
 }
 
+function missionRowButton(session, currentMessages) {
+  const config = missionConfig(session._id);
+  const state = missionLifecycleState(
+    deriveRuntimeState(
+      session,
+      session._id === currentSessionId ? currentMessages : [],
+    ),
+    config,
+    session,
+  );
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = `mission-row${session._id === currentSessionId ? ' current' : ''}`;
+  button.dataset.sessionId = session._id;
+  button.dataset.agentState = state.key;
+  button.dataset.runtimePhase = state.runtimePhase;
+  const phase = document.createElement('i');
+  phase.className = [
+    state.key,
+    ['loading', 'thinking', 'working'].includes(state.key) ? 'active' : '',
+    state.key === 'waiting' ? 'awaiting' : '',
+  ].filter(Boolean).join(' ');
+  phase.dataset.agentState = state.key;
+  phase.setAttribute('aria-hidden', 'true');
+  const copy = document.createElement('span');
+  copy.className = 'mission-row-copy';
+  const title = document.createElement('strong');
+  title.textContent = session.title || 'New mission';
+  const meta = document.createElement('span');
+  const surface = session.channel?.origin ?? 'desktop';
+  meta.textContent = `${surface} · ${state.label.toLowerCase()}`;
+  copy.append(title, meta);
+  const at = document.createElement('time');
+  at.textContent = timeAgo(missionArchived(session) ? session.archived : session.updatedAt);
+  button.setAttribute('aria-label', `${title.textContent} · ${state.label} · ${surface}`);
+  button.title = state.detail;
+  button.append(phase, copy, at);
+  button.addEventListener('click', () => openSession(session._id));
+  return button;
+}
+
+let archivedMissionsOpen = false;
+
 function renderMissionList(currentMessages = currentMissionMessages()) {
   const list = $('mission-list');
   const focusedSessionId = document.activeElement?.closest?.('.mission-row')?.dataset.sessionId ?? null;
   let restoreFocus = null;
   const query = $('mission-search').value.trim().toLowerCase();
-  const sessions = workspace.sessions().fetch().filter((session) => {
+  const matches = (session) => {
+    if (!query) return true;
     const config = missionConfig(session._id);
     const text = `${session.title ?? ''} ${config?.objective ?? ''} ${config?.status ?? 'active'} ${session.channel?.origin ?? 'desktop'}`.toLowerCase();
-    return !query || text.includes(query);
-  });
+    return text.includes(query);
+  };
+  const sessions = listedMissions().filter(matches);
+  const archived = archivedMissions().filter(matches);
   $('mission-count').textContent = String(sessions.length);
   list.textContent = '';
 
-  if (sessions.length === 0) {
+  if (sessions.length === 0 && !(query && archived.length > 0)) {
     const empty = document.createElement('div');
     empty.className = 'memory-empty';
     empty.textContent = query ? 'No matching missions.' : 'No missions.';
     list.append(empty);
-    return;
   }
 
   for (const session of sessions) {
-    const config = missionConfig(session._id);
-    const state = missionLifecycleState(
-      deriveRuntimeState(
-        session,
-        session._id === currentSessionId ? currentMessages : [],
-      ),
-      config,
-    );
-    const button = document.createElement('button');
-    button.type = 'button';
-    button.className = `mission-row${session._id === currentSessionId ? ' current' : ''}`;
-    button.dataset.sessionId = session._id;
-    button.dataset.agentState = state.key;
-    button.dataset.runtimePhase = state.runtimePhase;
-    const phase = document.createElement('i');
-    phase.className = [
-      state.key,
-      ['loading', 'thinking', 'working'].includes(state.key) ? 'active' : '',
-      state.key === 'waiting' ? 'awaiting' : '',
-    ].filter(Boolean).join(' ');
-    phase.dataset.agentState = state.key;
-    phase.setAttribute('aria-hidden', 'true');
-    const copy = document.createElement('span');
-    copy.className = 'mission-row-copy';
-    const title = document.createElement('strong');
-    title.textContent = session.title || 'New mission';
-    const meta = document.createElement('span');
-    const surface = session.channel?.origin ?? 'desktop';
-    meta.textContent = `${surface} · ${state.label.toLowerCase()}`;
-    copy.append(title, meta);
-    const at = document.createElement('time');
-    at.textContent = timeAgo(session.updatedAt);
-    button.setAttribute('aria-label', `${title.textContent} · ${state.label} · ${surface}`);
-    button.title = state.detail;
-    button.append(phase, copy, at);
-    button.addEventListener('click', () => openSession(session._id));
+    const button = missionRowButton(session, currentMessages);
     list.append(button);
     if (session._id === focusedSessionId) restoreFocus = button;
   }
+
+  // Shelved Missions stay one click away: collapsed by default, opened by the
+  // user or by a search that matches one of them.
+  if (archived.length > 0) {
+    const shelf = document.createElement('details');
+    shelf.className = 'mission-archive';
+    shelf.id = 'mission-archive';
+    shelf.open = archivedMissionsOpen || Boolean(query);
+    shelf.addEventListener('toggle', () => {
+      if (!query) archivedMissionsOpen = shelf.open;
+    });
+    const summary = document.createElement('summary');
+    const label = document.createElement('span');
+    label.textContent = 'Archived';
+    const count = document.createElement('span');
+    count.id = 'mission-archive-count';
+    count.textContent = String(archived.length);
+    summary.append(label, count);
+    shelf.append(summary);
+    for (const session of archived) {
+      const item = document.createElement('div');
+      item.className = 'mission-archive-item';
+      const button = missionRowButton(session, currentMessages);
+      const restore = document.createElement('button');
+      restore.type = 'button';
+      restore.className = 'mission-unarchive';
+      restore.textContent = 'Unarchive';
+      restore.title = 'Return this mission to the list. It stays completed until you reactivate it.';
+      restore.setAttribute('aria-label', `Unarchive ${session.title || 'New mission'}`);
+      restore.addEventListener('click', (event) => {
+        void withControlBusy(event.currentTarget, 'Restoring', () => unarchiveMission(session._id));
+      });
+      item.append(button, restore);
+      shelf.append(item);
+      if (session._id === focusedSessionId) restoreFocus = button;
+    }
+    list.append(shelf);
+  }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
+}
+
+async function archiveMission(sessionId) {
+  try {
+    const saved = await Meteor.callAsync('constellation.missionArchive', sessionId);
+    persistResumableMission(sessionId, saved);
+    if (sessionId === currentSessionId) {
+      // The archived Mission leaves the list, so land on the most recent one
+      // still on it, or start fresh exactly as launch does with no missions.
+      const next = listedMissions().find((session) => session._id !== sessionId);
+      openSession(next?._id ?? await createMission());
+    }
+    sessionChanged.changed();
+    toast('Mission archived. Find it under Archived at the foot of the list.');
+    return true;
+  } catch (error) {
+    toast(`Could not archive this mission: ${messageOf(error)}`, 'error');
+    return false;
+  }
+}
+
+async function unarchiveMission(sessionId) {
+  try {
+    const saved = await Meteor.callAsync('constellation.missionUnarchive', sessionId);
+    persistResumableMission(sessionId, saved);
+    sessionChanged.changed();
+    toast('Mission back on the list. Reactivate it from Mission settings to resume work.');
+    return true;
+  } catch (error) {
+    toast(`Could not unarchive this mission: ${messageOf(error)}`, 'error');
+    return false;
+  }
 }
 
 function primaryDefinition() {
@@ -4508,7 +4606,7 @@ function renderMissionState() {
   const verbosity = config?.debugTraces ? 'debug' : 'clean';
   if (chat.getAttribute('verbosity') !== verbosity) chat.setAttribute('verbosity', verbosity);
 
-  const runtimeState = missionLifecycleState(deriveRuntimeState(session, messages), config);
+  const runtimeState = missionLifecycleState(deriveRuntimeState(session, messages), config, session);
   const phase = runtimeState.runtimePhase;
   const crewBusy = missionCrewIsBusy();
   for (const button of [$('manage-mission-crew'), $('manage-mission-crew-inspector')]) {
@@ -4567,7 +4665,7 @@ function renderMissionState() {
   ) * 100);
   $('budget-fill').style.width = `${budgetPct}%`;
   $('budget-copy').textContent = `${spent.turns ?? 0} / ${thresholds.turns} turns · ${spent.toolCalls ?? 0} / ${thresholds.toolCalls} tools · $${Number(usage.cost ?? 0).toFixed(2)} / $${Number(thresholds.spend).toFixed(2)}`;
-  $('health-label').textContent = config?.status === 'completed' ? 'Completed'
+  $('health-label').textContent = config?.status === 'completed' ? (missionArchived(session) ? 'Archived' : 'Completed')
     : (config?.status === 'paused' ? 'Paused'
       : (runtimeState.key === 'error' ? 'Needs attention'
         : (budgetPct >= 100 ? 'Threshold reached'
@@ -4687,8 +4785,10 @@ function updateMissionConfigBadge(status = missionConfig()?.status ?? 'active') 
     ? runtime
     : {
       key: status,
-      label: status === 'completed' ? 'Completed' : 'Paused',
-      detail: status === 'completed' ? 'Mission completed' : 'Mission paused',
+      label: status === 'completed' ? (missionArchived(session) ? 'Archived' : 'Completed') : 'Paused',
+      detail: status === 'completed'
+        ? (missionArchived(session) ? 'Mission archived' : 'Mission completed')
+        : 'Mission paused',
     };
   badge.dataset.state = state.key;
   badge.title = state.detail;
@@ -4736,10 +4836,19 @@ async function openMissionSettings(sessionId = currentSessionId) {
   $('mission-config-approvals-hint').textContent = 'Other tool approval policies stay unchanged';
   $('mission-config-debug-traces').checked = config.debugTraces ?? false;
   $('mission-config-continuity').disabled = config.status === 'completed';
-  $('archive-mission').textContent = config.status === 'completed' ? 'Reactivate mission' : 'Complete mission';
-  $('mission-complete-effect').textContent = config.status === 'completed'
-    ? 'Restarts linked Pulses and allows this mission to resume.'
+  const shelved = missionArchived(AgentSessions.findOne(sessionId));
+  $('complete-mission').textContent = config.status === 'completed' ? 'Reactivate mission' : 'Complete mission';
+  $('archive-mission').textContent = shelved ? 'Unarchive mission' : 'Archive mission';
+  $('archive-mission').title = shelved
+    ? 'Returns it to the list; it stays completed until reactivated.'
+    : 'Removes it from the list, completing it first if needed.';
+  const effect = $('mission-complete-effect');
+  effect.dataset.completeEffect = config.status === 'completed'
+    ? (shelved
+      ? 'Resumes work, restarts Pulses, and returns it to the list.'
+      : 'Restarts linked Pulses and allows this mission to resume.')
     : 'Stops work, pauses linked Pulses, and disables resume.';
+  effect.textContent = effect.dataset.completeEffect;
   updateMissionStatusHint(config.status);
   updateMissionConfigBadge(config.status);
   beginGuardedEditor('mission-form');
@@ -4867,7 +4976,7 @@ function wireMissionSettings() {
       }
     });
   });
-  $('archive-mission').addEventListener('click', () => {
+  $('complete-mission').addEventListener('click', () => {
     const completed = missionConfig()?.status === 'completed';
     const statusSelect = $('mission-config-status');
     if (!completed && !statusSelect.querySelector('option[value="completed"]')) {
@@ -4881,6 +4990,27 @@ function wireMissionSettings() {
     updateMissionStatusHint(completed ? 'active' : 'completed');
     updateGuardedEditor('mission-form');
     $('mission-form').requestSubmit();
+  });
+  const archiveButton = $('archive-mission');
+  const effect = $('mission-complete-effect');
+  // The footer has one hint line. It describes Complete by default and
+  // describes Archive while that button has the pointer or focus.
+  for (const type of ['mouseenter', 'focus']) {
+    archiveButton.addEventListener(type, () => { effect.textContent = archiveButton.title; });
+  }
+  for (const type of ['mouseleave', 'blur']) {
+    archiveButton.addEventListener(type, () => {
+      effect.textContent = effect.dataset.completeEffect ?? effect.textContent;
+    });
+  }
+  archiveButton.addEventListener('click', (event) => {
+    const sessionId = editingMissionSessionId;
+    if (!sessionId) return;
+    const shelved = missionArchived(AgentSessions.findOne(sessionId));
+    void withControlBusy(event.currentTarget, shelved ? 'Restoring' : 'Archiving', async () => {
+      const done = shelved ? await unarchiveMission(sessionId) : await archiveMission(sessionId);
+      if (done) $('mission-dialog').close();
+    });
   });
 }
 
@@ -5251,7 +5381,7 @@ function populatePulseTargets(pulse) {
     option.textContent = `${agent.displayName} · ${agent.role}`;
     agentSelect.append(option);
   }
-  const sessions = workspace.sessions().fetch();
+  const sessions = listedMissions();
   const sessionSelect = $('pulse-session');
   sessionSelect.replaceChildren();
   for (const session of sessions) {
@@ -7511,7 +7641,8 @@ async function initializeWorkspace() {
   learningSubscriptionError = null;
   learningSubscription = subscribeToLearning();
   const subscriptions = [
-    { label: 'missions', handle: workspace.subscribeSessions() },
+    // Archived Missions ride along so the list's Archived section can show them.
+    { label: 'missions', handle: workspace.subscribeSessions(true) },
     { label: 'mission settings', handle: Meteor.subscribe('constellation.missions') },
     { label: 'memory', handle: Meteor.subscribe(NAMES.pubMemories) },
     { label: 'crew', handle: Meteor.subscribe('constellation.crew') },
@@ -7545,7 +7676,7 @@ async function initializeWorkspace() {
     }
   }
   if (!initialSession) {
-    const preferred = workspace.sessions().fetch().find((session) => {
+    const preferred = listedMissions().find((session) => {
       const config = missionConfig(session._id);
       return config?.continuity !== false && config?.status !== 'completed';
     });
