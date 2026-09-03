@@ -4626,6 +4626,14 @@ Meteor.methods({
         { $set: { phase: 'idle', updatedAt: new Date() } },
       );
     }
+    if (current.status === 'completed' && next.status !== 'completed') {
+      // A shelved (archived) Mission is always completed. Reopening one, to
+      // active or paused, returns it to the Mission list in the same step.
+      await AgentSessions.updateAsync(
+        { _id: sessionId, userId: this.userId, agent: 'orchestrator' },
+        { $unset: { archived: 1 } },
+      );
+    }
     await setMissionPulseState(this.userId, sessionId, next.status === 'active');
     await reconcileConfiguredMissionCrew(this.userId, sessionId);
     return MissionConfigs.findOneAsync(
@@ -4656,6 +4664,68 @@ Meteor.methods({
         { $set: { continuity: enabled }, $inc: { revision: 1 } },
       );
       return MissionConfigs.findOneAsync({ _id: sessionId, userId });
+    });
+  },
+
+  // Archiving shelves a Mission: it leaves the main list while every record
+  // stays intact and reachable from the list's Archived section. It uses the
+  // package's own `archived` stamp and is orthogonal to the lifecycle status,
+  // with one invariant: a shelved Mission is always completed, so no Pulse,
+  // channel, or launch-time resume can keep feeding a Mission nobody sees.
+  async 'constellation.missionArchive'(sessionId) {
+    check(sessionId, String);
+    await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
+      const session = await AgentSessions.findOneAsync({
+        _id: sessionId, userId, agent: 'orchestrator',
+      });
+      if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
+      const current = await ensureMissionConfig(userId, session);
+      if (current.status !== 'completed' || current.continuity !== false) {
+        await MissionConfigs.updateAsync(
+          { _id: sessionId, userId },
+          {
+            $set: { status: 'completed', continuity: false, updatedAt: new Date() },
+            $inc: { revision: 1 },
+          },
+        );
+        if (current.status !== 'completed') {
+          await stopMissionExecution(userId, session);
+          await setMissionPulseState(userId, sessionId, false);
+        }
+      }
+      if (!session.archived) {
+        await AgentSessions.updateAsync(
+          { _id: sessionId, userId, agent: 'orchestrator', erasingAt: { $exists: false } },
+          { $set: { archived: new Date() } },
+        );
+      }
+      return MissionConfigs.findOneAsync(
+        { _id: sessionId, userId }, { fields: { userId: 0 } },
+      );
+    });
+  },
+
+  // Unarchive only returns the Mission to the list. It stays completed until
+  // Reactivate, which remains the one path that resumes work.
+  async 'constellation.missionUnarchive'(sessionId) {
+    check(sessionId, String);
+    await claimWorkspace(this.userId);
+    const userId = this.userId;
+    return withWorkspaceConfigMutation(userId, async () => {
+      const session = await AgentSessions.findOneAsync({
+        _id: sessionId, userId, agent: 'orchestrator',
+      });
+      if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
+      await ensureMissionConfig(userId, session);
+      await AgentSessions.updateAsync(
+        { _id: sessionId, userId, agent: 'orchestrator', erasingAt: { $exists: false } },
+        { $unset: { archived: 1 } },
+      );
+      return MissionConfigs.findOneAsync(
+        { _id: sessionId, userId }, { fields: { userId: 0 } },
+      );
     });
   },
 

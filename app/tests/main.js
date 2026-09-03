@@ -1897,6 +1897,74 @@ if (Meteor.isClient) {
       assert.strictEqual(error?.error, "stale-mission");
     });
 
+    it("archives a Mission off the list by completing it first, and Reactivate returns it", async function () {
+      const workspace = new Agent("orchestrator");
+      const sessionId = await workspace.start({ title: "Mission archive test" });
+      await Meteor.callAsync("constellation.prepareSession", sessionId);
+      const pulseId = await Meteor.callAsync("constellation.pulseCreate", {
+        name: "Mission archive test pulse",
+        prompt: "Return a mission archive test receipt.",
+        agent: "orchestrator",
+        sessionId,
+        schedule: { kind: "interval", every: 1, unit: "hours" },
+        enabled: true,
+      });
+
+      const archived = await Meteor.callAsync("constellation.missionArchive", sessionId);
+      assert.strictEqual(archived.status, "completed", "archiving completes a running Mission first");
+      assert.strictEqual(archived.continuity, false, "an archived Mission is never the resume candidate");
+      assert.strictEqual(archived.revision, 2);
+      await waitUntil(
+        () => AgentSessions.findOne(sessionId)?.archived instanceof Date,
+        "the session should carry the package's archived stamp",
+      );
+      assert.deepEqual(
+        await Meteor.callAsync("constellation.pulseRun", pulseId),
+        { ok: false, reason: "mission-inactive" },
+      );
+      let continuityError;
+      try {
+        await Meteor.callAsync("constellation.missionContinuitySet", sessionId, true);
+      } catch (caught) {
+        continuityError = caught;
+      }
+      assert.strictEqual(continuityError?.error, "mission-completed");
+
+      const again = await Meteor.callAsync("constellation.missionArchive", sessionId);
+      assert.strictEqual(again.revision, archived.revision, "archiving twice changes nothing");
+
+      const restored = await Meteor.callAsync("constellation.missionUnarchive", sessionId);
+      assert.strictEqual(restored.status, "completed", "unarchive lists the Mission again without reopening it");
+      assert.strictEqual(restored.revision, archived.revision);
+      await waitUntil(
+        () => AgentSessions.findOne(sessionId) && !AgentSessions.findOne(sessionId).archived,
+        "unarchive should clear the archived stamp",
+      );
+
+      await Meteor.callAsync("constellation.missionArchive", sessionId);
+      await waitUntil(
+        () => AgentSessions.findOne(sessionId)?.archived instanceof Date,
+        "the session should be archived again",
+      );
+      const reactivated = await Meteor.callAsync(
+        "constellation.missionSave", sessionId, restored.revision, { status: "active" },
+      );
+      assert.strictEqual(reactivated.status, "active");
+      await waitUntil(
+        () => AgentSessions.findOne(sessionId) && !AgentSessions.findOne(sessionId).archived,
+        "reactivating an archived Mission must return it to the list",
+      );
+      assert.strictEqual((await Meteor.callAsync("constellation.pulseRun", pulseId)).ok, true);
+
+      let missing;
+      try {
+        await Meteor.callAsync("constellation.missionArchive", Random.id());
+      } catch (caught) {
+        missing = caught;
+      }
+      assert.strictEqual(missing?.error, "no-session");
+    });
+
     it("CRUDs people and configures human and agent Mission participants", async function () {
       const members = Mongo.getCollection("constellation_workspace_members")
         ?? new Mongo.Collection("constellation_workspace_members");
