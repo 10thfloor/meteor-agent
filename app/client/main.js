@@ -1012,6 +1012,47 @@ function renderCrew(
     row.append(avatar, copy, state, disclosure);
     list.append(row);
   }
+  // Agents that took part in this mission but are no longer on its crew —
+  // archived or disabled on the workspace roster, or dropped from a custom
+  // mission crew — stay visible as "left", so a transcript that names them
+  // never points at a crew member the panel refuses to show.
+  const present = new Set(definitions.map((definition) => definition.agent));
+  const knownAgents = new Set(crewConfigs().map((crewConfig) => crewConfig.agent));
+  const seen = new Set();
+  for (const message of messages) {
+    for (const call of message.toolCalls ?? []) {
+      if (knownAgents.has(call.name)) seen.add(call.name);
+    }
+  }
+  for (const row of session?.participants ?? []) {
+    if (row.kind === 'model' && row.agent) seen.add(row.agent);
+  }
+  for (const agent of [...seen].filter((name) => name !== 'orchestrator' && !present.has(name))) {
+    const crewConfig = crewConfigs().find((candidate) => candidate.agent === agent);
+    const reason = !crewConfig || crewConfigArchived(crewConfig)
+      ? 'Left · archived'
+      : (crewConfig.enabled === false ? 'Left · disabled' : 'Left · not on this mission');
+    const row = document.createElement('div');
+    row.className = 'crew-card';
+    row.dataset.agentState = 'left';
+    row.dataset.accent = crewConfig?.color ?? 'steel';
+    row.setAttribute('aria-label', `${crewConfig?.displayName ?? agent}. ${reason}.`);
+    const avatar = document.createElement('span');
+    avatar.className = `crew-avatar ${crewConfig?.color ?? 'steel'}`;
+    avatar.setAttribute('aria-hidden', 'true');
+    avatar.dataset.agentState = 'left';
+    avatar.textContent = crewConfig?.avatar ?? agent.slice(0, 1).toUpperCase();
+    avatar.append(document.createElement('i'));
+    const copy = document.createElement('span');
+    copy.className = 'crew-copy';
+    const name = document.createElement('strong');
+    name.textContent = crewConfig?.displayName ?? agent;
+    const role = document.createElement('span');
+    role.textContent = reason;
+    copy.append(name, role);
+    row.append(avatar, copy, crewStateGlyph('left', reason));
+    list.append(row);
+  }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
   $('crew-count').textContent = String(definitions.length);
   // Say which crew this is. 'inherit' follows the workspace roster; 'custom'
@@ -1039,6 +1080,11 @@ const CREW_STATE_GLYPHS = {
   stopped: [RING, ['rect', { x: '9.25', y: '9.25', width: '5.5', height: '5.5', rx: '1' }]],
   paused: [RING, ['path', { d: 'M10 9v6M14 9v6' }]],
   completed: [['path', { d: 'M5.5 12.5 9.8 16.8 18.5 7.8' }]],
+  // Departed: a door with the arrow pointing out of the room.
+  left: [
+    ['path', { d: 'M14.5 4.75H8.75A2.25 2.25 0 0 0 6.5 7v10a2.25 2.25 0 0 0 2.25 2.25h5.75' }],
+    ['path', { d: 'M12 12h8M17 9l3 3-3 3' }],
+  ],
 };
 
 function crewStateGlyph(agentState, label) {
