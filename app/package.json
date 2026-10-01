@@ -17,7 +17,7 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.23.5",
-    "@earendil-works/pi-ai": "^0.84.2",
+    "@earendil-works/pi-ai": "^1.0.0",
     "@modelcontextprotocol/sdk": "^1.30.0",
     "@swc/helpers": "^0.5.17",
     "marked": "18.0.11",

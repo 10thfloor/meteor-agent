@@ -13,7 +13,7 @@ export const PREFERRED_PROVIDER_MODELS = Object.freeze({
   xai: 'grok-4.3',
   groq: 'llama-3.3-70b-versatile',
   mistral: 'mistral-small-latest',
-  deepseek: 'deepseek-v4-flash',
+  deepseek: 'deepseek-flash',
   openrouter: 'anthropic/claude-haiku-4.5',
   'amazon-bedrock': 'anthropic.claude-haiku-4-5-20251001-v1:0',
   'google-vertex': 'gemini-2.5-flash',

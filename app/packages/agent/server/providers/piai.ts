@@ -1,7 +1,26 @@
 import { loadPiAi } from './loader';
 import type { Provider, ProviderChunk, ProviderMessage, ProviderRequest } from './types';
 
-/* Mapping layer for @earendil-works/pi-ai. Types read off installed dist. */
+/* Mapping layer for @earendil-works/pi-ai. Types read off installed dist —
+ * probed at 0.84.2, re-read at 1.0.0 (`dist/types.d.ts` unless noted):
+ *   Context { systemPrompt?, messages, tools? }                  :532
+ *   Message roles user / assistant / toolResult (1.0 adds system) :430
+ *   ToolCall { type: 'toolCall', id, name, arguments }           :280
+ *   Usage — required on every AssistantMessage                   :289
+ *   AssistantMessageEvent — text_delta, thinking_delta,
+ *     toolcall_delta (+ contentIndex), done, error               :564
+ *   Models.streamSimple(model, context, options)      models.d.ts:180
+ *
+ * Four releases between 0.84 and 1.0 were breaking; none reached this file:
+ *   0.84.3  GoogleThinkingLevel renamed — never referenced here.
+ *   0.85.0  Cloudflare binding fetch renamed — never referenced here.
+ *   0.86.0  Provider-FACING streams now receive a normalized
+ *           `TranscriptContext`. This adapter is a caller, not a provider:
+ *           `Models.streamSimple` still takes `Context` and folds
+ *           `systemPrompt`/`tools` into a leading system message itself.
+ *           `ToolCall.arguments` became JSON-only; ours are parsed JSON.
+ *   0.99.0  Image models joined the regular catalog; `getModel` and the
+ *           other unqualified reads stay chat-only. */
 
 /** pi-ai `TextContent`. */
 interface PiAiTextContent { type: 'text'; text: string }

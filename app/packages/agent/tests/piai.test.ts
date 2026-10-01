@@ -22,9 +22,11 @@ const req: ProviderRequest = {
 
 describe('pi-ai adapter mapping', () => {
   // Field names below are the ones the Step 1 probe found in pi-ai 0.84.2's
-  // `dist/types.d.ts`: `Context { systemPrompt, messages, tools }`, message
-  // roles `user` / `assistant` / `toolResult`, tool-call blocks
-  // `{ type: 'toolCall', id, name, arguments }`.
+  // `dist/types.d.ts`, re-read at 1.0.0: `Context { systemPrompt, messages,
+  // tools }` (:532), message roles `user` / `assistant` / `toolResult`
+  // (:430), tool-call blocks `{ type: 'toolCall', id, name, arguments }`
+  // (:280). 1.0 adds a `system` role for mid-conversation prompt changes; the
+  // adapter never emits one.
 
   it('splits "<provider>/<model-id>" and maps the system prompt', () => {
     const out = toPiAiRequest(req, 0);
@@ -171,8 +173,8 @@ describe('pi-ai adapter mapping', () => {
   });
 
   it('threads toolcall_delta contentIndex through, and omits it when absent', () => {
-    // pi-ai's types.d.ts:426-429 declares contentIndex on every toolcall_*
-    // event. It is the only attribution parallel calls have.
+    // pi-ai's types.d.ts:596-608 (1.0.0) declares contentIndex on every
+    // toolcall_* event. It is the only attribution parallel calls have.
     assert.deepEqual(
       translateEvent({ type: 'toolcall_delta', delta: '{"a":1}', contentIndex: 2 }),
       [{ kind: 'tool_args', chunk: '{"a":1}', contentIndex: 2 }],
@@ -263,12 +265,14 @@ describe('pi-ai adapter stream (pi-ai\'s own faux provider, no network)', () => 
 
   it('passes the request signal through to streamSimple\'s options', async function () {
     this.timeout(20000);
-    // Probe finding (pi-ai 0.84.2): `Models.streamSimple(model, context,
-    // options?: ModelsSimpleStreamOptions)`, and
+    // Probe finding (pi-ai 0.84.2, unchanged at 1.0.0):
+    // `Models.streamSimple(model, context, options?: ModelsSimpleStreamOptions)`
+    // (models.d.ts:180), and
     // `ModelsSimpleStreamOptions = SimpleStreamOptions & ModelsRequestTransforms`
-    // -> `SimpleStreamOptions extends StreamOptions`
-    // -> `StreamOptions extends ProviderRequestOptions<Model<Api>>`, which
-    // declares `signal?: AbortSignal`. That third argument is the ONLY thing
+    // (models.d.ts:47) -> `SimpleStreamOptions extends StreamOptions`
+    // (types.d.ts:242) -> `StreamOptions extends
+    // ProviderRequestOptions<Model<Api>>` (:111), which declares
+    // `signal?: AbortSignal` (:58). That third argument is the ONLY thing
     // that reaches the HTTP request, so an interrupt that does not arrive here
     // cancels nothing.
     const seen: any[] = [];
@@ -337,8 +341,8 @@ describe('Anthropic converter request body (injected fetch, no network)', () => 
   // The mapping tests above stop at pi-ai's `Context`. Everything after that —
   // `tool_result` blocks, `is_error`, `input_schema`, the system block — is
   // pi-ai's own Anthropic converter, and a mistake there is invisible until a
-  // real request is rejected. `ProviderRequestOptions` (dist/types.d.ts:49-59)
-  // makes that reachable offline:
+  // real request is rejected. `ProviderRequestOptions` (dist/types.d.ts:57-67
+  // at 1.0.0) makes that reachable offline:
   //
   //     export interface ProviderRequestOptions<TModel = Model<Api>> {
   //         signal?: AbortSignal;
@@ -350,9 +354,9 @@ describe('Anthropic converter request body (injected fetch, no network)', () => 
   //          */
   //         fetch?: FetchFunction;
   //
-  // `ModelsSimpleStreamOptions` extends it (models.d.ts:46), and the Anthropic
+  // `ModelsSimpleStreamOptions` extends it (models.d.ts:47), and the Anthropic
   // adapter hands the option straight to the SDK client it constructs
-  // (api/anthropic-messages.js:371 -> createClient(..., options?.fetch, ...)),
+  // (api/anthropic-messages.js:424 -> createClient(..., options?.fetch, ...)),
   // so the injected fetch sees the finished HTTP request. `createPiAiProvider`
   // grew a second `options` argument for exactly this — the loop still passes
   // none.
@@ -468,9 +472,9 @@ describe('Anthropic converter request body (injected fetch, no network)', () => 
   it('builds a request at all when history contains a replayed assistant message', async function () {
     this.timeout(30000);
     // Regression. pi-ai's `Usage` is REQUIRED on an AssistantMessage and its
-    // context estimator dereferences it unguarded (utils/estimate.js:4, reached
-    // from api/simple-options.js:6 on the way into every request). A replayed
-    // assistant row without one threw
+    // context estimator dereferences it unguarded (utils/estimate.js:5, reached
+    // from api/simple-options.js:7 on the way into every request — still true
+    // at 1.0.0). A replayed assistant row without one threw
     // "Cannot read properties of undefined (reading 'totalTokens')" before any
     // HTTP call — so every turn after the first died on the real Anthropic
     // path, while the faux-provider tests, which never build request options,
