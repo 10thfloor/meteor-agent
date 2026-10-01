@@ -271,6 +271,13 @@ const defaultFactory: McpClientFactory = async (_name, def) => {
     requestTimeoutMs: Math.max(1, budgetFor(def)),
   });
   await client.connect(transport);
+  // ADDING A METHOD TO THIS SEAM? pi-mcp's client is not shaped like the
+  // official SDK's, and an SDK-shaped call can fail without throwing. Options
+  // are `{ timeoutMs }`; a `{ timeout }` is ignored. `listResources(options)`
+  // walks every page and returns a bare array where the SDK returned
+  // `{ resources, nextCursor }`; one page is `listResourcesPage(cursor,
+  // options)`. `readResource` takes the uri itself. There are no prompt
+  // helpers: use `request('prompts/list' | 'prompts/get', params, options)`.
   return {
     listTools: async (_params, options) => ({
       tools: await client.listTools(
