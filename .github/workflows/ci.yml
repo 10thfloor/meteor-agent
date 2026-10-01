@@ -117,6 +117,13 @@ jobs:
         working-directory: app
         run: meteor npm ci || meteor npm install
 
+      - name: Run the workspace MCP server's wire-format tests
+        working-directory: app
+        # app/mcp/workspace-server.mjs is written against the protocol with no
+        # server library, so it carries its own tests: raw JSON-RPC over a real
+        # subprocess's stdio. Plain node:test, seconds, no Meteor build.
+        run: meteor npm run test:mcp-server
+
       - name: Install Playwright browser
         working-directory: app
         run: npx playwright install --with-deps chromium

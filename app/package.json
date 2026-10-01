@@ -13,6 +13,7 @@
     "test": "TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 --driver-package meteortesting:mocha ./packages/agent ./packages/agent-channel-slack ./packages/agent-channel-telegram ./packages/agent-channel-whatsapp ./packages/agent-channel-sms ./packages/agent-channel-email",
     "test-app": "TEST_WATCH=1 meteor test --full-app --driver-package meteortesting:mocha",
     "test-app:once": "CONSTELLATION_OFFLINE=1 TEST_BROWSER_DRIVER=playwright meteor test --full-app --once --port 3200 --driver-package meteortesting:mocha",
+    "test:mcp-server": "node --test mcp/workspace-server.test.mjs",
     "visualize": "meteor --production --extra-packages bundle-visualizer"
   },
   "dependencies": {

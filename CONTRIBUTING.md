@@ -60,6 +60,15 @@ meteor npm run test-app:once
 A test entry point no CI job executes is coverage that does not exist — the
 control-plane suite ran only on developers' machines until this job landed.
 
+The app's own MCP server (`app/mcp/workspace-server.mjs`) is written against
+the protocol with no server library, so it carries wire-format tests of its own:
+raw JSON-RPC over a real subprocess's stdio, on plain `node:test`. The full-app
+CI job runs them before the suite; locally:
+
+```bash
+meteor npm run test:mcp-server
+```
+
 ## The npm dependency policy (pi-ai, and now the MCP SDK)
 
 The package has four app-level npm dependencies — `@earendil-works/pi-ai`,
