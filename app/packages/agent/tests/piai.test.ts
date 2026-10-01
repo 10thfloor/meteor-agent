@@ -494,6 +494,203 @@ describe('Anthropic converter request body (injected fetch, no network)', () => 
   });
 });
 
+describe('provider success streams (injected fetch, real SDK decoding, no network)', () => {
+  // The faux provider never touches a provider SDK, and the request-body block
+  // above ends every stream on a 400. Neither would notice a release that
+  // changed how a REAL response is decoded — and a pi-ai bump moves the SDKs
+  // underneath it (0.84 -> 1.0 took @anthropic-ai/sdk 0.91 -> 0.124 and openai
+  // 6 -> 7 in one step). The bodies below are the providers' documented
+  // streaming wire events, served through the same injected `fetch`, so the
+  // whole response path runs: the SDK's SSE decoding, pi-ai's adapter, then
+  // `translateEvent`.
+  //
+  // Two tool calls in each, because parallel calls are where attribution
+  // breaks: their argument fragments must arrive under distinct contentIndexes.
+
+  const turn = {
+    system: 'be terse',
+    messages: [{ role: 'user' as const, content: 'hi' }],
+    tools: [{
+      name: 'look',
+      description: 'Look something up',
+      parameters: { type: 'object', properties: { q: { type: 'number' } }, required: ['q'] },
+    }],
+  };
+
+  const sse = (events: Array<[string | null, unknown]>) => events
+    .map(([name, data]) => `${name ? `event: ${name}\n` : ''}data: ${
+      typeof data === 'string' ? data : JSON.stringify(data)}\n\n`)
+    .join('');
+
+  const eventStream = (body: string) => new Response(
+    body, { status: 200, headers: { 'content-type': 'text/event-stream' } },
+  );
+
+  async function collect(stream: AsyncIterable<ProviderChunk>) {
+    const chunks: ProviderChunk[] = [];
+    for await (const c of stream) chunks.push(c);
+    const args = new Map<number | undefined, string>();
+    let text = '';
+    for (const c of chunks) {
+      if (c.kind === 'text') text += c.chunk;
+      if (c.kind === 'tool_args') args.set(c.contentIndex, (args.get(c.contentIndex) ?? '') + c.chunk);
+    }
+    return { text, args, done: chunks[chunks.length - 1] as any };
+  }
+
+  it('decodes an Anthropic Messages stream into text, attributed tool args and usage', async function () {
+    this.timeout(30000);
+    const all: any = await loadPiAi('providers/all');
+    const models = all.builtinModels();
+    const toolUse = (index: number, id: string, fragments: string[]): Array<[string, unknown]> => [
+      ['content_block_start', {
+        type: 'content_block_start', index, content_block: { type: 'tool_use', id, name: 'look', input: {} },
+      }],
+      ...fragments.map((partial_json): [string, unknown] => ['content_block_delta', {
+        type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json },
+      }]),
+      ['content_block_stop', { type: 'content_block_stop', index }],
+    ];
+    const body = sse([
+      ['message_start', {
+        type: 'message_start',
+        message: {
+          id: 'msg_test', type: 'message', role: 'assistant', model: 'claude-sonnet-5', content: [],
+          stop_reason: null, stop_sequence: null, usage: { input_tokens: 12, output_tokens: 1 },
+        },
+      }],
+      ['content_block_start', { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'hello ' } }],
+      ['content_block_delta', { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text: 'there' } }],
+      ['content_block_stop', { type: 'content_block_stop', index: 0 }],
+      ...toolUse(1, 'toolu_a', ['{"q":', '1}']),
+      ...toolUse(2, 'toolu_b', ['{"q":2}']),
+      ['message_delta', {
+        type: 'message_delta', delta: { stop_reason: 'tool_use', stop_sequence: null }, usage: { output_tokens: 9 },
+      }],
+      ['message_stop', { type: 'message_stop' }],
+    ]);
+    let requests = 0;
+    const provider = createPiAiProvider(async () => models as any, {
+      apiKey: 'test-key',
+      fetch: async () => { requests += 1; return eventStream(body); },
+    });
+
+    const { text, args, done } = await collect(
+      provider.stream({ model: 'anthropic/claude-sonnet-5', ...turn }),
+    );
+
+    assert.equal(requests, 1, 'one request, no retry');
+    assert.equal(text, 'hello there');
+    assert.lengthOf([...args.keys()], 2, 'each parallel call keeps its own contentIndex');
+    assert.deepEqual([...args.values()].map((json) => JSON.parse(json)), [{ q: 1 }, { q: 2 }]);
+    assert.equal(done.kind, 'done');
+    assert.deepEqual(done.toolCalls, [
+      { id: 'toolu_a', name: 'look', args: { q: 1 } },
+      { id: 'toolu_b', name: 'look', args: { q: 2 } },
+    ]);
+    assert.equal(done.usage.input, 12);
+    assert.equal(done.usage.output, 9);
+    assert.isAbove(done.usage.cost, 0, 'a catalog-priced model reports pi-ai\'s own cost');
+  });
+
+  it('decodes an OpenAI-compatible Chat Completions stream from a custom provider', async function () {
+    this.timeout(30000);
+    // The other pi-ai seam this repo leans on: a provider assembled with
+    // `createProvider` over `api/openai-completions.lazy`, which is how the
+    // reference app registers a local Ollama. The base URL is the discard
+    // port — if a release ever ignored the injected fetch, this fails on a
+    // refused connection instead of reaching whatever happens to be listening.
+    const piai: any = await loadPiAi();
+    const { openAICompletionsApi }: any = await loadPiAi('api/openai-completions.lazy');
+    const baseUrl = 'http://127.0.0.1:9/v1';
+    const models = piai.createModels();
+    models.setProvider(piai.createProvider({
+      id: 'local',
+      name: 'Local',
+      baseUrl,
+      auth: {
+        apiKey: { name: 'Local', resolve: async () => ({ auth: { apiKey: 'local' }, source: 'Local' }) },
+      },
+      models: [{
+        id: 'm1', name: 'm1', api: 'openai-completions', provider: 'local', baseUrl,
+        reasoning: false, input: ['text'],
+        // Unpriced on purpose: see the cost assertion below.
+        cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+        contextWindow: 32768, maxTokens: 4096,
+        compat: {
+          supportsStore: false, supportsDeveloperRole: false, maxTokensField: 'max_tokens',
+          supportsStrictMode: false, supportsLongCacheRetention: false, supportsReasoningEffort: false,
+        },
+      }],
+      api: openAICompletionsApi(),
+    }));
+
+    const chunk = (delta: unknown, finish_reason: string | null = null) => ({
+      id: 'chatcmpl-test', object: 'chat.completion.chunk', created: 1, model: 'm1',
+      choices: [{ index: 0, delta, finish_reason }],
+    });
+    const call = (index: number, fn: Record<string, string>, id?: string) => chunk({
+      tool_calls: [{ index, ...(id ? { id, type: 'function' } : {}), function: fn }],
+    });
+    const body = sse([
+      [null, chunk({ role: 'assistant', content: '' })],
+      [null, chunk({ content: 'hello ' })],
+      [null, chunk({ content: 'there' })],
+      [null, call(0, { name: 'look', arguments: '' }, 'call_a')],
+      [null, call(0, { arguments: '{"q":' })],
+      [null, call(0, { arguments: '1}' })],
+      [null, call(1, { name: 'look', arguments: '{"q":2}' }, 'call_b')],
+      [null, chunk({}, 'tool_calls')],
+      [null, {
+        id: 'chatcmpl-test', object: 'chat.completion.chunk', created: 1, model: 'm1', choices: [],
+        usage: { prompt_tokens: 20, completion_tokens: 8, total_tokens: 28 },
+      }],
+      [null, '[DONE]'],
+    ]);
+    const requests: Array<{ url: string; authorization: string | null; body: any }> = [];
+    const provider = createPiAiProvider(async () => models as any, {
+      fetch: async (url: any, init: any) => {
+        requests.push({
+          url: String(url),
+          authorization: new Headers(init.headers).get('authorization'),
+          body: JSON.parse(String(init.body)),
+        });
+        return eventStream(body);
+      },
+    });
+
+    const { text, args, done } = await collect(provider.stream({ model: 'local/m1', ...turn }));
+
+    // The request the compat flags are supposed to produce.
+    assert.lengthOf(requests, 1, 'one request, no retry');
+    const [request] = requests;
+    assert.equal(request.url, `${baseUrl}/chat/completions`);
+    assert.equal(request.authorization, 'Bearer local', 'the provider\'s own resolved key, not a global one');
+    assert.deepEqual(request.body.messages[0], { role: 'system', content: 'be terse' });
+    assert.equal(request.body.max_tokens, 4096);
+    assert.isUndefined(request.body.max_completion_tokens);
+    assert.isUndefined(request.body.store);
+    assert.deepEqual(request.body.tools, [{
+      type: 'function',
+      function: { name: 'look', description: 'Look something up', parameters: turn.tools[0].parameters },
+    }]);
+
+    // And the response, decoded.
+    assert.equal(text, 'hello there');
+    assert.lengthOf([...args.keys()], 2, 'each parallel call keeps its own contentIndex');
+    assert.deepEqual([...args.values()].map((json) => JSON.parse(json)), [{ q: 1 }, { q: 2 }]);
+    assert.equal(done.kind, 'done');
+    assert.deepEqual(done.toolCalls, [
+      { id: 'call_a', name: 'look', args: { q: 1 } },
+      { id: 'call_b', name: 'look', args: { q: 2 } },
+    ]);
+    assert.equal(done.usage.input, 20);
+    assert.equal(done.usage.output, 8);
+    assert.notProperty(done.usage, 'cost', 'a zero cost is omitted so the operator\'s own pricing applies');
+  });
+});
+
 describe('piAiProvider()', () => {
   it('maps PROVIDER_API_KEY to pi-ai\'s explicit apiKey option', () => {
     assert.deepEqual(
