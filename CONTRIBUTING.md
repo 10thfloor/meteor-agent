@@ -67,16 +67,19 @@ The package has four app-level npm dependencies — `@earendil-works/pi-ai`,
 `Npm.depends`. The first three are server-side and subject to every rule
 below; `marked` is client-only and covered by its own paragraph after the
 pins.
-pi-ai is **pre-1.0 and its API has moved during this project** (0.73 → 0.84
-renamed the scope and reshaped the streaming surface); the MCP SDK is post-1.0
-but ships weekly; typebox is post-1.0 and its `Compile`/`Value` surface is
-probed off the installed files exactly as the other two are. The first two are
-genuinely optional peers (see below); typebox is a **direct dependency** —
-argument validation degrades to a structural checker without it, but it must be
-pinned directly rather than leaned on as a transitive of pi-ai, because a pi-ai
-bump or a hoisting change could otherwise remove it and, worse, make
-`defineAgentMethod` throw at registration when full validation is expected. The
-package survives all three because of three rules — keep them:
+pi-ai **reached 1.0 on 2026-10-01 after an API that moved throughout this
+project** (0.73 → 0.84 renamed the scope and reshaped the streaming surface;
+0.84 → 1.0 crossed four breaking releases, none of which reached the surface
+this package calls — the probe notes in `server/providers/piai.ts` say which);
+the MCP SDK is post-1.0 but ships weekly; typebox is post-1.0 and its
+`Compile`/`Value` surface is probed off the installed files exactly as the
+other two are. The first two are genuinely optional peers (see below); typebox
+is a **direct dependency** — argument validation degrades to a structural
+checker without it, but it must be pinned directly rather than leaned on as a
+transitive of pi-ai, because a pi-ai bump or a hoisting change could otherwise
+remove it and, worse, make `defineAgentMethod` throw at registration when full
+validation is expected. The package survives all three because of three rules —
+keep them:
 
 1. **Each dependency is imported by exactly one file.** pi-ai (and typebox)
    only by `server/providers/loader.ts`, reached elsewhere through
@@ -115,17 +118,27 @@ package survives all three because of three rules — keep them:
      tests pin the SDK's resolved entry paths (`dist/esm/client/index.js`,
      `dist/esm/client/stdio.js`) and the two exported names the client needs, so
      a reshape of either fails loudly here;
+   - run the full-app suite (`meteor npm run test-app:once`) after a pi-ai bump
+     — a catalog refresh can retire a model id, and "Installed model defaults"
+     checks the reference app's intentional per-provider defaults
+     (`app/imports/constellation/models.js`) against the installed catalog
+     (1.0 replaced `deepseek-v4-flash` with `deepseek-flash`);
    - run `./scripts/verify-build.sh` — resolution is exports-map dependent and a
      packaging change can break the loader chain only in a real bundle;
    - run the live smokes: pi-ai's with an `ANTHROPIC_API_KEY`, the MCP one with
      `MCP_LIVE_TEST=1` (it spawns `npx -y @modelcontextprotocol/server-everything`
      and is the only test that proves the real protocol round trip).
 
-The app pins `^0.84.2` (pi-ai), `^1.30.0` (MCP SDK), `^1.3.7` (typebox), and
+The app pins `^1.0.0` (pi-ai), `^1.30.0` (MCP SDK), `^1.3.7` (typebox), and
 `18.0.11` (marked, exact). Do not widen any range in a commit that changes
-anything else. A typebox bump is a verification event too: run the suite (the
-tools suite pins the full ladder and `format` enforcement) and re-read the
-`Compile`/`Value` probe notes at the top of `server/tools.ts`.
+anything else. A caret on pi-ai now floats across minors, where `^0.84.2`
+floated only patches: the lockfile is what CI and the reference app run, so
+rule 3 applies to every lockfile move, not only to an edit of the range. pi-ai
+pins typebox exactly, so its bump usually moves typebox with it (1.0.0 took it
+from 1.3.7 to 1.3.27); keep the two deduplicated to one copy. A typebox bump is
+a verification event too: run the suite (the tools suite pins the full ladder
+and `format` enforcement) and re-read the `Compile`/`Value` probe notes at the
+top of `server/tools.ts`.
 
 **marked is the one client-side dependency, and it follows the same spirit
 with different mechanics.** It is imported by exactly one file —

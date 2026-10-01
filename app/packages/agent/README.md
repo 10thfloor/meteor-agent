@@ -20,6 +20,11 @@ dependency of `@earendil-works/pi-ai` today, but install it directly so a pi-ai
 bump or a hoisting change cannot remove it — see CONTRIBUTING's dependency
 policy.
 
+The package is verified against pi-ai **1.x**: CI runs the exact version in
+`app/package-lock.json`, currently 1.0.0. An app still on the 0.84 line keeps
+working — nothing the adapter calls changed across the 1.0 boundary — but new
+installs should take 1.x.
+
 **Remove `insecure` and `autopublish`** from your app (`meteor remove insecure
 autopublish`) — the defaults Meteor ships in every new app. `autopublish` would
 push transcripts to every client, and `insecure` grants clients direct write
