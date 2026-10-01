@@ -13,12 +13,13 @@
     "test": "TEST_BROWSER_DRIVER=playwright meteor test-packages --once --port 3200 --driver-package meteortesting:mocha ./packages/agent ./packages/agent-channel-slack ./packages/agent-channel-telegram ./packages/agent-channel-whatsapp ./packages/agent-channel-sms ./packages/agent-channel-email",
     "test-app": "TEST_WATCH=1 meteor test --full-app --driver-package meteortesting:mocha",
     "test-app:once": "CONSTELLATION_OFFLINE=1 TEST_BROWSER_DRIVER=playwright meteor test --full-app --once --port 3200 --driver-package meteortesting:mocha",
+    "test:mcp-server": "node --test mcp/workspace-server.test.mjs",
     "visualize": "meteor --production --extra-packages bundle-visualizer"
   },
   "dependencies": {
     "@babel/runtime": "^7.23.5",
     "@earendil-works/pi-ai": "^1.0.0",
-    "@modelcontextprotocol/sdk": "^1.30.0",
+    "@earendil-works/pi-mcp": "^1.0.0",
     "@swc/helpers": "^0.5.17",
     "marked": "18.0.11",
     "meteor-node-stubs": "^1.2.29",

@@ -834,7 +834,8 @@ authoritative where an older record describes an earlier release.
   Atlas or a single-node `--replSet` is sufficient.
 - `typebox` for full tool-argument validation.
 - `@earendil-works/pi-ai` as an app dependency unless you bring your own
-  provider; `@modelcontextprotocol/sdk` only if you use MCP tools.
+  provider; `@earendil-works/pi-mcp` only if you use MCP tools (the tagged
+  v0.3.0 uses `@modelcontextprotocol/sdk` there instead).
 
 ## How it holds together
 

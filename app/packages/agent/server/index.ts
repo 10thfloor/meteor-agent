@@ -85,7 +85,7 @@ export {
   type DiscoveryResult, type McpServerState, type McpServerStatus,
   type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
 } from './mcp/client';
-export { mcpSdkResolvable } from './mcp/loader';
+export { mcpClientResolvable, mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
 export { createPiAiProvider, piAiProvider, type PiAiModels } from './providers/piai';
 export { loadPiAi } from './providers/loader';

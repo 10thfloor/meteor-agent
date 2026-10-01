@@ -27,7 +27,8 @@
 #        asserts pi-ai's namespace loads, `Type` builds a schema, and
 #        `builtinModels()` returns a usable model — then repeats the whole
 #        chain for `typebox/value`, the full JSON-Schema checker behind
-#        `validateToolArgs`, and checks a rich schema in both directions.
+#        `validateToolArgs`, and checks a rich schema in both directions — and
+#        once more for `@earendil-works/pi-mcp`, the MCP client library.
 #
 # WHAT IT DOES NOT NEED
 #   No Mongo, no app boot, no listening port (so it cannot collide with anything
@@ -87,16 +88,20 @@ echo "compiled package: $(du -h "$BUNDLED_PKG" | cut -f1) $BUNDLED_PKG"
 
 # Drift guard. The probe below is a port of server/providers/loader.ts; these
 # markers assert the shipped bundle still contains the code it is a port OF.
-for marker in resolvePiAiEntry shimLoad CANDIDATE_DIRS '@earendil-works/pi-ai' typeboxValueResolvable; do
+for marker in resolvePiAiEntry shimLoad CANDIDATE_DIRS '@earendil-works/pi-ai' typeboxValueResolvable \
+  resolvePiMcpEntry '@earendil-works/pi-mcp'; do
   grep -qF -- "$marker" "$BUNDLED_PKG" \
     || fail "loader marker '$marker' missing from the bundle — server/providers/loader.ts
-      has changed shape and the probe in this script no longer mirrors it."
+      or server/mcp/loader.ts has changed shape and the probe in this script no
+      longer mirrors it."
 done
-echo "loader markers present (resolvePiAiEntry, shimLoad, CANDIDATE_DIRS, pi-ai)"
+echo "loader markers present (resolvePiAiEntry, shimLoad, CANDIDATE_DIRS, pi-ai, pi-mcp)"
 
-[ -d "$SERVER_DIR/npm/node_modules/@earendil-works/pi-ai" ] \
-  || fail "pi-ai is not in the bundle at programs/server/npm/node_modules"
-echo "pi-ai present at programs/server/npm/node_modules"
+for pkg in pi-ai pi-mcp; do
+  [ -d "$SERVER_DIR/npm/node_modules/@earendil-works/$pkg" ] \
+    || fail "$pkg is not in the bundle at programs/server/npm/node_modules"
+  echo "$pkg present at programs/server/npm/node_modules"
+done
 
 step "npm install inside the bundle (programs/server)"
 NPM_LOG="$BUILD_DIR/npm-install.log"
@@ -322,11 +327,49 @@ if (!V.Check(rich, { op: 'a' })) die('Value.Check rejected a valid rich-schema a
 if (V.Check(rich, { op: 'z' })) die('Value.Check accepted an out-of-enum argument');
 console.log(`Value.Check(enum)     : ok (accepts "a", rejects "z")`);
 
-console.log(`WINNING LOADER BRANCH : ${winner.label.trim()}  (typebox: ${tbWinner.label.trim()})`);
+/*
+ * The MCP client library through the same chain. pi-mcp is ESM-only, its
+ * exports map carries a `source` condition beside `import`, and it brings one
+ * dependency of its own (cross-spawn) that has to resolve from the relocated
+ * tree too — importing the entry proves all three at once. An app that never
+ * registers an MCP server never loads this, so nothing else in a deployment
+ * would notice it missing until the first tool call.
+ */
+const MCP = '@earendil-works/pi-mcp';
+const mcpEntry = resolvePackageEntry(MCP);
+if (!fs.existsSync(mcpEntry)) die(`pi-mcp entry does not exist: ${mcpEntry}`);
+if (!mcpEntry.endsWith(path.join('dist', 'index.js'))) {
+  die(`pi-mcp resolved to an entry other than its built one: ${mcpEntry}`);
+}
+console.log(`pi-mcp "."            : ${path.relative(findNodeModulesBase(MCP), mcpEntry)}`);
+
+const mcpUrl = pathToFileURL(mcpEntry).href;
+const mcpOutcomes = [];
+for (const [label, fn] of [
+  ['1 bare import', () => import(MCP)],
+  ['2 URL import', () => import(mcpUrl)],
+  ['3 temp shim', () => shimLoad(mcpUrl)],
+]) {
+  try { mcpOutcomes.push({ label, ok: true, ns: await fn() }); } catch (e) {
+    mcpOutcomes.push({ label, ok: false, why: String(e?.code || e?.message || e).slice(0, 140) });
+  }
+}
+for (const o of mcpOutcomes) {
+  console.log(`pi-mcp branch ${o.label.padEnd(16)} ${o.ok ? 'ok' : `fail  (${o.why})`}`);
+}
+const mcpWinner = mcpOutcomes.find((o) => o.ok);
+if (!mcpWinner) die('no loader branch resolved pi-mcp in the production bundle');
+if (typeof mcpWinner.ns.McpClient !== 'function'
+    || typeof mcpWinner.ns.StdioTransport !== 'function') {
+  die('pi-mcp exposes no McpClient/StdioTransport');
+}
+console.log('McpClient/StdioTransport: load, with their own dependency resolved');
+
+console.log(`WINNING LOADER BRANCH : ${winner.label.trim()}  (typebox: ${tbWinner.label.trim()}, pi-mcp: ${mcpWinner.label.trim()})`);
 PROBE_EOF
 
 # `meteor node` is Meteor's own dev-bundle Node — the version the bundle is
 # built for, and the one a `meteor`-managed deploy runs it under.
 ( cd "$SERVER_DIR" && meteor node agent-loader-probe.mjs )
 
-step "PASS — the production bundle carries the agent and its loader chain resolves pi-ai"
+step "PASS — the production bundle carries the agent and its loader chain resolves pi-ai, typebox and pi-mcp"

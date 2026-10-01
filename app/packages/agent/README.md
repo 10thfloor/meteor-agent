@@ -498,12 +498,30 @@ that is what discovery is for. Supplying either overrides it for that tool. A
 whole-server spec takes `gate` (and, if you insist, `description`) but not
 `name` or `args`: one of each cannot describe many tools.
 
-Requires the SDK as an app-level peer dependency, reached through a loader seam
-exactly as pi-ai is:
+Requires the MCP client library as an app-level peer dependency, reached through
+a loader seam exactly as pi-ai is:
 
 ```bash
-meteor npm install --save @modelcontextprotocol/sdk
+meteor npm install --save @earendil-works/pi-mcp
 ```
+
+The client is [`@earendil-works/pi-mcp`](https://www.npmjs.com/package/@earendil-works/pi-mcp),
+a standalone stdio client with one small dependency of its own. Releases up to
+and including v0.3.0 use the official `@modelcontextprotocol/sdk` instead: an
+app moving past v0.3.0 swaps one install for the other and changes nothing
+else. `mcpClientResolvable()` reports whether the library is on disk;
+`mcpSdkResolvable()` remains as a deprecated alias of it.
+
+**A server gets a minimal environment and bounded time.** The subprocess starts
+with a short allowlist of the host's variables (`PATH`, `HOME`, `USER`,
+`LOGNAME`, `SHELL`, `TERM`, or their Windows counterparts) plus the definition's
+own `env` — never the host's full environment. It is third-party code, and your
+process holds provider keys and connection strings. Its stderr goes to your
+server log. Connecting and listing tools share one deadline (`timeoutMs`,
+default 15s); a server that never answers is killed at that deadline, not left
+running. Each `tools/call` has 60s. Tool lists are read to their last page.
+Closing a connection closes the server's stdin and then signals its whole
+process group, so a wrapper such as `npx` does not leave the real server behind.
 
 **Connections are lazy and per server.** Nothing spawns at registration. The
 first turn that needs a server connects over stdio, runs `tools/list` once and

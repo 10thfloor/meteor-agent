@@ -23,13 +23,16 @@ export interface McpServerStatus {
     /** Present only during an active cooldown. */
     cooldownUntil?: Date;
 }
-/** 15s deadline for connect + discovery (the SDK's 60s default is too long
+/** 15s deadline for connect + discovery (pi-mcp's own 30s default is too long
  *  for something that blocks the turn). */
 export declare const MCP_DISCOVERY_TIMEOUT_MS = 15000;
+/** Deadline for one `tools/call`: the 60s every call had under the official
+ *  SDK, kept explicitly because pi-mcp's own default is 30s. */
+export declare const MCP_CALL_TIMEOUT_MS = 60000;
 /** Cooldown after a failed open. Expires on its own; a success clears it
  *  immediately. Not a permanent cache — that was an M2 bug. */
 export declare const MCP_FAILURE_COOLDOWN_MS = 30000;
-/** The slice of the SDK's RequestOptions this package sets. */
+/** The one request option the seam carries: a per-request deadline, in ms. */
 export interface McpRequestOptions {
     timeout?: number;
 }
@@ -48,12 +51,12 @@ export interface McpCallResult {
         [k: string]: unknown;
     }>;
     isError?: boolean;
-    /** The SDK's `CompatibilityCallToolResultSchema` shape, for pre-content
-     *  servers: `{ toolResult }` and no `content` at all. */
+    /** The result shape of the protocol's first revision, before `content`
+     *  existed: `{ toolResult }` and no `content` at all. */
     toolResult?: unknown;
     [k: string]: unknown;
 }
-/** Test seam for the SDK Client. Connecting is the factory's job. */
+/** Test seam for the MCP client. Connecting is the factory's job. */
 export interface McpClient {
     listTools(params?: Record<string, unknown>, options?: McpRequestOptions): Promise<{
         tools?: McpToolInfo[];
@@ -75,6 +78,11 @@ export declare function getMcpServer(name: string): McpServerDef | undefined;
  *  to a generic message on any sign of stack traces, paths, long opaque
  *  tokens, or control characters. */
 export declare function sanitizeMcpReason(raw: unknown, fallback?: string): string;
+/** The environment a server subprocess starts with: the allowlist above, then
+ *  the definition's own `env` over it. NOT the host's environment — an MCP
+ *  server is third-party code, and this process holds API keys and connection
+ *  strings it has no business reading. */
+export declare function mcpChildEnvironment(extra?: Record<string, string>): Record<string, string>;
 export type DiscoveryResult = {
     ok: true;
     tools: McpToolInfo[];

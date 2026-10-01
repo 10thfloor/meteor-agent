@@ -1,23 +1,28 @@
+import fs from 'fs';
+import os from 'os';
+import path from 'path';
 import { assert } from 'chai';
 import { Agent } from '../server/agent';
 import type { AgentMessage } from '../common/types';
 import type {
-  McpCallResult, McpClient, McpClientFactory, McpToolInfo,
+  McpCallResult, McpClient, McpClientFactory, McpServerDef, McpToolInfo,
 } from '../server/mcp/client';
 
 /**
- * MCP tools, tested WITHOUT the SDK and WITHOUT a network.
+ * MCP tools, tested WITHOUT a network.
  *
- * Everything below drives an in-process fake that implements the `McpClient`
- * interface — `listTools`/`callTool`/`close`, the three methods probed off
- * `@modelcontextprotocol/sdk`'s `dist/esm/client/index.d.ts` — injected through
+ * Most of this file drives an in-process fake that implements the `McpClient`
+ * seam — `listTools`/`callTool`/`close` — injected through
  * `_setMcpClientFactory`, the same seam shape as `_setBackoff` and
- * `setTypeboxValueLoader`. No subprocess is spawned, so the suite stays as fast
- * and as hermetic as it was.
+ * `setTypeboxValueLoader`. No subprocess is spawned there, so those tests stay
+ * as fast and as hermetic as they were.
  *
- * The loader tests at the bottom DO touch the installed SDK (reading its
- * `exports` map and importing two namespaces), which is filesystem work, not
- * network work. The one genuinely live test needs `MCP_LIVE_TEST=1`.
+ * Two blocks near the bottom touch the real client library,
+ * `@earendil-works/pi-mcp`. The loader tests read its `exports` map and import
+ * its root namespace, which is filesystem work. The default-factory tests run
+ * it against a real stdio server: a small script written to a temp directory
+ * and started with this process's own Node. The one test that reaches outside
+ * the machine needs `MCP_LIVE_TEST=1`.
  */
 
 /** A scripted fake server. `onList`/`onCall` may throw or reject to model a
@@ -502,12 +507,12 @@ describe('MCP tool specs', () => {
     } finally { restore(); }
   });
 
-  it('deadlines a connect that never answers instead of waiting on the SDK default', async () => {
+  it('deadlines a connect that never answers instead of waiting on the client\'s own default', async () => {
     const { _setMcpClientFactory, discoverMcpTools } = await import('../server/mcp/client');
     // 80ms stands in for the 15s default. The assertion is that the budget is
     // OBSERVED at all — an unbounded await here would hang the suite, which is
-    // exactly the production failure (the SDK's own default is 60s per request,
-    // paid per server, on a turn a user is watching).
+    // exactly the production failure (a client library's own default is 30s
+    // or more per request, paid per server, on a turn a user is watching).
     Agent.mcpServer('t-hang', { command: 'never-spawned', timeoutMs: 80, cooldownMs: 0 });
     // Never resolves and never rejects: the connect that hangs forever.
     const hangs: McpClientFactory = () => new Promise<McpClient>(() => {});
@@ -519,7 +524,7 @@ describe('MCP tool specs', () => {
       assert.isFalse(found.ok);
       assert.include((found as any).reason, 't-hang');
       assert.include((found as any).reason, 'did not connect');
-      assert.isBelow(elapsed, 5000, 'the deadline must fire, not the SDK default');
+      assert.isBelow(elapsed, 5000, 'the deadline must fire, not the client\'s default');
     } finally { restore(); }
   });
 
@@ -868,30 +873,278 @@ describe('MCP server lifecycle', () => {
   });
 });
 
-describe('MCP SDK loader seam', () => {
-  it('resolves the SDK through the exports map Meteor cannot follow', async function () {
+describe('pi-mcp loader seam', () => {
+  it('resolves pi-mcp through the exports map Meteor cannot follow', async function () {
     this.timeout(20000);
-    const { resolveMcpSdkEntry, mcpSdkResolvable } = await import('../server/mcp/loader');
-    assert.isTrue(mcpSdkResolvable());
-    const client = resolveMcpSdkEntry('client');
-    // PROBE, pinned: `exports["./client"].import` is `./dist/esm/client/index.js`,
-    // and the transport is behind the WILDCARD key `./*`. Neither path exists
-    // under the specifier a plain import would use.
-    assert.isTrue(client.startsWith('/'), client);
-    assert.include(client, 'dist/esm/client/index.js');
-    assert.include(resolveMcpSdkEntry('client/stdio.js'), 'dist/esm/client/stdio.js');
+    const { resolvePiMcpEntry, mcpClientResolvable } = await import('../server/mcp/loader');
+    assert.isTrue(mcpClientResolvable());
+    const entry = resolvePiMcpEntry();
+    // PROBE, pinned at 1.0.0: the package is ESM-only and `exports["."]` is a
+    // conditions object, `{ types, import, source }`. `import` is
+    // `./dist/index.js`. `source` names the TypeScript it was built from, which
+    // is not there to be run and must never be the condition picked.
+    assert.isTrue(entry.startsWith('/'), entry);
+    assert.include(entry, 'dist/index.js');
+    assert.notInclude(entry, '/src/');
   });
 
-  it('loads Client and StdioClientTransport, cached per subpath', async function () {
+  it('loads McpClient and StdioTransport from the root entry, cached', async function () {
     this.timeout(30000);
-    const { loadMcpSdk } = await import('../server/mcp/loader');
-    const clientNs: any = await loadMcpSdk('client');
-    const stdioNs: any = await loadMcpSdk('client/stdio.js');
-    assert.isFunction(clientNs.Client);
-    assert.isFunction(stdioNs.StdioClientTransport);
-    // The default factory merges over this rather than replacing it.
-    assert.isFunction(stdioNs.getDefaultEnvironment);
-    assert.strictEqual(clientNs, await loadMcpSdk('client'));
+    const { loadPiMcp } = await import('../server/mcp/loader');
+    const ns: any = await loadPiMcp();
+    assert.isFunction(ns.McpClient);
+    assert.isFunction(ns.StdioTransport);
+    assert.strictEqual(ns, await loadPiMcp());
+  });
+
+  it('keeps the old probe name as an alias of the new one, on the public entry too', async () => {
+    const loader = await import('../server/mcp/loader');
+    const api = await import('../server/index');
+    assert.strictEqual(loader.mcpSdkResolvable, loader.mcpClientResolvable);
+    assert.strictEqual(api.mcpClientResolvable, loader.mcpClientResolvable);
+    assert.strictEqual(api.mcpSdkResolvable, loader.mcpClientResolvable);
+  });
+});
+
+/**
+ * THE DEFAULT FACTORY, for real: pi-mcp's client and its stdio transport against
+ * a subprocess that speaks the protocol. Every test above swaps the factory out,
+ * so until this block the only test that ran the code a deployment runs was the
+ * opt-in live smoke.
+ *
+ * The server is the script below, written to a temp directory and started with
+ * the suite's own Node: no package, no network. It pages its tool list, reports
+ * its environment, and can be told to die mid-call, to hang on `initialize`, to
+ * outlive its stdin, or to leave its pid behind so a test can check the process
+ * is really gone.
+ */
+const FIXTURE_SERVER = String.raw`
+const fs = require('fs');
+if (process.env.FIXTURE_PID_FILE) fs.writeFileSync(process.env.FIXTURE_PID_FILE, String(process.pid));
+// A server that does not exit when its stdin closes: only a signal ends it.
+if (process.env.FIXTURE_LINGER === '1') setInterval(() => {}, 1000);
+const send = (message) => process.stdout.write(JSON.stringify(message) + '\n');
+const text = (value) => ({ content: [{ type: 'text', text: value }] });
+const tool = (name) => ({
+  name, description: 'fixture ' + name, inputSchema: { type: 'object', properties: {} },
+});
+let buffer = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => {
+  buffer += chunk;
+  let newline = buffer.indexOf('\n');
+  while (newline >= 0) {
+    const line = buffer.slice(0, newline);
+    buffer = buffer.slice(newline + 1);
+    newline = buffer.indexOf('\n');
+    if (!line.trim()) continue;
+    const request = JSON.parse(line);
+    if (request.id === undefined) continue;
+    const reply = (result) => send({ jsonrpc: '2.0', id: request.id, result });
+    if (request.method === 'initialize') {
+      if (process.env.FIXTURE_HANG === '1') continue;
+      reply({
+        protocolVersion: request.params.protocolVersion,
+        capabilities: { tools: {} },
+        serverInfo: { name: 'fixture', version: '1' },
+      });
+    } else if (request.method === 'tools/list') {
+      if (request.params && request.params.cursor === 'page-2') reply({ tools: [tool('crash')] });
+      else reply({ tools: [tool('echo'), tool('environment')], nextCursor: 'page-2' });
+    } else if (request.method === 'tools/call') {
+      const name = request.params.name;
+      const args = request.params.arguments || {};
+      if (name === 'echo') reply(text(String(args.message)));
+      else if (name === 'environment') reply(text(JSON.stringify(process.env)));
+      else if (name === 'crash') process.exit(7);
+    }
+  }
+});
+`;
+
+/** The `npx` shape: a process that stays in front of the real server and runs
+ *  it as its own child, sharing its stdio. */
+const FIXTURE_WRAPPER = String.raw`
+const { spawn } = require('child_process');
+const child = spawn(process.execPath, [process.env.FIXTURE_SERVER], { stdio: 'inherit' });
+child.on('exit', (code) => process.exit(code === null ? 1 : code));
+`;
+
+describe('MCP default factory (pi-mcp against a real stdio server, no network)', () => {
+  let dir = '';
+  let script = '';
+  let wrapper = '';
+  const registered: string[] = [];
+
+  const alive = (pid: number): boolean => {
+    try { process.kill(pid, 0); return true; } catch { return false; }
+  };
+
+  /** Poll until `done()`; the subprocess work here has no promise to await. */
+  const until = async (done: () => boolean, label: string, ms = 10000): Promise<void> => {
+    const deadline = Date.now() + ms;
+    while (!done()) {
+      if (Date.now() > deadline) assert.fail(`timed out waiting for ${label}`);
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => { setTimeout(r, 25); });
+    }
+  };
+
+  /** Register a fixture-backed server under a name this block unregisters. */
+  const register = (name: string, extra: Partial<McpServerDef> = {}): void => {
+    registered.push(name);
+    Agent.mcpServer(name, { command: process.execPath, args: [script], ...extra });
+  };
+
+  before(() => {
+    dir = fs.mkdtempSync(path.join(os.tmpdir(), 'agent-mcp-fixture-'));
+    script = path.join(dir, 'server.cjs');
+    wrapper = path.join(dir, 'wrapper.cjs');
+    fs.writeFileSync(script, FIXTURE_SERVER);
+    fs.writeFileSync(wrapper, FIXTURE_WRAPPER);
+  });
+
+  after(async () => {
+    const { unregisterMcpServer } = await import('../server/mcp/client');
+    await Promise.all(registered.map((name) => unregisterMcpServer(name)));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('discovers every page of a paged tool list and round-trips a call', async function () {
+    this.timeout(30000);
+    const { discoverMcpTools, callMcpTool, getMcpServerStatus } = await import('../server/mcp/client');
+    register('fixture-pages');
+
+    const found = await discoverMcpTools('fixture-pages');
+    assert.isTrue(found.ok, (found as any).reason);
+    // Two pages. A client that returns the first page and stops would find two
+    // tools here and never know there was a third.
+    assert.deepEqual(
+      (found as any).tools.map((t: McpToolInfo) => t.name), ['echo', 'environment', 'crash'],
+    );
+    assert.deepEqual(getMcpServerStatus('fixture-pages'), {
+      registered: true, state: 'connected', toolCount: 3,
+    });
+
+    const result = await callMcpTool('fixture-pages', 'echo', { message: 'over a real pipe' });
+    assert.deepEqual(result, { ok: true, value: 'over a real pipe' });
+  });
+
+  it('starts the server with an allowlisted environment, never the host\'s', async function () {
+    this.timeout(30000);
+    const { callMcpTool } = await import('../server/mcp/client');
+    // pi-mcp's own default is to pass the child everything this process holds:
+    // provider keys, the Mongo URL, channel tokens. This is the test that the
+    // factory turned that off.
+    const canary = 'AGENT_MCP_TEST_HOST_SECRET';
+    process.env[canary] = 'must-not-reach-the-child';
+    try {
+      register('fixture-env', { env: { FIXTURE_GRANTED: 'yes' } });
+      const result = await callMcpTool('fixture-env', 'environment', {});
+      assert.isTrue(result.ok, JSON.stringify((result as any).error));
+      const env = JSON.parse(String((result as any).value));
+      assert.notProperty(env, canary, 'a host variable outside the allowlist reached an MCP server');
+      assert.equal(env.FIXTURE_GRANTED, 'yes', 'the definition\'s own env must reach it');
+      assert.equal(env.PATH, process.env.PATH, 'and the allowlisted basics still do');
+    } finally {
+      delete process.env[canary];
+    }
+  });
+
+  it('builds that environment from the allowlist, then the definition', async () => {
+    const { mcpChildEnvironment } = await import('../server/mcp/client');
+    const canary = 'AGENT_MCP_TEST_HOST_SECRET';
+    const hostPath = process.env.PATH;
+    process.env[canary] = 'x';
+    try {
+      const env = mcpChildEnvironment({ GRANTED: '1' });
+      assert.notProperty(env, canary);
+      assert.equal(env.GRANTED, '1');
+      assert.equal(env.PATH, hostPath);
+      assert.equal(mcpChildEnvironment({ PATH: '/only/this' }).PATH, '/only/this',
+        'the definition wins over an inherited value');
+      // An exported shell function arrives as a value starting `()`. It is
+      // code, and it is skipped even though its name is on the allowlist.
+      process.env.PATH = '() { :; }; echo injected';
+      assert.notProperty(mcpChildEnvironment(), 'PATH');
+    } finally {
+      process.env.PATH = hostPath;
+      delete process.env[canary];
+    }
+  });
+
+  it('answers mcp-unavailable when the server dies mid-call, then reconnects on the next use', async function () {
+    this.timeout(30000);
+    const { callMcpTool, getMcpServerStatus } = await import('../server/mcp/client');
+    register('fixture-crash', { cooldownMs: 0 });
+
+    const died = await callMcpTool('fixture-crash', 'crash', {});
+    assert.isFalse(died.ok);
+    assert.equal((died as any).error.error, 'mcp-unavailable');
+    assert.equal(getMcpServerStatus('fixture-crash').state, 'disconnected',
+      'a dead connection is dropped, not kept for the next caller to trip over');
+
+    const again = await callMcpTool('fixture-crash', 'echo', { message: 'back' });
+    assert.deepEqual(again, { ok: true, value: 'back' }, 'the next use starts a fresh subprocess');
+  });
+
+  it('kills a server that never answers initialize, at the discovery budget', async function () {
+    this.timeout(30000);
+    const { discoverMcpTools } = await import('../server/mcp/client');
+    const pidFile = path.join(dir, 'hung.pid');
+    register('fixture-hung', {
+      timeoutMs: 1000, cooldownMs: 0, env: { FIXTURE_HANG: '1', FIXTURE_PID_FILE: pidFile },
+    });
+
+    const found = await discoverMcpTools('fixture-hung');
+    assert.isFalse(found.ok);
+    assert.include((found as any).reason, 'did not connect within 1000ms');
+
+    // Giving up on a server is not the same as getting rid of it. The client
+    // is built with the same budget, so its own `initialize` timeout fires
+    // alongside this package's deadline and takes the subprocess down with it.
+    await until(() => fs.existsSync(pidFile), 'the fixture to record its pid');
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    await until(() => !alive(pid), 'the hung server to be killed');
+  });
+
+  it('ends the subprocess when its server is unregistered', async function () {
+    this.timeout(30000);
+    const { discoverMcpTools, unregisterMcpServer } = await import('../server/mcp/client');
+    const pidFile = path.join(dir, 'stopped.pid');
+    register('fixture-stop', { env: { FIXTURE_PID_FILE: pidFile } });
+
+    const found = await discoverMcpTools('fixture-stop');
+    assert.isTrue(found.ok, (found as any).reason);
+    const pid = Number(fs.readFileSync(pidFile, 'utf8'));
+    assert.isTrue(alive(pid), 'the server is a live subprocess while connected');
+
+    assert.isTrue(await unregisterMcpServer('fixture-stop'));
+    await until(() => !alive(pid), 'the unregistered server to exit');
+  });
+
+  it('ends a lingering server started through a wrapper, not just the wrapper', async function () {
+    this.timeout(30000);
+    const { discoverMcpTools, unregisterMcpServer } = await import('../server/mcp/client');
+    // `npx some-server` is two processes, and the one this client spawned is
+    // not the server. Signalling only the direct child leaves the real one
+    // running for as long as it likes — here, forever, since it also ignores
+    // its stdin closing. The whole process group has to go.
+    const pidFile = path.join(dir, 'wrapped.pid');
+    registered.push('fixture-wrapped');
+    Agent.mcpServer('fixture-wrapped', {
+      command: process.execPath,
+      args: [wrapper],
+      env: { FIXTURE_SERVER: script, FIXTURE_PID_FILE: pidFile, FIXTURE_LINGER: '1' },
+    });
+
+    const found = await discoverMcpTools('fixture-wrapped');
+    assert.isTrue(found.ok, (found as any).reason);
+    const serverPid = Number(fs.readFileSync(pidFile, 'utf8'));
+    assert.isTrue(alive(serverPid), 'the real server is the wrapper\'s child, and alive');
+
+    assert.isTrue(await unregisterMcpServer('fixture-wrapped'));
+    await until(() => !alive(serverPid), 'the server behind the wrapper to be signalled');
   });
 });
 
@@ -1187,7 +1440,9 @@ describe('MCP schema hardening (M-MCP-SCHEMA)', () => {
 });
 
 /**
- * The ONE live test: a real subprocess, the real SDK, the real protocol.
+ * The ONE test that leaves the machine: a real third-party server, built on
+ * the official MCP SDK, so it is also the interop check between pi-mcp and the
+ * reference implementation.
  * `MCP_LIVE_TEST=1` enables it and it downloads a package with npx, so it is
  * pending by default — the same shape as the pi-ai live smoke.
  */
