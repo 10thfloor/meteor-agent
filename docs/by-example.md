@@ -782,14 +782,14 @@ throws Meteor's own duplicate-method error.
 ### 4. MCP servers
 
 ```bash
-meteor npm install --save @modelcontextprotocol/sdk
+meteor npm install --save @earendil-works/pi-mcp
 ```
 
 ```ts
 // server
-import { Agent, mcpSdkResolvable } from 'meteor/10thfloor:agent';
+import { Agent, mcpClientResolvable } from 'meteor/10thfloor:agent';
 
-if (!mcpSdkResolvable()) throw new Error('install @modelcontextprotocol/sdk');
+if (!mcpClientResolvable()) throw new Error('install @earendil-works/pi-mcp');
 
 Agent.mcpServer('docs', {
   command: 'npx',
@@ -812,10 +812,13 @@ Support.define({
 
 Nothing spawns at registration: the first turn that needs a server connects over
 stdio, runs `tools/list` once, and caches both for the process.
-`mcpSdkResolvable()` is a synchronous on-disk probe — the SDK is reachable only
-through its `exports` map, which Meteor's resolver cannot follow, so the package
-goes through the same loader seam pi-ai does, and a host that wants to fail its
-own boot on a missing peer dependency has no other way to ask. A whole-server
+`mcpClientResolvable()` is a synchronous on-disk probe — the client library is
+reachable only through its `exports` map, which Meteor's resolver cannot follow,
+so the package goes through the same loader seam pi-ai does, and a host that
+wants to fail its own boot on a missing peer dependency has no other way to ask.
+(The tagged v0.3.0 uses `@modelcontextprotocol/sdk` and the probe is called
+`mcpSdkResolvable()` there; that name remains as a deprecated alias.) The server
+starts with a minimal environment, never the host's own. A whole-server
 spec refuses `name` and `args` (one of each cannot describe many tools); both
 forms refuse `runAs`. A down server never fails a turn: a named tool stays listed
 and answers `mcp-unavailable`, which the model routes around. Depth in

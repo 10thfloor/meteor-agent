@@ -69,10 +69,10 @@ CI job runs them before the suite; locally:
 meteor npm run test:mcp-server
 ```
 
-## The npm dependency policy (pi-ai, and now the MCP SDK)
+## The npm dependency policy (pi-ai, pi-mcp, typebox)
 
 The package has four app-level npm dependencies — `@earendil-works/pi-ai`,
-`@modelcontextprotocol/sdk`, `typebox`, and `marked` — and none is ever an
+`@earendil-works/pi-mcp`, `typebox`, and `marked` — and none is ever an
 `Npm.depends`. The first three are server-side and subject to every rule
 below; `marked` is client-only and covered by its own paragraph after the
 pins.
@@ -80,7 +80,8 @@ pi-ai **reached 1.0 on 2026-10-01 after an API that moved throughout this
 project** (0.73 → 0.84 renamed the scope and reshaped the streaming surface;
 0.84 → 1.0 crossed four breaking releases, none of which reached the surface
 this package calls — the probe notes in `server/providers/piai.ts` say which);
-the MCP SDK is post-1.0 but ships weekly; typebox is post-1.0 and its
+pi-mcp reached 1.0 the same day, three days after its first release, so its
+surface is young however it is numbered; typebox is post-1.0 and its
 `Compile`/`Value` surface is probed off the installed files exactly as the
 other two are. The first two are genuinely optional peers (see below); typebox
 is a **direct dependency** — argument validation degrades to a structural
@@ -92,8 +93,8 @@ keep them:
 
 1. **Each dependency is imported by exactly one file.** pi-ai (and typebox)
    only by `server/providers/loader.ts`, reached elsewhere through
-   `loadPiAi()`/`loadTypebox()`; the MCP SDK only by `server/mcp/loader.ts`,
-   reached elsewhere through `loadMcpSdk()`. One adapter per dependency knows
+   `loadPiAi()`/`loadTypebox()`; pi-mcp only by `server/mcp/loader.ts`,
+   reached elsewhere through `loadPiMcp()`. One adapter per dependency knows
    its shapes — `server/providers/piai.ts` and `server/mcp/client.ts` — and
    every shape it uses is recorded in its header comment with the `.d.ts`
    source cited. `server/mcp/loader.ts` deliberately reuses the resolver in
@@ -103,11 +104,31 @@ keep them:
 2. **Never guess either API.** Every claim about them in this repo was read off
    the installed `dist/*.d.ts` or proved by a runtime probe. When a bump changes
    behavior, update the probe notes in the adapter header in the same commit.
-   Recorded finding worth keeping in mind: the MCP SDK is DUAL (its `exports`
-   carry `require` conditions pointing at a real CJS build, unlike pi-ai's
-   import-only map), so a bare `require.resolve` succeeds where it throws for
-   pi-ai — that still does not make a plain import work under Meteor, whose
-   resolver cannot follow an `exports` map at all. The seam stays.
+   Recorded findings for pi-mcp 1.0.0, each a default the factory in
+   `server/mcp/client.ts` overrides or leans on:
+   - its `exports` map is import-only like pi-ai's, with a `source` condition
+     beside `import` that names unbuilt TypeScript and must never be picked;
+   - `StdioTransport` hands the child the host's **entire environment** unless
+     `inheritEnv: false`. The factory turns that off and builds the allowlist
+     the official SDK used (`mcpChildEnvironment`). Dropping this would put
+     every provider key in every MCP server's hands, and nothing would fail;
+   - it buffers the server's stderr unless told `stderr: 'inherit'`;
+   - requests time out after 30s (the official SDK: 60s). The factory gives
+     `initialize` the server's discovery budget, so a server that never answers
+     is killed when the package gives up on it, and gives `tools/call` 60s;
+   - `listTools()` follows `nextCursor` to the last page, and `close()` signals
+     the server's whole process group, so a wrapper like `npx` cannot leave the
+     real server behind.
+
+   `tests/mcp.test.ts` holds the ones that would otherwise go wrong silently —
+   the entry, the environment, the handshake deadline, paging and shutdown — by
+   running the factory against a real stdio subprocess. Remove the override and
+   the matching test fails.
+
+   The package used `@modelcontextprotocol/sdk` through v0.3.0. It left because
+   that package ships its client fused to a server half this code never loads —
+   express, hono, ajv, zod: 84 installed packages, and three of the four
+   advisories the production audit carried.
    Second recorded finding: typebox is reached through **two** of its exports
    keys now, `./value` and `./compile`, and each is cached separately by
    `loadPackage`. `typebox/compile`'s namespace is
@@ -121,12 +142,13 @@ keep them:
    Schemas outside that subset are refused when no full checker is available.
 3. **A version bump is a verification event, not a routine update.** After
    `meteor npm install @earendil-works/pi-ai@<new>` or
-   `meteor npm install @modelcontextprotocol/sdk@<new>`:
+   `meteor npm install @earendil-works/pi-mcp@<new>`:
    - run the suite — the pi-ai adapter's mapping tests pin real field names and
      the stream tests run through pi-ai's own `fauxProvider`; the MCP loader
-     tests pin the SDK's resolved entry paths (`dist/esm/client/index.js`,
-     `dist/esm/client/stdio.js`) and the two exported names the client needs, so
-     a reshape of either fails loudly here;
+     tests pin pi-mcp's resolved entry (`dist/index.js`) and the two exported
+     names the client needs, and the default-factory tests run it against a
+     real subprocess, so a reshape or a changed default of either fails loudly
+     here;
    - run the full-app suite (`meteor npm run test-app:once`) after a pi-ai bump
      — a catalog refresh can retire a model id, and "Installed model defaults"
      checks the reference app's intentional per-provider defaults
@@ -135,10 +157,11 @@ keep them:
    - run `./scripts/verify-build.sh` — resolution is exports-map dependent and a
      packaging change can break the loader chain only in a real bundle;
    - run the live smokes: pi-ai's with an `ANTHROPIC_API_KEY`, the MCP one with
-     `MCP_LIVE_TEST=1` (it spawns `npx -y @modelcontextprotocol/server-everything`
-     and is the only test that proves the real protocol round trip).
+     `MCP_LIVE_TEST=1` (it spawns `npx -y @modelcontextprotocol/server-everything`,
+     a third-party server built on the official SDK, which makes it the interop
+     check against the reference implementation).
 
-The app pins `^1.0.0` (pi-ai), `^1.30.0` (MCP SDK), `^1.3.7` (typebox), and
+The app pins `^1.0.0` (pi-ai), `^1.0.0` (pi-mcp), `^1.3.7` (typebox), and
 `18.0.11` (marked, exact). Do not widen any range in a commit that changes
 anything else. A caret on pi-ai now floats across minors, where `^0.84.2`
 floated only patches: the lockfile is what CI and the reference app run, so

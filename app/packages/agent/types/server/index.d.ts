@@ -17,7 +17,7 @@ export type { FromSchema } from '../common/schema';
 export type { HookName, HookMap, HookPurpose, HookToolCall, BeforeProviderRequestHook, AfterToolResultHook, ProviderRequestHookContext, ToolResultHookContext, } from './hooks';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
 export { discoverMcpTools, disconnectMcpServer, unregisterMcpServer, getMcpServerStatus, stopMcp, type DiscoveryResult, type McpServerState, type McpServerStatus, type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory, } from './mcp/client';
-export { mcpSdkResolvable } from './mcp/loader';
+export { mcpClientResolvable, mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
 export { createPiAiProvider, piAiProvider, type PiAiModels } from './providers/piai';
 export { loadPiAi } from './providers/loader';

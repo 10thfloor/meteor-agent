@@ -1,4 +1,4 @@
-import { loadMcpSdk } from './loader';
+import { loadPiMcp } from './loader';
 // TYPE-only: `tools.ts` imports THIS module at runtime, so a runtime import
 // back would close a cycle. The result shape is the package's one tool-result
 // vocabulary and there is no second copy of it.
@@ -32,15 +32,19 @@ export interface McpServerStatus {
   cooldownUntil?: Date;
 }
 
-/** 15s deadline for connect + discovery (the SDK's 60s default is too long
+/** 15s deadline for connect + discovery (pi-mcp's own 30s default is too long
  *  for something that blocks the turn). */
 export const MCP_DISCOVERY_TIMEOUT_MS = 15_000;
+
+/** Deadline for one `tools/call`: the 60s every call had under the official
+ *  SDK, kept explicitly because pi-mcp's own default is 30s. */
+export const MCP_CALL_TIMEOUT_MS = 60_000;
 
 /** Cooldown after a failed open. Expires on its own; a success clears it
  *  immediately. Not a permanent cache — that was an M2 bug. */
 export const MCP_FAILURE_COOLDOWN_MS = 30_000;
 
-/** The slice of the SDK's RequestOptions this package sets. */
+/** The one request option the seam carries: a per-request deadline, in ms. */
 export interface McpRequestOptions {
   timeout?: number;
 }
@@ -57,13 +61,13 @@ export interface McpToolInfo {
 export interface McpCallResult {
   content?: Array<{ type?: string; text?: string; [k: string]: unknown }>;
   isError?: boolean;
-  /** The SDK's `CompatibilityCallToolResultSchema` shape, for pre-content
-   *  servers: `{ toolResult }` and no `content` at all. */
+  /** The result shape of the protocol's first revision, before `content`
+   *  existed: `{ toolResult }` and no `content` at all. */
   toolResult?: unknown;
   [k: string]: unknown;
 }
 
-/** Test seam for the SDK Client. Connecting is the factory's job. */
+/** Test seam for the MCP client. Connecting is the factory's job. */
 export interface McpClient {
   listTools(
     params?: Record<string, unknown>, options?: McpRequestOptions,
@@ -181,8 +185,8 @@ export function sanitizeMcpReason(raw: unknown, fallback: string = GENERIC): str
   return oneLine.length > MAX_REASON ? `${oneLine.slice(0, MAX_REASON - 1)}…` : oneLine;
 }
 
-/** The reason for a server that could not be reached. The detail is the SDK's
- *  or the OS's message, so it goes through the same sanitizer. */
+/** The reason for a server that could not be reached. The detail is the client
+ *  library's or the OS's message, so it goes through the same sanitizer. */
 function unavailable(server: string, e: unknown): string {
   const detail = sanitizeMcpReason(
     (e as Error)?.message, 'it could not be started or did not answer',
@@ -207,30 +211,75 @@ interface PendingAttempt {
   promise: Promise<ConnectResult>;
 }
 
-/** The default factory. env merges over the SDK's `getDefaultEnvironment()`
- *  as insurance — the SDK already merges, but a future version might not. */
-const defaultFactory: McpClientFactory = async (_name, def) => {
-  const clientNs = await loadMcpSdk('client') as any;
-  const stdioNs = await loadMcpSdk('client/stdio.js') as any;
-  const ClientCtor = clientNs?.Client;
-  const TransportCtor = stdioNs?.StdioClientTransport;
-  if (typeof ClientCtor !== 'function' || typeof TransportCtor !== 'function') {
-    throw new Error('the MCP SDK exposes no Client/StdioClientTransport');
+/** What this client tells a server it is. `scripts/check-release.mjs` holds
+ *  the version to the release's. */
+const CLIENT_INFO = { name: '10thfloor:agent', version: '0.3.0' };
+
+/** Variables a server subprocess inherits when its definition adds none: the
+ *  allowlist the official MCP SDK uses, itself modelled on sudo's. */
+const INHERITED_ENV_VARS = process.platform === 'win32'
+  ? [
+    'APPDATA', 'HOMEDRIVE', 'HOMEPATH', 'LOCALAPPDATA', 'PATH', 'PROCESSOR_ARCHITECTURE',
+    'SYSTEMDRIVE', 'SYSTEMROOT', 'TEMP', 'USERNAME', 'USERPROFILE', 'PROGRAMFILES',
+  ]
+  : ['HOME', 'LOGNAME', 'PATH', 'SHELL', 'TERM', 'USER'];
+
+/** The environment a server subprocess starts with: the allowlist above, then
+ *  the definition's own `env` over it. NOT the host's environment — an MCP
+ *  server is third-party code, and this process holds API keys and connection
+ *  strings it has no business reading. */
+export function mcpChildEnvironment(extra?: Record<string, string>): Record<string, string> {
+  const env: Record<string, string> = {};
+  for (const key of INHERITED_ENV_VARS) {
+    const value = process.env[key];
+    // A value starting `()` is an exported shell function: code, not data.
+    if (value === undefined || value.startsWith('()')) continue;
+    env[key] = value;
   }
-  const baseEnv = typeof stdioNs.getDefaultEnvironment === 'function'
-    ? stdioNs.getDefaultEnvironment() : {};
+  return { ...env, ...extra };
+}
+
+/** The default factory, over `@earendil-works/pi-mcp`. Probed at 1.0.0
+ *  (`dist/client.d.ts`, `dist/transports/stdio.d.ts`). Three of its defaults
+ *  are overridden on purpose:
+ *    - `StdioTransport` hands the child the host's WHOLE environment unless
+ *      `inheritEnv: false`. See `mcpChildEnvironment`.
+ *    - It pipes the server's stderr into a buffer. `'inherit'` keeps it in the
+ *      operator's log, where it has always been.
+ *    - Requests time out after 30s. `initialize` gets this server's discovery
+ *      budget instead, so a server that never answers is killed when this
+ *      package gives up on it; `tools/call` gets `MCP_CALL_TIMEOUT_MS`.
+ *  `listTools()` follows `nextCursor` through every page, and `close()` ends
+ *  the server's whole process group (stdin, then SIGTERM, then SIGKILL). */
+const defaultFactory: McpClientFactory = async (_name, def) => {
+  const ns = await loadPiMcp() as any;
+  const ClientCtor = ns?.McpClient;
+  const TransportCtor = ns?.StdioTransport;
+  if (typeof ClientCtor !== 'function' || typeof TransportCtor !== 'function') {
+    throw new Error('pi-mcp exposes no McpClient/StdioTransport');
+  }
   const transport = new TransportCtor({
     command: def.command,
     args: def.args ?? [],
-    ...(def.env ? { env: { ...baseEnv, ...def.env } } : {}),
+    inheritEnv: false,
+    env: mcpChildEnvironment(def.env),
+    stderr: 'inherit',
   });
-  const client = new ClientCtor(
-    { name: '10thfloor:agent', version: '0.3.0' }, { capabilities: {} },
-  );
+  const client = new ClientCtor({
+    ...CLIENT_INFO,
+    // 0 means "no timeout" to pi-mcp; a zero budget still has to end.
+    requestTimeoutMs: Math.max(1, budgetFor(def)),
+  });
   await client.connect(transport);
   return {
-    listTools: (params?: any, options?: any) => client.listTools(params, options),
-    callTool: (params: any) => client.callTool(params),
+    listTools: async (_params, options) => ({
+      tools: await client.listTools(
+        options?.timeout !== undefined && options.timeout > 0 ? { timeoutMs: options.timeout } : {},
+      ),
+    }),
+    callTool: (params) => client.callTool(
+      params.name, params.arguments, { timeoutMs: MCP_CALL_TIMEOUT_MS },
+    ),
     close: () => client.close(),
   };
 };
@@ -398,8 +447,8 @@ async function openConnection(
 
   try {
     // Discovery is part of connecting — a client with no tool list is useless.
-    // Budget passed both to the SDK (cancels the request) and as a deadline
-    // (insurance against a client that ignores the option).
+    // Budget passed both to the client (which cancels the request) and as a
+    // deadline (insurance against a client that ignores the option).
     const listed = await withDeadline(
       Promise.resolve(client.listTools(undefined, { timeout: budget })),
       budget,
