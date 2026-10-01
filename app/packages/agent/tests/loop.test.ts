@@ -2387,6 +2387,12 @@ describe('approval gates', () => {
       async () => state!.ran.length === 1,
       'the winding-down run to notice the verdict and execute the approved tool',
     );
+    // `ran` is set INSIDE the tool body, a beat before dispatch commits the
+    // answer and then clears `pending`; sampling between them is a race.
+    await waitFor(
+      async () => (await AgentSessions.findOneAsync('s-wake'))?.pending === undefined,
+      'the woken batch to commit its answer and clear the verdict',
+    );
 
     assert.deepEqual(state!.ran, ['refund'], 'a dropped wake-up loses an approved tool');
     const msgs = await AgentMessages
@@ -2600,6 +2606,12 @@ describe('approval gates', () => {
     await send.call({ userId: 'u1' }, 'gate-stopverdict', 's-stop-verdict', 'go ahead');
 
     await waitFor(async () => state.ran.length === 1, 'the send to resume the approved call');
+    // `ran` is set INSIDE the tool body, a beat before dispatch commits the
+    // answer and then clears `pending`; sampling between them is a race.
+    await waitFor(
+      async () => (await AgentSessions.findOneAsync('s-stop-verdict'))?.pending === undefined,
+      'the resumed batch to commit its answer and clear the verdict',
+    );
     msgs = await AgentMessages
       .find({ sessionId: 's-stop-verdict' }, { sort: { seq: 1 } }).fetchAsync();
     assert.deepEqual(unansweredToolUses(msgs), [], 'the resumed batch must close cleanly');
