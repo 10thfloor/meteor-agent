@@ -831,8 +831,9 @@ authoritative where an older record describes an earlier release.
 [Pi Durable](https://earendil.com/posts/pi-durable/) harness on Meteor. It
 gives Pi Durable a MongoDB storage, lets any server instance host a storage and
 take over one whose host died, and publishes conversations to the browser from
-any instance. `10thfloor:agent` does not use it, and it is not in the tagged
-release.
+any instance. Constellation's [Threads](docs/threads.md) view is built on it:
+quit the app in the middle of an answer, start it again, and the thread goes
+on. `10thfloor:agent` does not use it, and it is not in the tagged release.
 
 ## Requirements
 

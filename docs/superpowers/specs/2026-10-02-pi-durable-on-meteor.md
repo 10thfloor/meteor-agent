@@ -1,6 +1,6 @@
 # Pi Durable on Meteor
 
-**Status:** built, experimental. The storage, the host, request routing, the DDP surface and the client are in `app/packages/durable` and verified as §2 says. The reference app declares the package and does not use it yet. One Constellation surface on it and the kernel question (§9) are what remain.
+**Status:** built, experimental. The storage, the host, request routing, the DDP surface and the client are in `app/packages/durable` and verified as §2 says. Constellation has one surface on it, Threads ([`docs/threads.md`](../../threads.md)). The kernel question (§9) is what remains, and it is to be answered from use.
 **Date:** 2026-10-02
 **Package:** `10thfloor:durable` (new). `10thfloor:agent` is not changed.
 **Depends on:** `@earendil-works/pi-durable` 1.0.0 and `@earendil-works/chord` 1.0.0, both pinned exactly; pi-ai 1.x.
@@ -42,7 +42,8 @@ Everything here ran. The tests are in `app/packages/durable/tests/` and run
 in CI with the other packages. The cases that need a second operating-system
 process and a real signal ran under plain Node, against the same source files,
 while the package was written; the suite holds each of them with two hosts or
-two harnesses in one process instead.
+two harnesses in one process, and `scripts/verify-instances.mjs` runs the
+central ones in CI with two server processes from a production bundle.
 
 | Claim | How it was checked |
 | --- | --- |
@@ -58,6 +59,9 @@ two harnesses in one process instead.
 | Work survives its host | A host that stops answering: another takes the storage when the lease runs out and finishes the work. A host that stops in good order: another takes it at once. A host that restarts under its name: it takes its storages back at once. A commit whose outcome is unknown: the host reopens the storage and the work continues |
 | A server that is told to end hands over first | A real process sent SIGTERM in the middle of a tool call, with a lease of a minute: it closed its storage, ended by that same signal, and the survivor finished the work within five seconds. With a tool that ignores its cancellation: it gave its leases up after its grace and ended; the survivor finished the work |
 | Two processes given one name still work | Requests asked of the namesake go to the process that runs the storage; nothing is taken from it; the mistake is reported once |
+| Two real servers share a storage | `scripts/verify-instances.mjs`: two processes from the reference app's production bundle on one MongoDB, driven over DDP. A thread made on one is watched and spoken to through the other, which passes the input on and is published the answer as delta rows; the host is killed in the middle of a tool call and the other finishes the run, with the input in the transcript once; with a lease of a minute the host is sent SIGTERM, ends by that signal, and the other has the thread half a second later. With the handover turned off, that last step fails |
+| A host that dies in the middle of an answer | The next host keeps what had been committed of the answer as an entry that was cut short, asks the model again, and the submission settles with the whole answer |
+| The package carries a real surface | Constellation's Threads, driven in a real browser by the reference app's own suite: a tool call and the plan it writes, input queued behind a running tool and withdrawn, stop, fork with the plan as it was at the fork point, rename, delete; and by hand, the server killed in the middle of a tool call and started again |
 | A storage is erased wherever it is hosted | Asked of the instance that does not host it; every row is gone, the lease is gone, and a late notice of the finished request does not bring the storage back |
 | Any instance can watch a conversation | A real browser on a DDP connection, through `DurableConversation`: an answer arriving in at least 8 growing partial texts, a tool call while it runs, queued input, abort, fork, an application document kept current, and all of it again for a storage that a different host runs than the one the browser talks to |
 | The rows a viewer gets are the rows it may get | No `allow`, or anything but `true`: every method answers `not-authorized` and the publication is empty; an unknown definition answers the same; a client cannot write a raw entry, choose an agent, or name an operation; a `view` that turns false ends a live subscription |
@@ -300,17 +304,19 @@ Pi Durable has no users, and a user entry has no field for an author.
   of it, `applyImmutable`, and Meteor's bundler takes the module whole: 48 KB
   minified in the reference app's bundle, beside 15 KB for the package's own
   client.
-- **The exit handover has run in a real process only under plain Node.** In a
-  Meteor server its pieces are tested with a stand-in for `process`; a
-  production bundle sent SIGTERM is part of the next step.
+- **A cut-short answer does not say why.** A partial answer left by a host
+  that died and one stopped by a person are the same entry (`aborted`).
 
 ## 8. Open decisions
 
 1. **Whether to offer the storage upstream.** The announcement asks for help;
    a Mongo backend with their conformance suite passing is a contained
    contribution, and it would get their review. Nothing has been sent.
-2. **The storage unit in Constellation.** Mission (decision 3) or session tree.
-3. **The kernel.** §9.
+2. **The kernel.** §9.
+
+Settled since the first draft: the storage unit in Constellation. A thread is
+one storage, as decision 3 says a unit that works together should be; its
+forks are conversations of that storage.
 
 ## 9. The kernel question
 
@@ -330,16 +336,19 @@ sits on the old engine. And two of the package's stated
 properties change: tools stop being plain Meteor methods called by a loop we
 own, and the transcript stops being documents a selector can reach into.
 
-**Recommendation.** Do not move the kernel now. Put one real Constellation
-surface on `10thfloor:durable` and decide after that with evidence from use.
-Revisit when Pi Durable drops the experimental label or after two upstream
-releases, whichever comes first, by running this package's suite against each.
+**Recommendation.** Do not move the kernel now. Constellation has one real
+surface on `10thfloor:durable`; decide with evidence from using it. Revisit
+when Pi Durable drops the experimental label or after two upstream releases,
+whichever comes first, by running this package's suite against each.
+
+What using Threads should show, either way: whether tasks and documents make
+the things a Mission needs (approvals, a crew, budgets) simpler to build than
+they were on the loop; what it costs that a transcript is no longer documents
+a selector can reach into; and whether upstream's pace of change is one this
+repo can follow.
 
 ## 10. Next steps
 
-1. One Constellation surface on it, and with it a run of two real server
-   processes from a production bundle: a browser on the one that does not host
-   the storage, and the host killed, and told to end, in the middle of an
-   answer.
+1. Use Threads.
 2. Decide §8.1.
 3. The kernel, from use.
