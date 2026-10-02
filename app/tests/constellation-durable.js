@@ -232,10 +232,10 @@ if (Meteor.isServer) {
       assert.notInclude((await rowsOf(threadId)).map((entry) => entry.text).join("\n"), "in the fork");
 
       // A conversation the thread does not have is not the caller's to speak in or fork.
-      for (const refused of [
-        say(owner, threadId, "nowhere", { conversationId: 999 }),
-        call(owner, "constellation.durableThreadFork", threadId, 999, at),
-      ]) assert.strictEqual((await rejection(refused))?.error, "no-conversation");
+      for (const attempt of [
+        () => say(owner, threadId, "nowhere", { conversationId: 999 }),
+        () => call(owner, "constellation.durableThreadFork", threadId, 999, at),
+      ]) assert.strictEqual((await rejection(attempt()))?.error, "no-conversation");
     });
 
     it("runs on the workspace default, and takes only a model the catalog offers", async function () {
@@ -249,6 +249,36 @@ if (Meteor.isServer) {
       assert.strictEqual(refused?.error, "model-unavailable");
       // The thread still answers.
       assert.strictEqual((await settled(threadId, (await say(owner, threadId, "still here")).submissionId)).status, "done");
+    });
+
+    it("looks for provider credentials in the environment, the app's generic key standing in for Anthropic's alone", async function () {
+      const names = ["ANTHROPIC_API_KEY", "OPENAI_API_KEY", "PROVIDER_API_KEY"];
+      const saved = Object.fromEntries(names.map((name) => [name, process.env[name]]));
+      try {
+        for (const name of names) delete process.env[name];
+        assert.isUndefined(await server.authContext.env("ANTHROPIC_API_KEY"));
+        process.env.PROVIDER_API_KEY = "  generic-placeholder  ";
+        assert.strictEqual(await server.authContext.env("ANTHROPIC_API_KEY"), "generic-placeholder");
+        // The generic key is never offered to another provider.
+        assert.isUndefined(await server.authContext.env("OPENAI_API_KEY"));
+        // A provider's own variable comes first.
+        process.env.ANTHROPIC_API_KEY = "own-placeholder";
+        assert.strictEqual(await server.authContext.env("ANTHROPIC_API_KEY"), "own-placeholder");
+        process.env.ANTHROPIC_API_KEY = "";
+        assert.strictEqual(await server.authContext.env("ANTHROPIC_API_KEY"), "generic-placeholder");
+      } finally {
+        for (const name of names) {
+          if (saved[name] === undefined) delete process.env[name];
+          else process.env[name] = saved[name];
+        }
+      }
+      assert.isTrue(await server.authContext.fileExists("~"));
+      assert.isFalse(await server.authContext.fileExists(`~/no-such-file-${Random.id()}`));
+
+      // pi-ai takes the context, and its catalog has the model the workspace prefers for Anthropic.
+      const { builtinModels } = await durable.loadPiAi("providers/all");
+      const models = builtinModels({ authContext: server.authContext });
+      assert.ok(models.getModel("anthropic", "claude-haiku-4-5"));
     });
 
     it("is the owner's alone", async function () {

@@ -116,7 +116,7 @@ function scriptedProvider(faux) {
 }
 
 /** Where pi-ai looks for credentials: the environment, with the app's generic key standing in for Anthropic's. */
-const authContext = {
+export const authContext = {
   async env(name) {
     const value = process.env[name];
     if (typeof value === 'string' && value !== '') return value;
