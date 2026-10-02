@@ -1,0 +1,17 @@
+{
+  // Emits declarations into ./types. Separate from the app's tsconfig.json
+  // (which is noEmit) so a type error doesn't look like a build failure.
+  // `npm run types` regenerates; `npm run types:check` fails if anything changed.
+  "extends": "../../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": false,
+    "declaration": true,
+    "emitDeclarationOnly": true,
+    "declarationMap": true,
+    "outDir": "./types",
+    "rootDir": ".",
+    "stripInternal": true
+  },
+  "include": ["common/**/*.ts", "server/**/*.ts", "client/**/*.ts", "../../types/**/*.d.ts"],
+  "exclude": ["types", "tests"]
+}

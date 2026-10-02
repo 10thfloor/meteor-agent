@@ -1,6 +1,6 @@
 Package.describe({
   name: '10thfloor:durable',
-  version: '0.0.1',
+  version: '0.3.0',
   summary: 'Pi Durable on Meteor: MongoDB storage, leased hosting, DDP methods and a live publication',
   git: 'https://github.com/10thfloor/meteor-agent.git',
   documentation: 'README.md',

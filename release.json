@@ -7,6 +7,7 @@
     { "name": "10thfloor:agent-channel-telegram", "directory": "agent-channel-telegram", "role": "channel" },
     { "name": "10thfloor:agent-channel-whatsapp", "directory": "agent-channel-whatsapp", "role": "channel" },
     { "name": "10thfloor:agent-channel-sms", "directory": "agent-channel-sms", "role": "channel" },
-    { "name": "10thfloor:agent-channel-email", "directory": "agent-channel-email", "role": "channel" }
+    { "name": "10thfloor:agent-channel-email", "directory": "agent-channel-email", "role": "channel" },
+    { "name": "10thfloor:durable", "directory": "durable", "role": "runtime" }
   ]
 }
