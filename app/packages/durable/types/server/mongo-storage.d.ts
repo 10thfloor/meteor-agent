@@ -7,6 +7,8 @@ export type MongoClientLike = {
 };
 export type MongoDbLike = {
     collection(name: string): unknown;
+    /** Used for `killSessions` alone. Without it an unfinished commit ends when the server's own limit ends it. */
+    command?(command: Record<string, unknown>): Promise<unknown>;
 };
 /** The two run-time values this file needs from Pi Durable's own packages. */
 export type MongoStorageRuntime = {
@@ -29,6 +31,16 @@ export type MongoStorageOptions = {
      * as Pi Durable's SQLite backend does with `synchronous = NORMAL`; a failover can then lose the newest commits.
      */
     readonly writeConcern?: Record<string, unknown>;
+    /**
+     * How long `open()` and `destroy()` wait for a commit that is in flight before they end it. A commit takes
+     * milliseconds; one still unfinished after this belongs to an owner that stopped in the middle of it. Default 2000.
+     */
+    readonly commitGraceMs?: number;
+    /**
+     * How long `open()` and `destroy()` wait in all before they fail with `StorageBusy`. Default 120000, which is
+     * longer than MongoDB keeps a transaction whose client is gone.
+     */
+    readonly busyTimeoutMs?: number;
     readonly runtime: MongoStorageRuntime;
 };
 /**
@@ -39,10 +51,16 @@ export declare class StorageOwnershipLost extends Error {
     readonly key: string;
     constructor(key: string);
 }
+/** `open()` or `destroy()` gave up waiting: something kept the storage's meta row for longer than `busyTimeoutMs`. */
+export declare class StorageBusy extends Error {
+    readonly key: string;
+    constructor(key: string, waitedMs: number);
+}
 export declare const MONGO_SCHEMA_VERSION = 1;
 /** MongoDB implementation of the Pi Durable storage contract. */
 export declare class MongoStorage implements Storage {
     private readonly client;
+    private readonly db;
     private readonly c;
     private readonly key;
     /** The epoch this open took; `undefined` for a reader, which owns nothing and writes nothing. */
@@ -51,6 +69,10 @@ export declare class MongoStorage implements Storage {
     private readonly life;
     private readonly runtime;
     private readonly writeConcern;
+    /** The one session every commit of this owner runs in, which the meta row names. `undefined` for a reader. */
+    private readonly session;
+    /** Commits take turns: they share the session, and two at once would only make one of them start over. */
+    private committing;
     private nextId;
     private closed;
     private readonly conversationJson;
@@ -63,11 +85,18 @@ export declare class MongoStorage implements Storage {
      * is how a server instance that does not host a storage answers questions about it.
      */
     static reader(options: Omit<MongoStorageOptions, "writeConcern">): Promise<MongoStorage>;
-    /** Open the storage named `key`, creating it when absent, and take its ownership from any earlier open. */
+    /**
+     * Open the storage named `key`, creating it when absent, and take its ownership from any earlier open. A commit
+     * the earlier owner has in flight finishes first, or is ended after `commitGraceMs` (see `takeMeta`).
+     */
     static open(options: MongoStorageOptions): Promise<MongoStorage>;
-    /** Remove every record of the storage named `key`. The storage must not be open anywhere. */
+    /**
+     * Remove every record of the storage named `key`. The storage must not be open anywhere; a storage that is,
+     * through a mistake or a process that will not stop, loses its ownership first and can commit nothing more.
+     */
     static destroy(options: Omit<MongoStorageOptions, "runtime">): Promise<void>;
     commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq>;
+    private commitNow;
     mintId<I extends Id<string>>(): Promise<I>;
     conversation(id: ConversationId, _context: Context): Promise<ConversationRecord | undefined>;
     scanConversations(query: ConversationQuery, limit: number, cursor: Cursor | undefined, _context: Context): Promise<Page<ConversationRecord, Cursor>>;

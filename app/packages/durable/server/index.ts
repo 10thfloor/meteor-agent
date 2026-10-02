@@ -14,7 +14,7 @@ export type { DurableAction, DurableConfig, DurableContent, DurableDraft, Durabl
 export { DurableHost, HostedElsewhere, RequestExpired } from './host';
 export type { DurableHostOptions, Operation, OperationScope } from './host';
 export { applyRateLimits } from './methods';
-export { MongoStorage, StorageOwnershipLost, MONGO_SCHEMA_VERSION } from './mongo-storage';
+export { MongoStorage, StorageBusy, StorageOwnershipLost, MONGO_SCHEMA_VERSION } from './mongo-storage';
 export type { MongoStorageOptions, MongoStorageRuntime } from './mongo-storage';
 export { ConversationNotFound, OPERATIONS } from './operations';
 export type { AgentChoices } from './operations';
@@ -37,6 +37,10 @@ export type OpenMongoStorageOptions = {
   prefix?: string;
   /** What a commit waits for. Default `{ w: 'majority' }`; see `MongoStorageOptions.writeConcern`. */
   writeConcern?: Record<string, unknown>;
+  /** How long to wait for a commit in flight before ending it. Default 2000; see `MongoStorageOptions`. */
+  commitGraceMs?: number;
+  /** How long to wait in all before failing with `StorageBusy`. Default 120000; see `MongoStorageOptions`. */
+  busyTimeoutMs?: number;
 };
 
 /**
@@ -54,8 +58,14 @@ export async function readMongoStorage(key: string, options: { prefix?: string }
   return MongoStorage.reader({ ...meteorMongo(), prefix: PREFIX, key, ...options, runtime: await storageRuntime() });
 }
 
-/** Remove every record of a storage opened with `openMongoStorage`. It must not be open anywhere. */
-export function destroyMongoStorage(key: string, options: { prefix?: string } = {}): Promise<void> {
+/**
+ * Remove every record of a storage opened with `openMongoStorage`. It must not be open anywhere; one that is loses
+ * its ownership first. See `MongoStorage.destroy`.
+ */
+export function destroyMongoStorage(
+  key: string,
+  options: Pick<OpenMongoStorageOptions, 'prefix' | 'commitGraceMs' | 'busyTimeoutMs'> = {},
+): Promise<void> {
   return MongoStorage.destroy({ ...meteorMongo(), prefix: PREFIX, key, ...options });
 }
 

@@ -58,6 +58,11 @@ export type DurableHostOptions = {
      * never closes; what is left of it in memory cannot commit once the storage is opened again. Default 3 s.
      */
     readonly closeMs?: number;
+    /**
+     * How long taking a storage over, or erasing it, waits for a commit that is still in flight before ending it: the
+     * commit of a host that died or stalled in the middle of one. Default 2 s. Passed to every storage this host opens.
+     */
+    readonly commitGraceMs?: number;
     /** Told about failures that no caller is waiting on. Must not throw. */
     readonly onError?: (error: unknown, where: string) => void;
 };

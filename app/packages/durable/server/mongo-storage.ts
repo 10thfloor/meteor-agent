@@ -5,7 +5,7 @@
 // the few columns the contract's scans need, and documents are bases plus
 // ordered Chord delta tails.
 //
-// Two things are Mongo's own:
+// Three things are Mongo's own:
 //
 // - Many Pi Durable Sessions share one set of collections. Every row carries
 //   the storage `key`, and every index starts with it.
@@ -15,6 +15,15 @@
 //   write again, and neither can the owner of a storage that was destroyed,
 //   into a new one of the same key. Who may open a key, and when, is the
 //   host's decision (a lease); this file only makes a stale owner harmless.
+// - Nothing waits inside the server for a commit to end. Opening a storage,
+//   destroying it and committing to it all write its one meta row, so they
+//   take turns. A plain write that meets a row an open transaction has
+//   written is retried by the server, which holds one of its write tickets
+//   for it all the while. A server with four cores has four of them, and a
+//   transaction whose client died stays open for a minute or more: a few
+//   such waits would stop every write to the database. So each write to the
+//   meta row is made in a transaction, which is refused at once when the row
+//   is held, and the waiting is done here (see `takeMeta`).
 //
 // Nothing here is imported at run time. The driver, Chord's `apply`, and Pi
 // Durable's `StorageRejected` are passed in, so the file loads the same way
@@ -65,9 +74,19 @@ type StoredIncarnation = { readonly record: DocumentRecord; readonly version: nu
 
 /**
  * One storage's allocation state and owner. `_id` is the storage key. `life` is drawn when the row is created: a key
- * that was destroyed and used again is another storage, though its epochs start over.
+ * that was destroyed and used again is another storage, though its epochs start over. `sid` identifies the server
+ * session its owner commits in, for as long as that owner has the storage open: whoever takes the storage next can
+ * end a commit the owner left unfinished.
  */
-type MetaRow = { _id: string; nextId: number; nextSeq: number; schema: number; epoch: number; life?: string };
+type MetaRow = {
+	_id: string;
+	nextId: number;
+	nextSeq: number;
+	schema: number;
+	epoch: number;
+	life?: string;
+	sid?: unknown;
+};
 /** The one global ID namespace of a storage: which table owns each ID. */
 type IdRow = { _id: string; s: string; t: TableName };
 type ConversationRow = { _id: string; s: string; id: number; oc: number | null; ot: number | null; r: string };
@@ -117,6 +136,8 @@ type Filter = Record<string, unknown>;
 type Session = {
 	withTransaction<T>(run: () => Promise<T>, options?: Record<string, unknown>): Promise<T>;
 	endSession(): Promise<unknown>;
+	/** The session's name on the server. Its `id` is what `killSessions` takes. */
+	readonly id?: { readonly id: unknown };
 	readonly clusterTime?: unknown;
 	readonly operationTime?: unknown;
 	advanceClusterTime(clusterTime: never): void;
@@ -137,7 +158,11 @@ type Rows<Row> = {
 	createIndexes(specs: Record<string, unknown>[]): Promise<unknown>;
 };
 export type MongoClientLike = { startSession(): unknown };
-export type MongoDbLike = { collection(name: string): unknown };
+export type MongoDbLike = {
+	collection(name: string): unknown;
+	/** Used for `killSessions` alone. Without it an unfinished commit ends when the server's own limit ends it. */
+	command?(command: Record<string, unknown>): Promise<unknown>;
+};
 
 type Collections = {
 	readonly meta: Rows<MetaRow>;
@@ -172,6 +197,16 @@ export type MongoStorageOptions = {
 	 * as Pi Durable's SQLite backend does with `synchronous = NORMAL`; a failover can then lose the newest commits.
 	 */
 	readonly writeConcern?: Record<string, unknown>;
+	/**
+	 * How long `open()` and `destroy()` wait for a commit that is in flight before they end it. A commit takes
+	 * milliseconds; one still unfinished after this belongs to an owner that stopped in the middle of it. Default 2000.
+	 */
+	readonly commitGraceMs?: number;
+	/**
+	 * How long `open()` and `destroy()` wait in all before they fail with `StorageBusy`. Default 120000, which is
+	 * longer than MongoDB keeps a transaction whose client is gone.
+	 */
+	readonly busyTimeoutMs?: number;
 	readonly runtime: MongoStorageRuntime;
 };
 
@@ -185,6 +220,17 @@ export class StorageOwnershipLost extends Error {
 	constructor(key: string) {
 		super(`Storage ${JSON.stringify(key)} was opened again or destroyed; this owner can no longer commit`);
 		this.name = "StorageOwnershipLost";
+		this.key = key;
+	}
+}
+
+/** `open()` or `destroy()` gave up waiting: something kept the storage's meta row for longer than `busyTimeoutMs`. */
+export class StorageBusy extends Error {
+	readonly key: string;
+
+	constructor(key: string, waitedMs: number) {
+		super(`Storage ${JSON.stringify(key)} was still held by an unfinished commit after ${waitedMs} ms`);
+		this.name = "StorageBusy";
 		this.key = key;
 	}
 }
@@ -339,9 +385,109 @@ function collectionsOf(db: MongoDbLike, prefix: string): Collections {
 	};
 }
 
+/**
+ * A write to the meta row did not happen, and may happen if tried again. `held` says why: the row is written by a
+ * transaction that is still open, as opposed to a server that was briefly unable to answer.
+ */
+class Again extends Error {
+	readonly held: boolean;
+
+	constructor(held: boolean) {
+		super("The storage's meta row could not be written yet");
+		this.held = held;
+	}
+}
+
+const WRITE_CONFLICT = 112;
+const DUPLICATE_KEY = 11000;
+
+/** Whether a failed write to the meta row is worth another try, and if so as what. */
+const again = (error: unknown): Again | undefined => {
+	const failure = error as { hasErrorLabel?: (label: string) => boolean; code?: number };
+	if (failure.code === WRITE_CONFLICT) return new Again(true);
+	// Two first opens of one key both insert its row, and the second finds the first one's.
+	if (failure.code === DUPLICATE_KEY) return new Again(false);
+	if (typeof failure.hasErrorLabel === "function" && failure.hasErrorLabel("TransientTransactionError")) {
+		return new Again(false);
+	}
+	return undefined;
+};
+
+const pause = (ms: number): Promise<void> => new Promise((resolve) => setTimeout(resolve, ms));
+
+/** Tells one storage from the others a key has named, before and after a destroy. */
+const newLife = (): string => `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
+
+type Taking = Pick<MongoStorageOptions, "client" | "db" | "key" | "commitGraceMs" | "busyTimeoutMs">;
+
+/**
+ * Write a storage's meta row as its next owner or as its destroyer, waiting for a commit in flight without waiting
+ * inside the server (see the top of this file).
+ *
+ * The write runs in a transaction of its own. While a commit holds the row the server refuses the write at once,
+ * and it is tried again a little later. A commit takes milliseconds: one that still holds the row after
+ * `commitGraceMs` belongs to an owner that stopped in the middle of it. The row names the session that owner
+ * commits in. Ending that session ends the commit, and the row is free. Where the session cannot be ended, the
+ * commit ends when MongoDB's own limit for a transaction ends it, a minute or so later.
+ */
+async function takeMeta(
+	options: Taking,
+	collections: Collections,
+	write: (session: Session) => Promise<MetaRow | null>,
+): Promise<MetaRow | null> {
+	const graceMs = options.commitGraceMs ?? 2000;
+	const timeoutMs = options.busyTimeoutMs ?? 120_000;
+	const started = Date.now();
+	let ended = false;
+	for (let attempt = 0; ; attempt++) {
+		const session = options.client.startSession() as Session;
+		let held: boolean;
+		try {
+			return await session.withTransaction(
+				async () => {
+					try {
+						return await write(session);
+					} catch (error) {
+						// Left as the driver's own error, `withTransaction` would start over at once, for as long as the
+						// row is held.
+						throw again(error) ?? error;
+					}
+				},
+				{ writeConcern: { w: "majority" } },
+			);
+		} catch (error) {
+			if (!(error instanceof Again)) throw error;
+			held = error.held;
+		} finally {
+			await session.endSession();
+		}
+		const waited = Date.now() - started;
+		if (waited >= timeoutMs) throw new StorageBusy(options.key, waited);
+		if (held && !ended && waited >= graceMs) {
+			ended = true;
+			await endCommitSession(options, collections);
+		}
+		// 5 ms, doubling to a quarter of a second; each shortened by up to half, so that waiters do not come back together.
+		await pause(Math.min(250, 5 * 2 ** Math.min(attempt, 6)) * (0.5 + Math.random() / 2));
+	}
+}
+
+/** End the session the storage's present owner commits in, and with it a commit that owner left unfinished. */
+async function endCommitSession(options: Taking, collections: Collections): Promise<void> {
+	if (typeof options.db.command !== "function") return;
+	try {
+		const row = await collections.meta.findOne({ _id: options.key }, { projection: { sid: 1 } });
+		if (row === null || row.sid === undefined || row.sid === null) return;
+		await options.db.command({ killSessions: [{ id: row.sid }] });
+	} catch {
+		// Not permitted, or not offered: the commit then ends when the server's limit for a transaction ends it.
+	}
+}
+
 /** MongoDB implementation of the Pi Durable storage contract. */
 export class MongoStorage implements Storage {
 	private readonly client: MongoClientLike;
+	private readonly db: MongoDbLike;
 	private readonly c: Collections;
 	private readonly key: string;
 	/** The epoch this open took; `undefined` for a reader, which owns nothing and writes nothing. */
@@ -350,6 +496,10 @@ export class MongoStorage implements Storage {
 	private readonly life: string | undefined;
 	private readonly runtime: MongoStorageRuntime;
 	private readonly writeConcern: Record<string, unknown>;
+	/** The one session every commit of this owner runs in, which the meta row names. `undefined` for a reader. */
+	private readonly session: Session | undefined;
+	/** Commits take turns: they share the session, and two at once would only make one of them start over. */
+	private committing: Promise<unknown> = Promise.resolve();
 	private nextId: number;
 	private closed = false;
 	// Conversations are immutable once committed, so their encoded records are cached for ancestry walks.
@@ -358,12 +508,19 @@ export class MongoStorage implements Storage {
 	private lastClusterTime: unknown;
 	private lastOperationTime: unknown;
 
-	private constructor(options: MongoStorageOptions, collections: Collections, meta: MetaRow | undefined) {
+	private constructor(
+		options: MongoStorageOptions,
+		collections: Collections,
+		meta: MetaRow | undefined,
+		session: Session | undefined,
+	) {
 		this.client = options.client;
+		this.db = options.db;
 		this.c = collections;
 		this.key = options.key;
 		this.runtime = options.runtime;
 		this.writeConcern = options.writeConcern ?? { w: "majority" };
+		this.session = session;
 		this.epoch = meta?.epoch;
 		this.life = meta?.life;
 		this.nextId = meta?.nextId ?? Number.NaN;
@@ -378,42 +535,64 @@ export class MongoStorage implements Storage {
 		const prefix = options.prefix ?? DEFAULT_PREFIX;
 		const collections = collectionsOf(options.db, prefix);
 		await ensureIndexes(options.db, prefix, collections);
-		return new MongoStorage(options, collections, undefined);
+		return new MongoStorage(options, collections, undefined, undefined);
 	}
 
-	/** Open the storage named `key`, creating it when absent, and take its ownership from any earlier open. */
+	/**
+	 * Open the storage named `key`, creating it when absent, and take its ownership from any earlier open. A commit
+	 * the earlier owner has in flight finishes first, or is ended after `commitGraceMs` (see `takeMeta`).
+	 */
 	static async open(options: MongoStorageOptions): Promise<MongoStorage> {
 		const prefix = options.prefix ?? DEFAULT_PREFIX;
 		const collections = collectionsOf(options.db, prefix);
 		await ensureIndexes(options.db, prefix, collections);
-		const life = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
-		const take = () =>
-			collections.meta.findOneAndUpdate(
-				{ _id: options.key },
-				{ $setOnInsert: { nextId: 2, nextSeq: 1, schema: MONGO_SCHEMA_VERSION, life }, $inc: { epoch: 1 } },
-				{ upsert: true, returnDocument: "after", writeConcern: { w: "majority" } },
+		const life = newLife();
+		const session = options.client.startSession() as Session;
+		const sid = session.id?.id;
+		try {
+			const meta = await takeMeta(options, collections, (taking) =>
+				collections.meta.findOneAndUpdate(
+					{ _id: options.key },
+					{
+						$setOnInsert: { nextId: 2, nextSeq: 1, schema: MONGO_SCHEMA_VERSION, life },
+						$inc: { epoch: 1 },
+						...(sid === undefined ? { $unset: { sid: "" } } : { $set: { sid } }),
+					},
+					{ session: taking, upsert: true, returnDocument: "after" },
+				),
 			);
-		// Two first opens of one key can both try to insert it; the loser finds the row on its second try.
-		const meta = await take().catch((error: unknown) => {
-			if ((error as { code?: number }).code === 11000) return take();
+			if (meta === null) throw new Error("Durable Mongo metadata is missing");
+			if (meta.schema > MONGO_SCHEMA_VERSION) {
+				throw new Error(
+					`Durable Mongo schema version ${meta.schema} is newer than supported version ${MONGO_SCHEMA_VERSION}`,
+				);
+			}
+			if (!Number.isSafeInteger(meta.nextSeq) || typeof meta.nextId !== "number") {
+				throw new Error("Durable Mongo metadata is corrupt");
+			}
+			return new MongoStorage(options, collections, meta, session);
+		} catch (error) {
+			await session.endSession();
 			throw error;
-		});
-		if (meta === null) throw new Error("Durable Mongo metadata is missing");
-		if (meta.schema > MONGO_SCHEMA_VERSION) {
-			throw new Error(
-				`Durable Mongo schema version ${meta.schema} is newer than supported version ${MONGO_SCHEMA_VERSION}`,
-			);
 		}
-		if (!Number.isSafeInteger(meta.nextSeq) || typeof meta.nextId !== "number") {
-			throw new Error("Durable Mongo metadata is corrupt");
-		}
-		return new MongoStorage(options, collections, meta);
 	}
 
-	/** Remove every record of the storage named `key`. The storage must not be open anywhere. */
+	/**
+	 * Remove every record of the storage named `key`. The storage must not be open anywhere; a storage that is,
+	 * through a mistake or a process that will not stop, loses its ownership first and can commit nothing more.
+	 */
 	static async destroy(options: Omit<MongoStorageOptions, "runtime">): Promise<void> {
 		const collections = collectionsOf(options.db, options.prefix ?? DEFAULT_PREFIX);
 		const mine = { s: options.key };
+		// Take the storage before removing anything. A commit in flight then ends first, by finishing or by being
+		// ended, and no commit can begin: without that, one could add its rows to a storage that has just been emptied.
+		await takeMeta(options, collections, (taking) =>
+			collections.meta.findOneAndUpdate(
+				{ _id: options.key },
+				{ $inc: { epoch: 1 }, $set: { life: newLife() }, $unset: { sid: "" } },
+				{ session: taking, returnDocument: "after" },
+			),
+		);
 		await Promise.all([
 			collections.ids.deleteMany(mine),
 			collections.conversations.deleteMany(mine),
@@ -429,35 +608,39 @@ export class MongoStorage implements Storage {
 	async commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
 		this.assertOpen();
 		this.assertOwner();
+		// One at a time, in the order they were asked for. A commit that fails does not hold up the next.
+		const turn = this.committing.then(() => this.commitNow(writes));
+		this.committing = turn.catch(() => undefined);
+		return turn;
+	}
+
+	private async commitNow(writes: readonly StorageWrite[]): Promise<Seq> {
+		const session = this.session as Session;
 		const documentActions = this.prepareDocumentActions(writes);
 		const candidateNextId = this.candidateNextId(writes);
-		const session = this.client.startSession() as Session;
 		let seq = 0;
-		try {
-			// The callback may run more than once: the driver retries a transaction the server reports as transient.
-			await session.withTransaction(
-				async () => {
-					// Allocating the sequence is also the ownership check, and makes two commits to one storage conflict.
-					// The epoch alone would not do: a key that was destroyed and opened again counts from one again.
-					const meta = await this.c.meta.findOneAndUpdate(
-						{ _id: this.key, epoch: this.epoch, ...(this.life === undefined ? {} : { life: this.life }) },
-						{ $inc: { nextSeq: 1 }, $max: { nextId: candidateNextId } },
-						{ session, returnDocument: "before" },
-					);
-					if (meta === null) throw new StorageOwnershipLost(this.key);
-					seq = meta.nextSeq;
-					// Every read of the batch comes first, then one ordered bulk write per collection it touches.
-					await this.checkGlobalIds(session, writes);
-					const existing = await this.checkDocumentActions(session, documentActions);
-					await this.applyWrites(session, writes, documentActions, existing, seq);
-				},
-				{ readConcern: { level: "snapshot" }, writeConcern: this.writeConcern, readPreference: "primary" },
-			);
-			this.lastClusterTime = session.clusterTime;
-			this.lastOperationTime = session.operationTime;
-		} finally {
-			await session.endSession();
-		}
+		// The callback may run more than once: the driver retries a transaction the server reports as transient.
+		await session.withTransaction(
+			async () => {
+				// Allocating the sequence is also the ownership check, and what an `open()` or a `destroy()` elsewhere
+				// waits behind. The epoch alone would not do: a key that was destroyed and opened again counts from one
+				// again.
+				const meta = await this.c.meta.findOneAndUpdate(
+					{ _id: this.key, epoch: this.epoch, ...(this.life === undefined ? {} : { life: this.life }) },
+					{ $inc: { nextSeq: 1 }, $max: { nextId: candidateNextId } },
+					{ session, returnDocument: "before" },
+				);
+				if (meta === null) throw new StorageOwnershipLost(this.key);
+				seq = meta.nextSeq;
+				// Every read of the batch comes first, then one ordered bulk write per collection it touches.
+				await this.checkGlobalIds(session, writes);
+				const existing = await this.checkDocumentActions(session, documentActions);
+				await this.applyWrites(session, writes, documentActions, existing, seq);
+			},
+			{ readConcern: { level: "snapshot" }, writeConcern: this.writeConcern, readPreference: "primary" },
+		);
+		this.lastClusterTime = session.clusterTime;
+		this.lastOperationTime = session.operationTime;
 		this.nextId = Math.max(this.nextId, candidateNextId);
 		return seq as Seq;
 	}
@@ -711,7 +894,28 @@ export class MongoStorage implements Storage {
 
 	/** Reject every later operation. The client belongs to the host and stays open. */
 	async close(_context: Context): Promise<void> {
+		if (this.closed) return;
 		this.closed = true;
+		const session = this.session;
+		if (session === undefined) return;
+		// A commit under way finishes first.
+		await this.committing;
+		// The driver hands an ended session's name to whatever asks for a session next. The row must stop naming it
+		// before that, or a later `open()` could end a stranger's work. If the row cannot be changed now, because it
+		// is held or the database is away, the session is kept and never handed on.
+		const briefly = { client: this.client, db: this.db, key: this.key, busyTimeoutMs: 1000, commitGraceMs: Infinity };
+		try {
+			await takeMeta(briefly, this.c, (taking) =>
+				this.c.meta.findOneAndUpdate(
+					{ _id: this.key, epoch: this.epoch, ...(this.life === undefined ? {} : { life: this.life }) },
+					{ $unset: { sid: "" } },
+					{ session: taking, returnDocument: "after" },
+				),
+			);
+		} catch {
+			return;
+		}
+		await session.endSession();
 	}
 
 	private rowId(id: number): string {

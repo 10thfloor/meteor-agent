@@ -57,6 +57,7 @@ central ones in CI with two server processes from a production bundle.
 | A second process finishes what the first left | `kill -9` in the middle of a tool call, then a second process hosts the storage: a replay-safe tool reruns there; an unsafe one is reported to the model as interrupted, with the output it had streamed. The retried submission (same `requestId`) is found, not asked twice |
 | One instance runs a storage at a time, and the others reach it | Two hosts on one database: a call on the one that does not host the storage is answered by the one that does; the same request asked three times, from both, is admitted once |
 | Work survives its host | A host that stops answering: another takes the storage when the lease runs out and finishes the work. A host that stops in good order: another takes it at once. A host that restarts under its name: it takes its storages back at once. A commit whose outcome is unknown: the host reopens the storage and the work continues |
+| Taking a storage never waits inside the server, and a host that died in the middle of a commit is not waited for | `open()` against a meta row held by an open transaction: no operation of its is inside the server for longer than an eighth of a second, sampled for a second (a plain write is, the whole time, with a write ticket in its hand); it gives up as `StorageBusy` at its limit and leaves the owner its storage. An owner stopped in the middle of a commit, in one process and as a real process killed there: the next owner has the storage within two seconds of the lease, not after the server's minute; nothing of the unfinished commit remains, and the owner's call is passed to the new host, which admits it once. `destroy()` while a commit is finishing: the commit ends first and nothing is left behind |
 | A server that is told to end hands over first | A real process sent SIGTERM in the middle of a tool call, with a lease of a minute: it closed its storage, ended by that same signal, and the survivor finished the work within five seconds. With a tool that ignores its cancellation: it gave its leases up after its grace and ended; the survivor finished the work |
 | Two processes given one name still work | Requests asked of the namesake go to the process that runs the storage; nothing is taken from it; the mistake is reported once |
 | Two real servers share a storage | `scripts/verify-instances.mjs`: two processes from the reference app's production bundle on one MongoDB, driven over DDP. A thread made on one is watched and spoken to through the other, which passes the input on and is published the answer as delta rows; the host is killed in the middle of a tool call and the other finishes the run, with the input in the transcript once; with a lease of a minute the host is sent SIGTERM, ends by that signal, and the other has the thread half a second later. With the handover turned off, that last step fails |
@@ -75,7 +76,10 @@ Each protection was removed once to see its test fail: the head-marker index,
 the snapshot read, the ownership check, the storage-life check, the reopen
 after a failed commit, the re-check before opening for a request, the
 process-run in the lease, the stopped-host rule, both halves of giving leases
-up.
+up, the transaction around the meta row (a plain write parks in the server),
+the ending of a dead owner's session (the takeover waits a minute), the fence
+before destroying (the finishing commit's rows remain), one commit at a time,
+and the clearing of the session name on close.
 
 ## 3. What a commit costs
 
@@ -168,6 +172,26 @@ backend table for table.
   from one, and the epoch alone would let the old storage's owner in.
 - **A reader owns nothing.** `MongoStorage.reader()` serves every read of the
   contract without taking the epoch.
+- **Nothing waits inside the server.** Commits, `open()` and `destroy()` all
+  write the meta row, so they take turns; and MongoDB makes a plain write
+  that meets a row an open transaction has written wait by retrying it inside
+  the server, with one of the server's write tickets held the whole time. A
+  server with four cores has four, and a transaction whose client died stays
+  open for a minute or more: a few storages taken over from a host that died
+  while committing would hold every ticket and stop every write to the
+  database. (This is how `10thfloor:agent`'s contended commit test fails on
+  CI, as found while this was built.) So every write to the meta row is a
+  transaction of its own, refused at once while the row is held, and the
+  waiting is in the process: `open()` and `destroy()` try again with a growing
+  pause, for `busyTimeoutMs` (2 minutes) at most. A commit takes milliseconds;
+  one that holds the row past `commitGraceMs` (2 seconds) is a dead or
+  stalled owner's. The meta row names the server session the owner commits in
+  (one session per open storage; its commits run one at a time in it), and
+  `killSessions` ends that session, and the commit with it. `close()` clears
+  the name before it gives the session back, so a later `open()` never ends a
+  stranger's session with a recycled identifier. `destroy()` takes the
+  storage this way before it removes anything, so a commit in flight either
+  finishes first or is ended, and none can begin after.
 
 ### 5.2 Host (`server/host.ts`)
 
@@ -188,7 +212,8 @@ Who runs a storage, and when.
   leases already run out, so the next sweep takes them. A host that restarts
   under its name takes its storages back at once: a lease names the instance
   and the process run, and a starting process treats its name's leases as its
-  own last run's.
+  own last run's. A host that died in the middle of a commit is not waited
+  for: the storage's `open()` ends that commit after `commitGraceMs` (§5.1).
 - **A commit whose outcome is unknown** poisons the Session, by Pi Durable's
   own rule. The host closes that harness and opens the storage again, with a
   growing delay if it keeps failing; tasks resume from their checkpoints.
@@ -295,6 +320,11 @@ Pi Durable has no users, and a user entry has no field for an author.
   request's ID to make itself idempotent with.
 - **Requests wait at most 30 seconds for a host.** A deployment where no
   instance can host a storage answers `RequestExpired`.
+- **Ending a dead host's commit needs `killSessions`.** MongoDB allows it for
+  a user's own sessions, which these are. Where it is refused, a storage whose
+  host died in the middle of a commit resumes when MongoDB's own transaction
+  limit ends the commit: a minute, and up to half a minute more. Nothing is
+  lost.
 - **`esbuild` comes along.** Chord depends on it for a bundler Pi Durable
   never loads: about 10 MB installed, with a platform binary and an install
   script that runs when a bundle built on one platform is installed on

@@ -12,7 +12,43 @@ import { AGENT, hang, harnessOptions, loadPieces, type Pieces, type Slow, textOf
 // of a tool call, were run under plain Node while this file was written.)
 
 /** `tokensPerSecond` paces the model's answers, so that something can happen in the middle of one. */
-type HostOptions = { slow?: Slow; errors?: unknown[]; client?: any; tokensPerSecond?: number } & Record<string, any>;
+type HostOptions = {
+  slow?: Slow; errors?: unknown[]; client?: any; db?: any; tokensPerSecond?: number;
+} & Record<string, any>;
+
+/**
+ * A database, except that once `arm()` has been called a bulk write stops at a gate, and the commit it belongs to
+ * stays in the middle of its transaction: a host that stalled, or died, while committing.
+ */
+function stalling(db: any) {
+  let armed = false;
+  let open!: () => void;
+  const gate = new Promise<void>((resolve) => { open = resolve; });
+  let arrive!: () => void;
+  const reached = new Promise<void>((resolve) => { arrive = resolve; });
+  const pass = (target: any, property: PropertyKey) => {
+    const value = target[property];
+    return typeof value === 'function' ? value.bind(target) : value;
+  };
+  const stalled = new Proxy(db, {
+    get(target, property) {
+      if (property !== 'collection') return pass(target, property);
+      return (name: string) => new Proxy(target.collection(name), {
+        get(collection, method) {
+          if (method !== 'bulkWrite') return pass(collection, method);
+          return async (...args: unknown[]) => {
+            if (armed) {
+              arrive();
+              await gate;
+            }
+            return collection.bulkWrite(...args);
+          };
+        },
+      });
+    },
+  });
+  return { db: stalled, arm: () => { armed = true; }, open, reached };
+}
 
 describe('DurableHost', function () {
   this.timeout(60_000);
@@ -27,10 +63,10 @@ describe('DurableHost', function () {
     const prefix = `${Random.id(8)}/`;
     scenes.push(`${prefix}mission`);
     const host = (name: string, options: HostOptions = {}) => {
-      const { slow, errors, client, tokensPerSecond, ...rest } = options;
+      const { slow, errors, client, db, tokensPerSecond, ...rest } = options;
       const made = new DurableHost({
         client: client ?? mongo.client,
-        db: mongo.db,
+        db: db ?? mongo.db,
         runtime: { apply: pieces.apply, StorageRejected: pieces.durable.StorageRejected },
         Harness: pieces.durable.Harness,
         context: pieces.context,
@@ -264,6 +300,54 @@ describe('DurableHost', function () {
     // The harness left behind still tries to commit what it streams. It is not heard from again.
     await new Promise((resolve) => setTimeout(resolve, 400));
     assert.deepEqual(errors.filter(({ where }) => where.startsWith('harness')), []);
+  });
+
+  it('takes over from a host that died in the middle of a commit, without waiting for MongoDB to give the commit up', async function () {
+    const { key, host } = scene();
+    const stalled = stalling(mongo.db);
+    let reached!: () => void;
+    const inTool = new Promise<void>((resolve) => { reached = resolve; });
+    const a = host('a', {
+      db: stalled.db,
+      slow: (_job, signal) => {
+        reached();
+        return hang(signal);
+      },
+    });
+    const b = host('b', { idleMs: 60_000, commitGraceMs: 300, slow: async (job) => `${job} finished by b` });
+    await a.start();
+    const submission = await say(a, key, 'work 1');
+    await inTool;
+
+    // More input arrives while the tool runs. Its commit has written the storage's meta row when the process dies.
+    // MongoDB keeps such a transaction, and the row with it, for a minute or more.
+    const more = { conversationId: 1, draft: { type: 'input', content: 'one more thing', requestId: 'second' } };
+    stalled.arm();
+    const unfinished = a.call<{ submissionId: number }>(key, 'submit', more).catch((error: Error) => error.name);
+    await stalled.reached;
+    a.abandon();
+    const died = Date.now();
+    await b.start();
+
+    await done(b, key, submission);
+    // After the lease ran out, and not after the transaction did.
+    assert.isAbove(Date.now() - died, 500);
+    assert.isBelow(Date.now() - died, 8000);
+    assert.strictEqual(await b.owner(key), b.instanceId);
+    const finished = [
+      'pi.user:work 1', 'pi.assistant:', 'pi.tool-result:work 1 finished by b', 'pi.assistant:tool said: work 1 finished by b',
+    ];
+    // Nothing of the commit that was cut is there.
+    assert.deepEqual(await transcript(b, key), finished);
+
+    // Its sender asks again, as a sender does when no answer came, and it is admitted once.
+    const again = await b.call<{ submissionId: number }>(key, 'submit', more);
+    await done(b, key, again.submissionId);
+    // What is left of `a` gets to go on. Its commit goes nowhere; the call it was serving goes to `b`, which has
+    // admitted that request already.
+    stalled.open();
+    assert.deepEqual(await unfinished, { submissionId: again.submissionId });
+    assert.deepEqual(await transcript(b, key), [...finished, 'pi.user:one more thing', 'pi.assistant:echo: one more thing']);
   });
 
   it('hands its unfinished storages over at once when it stops', async function () {
