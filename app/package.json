@@ -18,7 +18,9 @@
   },
   "dependencies": {
     "@babel/runtime": "^7.23.5",
+    "@earendil-works/chord": "1.0.0",
     "@earendil-works/pi-ai": "^1.0.0",
+    "@earendil-works/pi-durable": "1.0.0",
     "@earendil-works/pi-mcp": "^1.0.0",
     "@swc/helpers": "^0.5.17",
     "marked": "18.0.11",
