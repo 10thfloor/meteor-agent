@@ -16,6 +16,8 @@ const generated = [
   'app/packages/agent-channel-sms/index.d.ts',
   'app/packages/agent-channel-email/types',
   'app/packages/agent-channel-email/index.d.ts',
+  'app/packages/durable/types',
+  'app/packages/durable/index.d.ts',
 ];
 
 // `git diff` does not report newly emitted, untracked declarations. Porcelain

@@ -10,6 +10,10 @@ import { telegram } from 'meteor/10thfloor:agent-channel-telegram';
 import { whatsapp } from 'meteor/10thfloor:agent-channel-whatsapp';
 import { sms } from 'meteor/10thfloor:agent-channel-sms';
 import { email } from 'meteor/10thfloor:agent-channel-email';
+import {
+  Durable, DurableConversation,
+  type DurableAction, type DurableConfig, type Operation,
+} from 'meteor/10thfloor:durable';
 
 declare const provider: Provider;
 declare const sessionId: string;
@@ -43,3 +47,22 @@ void telegram;
 void whatsapp;
 void sms;
 void email;
+
+const countEntries: Operation = async (_args, { harness, context }) =>
+  (await (await harness.root(context)).entries({}, 100, undefined, context)).items.length;
+const durableConfig: DurableConfig = {
+  harness: () => ({ models: undefined, registry: undefined }),
+  allow: (userId: string | null, action: DurableAction) => userId !== null && action === 'view',
+  operations: { countEntries },
+};
+const missions = new Durable('missions', durableConfig);
+const admitted: Promise<{ submissionId: number }> = missions.submit('m1', 1, 'hello');
+const chat = new DurableConversation({ host: 'missions', key: 'm1' });
+const partial: string = chat.streamingText();
+
+void admitted;
+void partial;
+// @ts-expect-error A definition without `harness` cannot open a storage.
+void new Durable('incomplete', {});
+// @ts-expect-error A browser conversation names the storage key as well as the definition.
+void new DurableConversation({ host: 'missions' });

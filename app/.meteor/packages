@@ -31,3 +31,4 @@ accounts-password
 10thfloor:agent-channel-sms
 10thfloor:agent-channel-email
 ddp-rate-limiter
+10thfloor:durable
