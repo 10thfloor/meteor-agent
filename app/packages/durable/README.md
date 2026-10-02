@@ -215,7 +215,11 @@ Nothing below needs configuration. It is what happens.
 - **A host that dies.** Its lease runs out within 30 seconds, another instance
   takes the storage at its next look (every 5 seconds), and Pi Durable resumes
   each unfinished task from its checkpoint: a replay-safe tool runs again, an
-  unsafe one is reported to the model as interrupted.
+  unsafe one is reported to the model as interrupted. A host that died in the
+  middle of a commit left a transaction open on the server, which MongoDB
+  would keep for a minute or more; the instance taking over waits
+  `commitGraceMs` (2 seconds) for it and then ends it, and nothing of that
+  commit remains.
 - **A host that is told to stop.** A production server that receives SIGTERM
   or SIGINT closes its storages first and leaves the ones with work for the
   next instance, which takes them at its next look. Then it ends as it would
@@ -250,6 +254,7 @@ apart.
       "idleMs": 30000,
       "requestMs": 30000,
       "closeMs": 3000,
+      "commitGraceMs": 2000,
       "shutdownMs": 5000,
       "writeConcern": { "w": "majority" },
       "rateLimit": {
@@ -287,6 +292,17 @@ follows the upstream SQLite backend table for table.
   checks it. A replaced owner gets `StorageOwnershipLost` and can never write
   again; it can still read. So does the owner of a storage that was destroyed,
   even when its key is in use again.
+- Nothing waits inside the server for a commit to end. A storage's commits,
+  its opening and its destruction all write its one meta row, so they take
+  turns, and MongoDB would make a plain write wait for an open transaction by
+  retrying it inside the server, holding one of the server's write tickets the
+  whole time. A server with four cores has four. Every write to the meta row
+  is therefore a transaction of its own, refused at once while the row is
+  held, and the waiting is done in the process, ticket-free. A commit that
+  holds the row for longer than `commitGraceMs` belongs to an owner that
+  stopped in the middle of it: the row names the session the owner commits
+  in, that session is ended, and with it the commit. One owner's commits run
+  one at a time, in the order asked.
 
 `openMongoStorage(key)`, `readMongoStorage(key)` and `destroyMongoStorage(key)`
 are that layer alone, for a storage only one process ever opens: no lease, no
@@ -338,6 +354,11 @@ DURABLE_BENCH=1 MOCHA_GREP='commit costs' TEST_CLIENT=0 meteor test-packages --o
   or to erase it) waits `closeMs` and then leaves its harness behind in
   memory, where it can no longer commit; the tool call itself runs on until
   it returns. Write tools that honor `abortSignal`.
+- **Ending a dead host's commit needs `killSessions`.** MongoDB lets a user
+  end their own sessions, which these are. Where the command is refused, an
+  instance taking over a storage whose host died in the middle of a commit
+  waits for MongoDB's own transaction limit instead: a minute, and up to half
+  a minute more. Nothing is lost; that storage resumes late.
 - **One record is one BSON document:** 16 MB at most.
 - **`with()` is local.** See "Your own operations".
 - **The browser pays for Chord's delta module.** The client needs one function

@@ -137,6 +137,11 @@ export type DurableHostOptions = {
 	 * never closes; what is left of it in memory cannot commit once the storage is opened again. Default 3 s.
 	 */
 	readonly closeMs?: number;
+	/**
+	 * How long taking a storage over, or erasing it, waits for a commit that is still in flight before ending it: the
+	 * commit of a host that died or stalled in the middle of one. Default 2 s. Passed to every storage this host opens.
+	 */
+	readonly commitGraceMs?: number;
 	/** Told about failures that no caller is waiting on. Must not throw. */
 	readonly onError?: (error: unknown, where: string) => void;
 };
@@ -494,7 +499,9 @@ export class DurableHost {
 			return { elsewhere: true, owner: undefined };
 		}
 		try {
-			const { client, db, prefix, runtime, writeConcern, context } = this.options;
+			const { client, db, prefix, runtime, writeConcern, commitGraceMs, context } = this.options;
+			// The lease is this instance's, so a commit still in flight is one its last host never finished: `open()`
+			// waits a moment for it and then ends it.
 			const storage = await MongoStorage.open({
 				client,
 				db,
@@ -502,6 +509,7 @@ export class DurableHost {
 				runtime,
 				...(prefix === undefined ? {} : { prefix }),
 				...(writeConcern === undefined ? {} : { writeConcern }),
+				...(commitGraceMs === undefined ? {} : { commitGraceMs }),
 			});
 			const live = new Set<number>();
 			const hosted: Hosted = { key, harness: undefined as never, live, users: 0, idle: undefined, gone: false };
@@ -850,8 +858,14 @@ export class DurableHost {
 		const erasure = (async () => {
 			try {
 				await this.close(hosted, "keep");
-				const { client, db, prefix } = this.options;
-				await MongoStorage.destroy({ client, db, key, ...(prefix === undefined ? {} : { prefix }) });
+				const { client, db, prefix, commitGraceMs } = this.options;
+				await MongoStorage.destroy({
+					client,
+					db,
+					key,
+					...(prefix === undefined ? {} : { prefix }),
+					...(commitGraceMs === undefined ? {} : { commitGraceMs }),
+				});
 				this.readers.delete(key);
 				await recorded?.();
 			} finally {

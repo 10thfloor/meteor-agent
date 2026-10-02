@@ -135,6 +135,7 @@ async function createCore(): Promise<DurableHost> {
     ...numeric('idleMs'),
     ...numeric('requestMs'),
     ...numeric('closeMs'),
+    ...numeric('commitGraceMs'),
     ...(tuning.writeConcern && typeof tuning.writeConcern === 'object' ? { writeConcern: tuning.writeConcern } : {}),
   });
   // A host made while the process is ending never hosts: what it is asked goes to the instances that stay.

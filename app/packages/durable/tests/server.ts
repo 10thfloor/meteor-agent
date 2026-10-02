@@ -11,6 +11,7 @@ before(async function awaitPackageStartup() {
 import './loader.test';
 import './conformance.test';
 import './storage.test';
+import './in-flight.test';
 import './harness.test';
 import './host.test';
 import './handover.test';
