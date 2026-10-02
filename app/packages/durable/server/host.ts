@@ -511,6 +511,9 @@ export class DurableHost {
 				{
 					...options,
 					onReport: (error) => {
+						// A harness that is gone has lost its storage or is being closed, and that was said when it
+						// happened. What it reports from then on, once for every commit it still tries, is the echo.
+						if (hosted.gone) return;
 						if (options.onReport !== undefined) options.onReport(error);
 						else this.report(error, `harness ${key}`);
 					},
