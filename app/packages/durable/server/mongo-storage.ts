@@ -12,8 +12,9 @@
 // - Ownership is enforced, not assumed. The contract says one process owns a
 //   storage at a time. Opening a key takes its `epoch`; every commit checks
 //   that epoch inside its transaction, so an owner that was replaced cannot
-//   write again. Who may open a key, and when, is the host's decision (a
-//   lease); this file only makes a stale owner harmless.
+//   write again, and neither can the owner of a storage that was destroyed,
+//   into a new one of the same key. Who may open a key, and when, is the
+//   host's decision (a lease); this file only makes a stale owner harmless.
 //
 // Nothing here is imported at run time. The driver, Chord's `apply`, and Pi
 // Durable's `StorageRejected` are passed in, so the file loads the same way
@@ -62,8 +63,11 @@ type DocumentAction = {
 /** A document incarnation as stored before the batch: its record and the version of its newest revision. */
 type StoredIncarnation = { readonly record: DocumentRecord; readonly version: number };
 
-/** One storage's allocation state and owner. `_id` is the storage key. */
-type MetaRow = { _id: string; nextId: number; nextSeq: number; schema: number; epoch: number };
+/**
+ * One storage's allocation state and owner. `_id` is the storage key. `life` is drawn when the row is created: a key
+ * that was destroyed and used again is another storage, though its epochs start over.
+ */
+type MetaRow = { _id: string; nextId: number; nextSeq: number; schema: number; epoch: number; life?: string };
 /** The one global ID namespace of a storage: which table owns each ID. */
 type IdRow = { _id: string; s: string; t: TableName };
 type ConversationRow = { _id: string; s: string; id: number; oc: number | null; ot: number | null; r: string };
@@ -171,12 +175,15 @@ export type MongoStorageOptions = {
 	readonly runtime: MongoStorageRuntime;
 };
 
-/** A commit reached a storage whose ownership another `open()` has since taken. Fatal to the Session that held it. */
+/**
+ * A commit reached a storage whose ownership another `open()` has since taken, or that has since been destroyed.
+ * Fatal to the Session that held it.
+ */
 export class StorageOwnershipLost extends Error {
 	readonly key: string;
 
 	constructor(key: string) {
-		super(`Storage ${JSON.stringify(key)} is owned by a later open; this owner can no longer commit`);
+		super(`Storage ${JSON.stringify(key)} was opened again or destroyed; this owner can no longer commit`);
 		this.name = "StorageOwnershipLost";
 		this.key = key;
 	}
@@ -339,6 +346,8 @@ export class MongoStorage implements Storage {
 	private readonly key: string;
 	/** The epoch this open took; `undefined` for a reader, which owns nothing and writes nothing. */
 	private readonly epoch: number | undefined;
+	/** Which storage of this key the epoch was taken in; see `MetaRow`. */
+	private readonly life: string | undefined;
 	private readonly runtime: MongoStorageRuntime;
 	private readonly writeConcern: Record<string, unknown>;
 	private nextId: number;
@@ -356,6 +365,7 @@ export class MongoStorage implements Storage {
 		this.runtime = options.runtime;
 		this.writeConcern = options.writeConcern ?? { w: "majority" };
 		this.epoch = meta?.epoch;
+		this.life = meta?.life;
 		this.nextId = meta?.nextId ?? Number.NaN;
 	}
 
@@ -376,10 +386,11 @@ export class MongoStorage implements Storage {
 		const prefix = options.prefix ?? DEFAULT_PREFIX;
 		const collections = collectionsOf(options.db, prefix);
 		await ensureIndexes(options.db, prefix, collections);
+		const life = `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 12)}`;
 		const take = () =>
 			collections.meta.findOneAndUpdate(
 				{ _id: options.key },
-				{ $setOnInsert: { nextId: 2, nextSeq: 1, schema: MONGO_SCHEMA_VERSION }, $inc: { epoch: 1 } },
+				{ $setOnInsert: { nextId: 2, nextSeq: 1, schema: MONGO_SCHEMA_VERSION, life }, $inc: { epoch: 1 } },
 				{ upsert: true, returnDocument: "after", writeConcern: { w: "majority" } },
 			);
 		// Two first opens of one key can both try to insert it; the loser finds the row on its second try.
@@ -427,8 +438,9 @@ export class MongoStorage implements Storage {
 			await session.withTransaction(
 				async () => {
 					// Allocating the sequence is also the ownership check, and makes two commits to one storage conflict.
+					// The epoch alone would not do: a key that was destroyed and opened again counts from one again.
 					const meta = await this.c.meta.findOneAndUpdate(
-						{ _id: this.key, epoch: this.epoch },
+						{ _id: this.key, epoch: this.epoch, ...(this.life === undefined ? {} : { life: this.life }) },
 						{ $inc: { nextSeq: 1 }, $max: { nextId: candidateNextId } },
 						{ session, returnDocument: "before" },
 					);

@@ -10,13 +10,11 @@ import {
   ROOT_CONVERSATION_ID,
   storageKey,
 } from '../common/names';
+import { handOver, handoverOnSignal } from './handover';
 import { DurableHost, type Operation } from './host';
-import { loadPackage } from './loader';
 import type { MongoStorage } from './mongo-storage';
 import { type AgentChoices, OPERATIONS } from './operations';
-
-export const PI_DURABLE = '@earendil-works/pi-durable';
-export const CHORD = '@earendil-works/chord';
+import { piRuntime } from './pi';
 
 /** What a client may ask for over DDP. The server-side API is never asked. */
 export type DurableAction =
@@ -50,7 +48,11 @@ export type DurableConfig = {
    */
   agent?(target: { key: string; userId: string | null; action: 'root' | 'create' | 'fork' }):
     AgentChoices | undefined | Promise<AgentChoices | undefined>;
-  /** More that can be asked of a storage from any instance, beside the built-in operations. */
+  /**
+   * More that can be asked of a storage from any instance, with `call()`,
+   * beside the built-in operations. Each is given the storage's harness on
+   * the instance that hosts it, and the app's `key`. A client cannot call one.
+   */
   operations?: Readonly<Record<string, Operation>>;
   /** Document kinds a viewer receives. Default `pi.live`, `pi.inbox`, `pi.usage`. */
   documents?: readonly string[];
@@ -60,6 +62,9 @@ export type DurableConfig = {
 
 const definitions = new Map<string, Durable>();
 let core: Promise<DurableHost> | undefined;
+/** Set once this process has been told to end: from then on it hosts nothing. */
+let leaving = false;
+let exitHooked = false;
 
 function packageSettings(): Record<string, any> {
   return (Meteor.settings as any)?.packages?.['10thfloor:durable'] ?? {};
@@ -69,23 +74,46 @@ function packageSettings(): Record<string, any> {
  * Names this server instance among those sharing the database. It is stable
  * across restarts of the same instance, so a restarted server resumes its own
  * storages at once, and distinct between instances: the host name, plus the
- * app's URL in development (where the port changes) or its port in production.
+ * app's URL in development (where the port changes) or its port in production,
+ * plus PM2's `NODE_APP_INSTANCE` where several processes share one port.
  * `DURABLE_INSTANCE_ID`, or `instanceId` in the package settings, overrides it.
+ * Processes that run at the same time need different names; see `DurableHost`.
  */
 export function instanceId(): string {
   const configured = process.env.DURABLE_INSTANCE_ID ?? packageSettings().instanceId;
   if (configured) return String(configured);
   const slot = Meteor.isDevelopment ? process.env.ROOT_URL : process.env.PORT;
-  return `${os.hostname()}|${slot ?? process.pid}`;
+  const worker = process.env.NODE_APP_INSTANCE;
+  return `${os.hostname()}|${slot ?? process.pid}${worker ? `|${worker}` : ''}`;
+}
+
+/** How long a process that is told to end may spend handing its storages over. `shutdownMs`; 0 turns it off. */
+function graceMs(): number {
+  const configured = packageSettings().shutdownMs;
+  return typeof configured === 'number' && configured >= 0 ? configured : 5000;
+}
+
+/** What this process does when it is told to end; see `handover.ts`. */
+async function leave(): Promise<void> {
+  leaving = true;
+  const host = await core?.catch(() => undefined);
+  if (host !== undefined) await handOver(host, graceMs());
+}
+
+/**
+ * Hand over on SIGTERM and SIGINT. Not under the `meteor` tool: its runner
+ * expects an app it kills to be gone at once, and the app it starts next has
+ * the same instance name, which takes its storages back without a handover.
+ */
+function hookExit(): void {
+  if (exitHooked) return;
+  exitHooked = true;
+  if (process.env.METEOR_PARENT_PID || graceMs() === 0) return;
+  handoverOnSignal(process, leave);
 }
 
 async function createCore(): Promise<DurableHost> {
-  const durable = await loadPackage(PI_DURABLE) as any;
-  const delta = await loadPackage(CHORD, 'delta') as any;
-  const context = (await loadPackage(CHORD, 'context') as any).BACKGROUND_CONTEXT;
-  if (typeof durable?.Harness?.open !== 'function' || typeof delta?.apply !== 'function' || !context) {
-    throw new Error('[10thfloor:durable] pi-durable or chord exposes no Harness/apply/BACKGROUND_CONTEXT');
-  }
+  const pi = await piRuntime();
   const { client, db } = (MongoInternals.defaultRemoteCollectionDriver() as any).mongo;
   const tuning = packageSettings();
   const numeric = (name: string) => (typeof tuning[name] === 'number' ? { [name]: tuning[name] } : {});
@@ -93,9 +121,9 @@ async function createCore(): Promise<DurableHost> {
     client,
     db,
     prefix: PREFIX,
-    runtime: { apply: delta.apply, StorageRejected: durable.StorageRejected },
-    Harness: durable.Harness,
-    context,
+    runtime: { apply: pi.apply, StorageRejected: pi.StorageRejected },
+    Harness: pi.Harness,
+    context: pi.context,
     instanceId: instanceId(),
     accepts: (key) => definitions.has(definitionOf(key)),
     harness: (key) => definitionFor(key).harnessOptions(key),
@@ -106,9 +134,12 @@ async function createCore(): Promise<DurableHost> {
     ...numeric('sweepMs'),
     ...numeric('idleMs'),
     ...numeric('requestMs'),
+    ...numeric('closeMs'),
     ...(tuning.writeConcern && typeof tuning.writeConcern === 'object' ? { writeConcern: tuning.writeConcern } : {}),
   });
-  await host.start();
+  // A host made while the process is ending never hosts: what it is asked goes to the instances that stay.
+  if (leaving) await host.stop();
+  else await host.start();
   return host;
 }
 
@@ -125,7 +156,12 @@ export function durableHost(): Promise<DurableHost> {
   return core;
 }
 
-/** Stop hosting on this instance: close every open storage and hand over the ones with work left. */
+/**
+ * Stop hosting on this instance: close every open storage and hand over the
+ * ones with work left. The next use of a definition starts hosting again. A
+ * production server does this by itself when it is told to end (SIGTERM or
+ * SIGINT), within `shutdownMs`; call it from a shutdown path of your own.
+ */
 export async function shutdown(): Promise<void> {
   const running = core;
   core = undefined;
@@ -178,10 +214,19 @@ export class Durable {
     if (typeof config?.harness !== 'function') throw new Error('[10thfloor:durable] a definition needs `harness(key)`');
     this.name = name;
     this.config = config;
-    this.operations = { ...OPERATIONS, ...config.operations };
+    const own: Record<string, Operation> = {};
+    for (const [op, run] of Object.entries(config.operations ?? {})) {
+      if (Object.hasOwn(OPERATIONS, op) || op.startsWith('$')) {
+        throw new Error(`[10thfloor:durable] the operation name ${JSON.stringify(op)} is taken by the package`);
+      }
+      // The host addresses a storage by the definition's name and the key; an app's operation is told its own key.
+      own[op] = (args, scope) => run(args, { ...scope, key: scope.key.slice(name.length + 1) });
+    }
+    this.operations = { ...OPERATIONS, ...own };
     this.documents = config.documents ?? DEFAULT_DOCUMENTS;
     this.hiddenEntries = config.hiddenEntries ?? DEFAULT_HIDDEN_ENTRIES;
     definitions.set(name, this);
+    hookExit();
     // Storages this definition left unfinished are resumed without waiting for anyone to ask.
     Meteor.startup(() => { void durableHost().catch((error) => Meteor._debug('[10thfloor:durable] start:', error)); });
   }
@@ -304,7 +349,7 @@ export class Durable {
     const { submissionId } = await this.submit(key, conversationId, draft);
     const record = await this.settled(key, submissionId, options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs });
     if (record.status !== 'done') return { status: 'unanswered', text: '', submissionId, reason: record.reason };
-    const context = (await loadPackage(CHORD, 'context') as any).BACKGROUND_CONTEXT;
+    const { context } = await piRuntime();
     const answer = await (await this.reader(key)).entry(record.answer, context);
     return { status: 'done', text: textOf(answer?.entry.model?.[0]), submissionId, entryId: record.answer };
   }

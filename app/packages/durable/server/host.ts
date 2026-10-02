@@ -31,8 +31,12 @@ import {
 	StorageOwnershipLost,
 } from "./mongo-storage";
 
-/** One lease per hosted storage. `until` is written and compared on the database's clock, never an instance's. */
-type LeaseRow = { _id: string; owner: string; until: Date; since: Date };
+/**
+ * One lease per hosted storage. `until` is written and compared on the database's clock, never an instance's. `owner`
+ * is the instance's name and `inc` the process run that holds the lease: a process renews and releases only what its
+ * own run took, and takes what an earlier run of its name left only while it starts.
+ */
+type LeaseRow = { _id: string; owner: string; inc?: string; until: Date; since: Date };
 
 /** Work addressed to whoever hosts storage `s`. `a` and `result` are JSON text. */
 type RequestRow = {
@@ -71,6 +75,7 @@ type Rows<Row> = {
 	): Promise<{ matchedCount: number; modifiedCount: number; upsertedCount: number }>;
 	updateMany(filter: Filter, update: unknown, options?: Record<string, unknown>): Promise<{ matchedCount: number; modifiedCount: number }>;
 	deleteOne(filter: Filter, options?: Record<string, unknown>): Promise<unknown>;
+	deleteMany(filter: Filter, options?: Record<string, unknown>): Promise<unknown>;
 	createIndexes(specs: Record<string, unknown>[]): Promise<unknown>;
 	watch(pipeline: Record<string, unknown>[], options?: Record<string, unknown>): ChangeStream;
 };
@@ -110,7 +115,9 @@ export type DurableHostOptions = {
 	operations?(key: string): Readonly<Record<string, Operation>> | undefined;
 	/**
 	 * Names this instance among those sharing the database. Keep it stable across restarts of the same instance: a
-	 * restarted process then resumes its own storages at once instead of waiting for its old lease to run out.
+	 * restarted process then resumes its own storages at once instead of waiting for its old lease to run out. Give
+	 * every process that runs at the same time its own name: a process that starts takes over whatever is leased to
+	 * its name, which is a running namesake's work too.
 	 */
 	readonly instanceId: string;
 	/** Passed to every storage this host opens. */
@@ -125,6 +132,11 @@ export type DurableHostOptions = {
 	readonly idleMs?: number;
 	/** How long a request may wait for a host. Default 30 s. */
 	readonly requestMs?: number;
+	/**
+	 * How long a storage may take to close before it is left behind. A harness whose tool ignores its cancellation
+	 * never closes; what is left of it in memory cannot commit once the storage is opened again. Default 3 s.
+	 */
+	readonly closeMs?: number;
 	/** Told about failures that no caller is waiting on. Must not throw. */
 	readonly onError?: (error: unknown, where: string) => void;
 };
@@ -188,6 +200,7 @@ export class DurableHost {
 	private readonly sweepMs: number;
 	private readonly idleMs: number;
 	private readonly requestMs: number;
+	private readonly closeMs: number;
 	private readonly slots = new Map<string, Slot>();
 	private readonly readers = new Map<string, { readonly reader: Promise<MongoStorage>; readonly at: number }>();
 	/** Storages being erased here; nothing reopens one until its erasure has finished. */
@@ -203,6 +216,11 @@ export class DurableHost {
 	private stream: ChangeStream | undefined;
 	private renewedAt = 0;
 	private running = false;
+	/** Set by `stop()`: this host opens nothing any more, and what it is asked goes to the other instances. */
+	private stopped = false;
+	/** While this process takes up what the last run of its name left; see `adopt()`. */
+	private adopting = false;
+	private namesakeReported = false;
 
 	constructor(options: DurableHostOptions) {
 		this.options = options;
@@ -216,13 +234,22 @@ export class DurableHost {
 		this.sweepMs = options.sweepMs ?? 5_000;
 		this.idleMs = options.idleMs ?? 30_000;
 		this.requestMs = options.requestMs ?? 30_000;
+		this.closeMs = options.closeMs ?? 3_000;
 	}
 
 	/** Begin renewing leases, consuming requests, and looking for storages nobody is running. Idempotent. */
 	async start(): Promise<void> {
 		if (this.running) return;
 		this.running = true;
-		await this.ensureIndexes();
+		this.stopped = false;
+		this.adopting = true;
+		try {
+			await this.ensureIndexes();
+		} catch (error) {
+			this.running = false;
+			this.adopting = false;
+			throw error;
+		}
 		this.renewedAt = Date.now();
 		this.heartbeat = setInterval(() => void this.renew(), this.heartbeatMs);
 		this.sweeper = setInterval(() => void this.sweep(), this.sweepMs);
@@ -232,7 +259,10 @@ export class DurableHost {
 
 	/**
 	 * Take up what the last process with this instance's name was running. Its leases are still live, so no sweep
-	 * would find them; they are this instance's by name, and opening each storage shuts the old process out.
+	 * would find them; they are this instance's by name, and opening each storage shuts the old process out. Until
+	 * this has gone through them, any lease in this instance's name is taken as its own, so a call that arrives first
+	 * does not wait behind the rest. Afterwards such a lease can only be a namesake's that is running now, and is
+	 * left alone.
 	 */
 	private async adopt(): Promise<void> {
 		try {
@@ -244,14 +274,18 @@ export class DurableHost {
 			}
 		} catch (error) {
 			this.report(error, "adopt");
+		} finally {
+			this.adopting = false;
 		}
 	}
 
 	/**
 	 * Stop hosting. Each harness is closed, which ends its running calls; a storage that still has live tasks keeps an
-	 * expired lease, so another instance takes it at its next look rather than after a full lease.
+	 * expired lease, so another instance takes it at its next look rather than after a full lease. A stopped host
+	 * opens nothing: what it is asked afterwards goes to the other instances by request, until `start()`.
 	 */
 	async stop(): Promise<void> {
+		this.stopped = true;
 		if (!this.running) return;
 		this.running = false;
 		this.stopTimers();
@@ -272,6 +306,7 @@ export class DurableHost {
 	 * of this host stay in memory and cannot commit once another host opens their storages.
 	 */
 	abandon(): void {
+		this.stopped = true;
 		this.running = false;
 		this.stopTimers();
 		for (const key of [...this.slots.keys()]) {
@@ -282,6 +317,27 @@ export class DurableHost {
 			}
 		}
 		this.slots.clear();
+	}
+
+	/**
+	 * Give up every lease this process holds, at once and without closing anything. For a process that has to exit
+	 * and could not wait for `stop()`: a harness whose tool ignores its cancellation never closes. The next instance
+	 * to look takes the storages that had work, and the epoch keeps whatever still runs here from committing.
+	 */
+	async surrender(): Promise<void> {
+		this.stopped = true;
+		this.running = false;
+		this.stopTimers();
+		const idle: string[] = [];
+		for (const [key, slot] of this.slots) {
+			if (slot.state !== "open") continue;
+			slot.hosted.gone = true;
+			if (slot.hosted.idle !== undefined) clearTimeout(slot.hosted.idle);
+			if (slot.hosted.live.size === 0) idle.push(key);
+		}
+		const mine = { owner: this.instanceId, inc: this.incarnation };
+		if (idle.length > 0) await this.leases.deleteMany({ _id: { $in: idle }, ...mine });
+		await this.leases.updateMany(mine, [{ $set: { until: "$$NOW" } }]);
 	}
 
 	/**
@@ -391,6 +447,8 @@ export class DurableHost {
 	 * request that has since been done, an erasure included, would create the storage afresh.
 	 */
 	private async host(key: string, need: "use" | "requests" = "use"): Promise<Hosted | Elsewhere> {
+		// A host that was told to stop opens nothing more: it would take a lease and leave with it.
+		if (this.stopped) return { elsewhere: true, owner: await this.owner(key) };
 		for (;;) {
 			const erasing = this.erasing.get(key);
 			if (erasing !== undefined) {
@@ -425,11 +483,14 @@ export class DurableHost {
 		// A storage this instance cannot run is, for this instance, always somebody else's.
 		if (this.options.accepts?.(key) === false) return { elsewhere: true, owner: await this.owner(key) };
 		const lease = await this.acquire(key);
-		if (!lease.held) return { elsewhere: true, owner: lease.owner };
+		if (!lease.held) {
+			if (lease.owner === this.instanceId) this.namesake(key);
+			return { elsewhere: true, owner: lease.owner };
+		}
 		// A lease that had to be created belongs to a storage nobody was running, or to no storage at all. Come for a
 		// request, find none waiting: there is nothing to open, and the lease goes back as if never taken.
 		if (need === "requests" && lease.created && (await this.requests.findOne({ s: key, ...this.actionable() })) === null) {
-			await this.leases.deleteOne({ _id: key, owner: this.instanceId });
+			await this.leases.deleteOne(this.held(key));
 			return { elsewhere: true, owner: undefined };
 		}
 		try {
@@ -471,9 +532,27 @@ export class DurableHost {
 			harness.resume();
 			return hosted;
 		} catch (error) {
-			await this.leases.deleteOne({ _id: key, owner: this.instanceId }).catch(() => undefined);
+			await this.leases.deleteOne(this.held(key)).catch(() => undefined);
 			throw error;
 		}
+	}
+
+	/**
+	 * A lease in this instance's name that is not this process's: another process is running under the same name.
+	 * The two still work as two instances, because a lease belongs to a process run. But each takes over everything
+	 * the other is running when it starts, so it is said, once.
+	 */
+	private namesake(key: string): void {
+		if (this.namesakeReported) return;
+		this.namesakeReported = true;
+		this.report(
+			new Error(
+				`Another running server process uses this instance's name ${JSON.stringify(this.instanceId)}: it holds ` +
+					`storage ${JSON.stringify(key)}. Give each process its own instance name; a process that starts takes ` +
+					"over what is leased to its name.",
+			),
+			"instance name",
+		);
 	}
 
 	/**
@@ -580,15 +659,31 @@ export class DurableHost {
 		if (hosted.idle !== undefined) clearTimeout(hosted.idle);
 		const promise = (async () => {
 			try {
-				await hosted.harness.close(this.options.context);
+				// Closing waits for the harness's running calls to end, and a tool that ignores its cancellation never
+				// does. Past `closeMs` the harness is left behind: `gone` here, and unable to commit once the storage is
+				// opened again or destroyed.
+				let timer: ReturnType<typeof setTimeout> | undefined;
+				const late = new Promise<"late">((resolve) => {
+					timer = setTimeout(() => resolve("late"), this.closeMs);
+				});
+				const closing = hosted.harness.close(this.options.context);
+				const outcome = await Promise.race([closing, late]);
+				clearTimeout(timer);
+				if (outcome === "late") {
+					closing.catch(() => undefined);
+					this.report(
+						new Error(`Storage ${JSON.stringify(hosted.key)} did not close within ${this.closeMs} ms and was left behind`),
+						`close ${hosted.key}`,
+					);
+				}
 			} catch (error) {
 				// A harness whose storage was taken, or whose last commit is in doubt, cannot close cleanly.
 				if (lease === "release") this.report(error, `close ${hosted.key}`);
 			}
 			try {
-				if (lease === "release") await this.leases.deleteOne({ _id: hosted.key, owner: this.instanceId });
+				if (lease === "release") await this.leases.deleteOne(this.held(hosted.key));
 				else if (lease === "handover") {
-					await this.leases.updateOne({ _id: hosted.key, owner: this.instanceId }, [{ $set: { until: "$$NOW" } }]);
+					await this.leases.updateOne(this.held(hosted.key), [{ $set: { until: "$$NOW" } }]);
 				}
 			} catch (error) {
 				this.report(error, `lease ${hosted.key}`);
@@ -602,25 +697,35 @@ export class DurableHost {
 
 	// ── Leases ─────────────────────────────────────────────────────────────────
 
-	/** Take the lease on `key` if it is free, expired, or already this instance's. Otherwise say who holds it. */
+	/** The lease on `key`, if this process holds it. */
+	private held(key: string): Filter {
+		return { _id: key, owner: this.instanceId, inc: this.incarnation };
+	}
+
+	/**
+	 * Take the lease on `key` if it is free, has run out, or is this process's already; while this process is taking
+	 * up what the last run of its name left, also if it is in this instance's name. Otherwise say who holds it.
+	 */
 	private async acquire(
 		key: string,
 	): Promise<{ held: true; created: boolean } | { held: false; owner: string | undefined }> {
 		const until = { $add: ["$$NOW", this.leaseMs] };
 		// `$literal`: in a pipeline, a string that starts with `$` would otherwise be read as a field path.
 		const me = { $literal: this.instanceId };
+		const run = { $literal: this.incarnation };
 		const majority = { writeConcern: { w: "majority" } };
 		// Two statements, because Mongo allows no `$expr` in the predicate of an upsert. Each is atomic on the one row,
-		// and each can only move the lease to this instance from a state in which it was free to take.
+		// and each can only move the lease to this process from a state in which it was free to take.
 		for (let attempt = 0; attempt < 2; attempt++) {
-			// A lease that is this instance's already, or that has run out.
+			const own = this.adopting ? { owner: this.instanceId } : { owner: this.instanceId, inc: this.incarnation };
 			const taken = await this.leases.findOneAndUpdate(
-				{ _id: key, $or: [{ owner: this.instanceId }, { $expr: { $lte: ["$until", "$$NOW"] } }] },
+				{ _id: key, $or: [own, { $expr: { $lte: ["$until", "$$NOW"] } }] },
 				[
 					{
 						$set: {
-							since: { $cond: [{ $eq: ["$owner", me] }, "$since", "$$NOW"] },
+							since: { $cond: [{ $and: [{ $eq: ["$owner", me] }, { $eq: ["$inc", run] }] }, "$since", "$$NOW"] },
 							owner: me,
+							inc: run,
 							until,
 						},
 					},
@@ -636,6 +741,7 @@ export class DurableHost {
 						{
 							$set: {
 								owner: { $ifNull: ["$owner", me] },
+								inc: { $ifNull: ["$inc", run] },
 								until: { $ifNull: ["$until", until] },
 								since: { $ifNull: ["$since", "$$NOW"] },
 							},
@@ -649,8 +755,9 @@ export class DurableHost {
 				if ((error as { code?: number }).code !== 11000) throw error;
 			}
 			const holder = await this.leases.findOne({ _id: key });
-			if (holder !== null && holder.owner !== this.instanceId) return { held: false, owner: holder.owner };
-			// Released, or taken by this instance's own name, between the statements: go round once more.
+			const takeable = holder === null || (holder.owner === this.instanceId && (this.adopting || holder.inc === this.incarnation));
+			if (!takeable) return { held: false, owner: holder.owner };
+			// Released, or come into this process's reach, between the statements: go round once more.
 		}
 		return { held: false, owner: undefined };
 	}
@@ -659,7 +766,7 @@ export class DurableHost {
 		const keys = this.hosted();
 		try {
 			if (keys.length > 0) {
-				const filter = { _id: { $in: keys }, owner: this.instanceId };
+				const filter = { _id: { $in: keys }, owner: this.instanceId, inc: this.incarnation };
 				const result = await this.leases.updateMany(filter, [{ $set: { until: { $add: ["$$NOW", this.leaseMs] } } }]);
 				if (result.matchedCount < keys.length) {
 					const held = new Set((await this.leases.find(filter, { projection: { _id: 1 } }).toArray()).map((row) => row._id));
@@ -710,8 +817,12 @@ export class DurableHost {
 	// ── Requests ───────────────────────────────────────────────────────────────
 
 	private operation(key: string, op: string): Operation {
-		const operation = this.options.operations?.(key)?.[op];
-		if (operation === undefined) throw new Error(`Unknown operation ${JSON.stringify(op)} for storage ${JSON.stringify(key)}`);
+		const operations = this.options.operations?.(key);
+		// Its own entries only: "toString" is not an operation.
+		const operation = operations !== undefined && Object.hasOwn(operations, op) ? operations[op] : undefined;
+		if (typeof operation !== "function") {
+			throw new Error(`Unknown operation ${JSON.stringify(op)} for storage ${JSON.stringify(key)}`);
+		}
 		return operation;
 	}
 
@@ -741,7 +852,7 @@ export class DurableHost {
 				this.readers.delete(key);
 				await recorded?.();
 			} finally {
-				await this.leases.deleteOne({ _id: key, owner: this.instanceId }).catch((error) => this.report(error, `lease ${key}`));
+				await this.leases.deleteOne(this.held(key)).catch((error) => this.report(error, `lease ${key}`));
 			}
 		})().finally(() => this.erasing.delete(key));
 		this.erasing.set(key, erasure);
@@ -911,7 +1022,7 @@ export class DurableHost {
 	private ensureIndexes(): Promise<void> {
 		this.indexes ??= (async () => {
 			await Promise.all([
-				this.leases.createIndexes([{ key: { until: 1 } }]),
+				this.leases.createIndexes([{ key: { until: 1 } }, { key: { owner: 1 } }]),
 				this.requests.createIndexes([
 					{ key: { s: 1, state: 1, at: 1 } },
 					{ key: { state: 1 } },

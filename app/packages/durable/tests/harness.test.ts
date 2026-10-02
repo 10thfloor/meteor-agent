@@ -1,14 +1,11 @@
 import { assert } from 'chai';
 import { Random } from 'meteor/random';
-import { destroyMongoStorage, loadChord, loadPiDurable, openMongoStorage } from 'meteor/10thfloor:durable';
-import { loadPackage } from '../server/loader';
+import { destroyMongoStorage, loadChord, loadPiAi, loadPiDurable, openMongoStorage } from 'meteor/10thfloor:durable';
 
 // The whole Pi Durable harness, not only its storage contract, running in a
 // Meteor server process on MongoStorage: a model turn with a tool call, an
 // application document changed in the same commits, and a reopen. The model
 // is pi-ai's faux provider, so nothing leaves the process.
-
-const PI_AI = '@earendil-works/pi-ai';
 
 describe('Pi Durable harness on MongoStorage, inside Meteor', function () {
   this.timeout(120_000);
@@ -53,9 +50,9 @@ describe('Pi Durable harness on MongoStorage, inside Meteor', function () {
   before(async function () {
     durable = await loadPiDurable();
     context = (await loadChord('context') as any).BACKGROUND_CONTEXT;
-    Type = (await loadPackage(PI_AI) as any).Type;
-    createModels = (await loadPackage(PI_AI, 'models') as any).createModels;
-    faux = await loadPackage(PI_AI, 'providers/faux');
+    Type = (await loadPiAi() as any).Type;
+    createModels = (await loadPiAi('models') as any).createModels;
+    faux = await loadPiAi('providers/faux');
   });
 
   after(async function () {

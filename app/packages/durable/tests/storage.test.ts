@@ -88,7 +88,28 @@ describe('MongoStorage', function () {
     const currentEntry = await current.mintId();
     assert.strictEqual(await current.commit([{ type: 'entry', value: entry(currentEntry, ROOT) }], context), 2);
     // The stale owner stays fenced; it does not recover by retrying.
-    assert.match((await failure(stale.commit([], context)))?.message, /owned by a later open/);
+    assert.match((await failure(stale.commit([], context)))?.message, /can no longer commit/);
+  });
+
+  it('keeps the owner of a destroyed storage out of a new storage with the same key', async function () {
+    const key = newKey();
+    const before = await openMongoStorage(key) as any;
+    await before.commit([root], context);
+    const lateEntry = await before.mintId();
+    await destroyMongoStorage(key);
+
+    // The key is used again. Its epochs start over, so the new owner holds the very epoch the old one held.
+    const after = await openMongoStorage(key) as any;
+    assert.strictEqual((await db.collection(`${PREFIX}meta`).findOne({ _id: key })).epoch, 1);
+    await after.commit([root], context);
+
+    const late = { type: 'entry', value: entry(lateEntry, ROOT, { data: 'from the storage that is gone' }) };
+    assert.strictEqual((await failure(before.commit([late], context)))?.name, 'StorageOwnershipLost');
+    assert.strictEqual(await after.entry(lateEntry, context), undefined);
+    assert.strictEqual(await rows('entries', { s: key }), 0);
+    // The new storage is untouched and goes on.
+    const next = await after.mintId();
+    assert.strictEqual(await after.commit([{ type: 'entry', value: entry(next, ROOT) }], context), 2);
   });
 
   it('gives two first opens of one key distinct epochs, so exactly one of them owns it', async function () {

@@ -399,4 +399,217 @@ describe('DurableHost', function () {
     await done(b, key, await say(b, key, 'fresh'), 5000);
     assert.deepEqual(await transcript(b, key), ['pi.user:fresh', 'pi.assistant:echo: fresh']);
   });
+
+  it('passes on what it is asked once it was told to stop, and opens nothing', async function () {
+    const { key, host } = scene();
+    const a = host('a', { idleMs: 60_000 });
+    const b = host('b', { idleMs: 60_000 });
+    await a.start();
+    await b.start();
+    await done(a, key, await say(a, key, 'before the stop'));
+    assert.deepEqual(a.hosted(), [key]);
+
+    await a.stop();
+    assert.isNull(await mongo.db.collection('pi_durable_leases').findOne({ _id: key }));
+
+    // A call that reaches the stopped instance, as one does while a server shuts down: it takes no lease to leave
+    // with. The work is done by the instance that stays.
+    const after = await say(a, key, 'after the stop');
+    assert.deepEqual(a.hosted(), []);
+    assert.deepEqual(b.hosted(), [key]);
+    assert.strictEqual(await a.owner(key), b.instanceId);
+    await done(a, key, after);
+    assert.deepEqual(await transcript(a, key), [
+      'pi.user:before the stop', 'pi.assistant:echo: before the stop',
+      'pi.user:after the stop', 'pi.assistant:echo: after the stop',
+    ]);
+    assert.strictEqual((await rejection(a.with(key, () => 'unreachable'))).name, 'HostedElsewhere');
+
+    // So does a host that is made after its process was told to end, and so never starts.
+    const late = host('late', { idleMs: 60_000 });
+    await late.stop();
+    const viaLate = await say(late, key, 'from a late host');
+    assert.deepEqual(late.hosted(), []);
+    await done(late, key, viaLate, 5000);
+    const lines = await transcript(late, key);
+    assert.strictEqual(lines[lines.length - 1], 'pi.assistant:echo: from a late host');
+  });
+
+  it('gives its leases up at once when it cannot wait for its storages to close', async function () {
+    const { key, host, prefix } = scene();
+    const idleKey = `${prefix}quiet`;
+    scenes.push(idleKey);
+    let reached!: () => void;
+    const inTool = new Promise<void>((resolve) => { reached = resolve; });
+    // A tool that ignores its cancellation. A lease of a minute: nothing here is the lease running out.
+    const a = host('a', {
+      leaseMs: 60_000,
+      idleMs: 60_000,
+      slow: () => { reached(); return new Promise<string>(() => undefined); },
+    });
+    const b = host('b', { leaseMs: 60_000, idleMs: 60_000, slow: async (job) => `${job} finished by b` });
+    await a.start();
+    await b.start();
+    await done(a, idleKey, await say(a, idleKey, 'nothing to finish'));
+    const submission = await say(a, key, 'work 7');
+    await inTool;
+    assert.sameMembers(a.hosted(), [key, idleKey]);
+
+    await a.surrender();
+    // The storage with work is taken by the instance that stays, without waiting for the lease.
+    await done(b, key, submission, 5000);
+    assert.strictEqual(await b.owner(key), b.instanceId);
+    const lines = await transcript(b, key);
+    assert.strictEqual(lines[lines.length - 1], 'pi.assistant:tool said: work 7 finished by b');
+    // The one without is simply free: nobody has to open it to find that out.
+    assert.isNull(await mongo.db.collection('pi_durable_leases').findOne({ _id: idleKey }));
+    assert.deepEqual(b.hosted(), [key]);
+  });
+
+  it('hands a storage over when it stops, even one whose tool will not stop', async function () {
+    const { key, host } = scene();
+    let reached!: () => void;
+    const inTool = new Promise<void>((resolve) => { reached = resolve; });
+    const errors: any[] = [];
+    const a = host('a', {
+      leaseMs: 60_000,
+      closeMs: 200,
+      errors,
+      slow: () => { reached(); return new Promise<string>(() => undefined); },
+    });
+    const b = host('b', { leaseMs: 60_000, idleMs: 60_000, slow: async (job) => `${job} finished by b` });
+    await a.start();
+    await b.start();
+    const submission = await say(a, key, 'work 11');
+    await inTool;
+
+    // Closing waits for the tool, which never comes back. The stop does not wait with it.
+    const began = Date.now();
+    await a.stop();
+    assert.isBelow(Date.now() - began, 2000);
+    assert.include(
+      errors.map(({ error }) => error.message),
+      `Storage ${JSON.stringify(key)} did not close within 200 ms and was left behind`,
+    );
+    await done(b, key, submission, 5000);
+    assert.strictEqual(await b.owner(key), b.instanceId);
+    const lines = await transcript(b, key);
+    assert.strictEqual(lines[lines.length - 1], 'pi.assistant:tool said: work 11 finished by b');
+  });
+
+  it('erases a storage whose tool will not stop, and keeps what is left of it out of the key\'s next storage', async function () {
+    const { key, host } = scene();
+    let reached!: () => void;
+    const inTool = new Promise<void>((resolve) => { reached = resolve; });
+    let finish!: (text: string) => void;
+    // A tool that ignores its cancellation and comes back only when the test lets it.
+    const a = host('a', {
+      idleMs: 60_000,
+      closeMs: 200,
+      slow: () => { reached(); return new Promise<string>((resolve) => { finish = resolve; }); },
+    });
+    await a.start();
+    await say(a, key, 'work 12');
+    await inTool;
+
+    const began = Date.now();
+    await a.destroy(key);
+    assert.isBelow(Date.now() - began, 2000);
+    assert.deepEqual(a.hosted(), []);
+    assert.strictEqual(await mongo.db.collection('pi_durable_entries').countDocuments({ s: key }), 0);
+
+    // The key is used again while the old harness is still in memory, waiting for its tool.
+    await done(a, key, await say(a, key, 'fresh'), 5000);
+    // Now the old tool comes back, and its harness goes to record the result.
+    finish('too late');
+    await new Promise((resolve) => setTimeout(resolve, 300));
+    assert.deepEqual(await transcript(a, key), ['pi.user:fresh', 'pi.assistant:echo: fresh']);
+    assert.strictEqual(await mongo.db.collection('pi_durable_tasks').countDocuments({ s: key, r: /work 12/ }), 0);
+  });
+
+  it('keeps a host that lost a storage out of the storage that later took its key', async function () {
+    const { key, host } = scene();
+    const a = host('a', { idleMs: 60_000 });
+    const b = host('b', { idleMs: 60_000 });
+    await a.start();
+    await done(a, key, await say(a, key, 'before'), 5000);
+    let zombie: any;
+    await a.with(key, (harness) => { zombie = harness; });
+    // `a` stops as a paused process does: nothing closed, its harness still in memory.
+    a.abandon();
+    await b.start();
+
+    // Erased by the instance that is left, once the lease of `a` has run out, and then used again. The new
+    // storage counts its epochs from one: its owner holds the very epoch `a` held in the old one.
+    await b.destroy(key);
+    await done(b, key, await say(b, key, 'fresh'), 5000);
+    assert.strictEqual((await mongo.db.collection('pi_durable_meta').findOne({ _id: key })).epoch, 1);
+
+    // The paused process wakes up and writes.
+    const root = await zombie.root(pieces.context);
+    const refused = await rejection(root.submit({ type: 'input', content: 'from the storage that is gone' }, pieces.context));
+    assert.instanceOf(refused, Error);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    assert.deepEqual(await transcript(b, key), ['pi.user:fresh', 'pi.assistant:echo: fresh']);
+    await zombie.close(pieces.context).catch(() => undefined);
+  });
+
+  it('works beside a running process that was given the same name, and says so', async function () {
+    const { key, host } = scene();
+    const errors: any[] = [];
+    const first = host('twin', { idleMs: 60_000, leaseMs: 60_000 });
+    const second = host('twin', { idleMs: 60_000, leaseMs: 60_000, errors });
+    assert.strictEqual(second.instanceId, first.instanceId);
+    await first.start();
+    await second.start();
+    // Both have finished starting: neither is looking for what an earlier run of its name left.
+    await until(() => !(first as any).adopting && !(second as any).adopting);
+
+    await say(first, key, 'from the first');
+    const epoch = async () => (await mongo.db.collection('pi_durable_meta').findOne({ _id: key }))?.epoch;
+    const opened = await epoch();
+
+    // Asked of the namesake: it does not take the storage from the process that runs it.
+    const viaSecond = await say(second, key, 'from the second');
+    assert.deepEqual(second.hosted(), []);
+    assert.deepEqual(first.hosted(), [key]);
+    assert.strictEqual(await epoch(), opened);
+    await done(second, key, viaSecond, 5000);
+    assert.deepEqual(await transcript(second, key), [
+      'pi.user:from the first', 'pi.assistant:echo: from the first',
+      'pi.user:from the second', 'pi.assistant:echo: from the second',
+    ]);
+    await say(second, key, 'and again');
+    // Said once, however often it happens.
+    const said = errors.filter(({ where }) => where === 'instance name');
+    assert.lengthOf(said, 1);
+    assert.include(said[0].error.message, "uses this instance's name");
+  });
+
+  it('takes over what a running namesake holds when it starts, and the namesake lets go', async function () {
+    const { key, host } = scene();
+    let reached!: () => void;
+    const inTool = new Promise<void>((resolve) => { reached = resolve; });
+    const first = host('twin', {
+      leaseMs: 60_000,
+      idleMs: 60_000,
+      slow: (_job, signal) => { reached(); return hang(signal); },
+    });
+    await first.start();
+    const submission = await say(first, key, 'work 8');
+    await inTool;
+
+    // A second process under the same name cannot tell a running namesake from its own last run.
+    const second = host('twin', { leaseMs: 60_000, idleMs: 60_000, slow: async (job) => `${job} finished by the newcomer` });
+    await second.start();
+    await done(second, key, submission, 5000);
+    const lines = await transcript(second, key);
+    assert.strictEqual(lines[lines.length - 1], 'pi.assistant:tool said: work 8 finished by the newcomer');
+    // The first finds out at its next renewal or commit, stops running the storage, and from then on asks the other.
+    await until(() => first.hosted().length === 0);
+    const later = await say(first, key, 'who has it now');
+    assert.deepEqual(first.hosted(), []);
+    assert.deepEqual(second.hosted(), [key]);
+    await done(first, key, later, 5000);
+  });
 });

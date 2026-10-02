@@ -195,6 +195,36 @@ describe('DurableConversation, over a real DDP connection', function () {
     assert.isOk(denied, 'a client-side insert is denied');
   });
 
+  it('keeps an application document current as the server changes it', async function () {
+    for (const where of ['open', 'away'] as const) {
+      const key = `${where}-${Random.id()}`;
+      // For `away`, another instance runs the storage, so the operation crosses from the instance asked to that one.
+      if (where === 'away') await Meteor.callAsync('durableTest.hostElsewhere', key);
+      else await DurableConversation.root(HOST, key);
+      const chat = watch(key);
+      await waitFor('the subscription', 5000, () => chat.ready());
+      const seen: string[][] = [];
+      const computation = Tracker.autorun(() => {
+        const items = chat.document('itest.todos')?.items;
+        if (items !== undefined) seen.push([...items]);
+      });
+      // Nothing has made the document yet.
+      assert.isUndefined(chat.document('itest.todos'), where);
+
+      assert.deepEqual(await Meteor.callAsync('durableTest.addTodo', key, 'write the runbook'), { items: ['write the runbook'] });
+      await waitFor('the first item', 5000, () => chat.document('itest.todos')?.items.length === 1);
+      await Meteor.callAsync('durableTest.addTodo', key, 'rehearse it');
+      await waitFor('the second item', 5000, () => chat.document('itest.todos')?.items.length === 2);
+      computation.stop();
+      assert.deepEqual(chat.document('itest.todos'), { items: ['write the runbook', 'rehearse it'] }, where);
+      // An autorun saw each state, in order, and never a list that lost an item.
+      assert.deepEqual(seen[0], ['write the runbook'], where);
+      assert.deepEqual(seen[seen.length - 1], ['write the runbook', 'rehearse it'], where);
+      // A kind the definition does not publish is not there to read.
+      assert.isUndefined(chat.document('pi.agent'), where);
+    }
+  });
+
   it('watches and speaks through a server instance that does not host the storage', async function () {
     const key = `away-${Random.id()}`;
     // Another instance opens the storage and keeps it. The one this browser is connected to never does.

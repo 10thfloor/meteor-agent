@@ -2,8 +2,8 @@ import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
 import { DEFAULT_HISTORY, indexed, NAMES } from '../common/names';
 import { DurableConversations, DurableEntries, DurableRevisions } from './collections';
-import { CHORD, definitionNamed } from './durable';
-import { loadPackage } from './loader';
+import { definitionNamed } from './durable';
+import { piRuntime } from './pi';
 
 // A conversation, to anyone the definition lets watch it.
 //
@@ -49,7 +49,7 @@ export function registerPublications(): void {
     // An unknown definition and a refused viewer look the same: nothing, and ready.
     if (definition === undefined || !(await definition.allows(userId, 'view', { key, conversationId }))) return [];
 
-    const context = (await loadPackage(CHORD, 'context') as any).BACKGROUND_CONTEXT;
+    const { context } = await piRuntime();
     const storage = definition.storage(key);
     const reader = await definition.reader(key);
 

@@ -2,10 +2,9 @@ import { Meteor } from 'meteor/meteor';
 import { MongoInternals } from 'meteor/mongo';
 import { PREFIX } from '../common/names';
 import { denyAllClientWrites } from './collections';
-import { CHORD, PI_DURABLE } from './durable';
-import { loadPackage, resolvePackageEntry } from './loader';
 import { applyRateLimits, registerMethods } from './methods';
-import { MongoStorage, type MongoStorageRuntime } from './mongo-storage';
+import { MongoStorage } from './mongo-storage';
+import { piRuntime } from './pi';
 import { registerPublications } from './publications';
 
 export { NAMES, ROOT_CONVERSATION_ID, storageKey } from '../common/names';
@@ -14,59 +13,23 @@ export { Durable, durableHost, instanceId, shutdown } from './durable';
 export type { DurableAction, DurableConfig, DurableContent, DurableDraft, DurableTarget } from './durable';
 export { DurableHost, HostedElsewhere, RequestExpired } from './host';
 export type { DurableHostOptions, Operation, OperationScope } from './host';
+export { applyRateLimits } from './methods';
 export { MongoStorage, StorageOwnershipLost, MONGO_SCHEMA_VERSION } from './mongo-storage';
 export type { MongoStorageOptions, MongoStorageRuntime } from './mongo-storage';
 export { ConversationNotFound, OPERATIONS } from './operations';
 export type { AgentChoices } from './operations';
-export { applyRateLimits } from './methods';
-export { CHORD, PI_DURABLE };
-
-/** `loadPiDurable()` for the harness, `loadPiDurable('testing')` for the conformance suite. */
-export function loadPiDurable(subpath?: string): Promise<unknown> {
-  return loadPackage(PI_DURABLE, subpath);
-}
-
-/** `loadChord('context')` for `BACKGROUND_CONTEXT`, `loadChord('delta')` for `apply`. */
-export function loadChord(subpath?: string): Promise<unknown> {
-  return loadPackage(CHORD, subpath);
-}
-
-/** Synchronous check for Pi Durable and Chord on disk. Cached after first answer. */
-let onDisk: boolean | null = null;
-export function piDurableResolvable(): boolean {
-  if (onDisk === null) {
-    try {
-      resolvePackageEntry(PI_DURABLE);
-      resolvePackageEntry(CHORD, 'delta');
-      onDisk = true;
-    } catch {
-      onDisk = false;
-    }
-  }
-  return onDisk;
-}
-
-let runtime: Promise<MongoStorageRuntime> | undefined;
-function storageRuntime(): Promise<MongoStorageRuntime> {
-  if (runtime === undefined) {
-    const loading = (async () => {
-      const durable = await loadPiDurable() as any;
-      const delta = await loadChord('delta') as any;
-      if (typeof delta?.apply !== 'function' || typeof durable?.StorageRejected !== 'function') {
-        throw new Error('[10thfloor:durable] pi-durable or chord exposes no apply/StorageRejected');
-      }
-      return { apply: delta.apply, StorageRejected: durable.StorageRejected };
-    })();
-    runtime = loading;
-    loading.catch(() => { if (runtime === loading) runtime = undefined; });
-  }
-  return runtime;
-}
+export { CHORD, loadChord, loadPiAi, loadPiDurable, PI_AI, PI_DURABLE, piDurableResolvable, piRuntime } from './pi';
+export type { PiRuntime } from './pi';
 
 /** This server's own Mongo connection: the client Meteor already holds, and its database. */
 function meteorMongo(): { client: any; db: any } {
   const { client, db } = (MongoInternals.defaultRemoteCollectionDriver() as any).mongo;
   return { client, db };
+}
+
+async function storageRuntime() {
+  const { apply, StorageRejected } = await piRuntime();
+  return { apply, StorageRejected };
 }
 
 export type OpenMongoStorageOptions = {

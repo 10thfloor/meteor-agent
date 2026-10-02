@@ -3,8 +3,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { Random } from 'meteor/random';
-import { destroyMongoStorage, loadChord, loadPiDurable, openMongoStorage } from 'meteor/10thfloor:durable';
-import { loadPackage } from '../server/loader';
+import { destroyMongoStorage, loadChord, loadPiAi, loadPiDurable, openMongoStorage } from 'meteor/10thfloor:durable';
 
 // What a commit costs on each backend, measured under the real harness: one
 // streamed answer, then one tool turn. This is where the table in the README
@@ -13,7 +12,6 @@ import { loadPackage } from '../server/loader';
 //   DURABLE_BENCH=1 MOCHA_GREP='commit costs' TEST_CLIENT=0 meteor test-packages --once \
 //     --port 3200 --driver-package meteortesting:mocha ./packages/durable
 
-const PI_AI = '@earendil-works/pi-ai';
 const enabled = process.env.DURABLE_BENCH === '1';
 
 type Sample = { kind: string; ms: number };
@@ -54,9 +52,9 @@ const percentile = (values: number[], p: number): number => {
     const durable = await loadPiDurable() as any;
     const sqlite = await loadPiDurable('storage/sqlite/node') as any;
     const context = (await loadChord('context') as any).BACKGROUND_CONTEXT;
-    const Type = (await loadPackage(PI_AI) as any).Type;
-    const createModels = (await loadPackage(PI_AI, 'models') as any).createModels;
-    const faux = await loadPackage(PI_AI, 'providers/faux') as any;
+    const Type = (await loadPiAi() as any).Type;
+    const createModels = (await loadPiAi('models') as any).createModels;
+    const faux = await loadPiAi('providers/faux') as any;
 
     const run = async (name: string, storage: any) => {
       const samples: Sample[] = [];

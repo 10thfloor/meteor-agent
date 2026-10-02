@@ -13,6 +13,7 @@ import './conformance.test';
 import './storage.test';
 import './harness.test';
 import './host.test';
+import './handover.test';
 import './durable.test';
 import './reactivity.test';
 import './bench.test';

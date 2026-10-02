@@ -12,14 +12,30 @@ import os from 'os';
 /** Dev uses `node_modules`; production `meteor build` uses `npm/node_modules`. */
 const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
 
+/**
+ * Chord and pi-ai are loaded as Pi Durable itself resolves them: a copy npm
+ * nested under it first, the shared one otherwise. npm nests a copy when the
+ * app's own version does not fit Pi Durable's range, so the shared one is then
+ * another version: what it hands out need not be what the harness expects.
+ */
+const RESOLVED_FROM: Record<string, string> = {
+  '@earendil-works/chord': '@earendil-works/pi-durable',
+  '@earendil-works/pi-ai': '@earendil-works/pi-durable',
+};
+
 /** One namespace per package + export key. The `|` is a separator no package name contains. */
 const cache = new Map<string, unknown>();
 
-function findNodeModulesBase(pkg: string): string | null {
-  let dir = process.cwd();
+function findNodeModulesBase(pkg: string, from: string): string | null {
+  const dependent = RESOLVED_FROM[pkg];
+  let dir = from;
   for (let i = 0; i < 8; i += 1) {
     for (const c of CANDIDATE_DIRS) {
       const root = path.join(dir, c);
+      if (dependent !== undefined) {
+        const nested = path.join(root, ...dependent.split('/'), 'node_modules');
+        if (fs.existsSync(path.join(nested, ...pkg.split('/')))) return nested;
+      }
       if (fs.existsSync(path.join(root, ...pkg.split('/')))) return root;
     }
     const parent = path.dirname(dir);
@@ -63,9 +79,13 @@ function resolveExportKey(exportsMap: unknown, key: string): string | undefined 
   return undefined;
 }
 
-/** Resolve a package entry through its exports map (Meteor's resolver can't). */
-export function resolvePackageEntry(pkg: string, subpath?: string): string {
-  const base = findNodeModulesBase(pkg);
+/**
+ * Resolve a package entry through its exports map (Meteor's resolver can't).
+ * `from` is where the search for `node_modules` starts: the server's working
+ * directory, except in tests.
+ */
+export function resolvePackageEntry(pkg: string, subpath?: string, from: string = process.cwd()): string {
+  const base = findNodeModulesBase(pkg, from);
   if (!base) {
     throw new Error(
       `[10thfloor:durable] ${pkg} not found. Install it in your app: ` +
@@ -97,22 +117,31 @@ async function shimLoad(urlHref: string): Promise<unknown> {
   }
 }
 
-/** Three-step hedge: bare import → file:// URL → temp shim. Cached per subpath. */
+/**
+ * Three-step hedge: bare import → file:// URL → temp shim. Cached per subpath.
+ * A package that is resolved from Pi Durable's side skips the bare import,
+ * which could only ever name the shared copy.
+ */
 export async function loadPackage(pkg: string, subpath?: string): Promise<unknown> {
   const rel = subpath ? subpath.replace(/^\.?\//, '') : '';
   const key = `${pkg}|${rel ? `./${rel}` : '.'}`;
   const hit = cache.get(key);
   if (hit) return hit;
-  const specifier = rel ? `${pkg}/${rel}` : pkg;
-  let ns: unknown;
-  try {
-    ns = await import(specifier);
-  } catch {
+  const byPath = async (): Promise<unknown> => {
     const href = pathToFileURL(resolvePackageEntry(pkg, subpath)).href;
     try {
-      ns = await import(href);
+      return await import(href);
     } catch {
-      ns = await shimLoad(href);
+      return shimLoad(href);
+    }
+  };
+  let ns: unknown;
+  if (RESOLVED_FROM[pkg] !== undefined) ns = await byPath();
+  else {
+    try {
+      ns = await import(rel ? `${pkg}/${rel}` : pkg);
+    } catch {
+      ns = await byPath();
     }
   }
   cache.set(key, ns);

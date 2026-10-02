@@ -1,8 +1,7 @@
 import { assert } from 'chai';
 import { MongoInternals } from 'meteor/mongo';
 import { Random } from 'meteor/random';
-import { destroyMongoStorage, DurableEntries, DurableRevisions, openMongoStorage } from 'meteor/10thfloor:durable';
-import { loadPackage } from '../server/loader';
+import { destroyMongoStorage, DurableEntries, DurableRevisions, loadPiAi, openMongoStorage } from 'meteor/10thfloor:durable';
 import { loadPieces } from './support';
 
 // Pi Durable lets clients attach to the one process that owns a storage.
@@ -11,8 +10,6 @@ import { loadPieces } from './support';
 // transactions, which is how every Pi Durable commit is made. This suite
 // checks exactly that, on ordinary cursors over the storage's collections,
 // while a harness streams an answer.
-
-const PI_AI = '@earendil-works/pi-ai';
 
 /** Which of Meteor's observe drivers serves this handle. */
 function driverOf(handle: any): 'changeStreams' | 'oplog' | 'polling' | 'unknown' {
@@ -28,8 +25,8 @@ describe('Meteor reactivity over Pi Durable commits', function () {
 
   it('shows a streamed answer growing, row by row, to a plain cursor observer', async function () {
     const { durable, context, apply } = await loadPieces();
-    const createModels = (await loadPackage(PI_AI, 'models') as any).createModels;
-    const faux = await loadPackage(PI_AI, 'providers/faux') as any;
+    const createModels = (await loadPiAi('models') as any).createModels;
+    const faux = await loadPiAi('providers/faux') as any;
 
     const key = `reactive-${Random.id()}`;
     // About two seconds of streaming; the harness commits the partial answer at most every 100 ms.
