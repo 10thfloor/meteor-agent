@@ -1,5 +1,6 @@
 import { assert } from 'chai';
 import { Meteor } from 'meteor/meteor';
+import { MongoInternals } from 'meteor/mongo';
 import { Agent } from '../server/agent';
 import { AgentMessages, AgentSessions } from '../common/collections';
 import { NAMES } from '../common/names';
@@ -265,6 +266,60 @@ describe('Transcript Commit Module Interface', () => {
         .sort((a: number, b: number) => a - b),
       Array.from({ length: count }, (_, i) => i),
     );
+  });
+
+  it('never has a plain write to a Session document in flight while one of its own transactions holds it', async () => {
+    // MongoDB would make such a plain write wait inside the server, holding one of
+    // the server's write tickets the whole time; on a four-core server four of them
+    // are all there are, and the transaction they wait for then cannot get one. See
+    // the note on `inTurn` in server/session-operations.ts.
+    const sessionId = 'transcript-turns';
+    await seedSession(sessionId);
+    const client = MongoInternals.defaultRemoteCollectionDriver().mongo.client;
+    const collectionProto = Object.getPrototypeOf(AgentSessions.rawCollection());
+    const probeSession = client.startSession();
+    const sessionProto = Object.getPrototypeOf(probeSession);
+    await probeSession.endSession();
+    const { updateOne } = collectionProto;
+    const { withTransaction } = sessionProto;
+    // Transactions of this process that have written the Session document and not finished.
+    const holding = new Set<unknown>();
+    const overlaps: string[] = [];
+    collectionProto.updateOne = function (this: any, filter: any, update: any, options: any) {
+      if (this.collectionName === AgentSessions.rawCollection().collectionName && filter?._id === sessionId) {
+        if (options?.session) {
+          holding.add(options.session);
+        } else if (holding.size > 0) {
+          overlaps.push(`plain ${Object.keys(update).join('+')} while ${holding.size} transaction(s) hold the document`);
+        }
+      }
+      return updateOne.call(this, filter, update, options);
+    };
+    sessionProto.withTransaction = async function (this: any, ...args: unknown[]) {
+      try {
+        return await withTransaction.apply(this, args);
+      } finally {
+        holding.delete(this);
+      }
+    };
+    try {
+      const count = 12;
+      const committed = await Promise.all(Array.from({ length: count }, (_, i) => (
+        commitUserMessage({
+          sessionId,
+          commitKey: `transcript-turns-${i}`,
+          draft: { content: `message-${i}` },
+        })
+      )));
+      assert.deepEqual(overlaps, []);
+      assert.deepEqual(
+        committed.map((result) => result.seq).sort((a, b) => a - b),
+        Array.from({ length: count }, (_, i) => i),
+      );
+    } finally {
+      collectionProto.updateOne = updateOne;
+      sessionProto.withTransaction = withTransaction;
+    }
   });
 
   it('admits exactly one concurrent commit at the final Turn-budget slot', async () => {
