@@ -52,6 +52,7 @@ import { telegram } from 'meteor/10thfloor:agent-channel-telegram';
 import { whatsapp } from 'meteor/10thfloor:agent-channel-whatsapp';
 import { sms } from 'meteor/10thfloor:agent-channel-sms';
 import { email } from 'meteor/10thfloor:agent-channel-email';
+import './constellation-durable';
 import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,

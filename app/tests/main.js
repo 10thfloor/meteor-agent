@@ -9,6 +9,7 @@ import {
 } from "meteor/10thfloor:agent";
 import { Mongo } from "meteor/mongo";
 import { Random } from "meteor/random";
+import "./constellation-durable.js";
 import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,

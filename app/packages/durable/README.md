@@ -384,3 +384,17 @@ server half runs Pi Durable's conformance suite against `MongoStorage`, the
 harness on it, and several hosts on one database (takeover, handover, restart,
 requests, erasure). The browser half drives `DurableConversation` in headless
 Chromium, including against a storage that another host runs.
+
+Two real server processes are a separate check, because they need a built
+app. `scripts/verify-instances.mjs` boots this repository's production bundle
+twice on one MongoDB and speaks DDP to both: input routed to the instance that
+hosts a thread, takeover after that instance is killed in the middle of a tool
+call, and handover when it is sent SIGTERM with a lease of a minute.
+
+## A surface built on it
+
+Constellation's **Threads** view is this package in use: a definition with
+tools, a plan document, a scripted offline model and a spending limit, an
+index of threads beside the storages, and a browser layer on
+`DurableConversation`. See [`docs/threads.md`](../../../docs/threads.md) and
+`app/server/constellation-durable.js`.
