@@ -11,7 +11,8 @@ import { AGENT, hang, harnessOptions, loadPieces, type Pieces, type Slow, textOf
 // with a second operating-system process, killed with SIGKILL in the middle
 // of a tool call, were run under plain Node while this file was written.)
 
-type HostOptions = { slow?: Slow; errors?: unknown[]; client?: any } & Record<string, any>;
+/** `tokensPerSecond` paces the model's answers, so that something can happen in the middle of one. */
+type HostOptions = { slow?: Slow; errors?: unknown[]; client?: any; tokensPerSecond?: number } & Record<string, any>;
 
 describe('DurableHost', function () {
   this.timeout(60_000);
@@ -26,7 +27,7 @@ describe('DurableHost', function () {
     const prefix = `${Random.id(8)}/`;
     scenes.push(`${prefix}mission`);
     const host = (name: string, options: HostOptions = {}) => {
-      const { slow, errors, client, ...rest } = options;
+      const { slow, errors, client, tokensPerSecond, ...rest } = options;
       const made = new DurableHost({
         client: client ?? mongo.client,
         db: mongo.db,
@@ -35,7 +36,7 @@ describe('DurableHost', function () {
         context: pieces.context,
         instanceId: `${prefix}${name}`,
         accepts: (key) => key.startsWith(prefix),
-        harness: () => harnessOptions(pieces, { slow }) as any,
+        harness: () => harnessOptions(pieces, { slow, tokensPerSecond }) as any,
         operations: () => OPERATIONS,
         leaseMs: 900,
         heartbeatMs: 150,
@@ -235,6 +236,36 @@ describe('DurableHost', function () {
     await zombie.close(pieces.context).catch(() => undefined);
   });
 
+  it('takes over in the middle of an answer, keeps what was said so far, and answers once', async function () {
+    const { key, host } = scene();
+    const errors: any[] = [];
+    // Slow enough that the answer is still arriving when its host goes.
+    const a = host('a', { tokensPerSecond: 25, errors });
+    const b = host('b', { idleMs: 60_000 });
+    await a.start();
+    const submission = await say(a, key, 'essay');
+    const revisions = mongo.db.collection('pi_durable_revisions');
+    await until(async () => await revisions.countDocuments({ s: key, k: JSON.stringify('pi.live'), t: 'delta' }) >= 3);
+    a.abandon();
+    await b.start();
+
+    const settled = await b.settled(key, submission as never, { timeoutMs: 15_000 });
+    assert.strictEqual(settled.status, 'done');
+    const page = await (await b.reader(key)).scanEntries({ conversationId: 1 as never }, 20, undefined, pieces.context);
+    const answers = [...page.items].reverse().filter((entry) => entry.kind === 'pi.assistant');
+    const whole = Array.from({ length: 80 }, (_, index) => `word${index}`).join(' ');
+    // What `a` had committed of the answer stays, marked as cut short; then the answer, whole, once.
+    assert.deepEqual(answers.map((entry) => (entry.model?.[0] as any).stopReason), ['aborted', 'stop']);
+    const partial = textOf(answers[0].model?.[0]);
+    assert.isAbove(partial.length, 0);
+    assert.isTrue(whole.startsWith(partial.trimEnd()));
+    assert.strictEqual(textOf(answers[1].model?.[0]), whole);
+    assert.strictEqual((settled as any).answer, answers[1].id);
+    // The harness left behind still tries to commit what it streams. It is not heard from again.
+    await new Promise((resolve) => setTimeout(resolve, 400));
+    assert.deepEqual(errors.filter(({ where }) => where.startsWith('harness')), []);
+  });
+
   it('hands its unfinished storages over at once when it stops', async function () {
     const { key, host } = scene();
     let reached!: () => void;
@@ -408,8 +439,11 @@ describe('DurableHost', function () {
     await b.start();
     await done(a, key, await say(a, key, 'before the stop'));
     assert.deepEqual(a.hosted(), [key]);
+    // An answered submission is not yet a finished task: wait for the storage to have none.
+    await a.with(key, (harness) => harness.waitForIdle(pieces.context));
 
     await a.stop();
+    // With nothing left to do there, the lease is given up, not left to run out.
     assert.isNull(await mongo.db.collection('pi_durable_leases').findOne({ _id: key }));
 
     // A call that reaches the stopped instance, as one does while a server shuts down: it takes no lease to leave
@@ -451,6 +485,8 @@ describe('DurableHost', function () {
     await a.start();
     await b.start();
     await done(a, idleKey, await say(a, idleKey, 'nothing to finish'));
+    // An answered submission is not yet a finished task: wait for that storage to have none.
+    await a.with(idleKey, (harness) => harness.waitForIdle(pieces.context));
     const submission = await say(a, key, 'work 7');
     await inTool;
     assert.sameMembers(a.hosted(), [key, idleKey]);
