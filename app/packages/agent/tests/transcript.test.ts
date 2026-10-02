@@ -48,7 +48,13 @@ const rawMessageInsertPrototype = (): object => {
   return holder;
 };
 
-describe('Transcript Commit Module Interface', () => {
+describe('Transcript Commit Module Interface', function () {
+  // Every commit here is a majority-acknowledged transaction, and several tests
+  // race a dozen of them on one Session. Mocha's default two seconds is less
+  // than the five the commit path itself allows a write; on a slow disk the
+  // suite and its reset hooks have run past it. These tests assert outcomes,
+  // not speed.
+  this.timeout(30000);
   beforeEach(reset);
   afterEach(reset);
 
