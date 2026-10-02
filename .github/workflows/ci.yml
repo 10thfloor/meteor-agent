@@ -162,4 +162,15 @@ jobs:
         # Exercises the pi-ai, typebox and pi-mcp resolution chains against
         # meteor build's relocated npm tree — the one layout the dev-tree suite
         # cannot reach.
+        env:
+          VERIFY_KEEP_BUNDLE: ${{ runner.temp }}/verify-bundle
         run: ./scripts/verify-build.sh
+
+      - name: Verify two instances of the bundle share threads
+        # Boots that bundle twice on one MongoDB (Meteor's own mongod) and
+        # speaks DDP to both: input routed to the instance that hosts a
+        # thread, takeover after the host is killed mid-tool, handover when
+        # it is told to end. The first time anything here boots a production
+        # bundle at all.
+        working-directory: app
+        run: meteor node ../scripts/verify-instances.mjs "${{ runner.temp }}/verify-bundle/bundle"
