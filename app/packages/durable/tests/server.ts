@@ -1,3 +1,4 @@
+import './ci-probe'; // TEMPORARY, NOT FOR MERGE
 import { startupComplete } from 'meteor/10thfloor:durable';
 
 // The mocha runner does not wait for Meteor.startup callbacks, so on a slow
