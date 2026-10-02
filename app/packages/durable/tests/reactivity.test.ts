@@ -1,20 +1,18 @@
 import { assert } from 'chai';
-import { Mongo } from 'meteor/mongo';
+import { MongoInternals } from 'meteor/mongo';
 import { Random } from 'meteor/random';
-import { destroyMongoStorage, loadChord, loadPiDurable, openMongoStorage } from 'meteor/10thfloor:durable';
+import { destroyMongoStorage, DurableEntries, DurableRevisions, openMongoStorage } from 'meteor/10thfloor:durable';
 import { loadPackage } from '../server/loader';
+import { loadPieces } from './support';
 
 // Pi Durable lets clients attach to the one process that owns a storage.
 // On Meteor the storage is Mongo, so any server instance can watch the rows
-// themselves. That only works if Meteor's oplog observer sees writes made
-// inside transactions, which is how every Pi Durable commit is made. This
-// suite checks exactly that, on ordinary cursors over the storage's
-// collections, while a harness streams an answer.
+// themselves. That only works if Meteor's observers see writes made inside
+// transactions, which is how every Pi Durable commit is made. This suite
+// checks exactly that, on ordinary cursors over the storage's collections,
+// while a harness streams an answer.
 
 const PI_AI = '@earendil-works/pi-ai';
-const Entries = new Mongo.Collection<any>('pi_durable_entries');
-const Documents = new Mongo.Collection<any>('pi_durable_documents');
-const Revisions = new Mongo.Collection<any>('pi_durable_revisions');
 
 /** Which of Meteor's observe drivers serves this handle. */
 function driverOf(handle: any): 'changeStreams' | 'oplog' | 'polling' | 'unknown' {
@@ -29,9 +27,7 @@ describe('Meteor reactivity over Pi Durable commits', function () {
   this.timeout(120_000);
 
   it('shows a streamed answer growing, row by row, to a plain cursor observer', async function () {
-    const durable = await loadPiDurable() as any;
-    const context = (await loadChord('context') as any).BACKGROUND_CONTEXT;
-    const apply = (await loadChord('delta') as any).apply;
+    const { durable, context, apply } = await loadPieces();
     const createModels = (await loadPackage(PI_AI, 'models') as any).createModels;
     const faux = await loadPackage(PI_AI, 'providers/faux') as any;
 
@@ -46,24 +42,24 @@ describe('Meteor reactivity over Pi Durable commits', function () {
     const harness = await durable.Harness.open(await openMongoStorage(key), { models, registry: durable.createRegistry() }, context);
     const root = await harness.root(context, { agent: { model: { provider: 'faux', modelId: 'faux-1' } } });
 
-    // What a second server instance would do: watch the rows, with no access to the harness.
-    const live = await Documents.findOneAsync({ s: key, sk: 'conversation', o: root.id, k: JSON.stringify('pi.live'), ra: null });
-    assert.isOk(live, 'the conversation has a pi.live document row');
-
+    // What a publication does, and what a second server instance could do: watch the rows, with no access to the
+    // harness. This is the selector `durable.conversation` uses for a conversation's documents.
     const events: { what: string; at: number; text?: string }[] = [];
     let value: any;
     const partial = () => {
       const message = value?.generation?.message;
       return (message?.content ?? []).flatMap((part: any) => (part.type === 'text' ? [part.text] : [])).join('');
     };
-    const revisions = await (Revisions.find({ s: key, d: live.id }, { sort: { q: 1 } }) as any).observeChangesAsync({
-      added(_id: string, row: any) {
-        // A base replaces the value; a delta is Chord operations on it. Rows arrive in commit order.
-        value = row.t === 'base' ? JSON.parse(row.c) : apply(value, JSON.parse(row.c));
-        events.push({ what: `revision:${row.t}`, at: Date.now(), text: partial() });
-      },
-    });
-    const entries = await (Entries.find({ s: key, c: root.id }) as any).observeChangesAsync({
+    const live = JSON.stringify('pi.live');
+    const revisions = await (DurableRevisions.find({ s: key, sk: 'conversation', o: root.id, cur: true, k: live }) as any)
+      .observeChangesAsync({
+        added(_id: string, row: any) {
+          // A base replaces the value; a delta is Chord operations on it. Rows arrive in commit order.
+          value = row.t === 'base' ? JSON.parse(row.c) : apply(value, JSON.parse(row.c));
+          events.push({ what: `revision:${row.t}`, at: Date.now(), text: partial() });
+        },
+      });
+    const entries = await (DurableEntries.find({ s: key, c: root.id }) as any).observeChangesAsync({
       added(_id: string, row: any) {
         events.push({ what: `entry:${JSON.parse(row.k)}`, at: Date.now() });
       },
@@ -82,7 +78,7 @@ describe('Meteor reactivity over Pi Durable commits', function () {
       assert.strictEqual(settled.status, 'done');
       const finished = Date.now();
 
-      // The observers are fed by the oplog, a moment behind the commits.
+      // The observers are fed a moment behind the commits.
       const deadline = Date.now() + 5000;
       while (!events.some((event) => event.what === 'entry:pi.assistant') && Date.now() < deadline) {
         await new Promise((resolve) => setTimeout(resolve, 20));
@@ -108,6 +104,9 @@ describe('Meteor reactivity over Pi Durable commits', function () {
       // Idle again: the live document is a base with no generation in it.
       assert.isUndefined(value?.generation);
       assert.isAtLeast(committed.length, 10);
+      // And that base is its only row: a current-only document keeps nothing older.
+      const db = (MongoInternals.defaultRemoteCollectionDriver() as any).mongo.db;
+      assert.strictEqual(await db.collection('pi_durable_revisions').countDocuments({ s: key, k: live }), 1);
       console.log(
         `[10thfloor:durable] ${driverOf(revisions)} observer: ${distinct.length} partial answers seen while streaming, ` +
         `answer entry ${answer!.at - finished} ms after the run settled`,

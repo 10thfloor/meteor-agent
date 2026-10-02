@@ -6,6 +6,7 @@ import {
   loadChord,
   MONGO_SCHEMA_VERSION,
   openMongoStorage,
+  readMongoStorage,
 } from 'meteor/10thfloor:durable';
 
 // What the conformance suite cannot see, because the contract does not speak
@@ -280,6 +281,103 @@ describe('MongoStorage', function () {
     assert.strictEqual(await revisions(rewindable), 7);
   });
 
+  it("marks exactly the rows that make up each current document's present value", async function () {
+    const key = newKey();
+    const storage = await openMongoStorage(key) as any;
+    const child = 2;
+    const latest = 3;
+    const rewindable = 4;
+    const scope = { kind: 'conversation', conversationId: ROOT };
+    // What a viewer of a conversation selects: one query, no join, no history.
+    const present = async (conversationId = ROOT) =>
+      (await db.collection(`${PREFIX}revisions`)
+        .find({ s: key, sk: 'conversation', o: conversationId, cur: true })
+        .sort({ q: 1 })
+        .toArray()).map((row: any) => `${JSON.parse(row.k)}:${row.t}:${row.q}`);
+    const total = (d: number) => rows('revisions', { s: key, d });
+    const change = (id: number, content: 'base' | 'delta', n: number) => ({
+      type: 'document.change',
+      id,
+      content: content === 'base'
+        ? { kind: 'base', version: 1, value: { n } }
+        : { kind: 'delta', version: 1, ops: [['s', ['n'], n]] },
+    });
+
+    await storage.commit([
+      root,
+      { type: 'conversation', value: { id: child } },
+      {
+        type: 'document.create',
+        record: { id: latest, kind: 'live', scope, history: 'latest', fork: 'initial' },
+        content: { kind: 'base', version: 1, value: { n: 0 } },
+      },
+      {
+        type: 'document.create',
+        record: { id: rewindable, kind: 'notes', scope, history: 'rewindable', fork: 'asOf' },
+        content: { kind: 'base', version: 1, value: { n: 0 } },
+      },
+    ], context);
+    await storage.commit([change(latest, 'delta', 1), change(rewindable, 'delta', 1)], context);
+    await storage.commit([change(latest, 'delta', 2), change(rewindable, 'delta', 2)], context);
+    assert.deepStrictEqual(await present(), [
+      'live:base:1', 'notes:base:1', 'live:delta:2', 'notes:delta:2', 'live:delta:3', 'notes:delta:3',
+    ]);
+
+    // A new base is the whole present value. The rewindable document keeps its older rows, unmarked.
+    await storage.commit([change(latest, 'base', 10), change(rewindable, 'base', 10)], context);
+    await storage.commit([change(rewindable, 'delta', 11)], context);
+    assert.deepStrictEqual(await present(), ['live:base:4', 'notes:base:4', 'notes:delta:5']);
+    assert.strictEqual(await total(latest), 1);
+    assert.strictEqual(await total(rewindable), 5);
+    assert.deepStrictEqual((await storage.document(rewindable, 3, context)).value, { n: 2 });
+
+    // A fork's copy is a present value of the child, and of nobody else.
+    await storage.commit([{
+      type: 'document.copy',
+      record: {
+        id: 5,
+        kind: 'notes',
+        scope: { kind: 'conversation', conversationId: child },
+        history: 'rewindable',
+        fork: 'asOf',
+      },
+      source: { id: rewindable, at: 'current' },
+    }], context);
+    assert.deepStrictEqual(await present(child), ['notes:base:6']);
+
+    // A retired incarnation has no present value; a rewindable one still has its history.
+    await storage.commit([
+      { type: 'document.retire', id: latest },
+      { type: 'document.retire', id: rewindable },
+    ], context);
+    assert.deepStrictEqual(await present(), []);
+    assert.strictEqual(await total(latest), 0);
+    assert.strictEqual(await total(rewindable), 5);
+    assert.deepStrictEqual((await storage.document(rewindable, 5, context)).value, { n: 11 });
+    assert.deepStrictEqual(await present(child), ['notes:base:6']);
+  });
+
+  it('lets a reader see every commit without taking the storage from its owner', async function () {
+    const key = newKey();
+    const reader = await readMongoStorage(key) as any;
+    // A storage nobody has written is simply empty to a reader.
+    assert.strictEqual(await reader.conversation(ROOT, context), undefined);
+
+    const owner = await openMongoStorage(key) as any;
+    await owner.commit([root, { type: 'entry', value: entry(2, ROOT, { data: 'one' }) }], context);
+    assert.deepStrictEqual(await reader.conversation(ROOT, context), { id: ROOT });
+    assert.strictEqual((await reader.entry(2, context)).entry.data, 'one');
+
+    assert.match((await failure(reader.commit([{ type: 'entry', value: entry(3, ROOT) }], context)))?.message, /opened as a reader/);
+    assert.match((await failure(reader.mintId()))?.message, /opened as a reader/);
+
+    // Opening a reader took nothing: the owner still commits, and the reader sees it.
+    await readMongoStorage(key);
+    assert.strictEqual(await owner.commit([{ type: 'entry', value: entry(3, ROOT, { data: 'two' }) }], context), 2);
+    const page = await reader.scanEntries({ conversationId: ROOT }, 10, undefined, context);
+    assert.deepStrictEqual(page.items.map((item: any) => item.data), ['two', 'one']);
+  });
+
   it('answers every contract read from the index made for it', async function () {
     // Rows the queries below must step over without touching: a second storage in the same collections, and inside
     // this one other conversations, statuses, kinds, scopes, and documents. A read served by the wrong index
@@ -329,6 +427,7 @@ describe('MongoStorage', function () {
         { id: 51, kind: 'notes', scope: session, key: 'b' },
         { id: 52, kind: 'plan', scope: session },
         { id: 53, kind: 'notes', scope: { kind: 'task', taskId: 30 } },
+        { id: 54, kind: 'notes', scope: { kind: 'conversation', conversationId: ROOT }, history: 'rewindable', fork: 'asOf' },
       ].map((record) => ({
         type: 'document.create',
         record,
@@ -336,12 +435,17 @@ describe('MongoStorage', function () {
       })),
     ], context);
     for (let n = 1; n <= 4; n += 1) {
-      await storage.commit([50, 51].map((id) => ({
+      await storage.commit([50, 51, 54].map((id) => ({
         type: 'document.change',
         id,
         content: { kind: 'delta', version: 1, ops: [['s', ['n'], n]] },
       })), context);
     }
+    // History the viewer's query must not touch: five superseded rows of the rewindable document.
+    await storage.commit(
+      [{ type: 'document.change', id: 54, content: { kind: 'base', version: 1, value: { n: 9 } } }],
+      context,
+    );
 
     const profile = async (run: () => Promise<void>): Promise<any[]> => {
       await db.command({ profile: 0 });
@@ -393,6 +497,14 @@ describe('MongoStorage', function () {
       assert.strictEqual(
         (await storage.scanDocuments({ scope: session, at: createdAt, kind: 'notes' }, 10, undefined, context)).items.length,
         2,
+      );
+      // The query a viewer makes for the present value of a conversation's documents.
+      assert.strictEqual(
+        (await db.collection(`${PREFIX}revisions`)
+          .find({ s: key, sk: 'conversation', o: ROOT, cur: true })
+          .sort({ q: 1 })
+          .toArray()).length,
+        1,
       );
       // A commit's own reads and writes are profiled too.
       await storage.commit([

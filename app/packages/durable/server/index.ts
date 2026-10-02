@@ -1,12 +1,25 @@
+import { Meteor } from 'meteor/meteor';
 import { MongoInternals } from 'meteor/mongo';
+import { PREFIX } from '../common/names';
+import { denyAllClientWrites } from './collections';
+import { CHORD, PI_DURABLE } from './durable';
 import { loadPackage, resolvePackageEntry } from './loader';
+import { applyRateLimits, registerMethods } from './methods';
 import { MongoStorage, type MongoStorageRuntime } from './mongo-storage';
+import { registerPublications } from './publications';
 
+export { NAMES, ROOT_CONVERSATION_ID, storageKey } from '../common/names';
+export { DurableConversations, DurableEntries, DurableRevisions } from './collections';
+export { Durable, durableHost, instanceId, shutdown } from './durable';
+export type { DurableAction, DurableConfig, DurableContent, DurableDraft, DurableTarget } from './durable';
+export { DurableHost, HostedElsewhere, RequestExpired } from './host';
+export type { DurableHostOptions, Operation, OperationScope } from './host';
 export { MongoStorage, StorageOwnershipLost, MONGO_SCHEMA_VERSION } from './mongo-storage';
 export type { MongoStorageOptions, MongoStorageRuntime } from './mongo-storage';
-
-export const PI_DURABLE = '@earendil-works/pi-durable';
-export const CHORD = '@earendil-works/chord';
+export { ConversationNotFound, OPERATIONS } from './operations';
+export type { AgentChoices } from './operations';
+export { applyRateLimits } from './methods';
+export { CHORD, PI_DURABLE };
 
 /** `loadPiDurable()` for the harness, `loadPiDurable('testing')` for the conformance suite. */
 export function loadPiDurable(subpath?: string): Promise<unknown> {
@@ -35,15 +48,18 @@ export function piDurableResolvable(): boolean {
 
 let runtime: Promise<MongoStorageRuntime> | undefined;
 function storageRuntime(): Promise<MongoStorageRuntime> {
-  runtime ??= (async () => {
-    const durable = await loadPiDurable() as any;
-    const delta = await loadChord('delta') as any;
-    if (typeof delta?.apply !== 'function' || typeof durable?.StorageRejected !== 'function') {
-      throw new Error('[10thfloor:durable] pi-durable or chord exposes no apply/StorageRejected');
-    }
-    return { apply: delta.apply, StorageRejected: durable.StorageRejected };
-  })();
-  runtime.catch(() => { runtime = undefined; });
+  if (runtime === undefined) {
+    const loading = (async () => {
+      const durable = await loadPiDurable() as any;
+      const delta = await loadChord('delta') as any;
+      if (typeof delta?.apply !== 'function' || typeof durable?.StorageRejected !== 'function') {
+        throw new Error('[10thfloor:durable] pi-durable or chord exposes no apply/StorageRejected');
+      }
+      return { apply: delta.apply, StorageRejected: durable.StorageRejected };
+    })();
+    runtime = loading;
+    loading.catch(() => { if (runtime === loading) runtime = undefined; });
+  }
   return runtime;
 }
 
@@ -61,15 +77,40 @@ export type OpenMongoStorageOptions = {
 };
 
 /**
- * Open the Pi Durable storage named `key` on this server's Mongo connection,
- * and take its ownership from any earlier open. Commits are transactions, so
- * the deployment must be a replica set; `meteor run` starts one.
+ * Open a Pi Durable storage on this server's Mongo connection yourself, and
+ * take its ownership from any earlier open. This is the layer under `Durable`:
+ * no lease, no host, nothing that keeps two instances from taking the storage
+ * from each other in turn. Use it for a storage only one process ever opens.
  */
 export async function openMongoStorage(key: string, options: OpenMongoStorageOptions = {}): Promise<MongoStorage> {
-  return MongoStorage.open({ ...meteorMongo(), key, ...options, runtime: await storageRuntime() });
+  return MongoStorage.open({ ...meteorMongo(), prefix: PREFIX, key, ...options, runtime: await storageRuntime() });
 }
 
-/** Remove every record of the storage named `key`. It must not be open anywhere. */
-export function destroyMongoStorage(key: string, options: { prefix?: string } = {}): Promise<void> {
-  return MongoStorage.destroy({ ...meteorMongo(), key, prefix: options.prefix });
+/** Read a storage without owning it: every read of the storage contract, no commit. See `MongoStorage.reader`. */
+export async function readMongoStorage(key: string, options: { prefix?: string } = {}): Promise<MongoStorage> {
+  return MongoStorage.reader({ ...meteorMongo(), prefix: PREFIX, key, ...options, runtime: await storageRuntime() });
 }
+
+/** Remove every record of a storage opened with `openMongoStorage`. It must not be open anywhere. */
+export function destroyMongoStorage(key: string, options: { prefix?: string } = {}): Promise<void> {
+  return MongoStorage.destroy({ ...meteorMongo(), prefix: PREFIX, key, ...options });
+}
+
+/**
+ * Resolves once the package has registered its methods and its publication.
+ * The mocha runner does not wait for `Meteor.startup`, so suites wait on this.
+ */
+export const startupComplete: Promise<void> = new Promise((resolve, reject) => {
+  Meteor.startup(() => {
+    try {
+      denyAllClientWrites();
+      registerMethods();
+      registerPublications();
+      applyRateLimits((Meteor.settings as any)?.packages?.['10thfloor:durable']);
+      resolve();
+    } catch (error) {
+      reject(error);
+    }
+  });
+});
+startupComplete.catch((error) => Meteor._debug('[10thfloor:durable] startup:', error));

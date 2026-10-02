@@ -86,7 +86,26 @@ type DocumentRow = {
 	v: number;
 	r: string;
 };
-type RevisionRow = { _id: string; s: string; d: number; q: number; t: DocumentContent["kind"]; v: number; c: string };
+/**
+ * One base or delta of a document. `sk`, `o`, `k` and `kv` repeat the document's address, and `cur` marks the rows
+ * that make up a current incarnation's present value (its newest base and the deltas after it). The contract needs
+ * none of the five; they let a viewer select "the live state of this conversation's documents" with one indexed
+ * query and no join. A current-only document has no other rows. A rewindable one keeps its history unmarked.
+ */
+type RevisionRow = {
+	_id: string;
+	s: string;
+	d: number;
+	q: number;
+	t: DocumentContent["kind"];
+	v: number;
+	c: string;
+	sk: DocumentRecord["scope"]["kind"];
+	o: number;
+	k: string;
+	kv: string;
+	cur?: true;
+};
 
 // The part of the MongoDB Node driver (6.x) this file calls, stated structurally: a Meteor server passes the client
 // it already holds, and a plain Node host passes its own, without this file naming a driver version.
@@ -289,6 +308,7 @@ function ensureIndexes(db: MongoDbLike, prefix: string, collections: Collections
 				collections.revisions.createIndexes([
 					{ key: { s: 1, d: 1, q: 1 }, unique: true },
 					{ key: { s: 1, d: 1, t: 1, q: -1 } },
+					{ key: { s: 1, sk: 1, o: 1, q: 1 }, name: "current", partialFilterExpression: { cur: true } },
 				]),
 			]);
 		})();
@@ -317,7 +337,8 @@ export class MongoStorage implements Storage {
 	private readonly client: MongoClientLike;
 	private readonly c: Collections;
 	private readonly key: string;
-	private readonly epoch: number;
+	/** The epoch this open took; `undefined` for a reader, which owns nothing and writes nothing. */
+	private readonly epoch: number | undefined;
 	private readonly runtime: MongoStorageRuntime;
 	private readonly writeConcern: Record<string, unknown>;
 	private nextId: number;
@@ -328,14 +349,26 @@ export class MongoStorage implements Storage {
 	private lastClusterTime: unknown;
 	private lastOperationTime: unknown;
 
-	private constructor(options: MongoStorageOptions, collections: Collections, meta: MetaRow) {
+	private constructor(options: MongoStorageOptions, collections: Collections, meta: MetaRow | undefined) {
 		this.client = options.client;
 		this.c = collections;
 		this.key = options.key;
 		this.runtime = options.runtime;
 		this.writeConcern = options.writeConcern ?? { w: "majority" };
-		this.epoch = meta.epoch;
-		this.nextId = meta.nextId;
+		this.epoch = meta?.epoch;
+		this.nextId = meta?.nextId ?? Number.NaN;
+	}
+
+	/**
+	 * Read the storage named `key` without owning it: every read of the contract, no commit, no ID. It takes no
+	 * epoch, so the owner is not disturbed, and it sees each commit as soon as the owner's `commit()` resolves. This
+	 * is how a server instance that does not host a storage answers questions about it.
+	 */
+	static async reader(options: Omit<MongoStorageOptions, "writeConcern">): Promise<MongoStorage> {
+		const prefix = options.prefix ?? DEFAULT_PREFIX;
+		const collections = collectionsOf(options.db, prefix);
+		await ensureIndexes(options.db, prefix, collections);
+		return new MongoStorage(options, collections, undefined);
 	}
 
 	/** Open the storage named `key`, creating it when absent, and take its ownership from any earlier open. */
@@ -384,6 +417,7 @@ export class MongoStorage implements Storage {
 
 	async commit(writes: readonly StorageWrite[], _context: Context): Promise<Seq> {
 		this.assertOpen();
+		this.assertOwner();
 		const documentActions = this.prepareDocumentActions(writes);
 		const candidateNextId = this.candidateNextId(writes);
 		const session = this.client.startSession() as Session;
@@ -418,6 +452,7 @@ export class MongoStorage implements Storage {
 
 	async mintId<I extends Id<string>>(): Promise<I> {
 		this.assertOpen();
+		this.assertOwner();
 		if (!Number.isSafeInteger(this.nextId)) throw new Error("ID space is exhausted");
 		return this.nextId++ as I;
 	}
@@ -994,10 +1029,16 @@ export class MongoStorage implements Storage {
 				record = existing!.record;
 			}
 
+			const address = addressColumns(record);
 			if (content !== undefined) {
-				// A current-only document needs nothing older than its newest base.
-				if (content.kind === "base" && isCurrentOnly(record)) {
-					revisions.push({ deleteMany: { filter: { s, d: id } } });
+				// A new base starts the present value over. A current-only document needs nothing older; a rewindable
+				// one keeps its older rows as history and only stops marking them current.
+				if (content.kind === "base" && existing !== undefined) {
+					revisions.push(
+						isCurrentOnly(record)
+							? { deleteMany: { filter: { s, d: id } } }
+							: { updateMany: { filter: { s, d: id, cur: true }, update: { $unset: { cur: "" } } } },
+					);
 				}
 				const row: RevisionRow = {
 					_id: `${s}:${id}:${seq}`,
@@ -1007,6 +1048,11 @@ export class MongoStorage implements Storage {
 					t: content.kind,
 					v: content.version,
 					c: content.kind === "base" ? encodeJson(content.value) : encodeJson(content.ops),
+					sk: address.sk,
+					o: address.o,
+					k: address.k,
+					kv: address.kv,
+					cur: true,
 				};
 				revisions.push({ insertOne: { document: row } });
 				if (existing !== undefined && existing.version !== content.version) {
@@ -1021,7 +1067,12 @@ export class MongoStorage implements Storage {
 						updateOne: { filter: { _id: this.rowId(id) }, update: { $set: { ra: seq, r: encodeJson(record) } } },
 					});
 				}
-				if (isCurrentOnly(record)) revisions.push({ deleteMany: { filter: { s, d: id } } });
+				// A retired incarnation has no present value.
+				revisions.push(
+					isCurrentOnly(record)
+						? { deleteMany: { filter: { s, d: id } } }
+						: { updateMany: { filter: { s, d: id, cur: true }, update: { $unset: { cur: "" } } } },
+				);
 			}
 		}
 
@@ -1038,5 +1089,9 @@ export class MongoStorage implements Storage {
 
 	private assertOpen(): void {
 		if (this.closed) throw new Error("MongoStorage is closed");
+	}
+
+	private assertOwner(): void {
+		if (this.epoch === undefined) throw new Error("MongoStorage was opened as a reader and cannot write");
 	}
 }
