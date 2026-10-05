@@ -194,17 +194,21 @@
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
                   <section class="inspector-section">
-                    <div class="section-heading"><span>CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention">Reviews <b id="mission-reviews-count">0</b></button><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Mission crew</button></span></div>
+                    <div class="section-heading"><span>CREW <b class="section-count" id="mission-crew-count" title="People and agents on this Mission">0</b></span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention" data-pending="false">Reviews <b id="mission-reviews-count">0</b></button></div>
                     <div class="crew-subsection">
                       <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
                       <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
                       <p class="compact-empty" id="mission-crew-people-empty">No people added</p>
                     </div>
                     <div class="crew-subsection">
-                      <div class="crew-subsection-heading"><span>Agents <small class="crew-mode-hint" id="crew-mode-hint"></small></span><span id="crew-count">0</span></div>
+                      <div class="crew-subsection-heading"><span>Agents</span><span id="crew-count">0</span></div>
                       <div class="crew-list" id="crew-list" role="group" aria-label="Agents in this mission"></div>
                     </div>
-                    <button class="workspace-crew-link" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Workspace roster</button>
+                    <p class="crew-mode-hint" id="crew-mode-hint"></p>
+                    <div class="crew-actions">
+                      <button class="crew-action" id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Mission crew</button>
+                      <button class="crew-action" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Workspace roster</button>
+                    </div>
                   </section>
                   <section class="inspector-section mission-health">
                     <div class="section-heading"><span>MISSION HEALTH</span><span class="health-state" id="health-label" data-state="nominal">Nominal</span></div>

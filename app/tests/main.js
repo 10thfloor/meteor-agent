@@ -11,6 +11,7 @@ import { Mongo } from "meteor/mongo";
 import { Random } from "meteor/random";
 import "./constellation-durable.js";
 import "./mission-health.js";
+import "./mission-crew.js";
 import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,

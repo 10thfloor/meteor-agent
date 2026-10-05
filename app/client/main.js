@@ -1016,14 +1016,15 @@ function renderMissionCollaboration(view = missionParticipation()) {
     name.textContent = person.displayName;
     const detail = document.createElement('span');
     const channels = (person.surfaceKinds ?? []).map(surfaceLabel);
+    // One line under the name, as an agent has: the owner's says so, and
+    // anyone else's says how they reach the Mission. Everyone here who is
+    // not the owner is a participant, so no row needs a badge to say it.
     detail.textContent = person.role === 'owner'
       ? 'Owner · Desktop'
       : (channels.length ? channels.join(' · ') : connectionLabel(person.connection));
     copy.append(name, detail);
-    const role = document.createElement('span');
-    role.className = 'mission-person-role';
-    role.textContent = person.role === 'owner' ? 'Owner' : 'Participant';
-    row.append(avatar, copy, role);
+    row.dataset.role = person.role === 'owner' ? 'owner' : 'participant';
+    row.append(avatar, copy);
     peopleList.append(row);
   }
   $('mission-crew-people-empty').hidden = people.length > 0;
@@ -1157,11 +1158,13 @@ function renderCrew(
   $('crew-count').textContent = String(definitions.length);
   // Say which crew this is. 'inherit' follows the workspace roster; 'custom'
   // is this mission's own subset — the distinction the two levels turn on.
+  // A mission that chose its own keeps the list in its settings. (The mode by
+  // name is a field of the participation view, not of these.)
   const specialistsOnRoster = specialistDefinitions().length;
   const specialistsHere = definitions.length - 1;
-  $('crew-mode-hint').textContent = (config?.agentMode ?? 'inherit') === 'inherit'
-    ? '· follows the workspace roster'
-    : `· ${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`;
+  $('crew-mode-hint').textContent = Array.isArray(config?.agents)
+    ? `${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`
+    : 'Follows the workspace roster';
 }
 
 // Crew rows are too narrow for the state as words ("APPROVAL NEEDED" clipped
@@ -2596,6 +2599,8 @@ function renderReviews() {
     'aria-label',
     `Open learning reviews, ${attentionCopy}`,
   );
+  // The button wears its count only while something waits for review.
+  $('open-learning-reviews').dataset.pending = String(pendingCount > 0);
   $('command-reviews-count').textContent = attentionCopy;
   $('reviews-directory-summary').textContent = attentionCopy;
   $('reviews-needs-count').textContent = String(pendingCount);
