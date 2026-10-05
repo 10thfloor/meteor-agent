@@ -24,7 +24,7 @@ tools, and the machinery under test.
 | You can | How |
 | --- | --- |
 | Talk | Type and press Enter. The answer streams as it is committed |
-| Add to work in progress | While the agent is busy: **Steer** adds your message to the current work, **Queue** holds it until the answer is done. A queued message can be withdrawn |
+| Add to work in progress | While the agent is busy: **Steer** adds your message to the current work, **Queue** holds it until the answer is done. A queued message can be removed |
 | Stop | **Stop** cancels the current run |
 | Fork | **Fork from here** under any answer starts a branch that sees the conversation up to that point, with the plan as it was there. Switch with **Branch** |
 | Change the model | **Model** lists what the workspace's catalog offers; it applies from the next request |
@@ -43,7 +43,7 @@ The agent's tools are `update_plan` (the plan beside the conversation),
 - **Fork and compare.** Ask for a plan, fork from the answer, and take the
   fork somewhere else. Each branch keeps its own plan and its own spend.
 - **Talk over it.** Start something long and steer it, or queue a follow-up
-  and withdraw it.
+  and remove it.
 
 Offline (`npm run desktop:offline`) threads run on a scripted model that needs
 no key: `plan: first, second, third`, `wait 10` and `what time is it?` each

@@ -87,7 +87,7 @@ export function transcriptRows(entries) {
             text,
             past,
             // Stopped by a person, or left unfinished by a server that went away: the entry does not say which.
-            ...(message?.stopReason === 'aborted' ? { note: 'Cut short' } : {}),
+            ...(message?.stopReason === 'aborted' ? { note: 'Stopped' } : {}),
             ...(message?.stopReason === 'error' ? { note: message.errorMessage || 'The model request failed' } : {}),
           });
         }

@@ -93,7 +93,7 @@ describe("Threads: shared helpers", function () {
     assert.deepInclude(rows[2], { text: "New context", detail: "carry this over" });
     assert.deepEqual(rows[4].call, { id: "call-1", name: "update_plan", arguments: { items: [] } });
     assert.deepInclude(rows[5], { callId: "call-1", name: "update_plan", text: "Plan saved", failed: false });
-    assert.deepInclude(rows[6], { text: "Half an", note: "Cut short" });
+    assert.deepInclude(rows[6], { text: "Half an", note: "Stopped" });
     assert.deepInclude(rows[7], { text: "", note: "overloaded" });
     assert.strictEqual(messageText({ role: "system", content: "hidden" }), "");
   });
@@ -622,7 +622,7 @@ if (Meteor.isClient) {
       const count = threadCount();
       const button = $("threads-delete");
       button.click();
-      assert.strictEqual(button.textContent, "Delete for good?");
+      assert.strictEqual(button.textContent, "Confirm delete");
       assert.strictEqual(threadCount(), count);
       button.click();
       await until(() => threadCount() === count - 1, "the thread to go");

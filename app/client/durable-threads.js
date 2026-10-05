@@ -48,16 +48,16 @@ const LAYER = `
     <div class="sidebar-section-label"><span>Threads</span><span id="threads-count">0</span></div>
     <div class="mission-list" id="threads-list" aria-label="Threads"></div>
     <div class="threads-note">
-      <strong>Committed before it is shown</strong>
-      <span>A thread survives a restart in the middle of an answer and picks up where it was.</span>
+      <strong>Resumes after a restart</strong>
+      <span>Each step is saved before it is shown.</span>
     </div>
   </aside>
   <div class="threads-stage">
     <div class="threads-empty" id="threads-empty">
       <p class="eyebrow">Threads</p>
-      <h2>A conversation that survives its server</h2>
-      <p>Every model turn, tool call and plan change is stored before you see it. Stop the app in the middle of an answer and the thread goes on from there. Fork from any answer to try another direction.</p>
-      <button class="primary-action" id="threads-start" type="button">Start a thread</button>
+      <h2>No threads yet</h2>
+      <p>Threads are saved step by step and resume after a restart. Any answer can be forked.</p>
+      <button class="primary-action" id="threads-start" type="button">New thread</button>
     </div>
     <div class="threads-open" id="threads-open" hidden>
       <header class="threads-topbar">
@@ -69,8 +69,8 @@ const LAYER = `
         <div class="threads-controls">
           <label class="threads-select"><span>Branch</span><select id="threads-branch" aria-label="Conversation"></select></label>
           <label class="threads-select"><span>Model</span><select id="threads-model" aria-label="Model"></select></label>
-          <button class="secondary-action" id="threads-reset" type="button" title="Start a new context. Earlier messages stay in the thread; the model no longer sees them.">New context</button>
-          <button class="secondary-action" id="threads-compact" type="button" title="Summarize earlier messages to make room">Summarize</button>
+          <button class="secondary-action" id="threads-reset" type="button" title="Starts a new context. Earlier messages stay in the thread but are no longer sent to the model.">New context</button>
+          <button class="secondary-action" id="threads-compact" type="button" title="Summarizes earlier messages to free up context">Summarize</button>
           <button class="secondary-action threads-danger" id="threads-delete" type="button">Delete</button>
         </div>
       </header>
@@ -88,12 +88,12 @@ const LAYER = `
         </aside>
       </div>
       <form class="threads-composer" id="threads-composer">
-        <p class="threads-offline" id="threads-offline" role="status" hidden>The server is not answering. This is the thread as it was last stored; it goes on from here when the server is back.</p>
-        <textarea id="threads-input" rows="2" maxlength="20000" placeholder="Say something. Enter sends, Shift+Enter adds a line." aria-label="Message"></textarea>
+        <p class="threads-offline" id="threads-offline" role="status" hidden>Disconnected. Showing the last saved state; the thread continues when the server is back.</p>
+        <textarea id="threads-input" rows="2" maxlength="20000" placeholder="Write a message. Enter to send, Shift+Enter for a new line." aria-label="Message"></textarea>
         <div class="threads-composer-row">
           <span class="threads-status" id="threads-status" role="status"></span>
           <button class="secondary-action" id="threads-stop" type="button" hidden>Stop</button>
-          <button class="secondary-action" id="threads-steer" type="button" hidden title="Add this to the work in progress">Steer</button>
+          <button class="secondary-action" id="threads-steer" type="button" hidden title="Adds this message to the answer in progress">Steer</button>
           <button class="primary-action" id="threads-send" type="submit">Send</button>
         </div>
       </form>
@@ -375,8 +375,8 @@ function renderTranscript() {
   }
   if (rows.length === 0 && current.ready()) {
     const hint = el('div', 'threads-hint');
-    hint.appendChild(el('strong', '', 'Nothing said yet'));
-    hint.appendChild(el('span', '', 'Ask for something with several steps and the agent keeps a plan beside the conversation.'));
+    hint.appendChild(el('strong', '', 'No messages yet'));
+    hint.appendChild(el('span', '', 'For multi-step requests, the agent keeps a plan beside the conversation.'));
     nodes.push(hint);
   }
   const live = el('div', 'threads-live');
@@ -393,7 +393,7 @@ function renderLive() {
   $('threads-stop').hidden = !busy;
   $('threads-steer').hidden = !busy;
   $('threads-send').textContent = busy ? 'Queue' : 'Send';
-  $('threads-send').title = busy ? 'Send this after the current answer' : '';
+  $('threads-send').title = busy ? 'Sends after the current answer' : '';
   if (!current || !live) return;
   const container = $('threads-transcript');
   following(container, () => {
@@ -431,7 +431,7 @@ function renderSide() {
   const plan = current?.document(DURABLE_PLAN_KIND)?.items ?? [];
   const list = $('threads-plan');
   if (plan.length === 0) {
-    const empty = el('li', 'threads-plan-empty', 'No plan yet. The agent writes one when the work has several steps.');
+    const empty = el('li', 'threads-plan-empty', 'No plan yet. The agent adds one for multi-step work.');
     list.replaceChildren(empty);
   } else {
     list.replaceChildren(...plan.map((item) => {
@@ -446,8 +446,8 @@ function renderSide() {
   $('threads-queue').replaceChildren(...queued.map((item) => {
     const node = el('li');
     node.appendChild(el('span', '', typeof item.content === 'string' ? item.content : messageText({ role: 'user', content: item.content })));
-    node.appendChild(el('em', '', item.mode === 'steer' ? 'Steers the work in progress' : 'After this answer'));
-    const withdraw = el('button', 'threads-withdraw', 'Withdraw');
+    node.appendChild(el('em', '', item.mode === 'steer' ? 'Steers the current answer' : 'After this answer'));
+    const withdraw = el('button', 'threads-withdraw', 'Remove');
     withdraw.type = 'button';
     withdraw.addEventListener('click', () => act(withdraw, () => current.withdraw(item.id)));
     node.appendChild(withdraw);
@@ -458,7 +458,7 @@ function renderSide() {
   const { input, output } = threadTokens(usage);
   const spent = threadSpend(usage);
   $('threads-usage').textContent = input + output === 0
-    ? 'Nothing spent in this conversation'
+    ? 'No usage yet'
     : `$${spent.toFixed(spent > 0 && spent < 0.01 ? 4 : 2)} · ${compact(input)} in · ${compact(output)} out`;
 }
 
@@ -594,7 +594,7 @@ function wire() {
   $('threads-steer').addEventListener('click', (event) => { void say(event.currentTarget, 'steer'); });
   $('threads-stop').addEventListener('click', (event) => act(event.currentTarget, async () => {
     const { idle } = await chat.abort();
-    if (!idle) status('Asked to stop. A tool is still finishing.');
+    if (!idle) status('Stopping. A tool is still finishing.');
   }));
   $('threads-reset').addEventListener('click', async (event) => {
     await act(event.currentTarget, () => chat.reset());
@@ -604,7 +604,7 @@ function wire() {
     await act(event.currentTarget, async () => {
       await chat.compact();
       // Whether there was enough to summarize is known only once the task has looked.
-      status('Asked for a summary. A marker appears in the thread if there was enough to summarize.');
+      status('Summary requested. A marker appears if there was enough to summarize.');
     });
     $('threads-input').focus({ preventScroll: true });
   });
@@ -619,7 +619,7 @@ function wire() {
     const button = event.currentTarget;
     // Twice, on purpose: the first press says what the second will do.
     if (!deleteArmed) {
-      button.textContent = 'Delete for good?';
+      button.textContent = 'Confirm delete';
       deleteArmed = setTimeout(disarmDelete, 4000);
       return;
     }
