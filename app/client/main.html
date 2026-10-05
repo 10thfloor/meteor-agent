@@ -207,14 +207,22 @@
                     <button class="workspace-crew-link" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Workspace roster</button>
                   </section>
                   <section class="inspector-section mission-health">
-                    <div class="section-heading"><span>MISSION HEALTH</span><span id="health-label">Nominal</span></div>
-                    <div class="health-grid">
-                      <div><strong id="usage-tokens">0</strong><span>tokens</span></div>
-                      <div><strong id="usage-tools">0</strong><span>tool calls</span></div>
-                      <div><strong id="usage-cost">$0.00</strong><span>model cost</span></div>
+                    <div class="section-heading"><span>MISSION HEALTH</span><span class="health-state" id="health-label" data-state="nominal">Nominal</span></div>
+                    <div class="health-meters" id="health-meters">
+                      <div class="health-meter" data-meter="turns" data-level="ok">
+                        <div class="health-meter-line"><span id="health-turns-label">Turns</span><b><strong data-used>0</strong> / <span data-alert>80</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-turns-label" aria-valuemin="0" aria-valuemax="80" aria-valuenow="0"><i></i></div>
+                      </div>
+                      <div class="health-meter" data-meter="toolCalls" data-level="ok">
+                        <div class="health-meter-line"><span id="health-tools-label">Tool calls</span><b><strong data-used>0</strong> / <span data-alert>40</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-tools-label" aria-valuemin="0" aria-valuemax="40" aria-valuenow="0"><i></i></div>
+                      </div>
+                      <div class="health-meter" data-meter="spend" data-level="ok">
+                        <div class="health-meter-line"><span id="health-spend-label">Model spend</span><b><strong data-used>$0.00</strong> / <span data-alert>$5.00</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-spend-label" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0"><i></i></div>
+                      </div>
                     </div>
-                    <div class="budget-bar"><span id="budget-fill"></span></div>
-                    <p id="budget-copy">0 / 40 tool calls</p>
+                    <p class="health-totals"><span>Tokens</span><b><strong id="usage-tokens">0</strong><span id="usage-token-split"></span></b></p>
                   </section>
                   <section class="inspector-section">
                     <div class="section-heading"><span>CHANNELS</span><button type="button" data-view-link="channels">Channel settings</button></div>
