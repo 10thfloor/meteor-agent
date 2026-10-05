@@ -900,7 +900,10 @@ function createSurfaceRow(surface, compact = false, participantNames = new Map()
   icon.className = `surface-kind-icon ${surface.kind}`;
   icon.dataset.kind = surface.kind;
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = surfaceLabel(surface.kind).slice(0, 1).toUpperCase();
+  // The glyph the Channels page uses for this kind, so Slack and SMS are not
+  // both "S" here.
+  icon.textContent = CHANNEL_ICONS[surface.kind]?.[0]
+    ?? surfaceLabel(surface.kind).slice(0, 1).toUpperCase();
   const copy = document.createElement('span');
   copy.className = 'surface-list-copy';
   const name = document.createElement('strong');
@@ -910,8 +913,9 @@ function createSurfaceRow(surface, compact = false, participantNames = new Map()
   const participantName = surface.participantKey
     ? participantNames.get(surface.participantKey)
     : '';
+  const lastActive = surface.lastActivityAt ? timeAgo(surface.lastActivityAt) : '';
   detail.textContent = surface.detail || [participantName, audience,
-    surface.lastActivityAt ? `active ${timeAgo(surface.lastActivityAt)}` : '']
+    lastActive && (lastActive === 'now' ? 'active now' : `active ${lastActive} ago`)]
     .filter(Boolean).join(' · ');
   copy.append(name, detail);
   const status = document.createElement('span');
@@ -1032,6 +1036,8 @@ function renderMissionCollaboration(view = missionParticipation()) {
   renderSurfaceList(
     'mission-surface-list', 'mission-surface-empty', surfaces, true, participants,
   );
+  $('mission-surface-count').textContent = String(surfaces.length);
+  $('mission-surface-count').hidden = surfaces.length === 0;
   if ($('mission-crew-dialog')?.open) renderMissionCrewDialog();
 }
 

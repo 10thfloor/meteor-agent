@@ -12,6 +12,7 @@ import { Random } from "meteor/random";
 import "./constellation-durable.js";
 import "./mission-health.js";
 import "./mission-crew.js";
+import "./mission-channels.js";
 import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,

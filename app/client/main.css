@@ -1123,11 +1123,8 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
 .crew-action:disabled:hover { border-color:var(--line); background:transparent; color:var(--muted); }
 
 .surface-list { display:flex; flex-direction:column; gap:6px; }
-.surface-list.compact { gap:5px; }
 .surface-list-item { min-width:0; min-height:42px; display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:9px; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#111412; }
-.surface-list.compact .surface-list-item { min-height:38px; grid-template-columns:25px minmax(0,1fr) auto; padding:5px 7px; }
 .surface-kind-icon { width:28px; height:28px; display:grid; place-items:center; border-radius:8px; background:#262b28; color:#c1c7c0; font-size:8px; font-weight:740; text-transform:uppercase; }
-.surface-list.compact .surface-kind-icon { width:25px; height:25px; border-radius:7px; }
 .surface-kind-icon[data-kind="slack"],.surface-kind-icon.slack { background:#3b2d1f; color:#f3c36b; }
 .surface-kind-icon[data-kind="telegram"],.surface-kind-icon.telegram { background:#193044; color:#8fc5f1; }
 .surface-kind-icon[data-kind="email"],.surface-kind-icon.email { background:#3b2220; color:#e99188; }
@@ -1139,6 +1136,15 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
 .surface-status { color:#959c95; font-size:9px; text-transform:capitalize; }
 .surface-status[data-status="closing"],.surface-status[data-state="closing"] { color:var(--signal-bright); }
 .surface-status[data-status="bound"],.surface-status[data-state="bound"] { color:#91c8a5; }
+/* In the Mission inspector, channel rows match the Crew rows: no box, icon on the section's left edge, same type sizes.
+   The status sits on the name's line so the detail line below can use the full width. */
+.surface-list.compact { gap:3px; margin-inline:-7px; }
+.surface-list.compact .surface-list-item { grid-template-rows:auto auto; align-content:center; align-items:baseline; gap:2px 7px; padding:4px 6px; border-color:transparent; background:transparent; }
+.surface-list.compact .surface-kind-icon { grid-row:1 / span 2; align-self:center; width:27px; height:27px; font-size:11px; font-weight:720; }
+.surface-list.compact .surface-list-copy { display:contents; }
+.surface-list.compact .surface-list-copy strong { grid-column:2; grid-row:1; color:#d3d7d0; font-size:13px; }
+.surface-list.compact .surface-list-copy small { grid-column:2 / span 2; grid-row:2; margin-top:0; }
+.surface-list.compact .surface-status { grid-column:3; grid-row:1; font-size:11px; font-weight:600; white-space:nowrap; }
 
 .crew-dialog > header { position:relative; }
 .crew-dialog-actions { display:flex; align-items:center; gap:8px; }
