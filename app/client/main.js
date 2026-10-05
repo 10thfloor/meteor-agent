@@ -4608,7 +4608,7 @@ function renderMissionHealth(session, config, runtimeState, phase, busy) {
     if (alert.textContent !== meter.alertText) alert.textContent = meter.alertText;
     row.style.setProperty('--meter-fill', String(meter.fill));
     // Where the alert comes from, for whoever wonders what the second number is.
-    row.title = `${meter.label}: ${meter.usedText} of an alert at ${meter.alertText}. Alerts are set in Mission settings.`;
+    row.title = `${meter.label}: ${meter.usedText} of ${meter.alertText}. Alert levels are set in Mission settings.`;
     // A meter needs a range: an alert set to nothing is reached by the first of anything.
     const most = meter.alert > 0 ? meter.alert : Math.max(meter.used, 1);
     bar.setAttribute('aria-valuemax', String(most));
