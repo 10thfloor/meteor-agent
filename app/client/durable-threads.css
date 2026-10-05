@@ -12,6 +12,11 @@
   overflow: hidden;
 }
 
+/* What the layer covers is not painted at all. Covering it is not enough: on a narrow window the Mission's
+   inspector becomes a drawer above the stage, and above any place this layer could reasonably take. */
+.workspace-shell[data-threads-open] .content-stage,
+.workspace-shell[data-threads-open] #mission-sidebar { visibility: hidden; }
+
 /* While the layer is open, the view underneath is not the one in front. */
 .workspace-shell[data-threads-open] .rail-button[data-view].active { color: #666c67; background: transparent; }
 .workspace-shell[data-threads-open] .rail-button[data-view].active::before { content: none; }
@@ -36,7 +41,8 @@
 .threads-note strong { display: block; color: #d9dcd5; font-size: 12px; font-weight: 600; }
 .threads-note span { display: block; margin-top: 5px; color: var(--muted); font-size: 12px; line-height: 1.45; }
 
-.threads-stage { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+/* The stage lays itself out by its own width (see the end of this file), whatever takes room beside it. */
+.threads-stage { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: hidden; container: threads-stage / inline-size; }
 
 .threads-empty { margin: auto; max-width: 520px; padding: 34px; }
 .threads-empty .eyebrow { font-size: 11px; }
@@ -250,9 +256,14 @@
 .threads-status { flex: 1; min-width: 0; color: var(--muted); font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
 .threads-status[data-kind="error"] { color: #dc8b82; }
 
-@media (max-width: 1080px) {
-  .threads-body { grid-template-columns: minmax(0, 1fr); }
-  .threads-side { display: none; }
+/* A narrow stage has no room beside the conversation: the plan and the queue go above it, side by side, and take
+   no room at all while there is neither. They are never simply gone: a queued message is withdrawn from there. */
+@container threads-stage (max-width: 740px) {
+  .threads-body { grid-template-columns: minmax(0, 1fr); grid-template-rows: auto minmax(0, 1fr); }
+  .threads-side { order: -1; display: flex; gap: 28px; max-height: 32vh; padding: 12px 26px; border-left: 0; border-bottom: 1px solid var(--line); }
+  .threads-side section { flex: 1; min-width: 0; }
+  .threads-side section + section { margin-top: 0; }
+  .threads-side:has(.threads-plan-empty):has(#threads-queue-section[hidden]) { display: none; }
 }
 @media (prefers-reduced-motion: reduce) {
   .threads-streaming .threads-message-body::after, .threads-thinking::after { animation: none; }

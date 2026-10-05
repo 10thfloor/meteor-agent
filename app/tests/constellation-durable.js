@@ -401,6 +401,20 @@ if (Meteor.isClient) {
       }, `"${text}" to be taken`);
     }
     const idle = () => until(() => $("threads-stop").hidden && $("threads-send").textContent === "Send", "the run to end");
+    const box = (node) => node.getBoundingClientRect();
+
+    /** Give the layer's stage `width` pixels while `work` runs, as a narrow window does. */
+    async function narrowed(width, work) {
+      const layer = $("threads-layer");
+      const spare = box(layer.querySelector(".threads-stage")).width - width;
+      assert.isAbove(spare, 0, "the test page is wider than the narrow stage it asks for");
+      layer.style.right = `${Math.round(spare)}px`;
+      try {
+        return await work();
+      } finally {
+        layer.style.right = "";
+      }
+    }
 
     before(async function () {
       // The button appears once the workspace has started; before that the app is still choosing its own view.
@@ -436,11 +450,19 @@ if (Meteor.isClient) {
       // What is underneath cannot take focus, and the app's own idea of its view has not changed.
       assert.isTrue(stage.inert);
       assert.strictEqual(shell().dataset.currentView, before);
+      // Nor is any of it painted, whatever sits above the stage: on a narrow window the Mission's inspector
+      // is a drawer with a place of its own in front.
+      const painted = (element) => getComputedStyle(element).visibility === "visible";
+      const underneath = [stage, $("mission-sidebar"), $("inspector-pane")].filter(Boolean);
+      assert.isAtLeast(underneath.length, 2);
+      assert.deepEqual(underneath.map(painted), underneath.map(() => false));
+      assert.isTrue(painted(layer));
 
       // Closed by its own button: everything is as it was.
       rail.click();
       assert.isTrue(layer.hidden);
       assert.isFalse(stage.inert);
+      assert.deepEqual(underneath.map(painted), underneath.map(() => true));
       assert.strictEqual(current.getAttribute("aria-current"), "page");
       assert.isNull(rail.getAttribute("aria-current"));
 
@@ -463,6 +485,11 @@ if (Meteor.isClient) {
       await until(() => threadCount() === count + 1 && visible($("threads-input")), "the new thread");
       assert.strictEqual($("threads-title").textContent, "New thread");
       assert.deepEqual(plan(), []);
+      // With no plan and nothing queued, a narrow stage gives that part of the layer no room.
+      const side = document.querySelector(".threads-side");
+      const transcript = $("threads-transcript");
+      await narrowed(600, () => assert.strictEqual(getComputedStyle(side).display, "none"));
+      assert.isTrue(visible(side));
 
       await say("plan: draft the brief, review it, ship");
       await until(() => plan().length === 3, "the plan");
@@ -477,6 +504,14 @@ if (Meteor.isClient) {
       await until(() => $("threads-title").textContent === "plan: draft the brief, review it, ship", "the title");
       assert.match($("threads-usage").textContent, /^\$0\.00 · [\d.k]+ in · [\d.k]+ out$/);
       assert.strictEqual(document.activeElement, $("threads-input"));
+
+      // The plan is beside the conversation where there is room and above it where there is not. It is never gone.
+      assert.isAtLeast(box(side).left, box(transcript).right - 1);
+      await narrowed(600, () => {
+        assert.isTrue(visible($("threads-plan")));
+        assert.isAtMost(box(side).bottom, box(transcript).top + 1);
+        assert.isAbove(box(transcript).height, 100);
+      });
     });
 
     it("queues what is said while a tool runs, lets it be withdrawn, and stops the work", async function () {
@@ -490,6 +525,8 @@ if (Meteor.isClient) {
       const [queued] = [...$("threads-queue").children];
       assert.include(queued.textContent, "and one more thing");
       assert.include(queued.textContent, "After this answer");
+      // On a narrow stage the queue is still there to withdraw from.
+      await narrowed(600, () => assert.isTrue(visible(queued.querySelector(".threads-withdraw"))));
       queued.querySelector(".threads-withdraw").click();
       await until(() => $("threads-queue-section").hidden, "the withdrawal");
 
