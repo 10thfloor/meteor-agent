@@ -32,6 +32,10 @@ export interface AgentChatElement extends HTMLElement {
     draftText: string;
     mentionSources: Record<string, MentionSource>;
     timelineItems: ChatTimelineItem[];
+    /** Show "Reply in thread" on user and assistant rows. */
+    threadable: boolean;
+    /** Paint only rows with `seq >= fromSeq`; `null` paints every row. */
+    fromSeq: number | null;
     setDraft(text: string, options?: ComposerDraftOptions): void;
     focusComposer(): void;
     submitDraft(): Promise<void>;

@@ -45,6 +45,10 @@ export interface AgentChatElement extends HTMLElement {
   draftText: string;
   mentionSources: Record<string, MentionSource>;
   timelineItems: ChatTimelineItem[];
+  /** Show "Reply in thread" on user and assistant rows. */
+  threadable: boolean;
+  /** Paint only rows with `seq >= fromSeq`; `null` paints every row. */
+  fromSeq: number | null;
   setDraft(text: string, options?: ComposerDraftOptions): void;
   focusComposer(): void;
   submitDraft(): Promise<void>;
@@ -1281,7 +1285,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
   class AgentChat extends HTMLElement {
     static get observedAttributes() {
-      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode', 'recipient', 'composer-disabled', 'send-disabled', 'aria-disabled', 'multiline', 'composer-layout', 'submit-label', 'threadable'];
+      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode', 'recipient', 'composer-disabled', 'send-disabled', 'aria-disabled', 'multiline', 'composer-layout', 'submit-label', 'threadable', 'from-seq'];
     }
 
     private ui!: {
@@ -1470,6 +1474,25 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     get threadable(): boolean { return this.hasAttribute('threadable'); }
 
     set threadable(next: boolean) { this.toggleAttribute('threadable', !!next); }
+
+    /** Paint only rows with `seq >= fromSeq` (display only; the model still
+     *  sees every row). The first painted row — the thread's parent message —
+     *  carries the `thread-root` part. For a thread session pass its
+     *  `thread.anchorSeq`. `null` (no attribute) paints every row. */
+    get fromSeq(): number | null {
+      const raw = this.getAttribute('from-seq');
+      if (raw === null || raw.trim() === '') return null;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : null;
+    }
+
+    set fromSeq(next: number | null) {
+      if (next === null || next === undefined || !Number.isFinite(next)) {
+        this.removeAttribute('from-seq');
+      } else {
+        this.setAttribute('from-seq', String(next));
+      }
+    }
 
     get composerMode(): ComposerMode { return composerMode(this.getAttribute('composer-mode')); }
 
@@ -1767,7 +1790,10 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       if (name === 'send-disabled') { this.applyComposerMode(); return; }
       // `verbosity` changes only what is DRAWN. Re-subscribing for it would
       // tear down a live session to change a privacy/display boundary.
-      if (name === 'verbosity' || name === 'threadable') { this.paint(); return; }
+      if (name === 'verbosity' || name === 'threadable' || name === 'from-seq') {
+        this.paint();
+        return;
+      }
       // `agent` or `session-id`: a clean re-subscribe, COALESCED — see
       // `queueReattach`.
       this.queueReattach();
@@ -1904,7 +1930,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       return `${signature}:${this.timeline.map((item) => `${item.id}:${item.afterMessageId ?? ''}`).join(',')}`;
     }
 
-    private timelineNodes(rows: ViewMessage[], render: (row: ViewMessage) => HTMLElement | null): HTMLElement[] {
+    private timelineNodes(
+      rows: ViewMessage[], render: (row: ViewMessage) => HTMLElement | null,
+      /** Rows outside the `from-seq` window; items placed after them stay hidden too. */
+      hidden: Set<string> | null = null,
+    ): HTMLElement[] {
       const at = (value: Date | number | undefined) => {
         const number = value instanceof Date ? value.getTime() : value;
         return typeof number === 'number' && Number.isFinite(number) ? number : Number.POSITIVE_INFINITY;
@@ -1913,6 +1943,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const buckets = new Map<number, HTMLElement[]>();
       for (const item of sorted) {
+        if (item.afterMessageId && hidden?.has(item.afterMessageId)) continue;
         const anchor = item.afterMessageId ? rows.findIndex((row) => row._id === item.afterMessageId) : -1;
         const following = rows.findIndex((row) => at(row.createdAt) > at(item.createdAt)
           || (at(row.createdAt) === at(item.createdAt) && row._id > item.id));
@@ -1934,10 +1965,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     private paint() {
       const { client, sid } = this;
-      const rows: ViewMessage[] = client && sid
+      const all: ViewMessage[] = client && sid
         ? (client.messages(sid).fetch() as ViewMessage[])
         : [];
-      const names = toolNames(rows);
+      // `from-seq` is a display window only: earlier rows stay in the model's
+      // context. Tool names still come from every row.
+      const fromSeq = this.fromSeq;
+      const rows = fromSeq === null ? all : all.filter((m) => m.seq >= fromSeq);
+      const hidden = fromSeq === null
+        ? null
+        : new Set(all.filter((m) => m.seq < fromSeq).map((m) => m._id));
+      const names = toolNames(all);
       // The chip's mint-and-navigate: a click-time capability, never a
       // standing URL (participants spec §7.3). `assign` on an
       // attachment-disposition response downloads without navigating away.
@@ -1955,10 +1993,22 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const agentNames = new Map((session?.participants ?? [])
         .filter((p) => p.kind === 'model' && p.agent)
         .map((p) => [p.agent!, p.displayName]));
-      const nodes = this.timelineNodes(rows, (m) => renderRow(
-        m, names, download, mode, mentions, agentNames,
-        this.threadable && sid ? sid : null,
-      ));
+      // The first shown row is the thread's parent message: the session's
+      // recorded anchor when it is in view, else the first row in the window.
+      const rootId = fromSeq === null
+        ? null
+        : (rows.find((m) => m._id === session?.thread?.messageId) ?? rows[0])?._id ?? null;
+      const nodes = this.timelineNodes(rows, (m) => {
+        const row = renderRow(
+          m, names, download, mode, mentions, agentNames,
+          this.threadable && sid ? sid : null,
+        );
+        if (row && m._id === rootId) {
+          row.classList.add('thread-root');
+          row.setAttribute('part', `${row.getAttribute('part')} thread-root`);
+        }
+        return row;
+      }, hidden);
       if (this.failure) nodes.push(failureRow(this.failure));
       // Subscription hydration starts from an empty collection. Treat the
       // first durable rows as pinned even if layout has not established a

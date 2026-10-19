@@ -139,7 +139,7 @@ describe('message threads', () => {
       const id: string = await thread.call({ userId: 'u1' }, 'thr-a', 'ta-1', 'ta-1-m2');
       const doc = (await AgentSessions.findOneAsync(id))!;
       assert.deepEqual(doc.thread, {
-        sessionId: 'ta-1', seq: 2, messageId: 'ta-1-m2', replies: 0, repliers: [],
+        sessionId: 'ta-1', seq: 2, messageId: 'ta-1-m2', anchorSeq: 2, replies: 0, repliers: [],
       });
       assert.deepEqual(doc.forkedFrom, { sessionId: 'ta-1', seq: 2 });
       assert.equal(doc.title, 'second question', 'titled from its first message');
@@ -174,6 +174,7 @@ describe('message threads', () => {
       const doc = (await AgentSessions.findOneAsync(id))!;
       assert.equal(doc.thread!.seq, 3, 'the cut includes the whole batch the anchor opened');
       assert.equal(doc.thread!.messageId, 'tb-1-m1');
+      assert.equal(doc.thread!.anchorSeq, 1, 'the anchor sits below the cut');
       const seqs = (await AgentMessages.find({ sessionId: id }, { sort: { seq: 1 } })
         .fetchAsync()).map((m) => m.seq);
       assert.deepEqual(seqs, [0, 1, 2, 3]);
@@ -294,7 +295,10 @@ describe('message threads', () => {
       const thread = (await AgentSessions.findOneAsync(tid))!;
       assert.deepEqual(
         { ...thread.thread, lastReplyAt: undefined },
-        { sessionId: 'tg-1', seq: 4, messageId: row._id, replies: 0, repliers: [], lastReplyAt: undefined },
+        {
+          sessionId: 'tg-1', seq: 4, messageId: row._id, anchorSeq: 4,
+          replies: 0, repliers: [], lastReplyAt: undefined,
+        },
       );
       const copy = (await AgentMessages.findOneAsync({ sessionId: tid, seq: 4 }))!;
       assert.equal(copy.content, 'side question');
