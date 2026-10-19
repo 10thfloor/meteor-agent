@@ -9,6 +9,9 @@ import { AttachmentDownloadTokens } from './downloads';
 import { AgentExperiences, AgentMemoryFrames } from './learning-collections';
 import { isRunning } from './turn-state';
 import { discardTurn, locateBatch, UserMessageReservations } from './transcript';
+import { eraseSessionEvidence } from './evidence';
+import { AgentObservations } from './observations';
+import { AgentWorkflowRuns } from './workflows';
 
 /** Outcome deliberately hides whether an id belonged to another owner/agent. */
 export type SessionErasure = 'erased' | 'absent';
@@ -259,6 +262,9 @@ async function purge(rootId: string, rows: AgentSession[]): Promise<void> {
   // Experience, and Practice records. Delete Frames before Session rows so a
   // crash leaves the durable root fence available for an idempotent retry.
   await AgentMemoryFrames.removeAsync({ sessionId: { $in: ids } });
+  await eraseSessionEvidence(ids);
+  await AgentObservations.removeAsync({ sessionId: { $in: ids } });
+  await AgentWorkflowRuns.removeAsync({ missionId: { $in: ids } });
   // Erasure symmetry: session-audience Experiences quote this conversation
   // verbatim, no recall path can ever target a dead session key, and nothing
   // else reaps them — an erase must not leave conversation-derived text

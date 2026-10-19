@@ -8,6 +8,8 @@ import type { RunConfig } from './loop';
  * second configurable field would let the two names drift. */
 export type AgentIdentityConfig = Omit<IdentityConfig, 'name'>;
 export interface AgentConfig {
+    /** Developer-published definition version used by pinned delegation edges. */
+    version?: string;
     /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
      *  custom `provider` gives the string its own meaning. */
     model: string;

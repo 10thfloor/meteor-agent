@@ -2,7 +2,7 @@ import { Mongo } from 'meteor/mongo';
 import { Random } from 'meteor/random';
 import { NAMES } from '../common/names';
 import type { Fields, TypedCollection } from '../common/db';
-import { AgentAttachments, sanitizeAttachmentName } from './attachments';
+import { AgentAttachments, sanitizeAttachmentName, readAttachmentContent } from './attachments';
 import {
   beginSessionMutationOperation, withSessionOperationTransaction,
 } from './session-operations';
@@ -87,7 +87,7 @@ async function openAttachmentDownload(token: string): Promise<{
       file: {
         name: sanitizeAttachmentName(row.name),
         contentType: row.contentType,
-        content: Buffer.from(row.content, 'base64'),
+        content: Buffer.from(await readAttachmentContent(row), 'base64'),
       },
       signal: operation.signal,
       assertActive: () => operation.assertActive(),
@@ -95,6 +95,10 @@ async function openAttachmentDownload(token: string): Promise<{
     };
     transferred = true;
     return opened;
+  } catch {
+    // Missing/disconnected external storage is indistinguishable from a missing
+    // attachment on the public token route. Never leak provider diagnostics.
+    return null;
   } finally {
     // Once returned, the caller owns the operation through response completion.
     // Every failed lookup/conversion path must release it here instead.

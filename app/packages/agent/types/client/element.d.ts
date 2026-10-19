@@ -1,4 +1,45 @@
+import { Agent } from './agent';
 export type ComposerMode = 'ask' | 'note';
+export interface ComposerSubmission {
+    sessionId: string;
+    text: string;
+    mode: ComposerMode;
+    /** Explicit model participant selected by the host. Crew notes omit it. */
+    recipient?: string;
+}
+/** Optional application-owned write boundary. Throw to preserve the draft. */
+export type ComposerSubmissionHandler = (submission: ComposerSubmission) => Promise<unknown>;
+export interface ComposerDraftOptions {
+    selectionStart?: number;
+    selectionEnd?: number;
+    focus?: boolean;
+}
+export interface ChatTimelineItem {
+    id: string;
+    createdAt: Date | number;
+    afterMessageId?: string;
+    element: HTMLElement;
+}
+/** Public property/method surface for typed app-owned custom elements. */
+export interface AgentChatElement extends HTMLElement {
+    readonly sessionId: string | null;
+    readonly agentInstance: Agent | null;
+    composerMode: ComposerMode;
+    /** Model participant ID for asks. Undefined preserves leading-@/primary routing. */
+    recipient: string | undefined;
+    submissionHandler: ComposerSubmissionHandler | null;
+    allowEmptySubmit: boolean;
+    draftText: string;
+    mentionSources: Record<string, MentionSource>;
+    timelineItems: ChatTimelineItem[];
+    setDraft(text: string, options?: ComposerDraftOptions): void;
+    focusComposer(): void;
+    submitDraft(): Promise<void>;
+    insertMention(prefix: string, handle: string): boolean;
+    openMentions(prefix: string): boolean;
+    /** Reveal an already rendered, visible message without changing the session. */
+    revealMessage(messageId: string): boolean;
+}
 /** Something a message can name with `@`. Model participants are resolved
  *  automatically; app-specific subjects (via `mentionables`) autocomplete
  *  and render but schedule nothing. */
@@ -10,6 +51,8 @@ export interface Mentionable {
     kind?: string;
     /** A second line in the typeahead — an address, a role, a price, a date. */
     detail?: string;
+    /** Non-@ references can open an app-owned detail view without sending. */
+    actionable?: boolean;
 }
 /** A field name or a function derived from the record. */
 type Field<T> = string | ((record: never) => T | undefined);
@@ -22,6 +65,9 @@ export interface MentionCollection {
 interface MentionShape {
     /** The `part` token every entry from this source carries. */
     kind?: string;
+    actionable?: boolean;
+    /** Visible feedback while a source is loading or has no matching entries. */
+    emptyText?: string;
     /** What follows the symbol. Required — nothing else identifies the record. */
     handle: Field<string>;
     /** Defaults to the handle. */
@@ -43,6 +89,8 @@ export type MentionSource = (MentionShape & {
     collection?: never;
 }) | {
     kind?: string;
+    actionable?: boolean;
+    emptyText?: string;
     /** Everything matching what has been typed so far. `''` means "the symbol
      *  was just typed" — answer with a sensible opening set, not everything. */
     search(query: string): Mentionable[];

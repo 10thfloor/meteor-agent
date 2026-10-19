@@ -20,6 +20,11 @@ export interface ToolContext {
      *  replaces it for that one tool — see `RUNAS_NOTE` and `runTool`. */
     userId: string | null;
     sessionId: string;
+    /** Cooperative cancellation for dispatched inline tools on Stop, erasure,
+     * or lost worker authority. Pass to I/O or an isolated execution provider;
+     * the framework cannot forcibly terminate arbitrary tool implementations.
+     * Optional for compatibility with direct runTool callers. */
+    signal?: AbortSignal;
     /** Set by loop dispatch; optional for direct `runTool` callers. */
     toolCallId?: string;
     /** Committed assistant Message that contains this Tool call. Set by loop
@@ -74,7 +79,48 @@ export type SubagentTool = {
     args?: unknown;
     name?: string;
     gate?: Gate;
+    /** Exact developer-published AgentConfig version. Mismatch refuses dispatch. */
+    version?: string;
+    /** Per-edge ceilings, always intersected with the child's own limits. */
+    budget?: SubagentBudget;
+    /** Transform only the explicitly delegated prompt; no parent transcript is
+     * implicitly disclosed. Throwing or returning an empty string refuses. */
+    context?: (context: DelegationContext) => string | Promise<string>;
+    beforeDelegate?: (context: DelegationContext) => DelegationDecision | Promise<DelegationDecision>;
+    afterDelegate?: (context: DelegationCompletion) => DelegationProjection | false | Promise<DelegationProjection | false>;
 };
+export interface SubagentBudget {
+    toolCalls?: number;
+    spend?: number;
+    maxIterations?: number;
+}
+export interface DelegationContext {
+    prompt: string;
+    userId: string | null;
+    sessionId: string;
+    agent: string;
+    toolCallId?: string;
+}
+export type DelegationDecision = boolean | {
+    prompt?: string;
+    budget?: SubagentBudget;
+};
+export interface DelegationCompletion extends DelegationContext {
+    childSessionId: string;
+    ok: boolean;
+    text?: string;
+    error?: {
+        error: string;
+        reason?: string;
+    };
+}
+export interface DelegationProjection {
+    model: string;
+    display?: string;
+    transcript?: string;
+}
+/** Dispatch also validates hook-supplied limits before any child is born. */
+export declare function validateSubagentBudget(budget?: SubagentBudget): void;
 /** The default subagent argument schema: one string, the child's first user
  *  message. Deliberately minimal — a subagent is given a task in prose, and
  *  every additional field is one more thing the parent model can get wrong. */
@@ -134,6 +180,7 @@ export interface ResolvedTool {
     /** `kind: 'subagent'` only: the REGISTRY NAME of the agent to run. Resolved
      *  to a config at dispatch, never here — see `resolveTools`. */
     subagent?: string;
+    delegation?: Pick<SubagentTool, 'version' | 'budget' | 'context' | 'beforeDelegate' | 'afterDelegate'>;
     /** `kind: 'mcp'` only. `tool` absent means the WHOLE SERVER: a placeholder
      *  that `expandMcpTools` replaces with one entry per discovered tool, and
      *  that never reaches dispatch. */
@@ -159,7 +206,30 @@ export interface ToolResult {
         error: string;
         reason?: string;
     };
+    /** Human-safe activity text. Model context continues to use `value`. */
+    display?: string;
+    /** Human-readable persistent history, independent of model context. */
+    transcript?: string;
+    /** Private audit data; dispatch never places this field on a Message. */
+    auditValue?: unknown;
 }
+declare const TOOL_OUTPUT: unique symbol;
+export interface ProjectedToolOutput {
+    readonly [TOOL_OUTPUT]: true;
+    model: unknown;
+    display: string;
+    transcript: string;
+    raw?: unknown;
+}
+/** Explicit projections keep large nested/tool payloads out of model context
+ * and JSON out of human-facing history. The symbol prevents remote JSON from
+ * impersonating a host-defined projection. */
+export declare function toolOutput(input: {
+    model: unknown;
+    display: string;
+    transcript?: string;
+    raw?: unknown;
+}): ProjectedToolOutput;
 /** The verdict shape. `reason` names the offending FIELD and never echoes its
  *  value: it is fed back to the model and, through the tool row, published. */
 export type ValidationResult = {

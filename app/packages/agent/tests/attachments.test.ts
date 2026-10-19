@@ -136,7 +136,7 @@ describe('attachments', () => {
       assert.equal(ref.name, 'summary.csv');
       assert.equal(ref.size, 15);
       const row = (await AgentAttachments.findOneAsync({ _id: ref.id, sessionId }))!;
-      assert.equal(Buffer.from(row.content, 'base64').toString('utf8'), 'id,total\n1,200\n');
+      assert.equal(Buffer.from(row.content!, 'base64').toString('utf8'), 'id,total\n1,200\n');
       assert.equal(row.origin, 'inbound');
       assert.isUndefined(row.staged);
     });
@@ -263,8 +263,8 @@ describe('attachments', () => {
 
     it('sanitizes names: control characters stripped, length capped, never empty', async () => {
       const { sanitizeAttachmentName } = await import('../server/attachments');
-      assert.equal(sanitizeAttachmentName('re port.csv'), 'report.csv');
-      assert.equal(sanitizeAttachmentName('   '), 'file');
+      assert.equal(sanitizeAttachmentName('re\x00po\x1frt.csv'), 'report.csv');
+      assert.equal(sanitizeAttachmentName('  \x07 '), 'file');
       assert.equal(sanitizeAttachmentName('x'.repeat(200)).length, 160);
       assert.equal(sanitizeAttachmentName('../../etc/passwd'), '../../etc/passwd', 'a path is inert in a collection — display hygiene only');
     });
@@ -526,5 +526,188 @@ describe('attachments', () => {
     assert.equal(prettySize(18432), '18 KB');
     assert.equal(prettySize(5 * 1024 * 1024), '5 MB');
     assert.equal(prettySize(12 * 1024 * 1024), '12 MB');
+  });
+});
+
+describe('external attachment storage', function () {
+  this.timeout(20000);
+  let store: typeof import('../server/attachments');
+  let sessionId: string;
+  let foreignSessionId: string;
+  let calls: Array<{ kind: string; input: any }>;
+  let remote: Map<string, string>;
+  let adapter: import('../server/attachments').AttachmentStorageAdapter;
+  const create = (patch: Partial<import('../server/attachments').CreateAttachmentOptions> = {}) => store.createAttachment({
+    sessionId, name: 'private.txt', contentType: 'text/plain', content: 'remote bytes only', ...patch,
+  });
+  before(async () => { store = await import('../server/attachments'); });
+  beforeEach(async () => {
+    sessionId = Random.id(); foreignSessionId = Random.id(); calls = []; remote = new Map();
+    await seedAttachmentSessions(sessionId, foreignSessionId);
+    adapter = {
+      name: 'fixture-storage',
+      async write(input, context) {
+        await context.assertActive(); calls.push({ kind: 'write', input });
+        const key = `${input.sessionId}:${input.id}:${input.sha256}`;
+        remote.set(key, input.content); return { key, sha256: input.sha256 };
+      },
+      async read(input, context) {
+        await context.assertActive(); calls.push({ kind: 'read', input });
+        const content = remote.get(String(input.storageReference.key));
+        if (content === undefined) throw new Error('remote file missing'); return content;
+      },
+    };
+    store.configureAttachmentStorage(adapter);
+  });
+  afterEach(async () => {
+    store.configureAttachmentStorage(null);
+    await store.AgentAttachments.removeAsync({ sessionId: { $in: [sessionId, foreignSessionId] } });
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.removeAsync({ _id: { $in: [sessionId, foreignSessionId] } });
+  });
+
+  it('writes verified external bytes and retains only non-secret metadata in Mongo', async () => {
+    const ref = await create(); const row = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    assert.notProperty(row, 'content'); assert.equal(row.storageProvider, 'fixture-storage');
+    assert.match(row.contentSha256!, /^[a-f0-9]{64}$/); assert.deepEqual(calls.map((call) => call.kind), ['write', 'read']);
+    assert.notInclude(JSON.stringify(row), b64('remote bytes only'));
+    assert.equal(await store.readAttachmentContent(row), b64('remote bytes only'));
+    const { Agent } = await import('../server/agent');
+    assert.equal(await Agent.attachments.readContent(row), b64('remote bytes only'));
+    assert.isFunction(Agent.attachments.configureStorage); assert.isFunction(Agent.attachments.migrateContent);
+  });
+  it('retains the default Mongo store when no external adapter is configured', async () => {
+    store.configureAttachmentStorage(null); const ref = await create(); const row = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    assert.equal(row.content, b64('remote bytes only')); assert.notProperty(row, 'storageReference'); assert.isEmpty(calls);
+    assert.equal(await store.readAttachmentContent(row), row.content);
+  });
+  it('adopts tool retries without a second upload and re-stages the original ref', async () => {
+    const first = await create({ toolCallId: 'same', attach: true }); await store.claimStagedRefs(sessionId);
+    const second = await create({ toolCallId: 'same', attach: true, content: 'different retry payload' });
+    assert.equal(first.id, second.id); assert.equal(calls.filter((call) => call.kind === 'write').length, 1);
+    const row = (await store.AgentAttachments.findOneAsync(first.id))!; assert.isTrue(row.staged);
+    assert.equal(await store.readAttachmentContent(row), b64('remote bytes only'));
+  });
+  it('does not fall back to Mongo when external upload or verification fails', async () => {
+    for (const failure of ['write', 'verify']) {
+      store.configureAttachmentStorage({ ...adapter,
+        ...(failure === 'write' ? { write: async () => { throw new Error('secret provider token'); } }
+          : { read: async () => b64('incorrect content') }),
+      });
+      assert.equal(await refusalOf(create()), 'attachment-storage-write-failed');
+      assert.equal(await store.AgentAttachments.find({ sessionId }).countAsync(), 0);
+    }
+  });
+  it('provides a fixed storage-required hint without exposing adapter diagnostics', async () => {
+    const { Meteor } = await import('meteor/meteor');
+    for (const code of ['attachment-storage-required', 'attachment-storage-invalid', 'provider-error']) {
+      store.configureAttachmentStorage({ ...adapter, write: async () => { throw new Meteor.Error(code, 'secret token', 'private diagnostics'); } });
+      let error: any;
+      try { await create(); } catch (caught) { error = caught; }
+      assert.equal(error?.error, code === 'attachment-storage-required' ? code : 'attachment-storage-write-failed');
+      if (code === 'attachment-storage-required') assert.equal(error.reason, 'Enable file storage for this conversation before saving attachments.');
+      assert.notInclude(JSON.stringify(error), 'secret token'); assert.notInclude(JSON.stringify(error), 'private diagnostics');
+      assert.equal(await store.AgentAttachments.find({ sessionId }).countAsync(), 0);
+    }
+  });
+  it('rejects secret-bearing, URL or byte-bearing adapter references', async () => {
+    for (const reference of [{ token: 'private' }, { url: 'https://signed.example/file?secret=1' }, { content: b64('bytes') }, { nested: { secret: 'private' } }, { key: 'x'.repeat(1025) }]) {
+      store.configureAttachmentStorage({ ...adapter, write: async () => reference as any });
+      assert.equal(await refusalOf(create()), 'attachment-storage-invalid');
+      assert.equal(await store.AgentAttachments.find({ sessionId }).countAsync(), 0);
+    }
+  });
+  it('reloads authoritative metadata and refuses foreign-session or forged locators', async () => {
+    const ref = await create(); const row = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    assert.equal(await store.readAttachmentContent({ ...row, storageReference: { key: 'forged' }, content: b64('forged') } as any), b64('remote bytes only'));
+    const before = calls.length;
+    assert.equal(await refusalOf(store.readAttachmentContent({ _id: row._id, sessionId: foreignSessionId })), 'attachment-unavailable');
+    assert.equal(calls.length, before);
+    const hydrated = await store.hydrateRefs(foreignSessionId, [ref]); assert.deepEqual(hydrated.attachments, []); assert.deepEqual(hydrated.missing, [ref]);
+  });
+  it('hydrates delivery bytes and model text through the adapter', async () => {
+    const ref = await create(); const hydrated = await store.hydrateRefs(sessionId, [ref]);
+    assert.equal(hydrated.attachments[0].content, b64('remote bytes only')); assert.isEmpty(hydrated.missing);
+    const result: any = await store.readTool.run({ id: ref.id }, { userId: null, sessionId });
+    assert.equal(result.text, 'remote bytes only'); assert.notProperty(result, 'content');
+  });
+  it('hydrates request images through the adapter and omits unavailable external images', async () => {
+    const ref = await create({ name: 'image.png', contentType: 'image/png', content: { base64: b64('image fixture') } });
+    const rows = [{ role: 'tool' as const, seq: 1, toolCallId: 'image-call', attachments: [ref] }];
+    const messages: import('../server/providers/types').ProviderMessage[] = [{ role: 'tool', toolCallId: 'image-call', content: 'Image' }];
+    assert.isTrue(await store.hydrateImageRefs(sessionId, rows, messages)); assert.equal(messages[0].images![0].data, b64('image fixture'));
+    remote.clear(); const unavailable: import('../server/providers/types').ProviderMessage[] = [{ role: 'tool', toolCallId: 'image-call', content: 'Image' }];
+    assert.isFalse(await store.hydrateImageRefs(sessionId, rows, unavailable)); assert.isUndefined(unavailable[0].images);
+    const result: any = await store.readTool.run({ id: ref.id }, { userId: null, sessionId, imageInput: true, attachToResult: () => { assert.fail('Missing image must not be attached'); } });
+    assert.isTrue(result.unavailable); assert.equal(result.reason, 'storage-unavailable');
+  });
+  it('reports missing external bytes without falling back to a stale Mongo content field', async () => {
+    const ref = await create(); await store.AgentAttachments.updateAsync(ref.id, { $set: { content: b64('stale Mongo content') } });
+    remote.clear(); const row = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    assert.equal(await refusalOf(store.readAttachmentContent(row)), 'attachment-storage-unavailable');
+    const hydrated = await store.hydrateRefs(sessionId, [ref]); assert.isEmpty(hydrated.attachments); assert.deepEqual(hydrated.missing, [ref]);
+    const result: any = await store.readTool.run({ id: ref.id }, { userId: null, sessionId }); assert.isTrue(result.unavailable);
+    store.configureAttachmentStorage(null);
+    assert.equal(await refusalOf(store.readAttachmentContent(row)), 'attachment-storage-unavailable');
+  });
+  it('rejects changed external bytes even when the decoded size still matches', async () => {
+    const ref = await create(); const row = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    remote.set(String(row.storageReference!.key), b64('REMOTE BYTES ONLY'));
+    assert.equal(await refusalOf(store.readAttachmentContent(row)), 'attachment-storage-unavailable');
+  });
+  it('uses external storage for web downloads and inbound admission', async () => {
+    const inbound = await store.admitInboundAttachments(sessionId, [{ name: 'incoming.txt', contentType: 'text/plain', size: 5, content: b64('hello') }]);
+    assert.lengthOf(inbound.refs, 1); const row = (await store.AgentAttachments.findOneAsync(inbound.refs[0].id))!; assert.notProperty(row, 'content');
+    const { issueAttachmentToken, redeemAttachmentToken } = await import('../server/downloads');
+    const token = await issueAttachmentToken(sessionId, row._id); assert.isString(token);
+    const download = await redeemAttachmentToken(token!); assert.equal(download!.content.toString(), 'hello');
+  });
+  it('returns not-found rather than a public exception when download storage is unavailable', async () => {
+    const ref = await create(); const { issueAttachmentToken, redeemAttachmentToken, handleDownload } = await import('../server/downloads');
+    const token = await issueAttachmentToken(sessionId, ref.id); remote.clear();
+    assert.isNull(await redeemAttachmentToken(token!));
+    const secondToken = await issueAttachmentToken(sessionId, ref.id); assert.equal((await handleDownload(secondToken!)).status, 404);
+    const { AgentSessions } = await import('../common/collections'); assert.isEmpty((await AgentSessions.findOneAsync(sessionId))!.operations ?? []);
+  });
+  it('migrates legacy bytes only after the remote copy is verified', async () => {
+    store.configureAttachmentStorage(null); const ref = await create(); const before = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    let checkedBeforeRemoval = false;
+    store.configureAttachmentStorage({ ...adapter, read: async (input, context) => {
+      assert.equal((await store.AgentAttachments.findOneAsync(ref.id))!.content, before.content); checkedBeforeRemoval = true;
+      return adapter.read(input, context);
+    } });
+    const migrated = await store.migrateAttachmentContent({ id: ref.id, sessionId }); assert.equal(migrated.id, ref.id); assert.isTrue(checkedBeforeRemoval);
+    const after = (await store.AgentAttachments.findOneAsync(ref.id))!; assert.notProperty(after, 'content'); assert.equal(after.storageProvider, 'fixture-storage');
+    assert.equal(after.size, before.size); assert.equal(after.createdAt.getTime(), before.createdAt.getTime());
+    store.configureAttachmentStorage(adapter); const writes = calls.filter((call) => call.kind === 'write').length;
+    await store.migrateAttachmentContent({ id: ref.id, sessionId }); assert.equal(calls.filter((call) => call.kind === 'write').length, writes);
+    assert.equal(await store.readAttachmentContent(after), before.content);
+  });
+  it('retains original Mongo bytes when migration write or verification fails', async () => {
+    store.configureAttachmentStorage(null); const ref = await create(); const before = (await store.AgentAttachments.findOneAsync(ref.id))!;
+    for (const failure of ['write', 'verify']) {
+      store.configureAttachmentStorage({ ...adapter, ...(failure === 'write' ? { write: async () => { throw new Error('offline'); } } : { read: async () => b64('wrong') }) });
+      assert.equal(await refusalOf(store.migrateAttachmentContent({ id: ref.id, sessionId })), 'attachment-storage-write-failed');
+      assert.deepEqual(await store.AgentAttachments.findOneAsync(ref.id), before);
+    }
+  });
+  it('preserves a concurrent legacy edit instead of unsetting its new bytes during migration', async () => {
+    store.configureAttachmentStorage(null); const ref = await create();
+    store.configureAttachmentStorage({ ...adapter, read: async (input, context) => {
+      const content = await adapter.read(input, context);
+      await store.AgentAttachments.updateAsync(ref.id, { $set: { content: b64('concurrent edit'), size: 15 } }); return content;
+    } });
+    assert.equal(await refusalOf(store.migrateAttachmentContent({ id: ref.id, sessionId })), 'attachment-storage-conflict');
+    const row = (await store.AgentAttachments.findOneAsync(ref.id))!; assert.equal(row.content, b64('concurrent edit')); assert.notProperty(row, 'storageReference');
+  });
+  it('refuses external writes for fenced sessions and cannot commit metadata after an erasure fence', async () => {
+    const { AgentSessions } = await import('../common/collections');
+    await AgentSessions.updateAsync(sessionId, { $set: { erasingAt: new Date() } });
+    assert.equal(await refusalOf(create()), 'no-session'); assert.isEmpty(calls);
+    await AgentSessions.updateAsync(sessionId, { $unset: { erasingAt: 1 } });
+    store.configureAttachmentStorage({ ...adapter, write: async (input, context) => {
+      const reference = await adapter.write(input, context); await AgentSessions.updateAsync(sessionId, { $set: { erasingAt: new Date() } }); return reference;
+    } });
+    assert.isNotNull(await refusalOf(create())); assert.equal(await store.AgentAttachments.find({ sessionId }).countAsync(), 0);
   });
 });

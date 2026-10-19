@@ -13,8 +13,13 @@ export interface AgentAttachment {
     contentType: string;
     /** Decoded byte count, computed at write time (never trusted from provider). */
     size: number;
-    /** The bytes, base64. Decode-validity verified at write time. */
-    content: string;
+    /** Legacy/default Mongo bytes. Absent for externally stored attachments. */
+    content?: string;
+    /** Server-only locator. Never include credentials, signed URLs or file bytes. */
+    storageProvider?: string;
+    storageReference?: AttachmentStorageReference;
+    /** Binds externally stored immutable bytes to this metadata row. */
+    contentSha256?: string;
     origin: 'inbound' | 'tool';
     /** Present only while awaiting the turn-final flush: `attach: true` marks
      *  the row staged; the loop's commit claims it (an atomic unstage per row —
@@ -36,6 +41,46 @@ export interface AttachmentModifier {
     };
 }
 export declare const AgentAttachments: TypedCollection<AgentAttachment, string | AttachmentQuery, AttachmentModifier>;
+/** Small, non-secret provider locator. No nested payloads or embedded bytes. */
+export type AttachmentStorageReference = Record<string, string | number | boolean | null>;
+export interface AttachmentStorageMetadata {
+    id: string;
+    sessionId: string;
+    name: string;
+    contentType: string;
+    size: number;
+    sha256: string;
+}
+export interface AttachmentStorageContext {
+    signal: AbortSignal;
+    /** Renew/check the Session erasure fence immediately before external I/O. */
+    assertActive(): Promise<void>;
+}
+export interface AttachmentStorageAdapter {
+    name: string;
+    /** Must be immutable/idempotent: never replace other bytes at an existing
+     * locator. A content-addressed path avoids cross-process retry races. */
+    write(input: AttachmentStorageMetadata & {
+        content: string;
+    }, context: AttachmentStorageContext): Promise<AttachmentStorageReference>;
+    read(input: AttachmentStorageMetadata & {
+        storageReference: AttachmentStorageReference;
+    }, context: AttachmentStorageContext): Promise<string>;
+}
+/** Configure at server startup. Null restores the framework's default Mongo
+ * store; it does not migrate existing external metadata back into Mongo. */
+export declare function configureAttachmentStorage(adapter: AttachmentStorageAdapter | null): void;
+/** Resolve only an authoritative row in the supplied Session. A forged locator
+ * or bytes on the caller's object are never used. Reads hold the lifecycle fence
+ * across remote I/O; callers remain responsible for their user authorization. */
+export declare function readAttachmentContent(row: Pick<AgentAttachment, '_id' | 'sessionId'>): Promise<string>;
+/** Explicit host migration. Remote bytes are written and read back before the
+ * old bytes are atomically replaced by their locator; a failed verification,
+ * erasure fence or concurrent row change never removes the original content. */
+export declare function migrateAttachmentContent(input: {
+    id: string;
+    sessionId: string;
+}): Promise<AttachmentRef>;
 /** Write-time caps per message (§5). Defaults sit under Postmark's outbound
  *  ceiling after base64 inflation (4/3). */
 export interface AttachmentCaps {

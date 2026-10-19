@@ -11,6 +11,11 @@ import { runAfterToolResult, type ToolResultHookContext } from './hooks';
 import { commitBudgetNote } from './turn-state';
 import { commitLeasedMessage, discardTurn, locateBatch } from './transcript';
 import type { RunConfig } from './loop';
+import { beginToolCancellation } from './tool-cancellation';
+import { commitHandoff, isHandoffTool } from './handoff';
+import {
+  captureToolAudit, evidenceTask, finishEvidenceSpan, startEvidenceSpan,
+} from './evidence';
 
 /** Tool-call dispatch. `runTurn` is injected (not imported) to break the
  *  dispatch -> loop value cycle — same DI pattern as `runSubagent`. */
@@ -32,8 +37,28 @@ async function dispatchTool(
   tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn,
   authorize?: () => boolean | Promise<boolean>,
 ): Promise<SubagentDispatch> {
-  if (tool.kind === 'subagent') return runSubagent(tool, args, ctx, runTurn, authorize);
-  return { result: await runTool(tool, args, ctx, authorize) };
+  const cancellation = tool.kind === 'inline' ? await beginToolCancellation(ctx.sessionId) : undefined;
+  const toolCtx = cancellation ? { ...ctx, signal: cancellation.signal } : ctx;
+  let spanId: string | undefined;
+  try {
+    spanId = await evidenceTask(() => startEvidenceSpan({ sessionId: ctx.sessionId,
+      kind: 'tool', name: tool.name, summary: `Running ${tool.name}`,
+      toolCallId: ctx.toolCallId, messageId: ctx.assistantMessageId }));
+    const dispatched = tool.kind === 'subagent'
+      ? await runSubagent(tool, args, ctx, runTurn, authorize)
+      : { result: await runTool(tool, args, toolCtx, authorize) };
+    await evidenceTask(async () => {
+      await captureToolAudit(spanId, dispatched.result.auditValue ?? dispatched.result.value ?? dispatched.result.error);
+      await finishEvidenceSpan(spanId, { status: dispatched.result.ok ? 'completed' : 'failed',
+        summary: dispatched.result.display ?? (dispatched.result.ok ? `${tool.name} completed` : `${tool.name} failed`) });
+    });
+    return dispatched;
+  } catch (error) {
+    await evidenceTask(() => finishEvidenceSpan(spanId, { status: 'failed', summary: `${tool.name} failed` }));
+    throw error;
+  } finally {
+    await cancellation?.close();
+  }
 }
 
 /** Latch: warn once per distinct serialization failure kind. */
@@ -71,6 +96,17 @@ function toolResultContent(
   return { content, error: result.ok ? undefined : clampErrorReason(result.error, maxChars) };
 }
 
+function humanToolResult(result: ToolResult, name: string): {
+  displayContent?: string; transcriptContent?: string;
+} {
+  // Legacy tools keep each UI's localized/humanized generic activity label.
+  // An explicit host projection carries meaningful result-specific text.
+  if (result.display === undefined && result.transcript === undefined) return {};
+  const fallback = result.ok ? `${name} completed.` : `${name} could not complete.`;
+  return { displayContent: (result.display ?? result.transcript ?? fallback).slice(0, 2000),
+    transcriptContent: (result.transcript ?? result.display ?? fallback).slice(0, 8000) };
+}
+
 /** Clamp `error.reason` to `maxChars` — it's a separate field from `content`,
  *  so the content truncation doesn't bound it. */
 function clampErrorReason(
@@ -88,7 +124,7 @@ function clampErrorReason(
 
 /** parked = awaiting external answer, abandoned = turn gone,
  *  completed = all calls answered (safe to re-enter think loop). */
-export type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
+export type DispatchOutcome = 'completed' | 'parked' | 'abandoned' | 'ended';
 
 /** A host `canUse` predicate THREW — an application failure, not a policy
  *  denial. Callers convert it into an `entitlement-unavailable` result so the
@@ -167,12 +203,24 @@ export async function dispatchCalls(
       _id: Random.id(), role: 'tool',
       toolCallId: call.id,
       content: row.content,
+      ...humanToolResult(result, call.name),
       error: row.error,
       ...(turn.from ? { from: turn.from } : {}),
       createdAt: new Date(),
     });
     return seq !== null;
   };
+
+  // A handoff is a turn boundary, never one member of a parallel work batch.
+  // Answer every call without running any so no tool_use is stranded and the
+  // model can issue the intended control action alone on its next iteration.
+  if (turn.batchIds.length !== 1 && calls.some((call) => isHandoffTool(tools.find((tool) => tool.name === call.name)))) {
+    for (const call of calls) {
+      if (!(await refuse(call, { ok: false, error: { error: 'handoff-batch',
+        reason: 'Call handoff_to_agent alone, without other tools in the same response.' } }))) return abandon();
+    }
+    return 'completed';
+  }
 
   for (const call of calls) {
     // §7 backstop: a config-forbidden tool must not park (nothing may grant it).
@@ -221,6 +269,31 @@ export async function dispatchCalls(
     }
 
     const tool = tools.find((t) => t.name === call.name);
+
+    if (isHandoffTool(tool)) {
+      let unavailable = false;
+      const outcome = await commitHandoff({
+        sessionId, sourceAgent: turn.agent, userId: turn.userId,
+        messageId: turn.messageId, toolCallId: call.id, args: call.args,
+        relayCap: budget?.relay ?? 4, toolCallCap: budget?.toolCalls,
+        authorize: async () => {
+          try { return await mayUse(call.name, call.args, call.id) && await holdsLease(sessionId); }
+          catch { unavailable = true; return false; }
+        },
+      });
+      if (outcome.kind === 'abandoned') return abandon();
+      if (outcome.kind === 'committed') return 'ended';
+      const refusal = unavailable ? { ok: false, error: { error: 'entitlement-unavailable',
+        reason: 'The application entitlement check failed. The handoff may be retried.' } } : outcome.result;
+      if (!(await refuse(call, refusal))) return abandon();
+      if (outcome.capped) {
+        await commitLeasedMessage(sessionId, { _id: Random.id(), role: 'note', kind: 'budget', budget: 'relay',
+          error: { error: 'budget-exhausted', reason: 'Relay budget reached — a human message resets it.' }, createdAt: new Date(),
+        }, { unlessStopped: true });
+        return 'ended';
+      }
+      continue;
+    }
 
     // The sole gate evaluation site. Uses `turn.userId` (session owner), never
     // a `runAs` escalation — the escalation must not approve itself.
@@ -421,11 +494,13 @@ export async function dispatchCalls(
     });
 
     // Atomic seq + budget $inc — a subagent costs one toolCall to the parent.
+    // A subagent's live marker ends in the same transaction as its tool row.
     const row = toolResultContent(result, limits.maxResultChars);
     const toolSeq = await commitLeasedMessage(sessionId, {
       _id: Random.id(), role: 'tool',
       toolCallId: call.id,
       content: row.content,
+      ...humanToolResult(result, call.name),
       error: row.error,
       // Present even for a failed child — the transcript is what a human opens.
       childSessionId,
@@ -433,7 +508,10 @@ export async function dispatchCalls(
       // Attachments that survived the hook chain.
       ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
-    }, { inc: refusedByCanUse ? {} : { 'budgetSpent.toolCalls': 1 } });
+    }, {
+      inc: refusedByCanUse ? {} : { 'budgetSpent.toolCalls': 1 },
+      ...(tool?.kind === 'subagent' ? { unset: { activeChild: 1 } } : {}),
+    });
     // Null seq = turn gone; abandon to avoid stranding a tool_use.
     if (toolSeq === null) return abandon();
   }
@@ -604,6 +682,7 @@ export async function resumeParkedTurn(
     const seq = await commitLeasedMessage(sessionId, {
       _id: Random.id(), role: 'tool', toolCallId: call.id,
       content: row.content,
+      ...humanToolResult(result, call.name),
       error: row.error,
       childSessionId,
       ...(from ? { from } : {}),
@@ -612,6 +691,7 @@ export async function resumeParkedTurn(
     }, {
       inc: (pending.verdict === 'denied' || refusedByCanUse)
         ? {} : { 'budgetSpent.toolCalls': 1 },
+      ...(tool?.kind === 'subagent' ? { unset: { activeChild: 1 } } : {}),
     });
     if (seq === null) return abandon();
   }

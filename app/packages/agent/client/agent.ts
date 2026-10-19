@@ -8,6 +8,12 @@ import { mergeView } from '../common/merge';
 import type { Phase, ViewMessage } from '../common/types';
 import type { SessionQuery } from '../common/db';
 
+export interface SendOptions {
+  /** Explicit model participant ID. When supplied, it takes precedence over
+   * a leading @mention and fails if that participant is unavailable. */
+  to?: string;
+}
+
 /** Client-side handle on one agent. Uses minimongo's synchronous API
  *  (the async-only rule is server-side). */
 export class Agent {
@@ -105,10 +111,10 @@ export class Agent {
     return Meteor.callAsync(NAMES.mStart, this.name, opts);
   }
 
-  send(sessionId: string, text: string): Promise<string> {
+  send(sessionId: string, text: string, options?: SendOptions): Promise<string> {
     // Stable across Meteor's transparent method retry: the server's private
     // Transcript Commit Module uses this only as an idempotency identity.
-    return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text, Random.id());
+    return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text, Random.id(), options);
   }
 
   /** Commit human-to-crew context without waking an agent. The stable retry

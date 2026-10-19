@@ -36,7 +36,7 @@ export interface PrepareTurnLearningOptions {
 function triggerForAgent(
   message: AgentMessage, session: AgentSession, agentName: string,
 ): boolean {
-  if (message.role === 'assistant') {
+  if (message.role === 'assistant' || (message.role === 'tool' && message.kind === 'handoff' && !message.error)) {
     return message.to === modelParticipantId(agentName);
   }
   if (message.role === 'system') {
@@ -50,8 +50,9 @@ function triggerForAgent(
   // Crew notes promise "no model work" (participants.ts applies the same
   // rule); one landing mid-park must not become the next trigger.
   if (message.kind === 'crew-note') return false;
-  if (!session.participants?.length) return session.agent === agentName;
+  if (!session.participants?.length) return message.to === undefined && session.agent === agentName;
   const addressee = resolveAddressee(message.content, message.to, session);
+  if (message.to !== undefined && !addressee) return false;
   // An unaddressed user message follows the Session's ordinary routing rule:
   // it activates the primary Agent. Explicit addresses remain isolated to the
   // selected participant.

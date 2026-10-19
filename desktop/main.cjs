@@ -1,11 +1,13 @@
 const {
-  app, BrowserWindow, Menu, safeStorage, shell,
+  app, BrowserWindow, Menu, powerMonitor, safeStorage, shell,
 } = require('electron');
 const { spawn } = require('node:child_process');
 const { randomBytes } = require('node:crypto');
 const fs = require('node:fs');
 const http = require('node:http');
+const net = require('node:net');
 const path = require('node:path');
+const { createServerRecovery, probeApplicationHealth, probeListenerOccupancy, stopOwnedProcess } = require('./server-recovery.cjs');
 
 const ROOT = path.resolve(__dirname, '..');
 const METEOR_APP = path.join(ROOT, 'app');
@@ -20,7 +22,21 @@ if (process.env.METEOR_DESKTOP_AUTOMATION === '1') {
 
 let mainWindow = null;
 let meteorProcess = null;
-let ownsMeteorProcess = false;
+let meteorEnvironment = null;
+let quitting = false;
+let quitAllowed = false;
+const serverRecovery = createServerRecovery({
+  probe: () => probeApplicationHealth(http, `${APP_URL}/__constellation/health`),
+  launch: launchMeteor,
+  stop: stopOwnedProcess,
+  canLaunch: async () => !await probeServer(),
+  onOutput: (stream, chunk) => process[stream].write(`[meteor] ${chunk}`),
+  onState: (state, { attempts }) => {
+    if (state === 'restarting') console.warn(`[constellation] restarting the owned local server (attempt ${attempts}/3); keeping the window open`);
+    if (state === 'recovery-paused' || state === 'stop-unconfirmed') console.error('[constellation] local server recovery paused. Quit and reopen Constellation to retry.');
+    if (state === 'external-unavailable') console.warn('[constellation] the existing local server is unavailable. It was started outside this window and will not be restarted.');
+  },
+});
 
 function loadCredentialKey() {
   const supplied = process.env.CONSTELLATION_CONFIG_KEY;
@@ -68,55 +84,49 @@ function isAllowedExternalUrl(value) {
 }
 
 function probeServer() {
-  return new Promise((resolve) => {
-    const req = http.get(APP_URL, { timeout: 800 }, (response) => {
-      response.resume();
-      resolve(response.statusCode >= 200 && response.statusCode < 500);
-    });
-    req.on('timeout', () => {
-      req.destroy();
-      resolve(false);
-    });
-    req.on('error', () => resolve(false));
-  });
+  return probeListenerOccupancy(net, { host: '127.0.0.1', port: PORT });
 }
 
 async function waitForServer() {
   const startedAt = Date.now();
   while (Date.now() - startedAt < STARTUP_TIMEOUT_MS) {
-    if (await probeServer()) return;
-    if (meteorProcess?.exitCode !== null && meteorProcess?.exitCode !== undefined) {
-      throw new Error(`Meteor stopped during startup (exit ${meteorProcess.exitCode})`);
-    }
+    if (await probeApplicationHealth(http, `${APP_URL}/__constellation/health`)) return;
+    if (quitting) throw new Error('Constellation is quitting');
     await new Promise((resolve) => setTimeout(resolve, 450));
   }
   throw new Error(`Meteor did not become ready within ${STARTUP_TIMEOUT_MS / 1000}s`);
 }
 
 async function ensureMeteor() {
-  if (await probeServer()) return;
+  if (await probeServer()) {
+    serverRecovery.start();
+    await waitForServer();
+    return;
+  }
 
-  ownsMeteorProcess = true;
   const credentialKey = loadCredentialKey();
-  const env = {
+  // Reuse this exact environment on recovery. In particular, never generate a
+  // replacement credential key or lose keys inherited from the launch shell.
+  meteorEnvironment = {
     ...process.env,
     ROOT_URL: APP_URL,
     PORT: String(PORT),
     ...(credentialKey ? { CONSTELLATION_CONFIG_KEY: credentialKey } : {}),
   };
+  const child = launchMeteor();
+  serverRecovery.start({ process: child, ownsProcess: true });
+  await waitForServer();
+}
+
+function launchMeteor() {
+  if (quitting || !meteorEnvironment) throw new Error('Local server launch is unavailable.');
   meteorProcess = spawn('meteor', ['run', '--port', String(PORT)], {
     cwd: METEOR_APP,
-    env,
+    env: meteorEnvironment,
+    detached: process.platform !== 'win32',
     stdio: ['ignore', 'pipe', 'pipe'],
   });
-
-  meteorProcess.stdout.on('data', (chunk) => process.stdout.write(`[meteor] ${chunk}`));
-  meteorProcess.stderr.on('data', (chunk) => process.stderr.write(`[meteor] ${chunk}`));
-  meteorProcess.on('error', (error) => {
-    console.error('[constellation] could not start Meteor:', error.message);
-  });
-
-  await waitForServer();
+  return meteorProcess;
 }
 
 function buildMenu() {
@@ -206,6 +216,8 @@ async function createWindow() {
 app.whenReady().then(async () => {
   app.setName('Constellation');
   buildMenu();
+  powerMonitor.on('suspend', () => serverRecovery.suspend());
+  powerMonitor.on('resume', () => serverRecovery.resume());
   try {
     await ensureMeteor();
     await createWindow();
@@ -215,7 +227,7 @@ app.whenReady().then(async () => {
   }
 
   app.on('activate', async () => {
-    if (BrowserWindow.getAllWindows().length === 0) await createWindow();
+    if (!quitting && BrowserWindow.getAllWindows().length === 0) await createWindow();
   });
 });
 
@@ -223,7 +235,12 @@ app.on('window-all-closed', () => {
   if (process.platform !== 'darwin') app.quit();
 });
 
-app.on('before-quit', () => {
-  if (!ownsMeteorProcess || !meteorProcess || meteorProcess.killed) return;
-  meteorProcess.kill('SIGTERM');
+app.on('before-quit', (event) => {
+  if (quitAllowed) return;
+  event.preventDefault();
+  if (quitting) return;
+  quitting = true;
+  void serverRecovery.shutdown().catch(() => {
+    console.error('[constellation] local server shutdown was not confirmed.');
+  }).finally(() => { quitAllowed = true; app.quit(); });
 });

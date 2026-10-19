@@ -4,6 +4,10 @@ import { type Skill, type ToolSpec } from './tools';
 export interface PrepareToolRuntimeOptions {
     specs: ToolSpec[];
     skills?: Skill[];
+    conversation?: {
+        session: Pick<AgentSession, 'agent' | 'participants' | 'parent' | 'ephemeral'>;
+        agent: string;
+    };
     /** Configured Memory and the facts that decide whether this Session may
      * expose it. Presence protects the reserved names even for an ineligible
      * child/throwaway Session. */

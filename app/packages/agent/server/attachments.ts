@@ -14,8 +14,8 @@ import {
   withSessionOperationTransaction,
 } from './session-operations';
 
-/* Attachment store (§5): bytes in a side collection, separate from transcript rows.
- * Server-only — bytes leave only inside outbound payloads. */
+/* Attachment store (§5): metadata is separate from transcript rows. Bytes use
+ * Mongo by default, or the host's explicit server-only storage adapter. */
 
 // ---- The document ----------------------------------------------------------
 
@@ -29,8 +29,13 @@ export interface AgentAttachment {
   contentType: string;
   /** Decoded byte count, computed at write time (never trusted from provider). */
   size: number;
-  /** The bytes, base64. Decode-validity verified at write time. */
-  content: string;
+  /** Legacy/default Mongo bytes. Absent for externally stored attachments. */
+  content?: string;
+  /** Server-only locator. Never include credentials, signed URLs or file bytes. */
+  storageProvider?: string;
+  storageReference?: AttachmentStorageReference;
+  /** Binds externally stored immutable bytes to this metadata row. */
+  contentSha256?: string;
   origin: 'inbound' | 'tool';
   /** Present only while awaiting the turn-final flush: `attach: true` marks
    *  the row staged; the loop's commit claims it (an atomic unstage per row —
@@ -52,6 +57,163 @@ export interface AttachmentModifier {
 export const AgentAttachments =
   new Mongo.Collection<AgentAttachment>(NAMES.attachments) as unknown as
     TypedCollection<AgentAttachment, string | AttachmentQuery, AttachmentModifier>;
+
+/** Small, non-secret provider locator. No nested payloads or embedded bytes. */
+export type AttachmentStorageReference = Record<string, string | number | boolean | null>;
+export interface AttachmentStorageMetadata {
+  id: string;
+  sessionId: string;
+  name: string;
+  contentType: string;
+  size: number;
+  sha256: string;
+}
+export interface AttachmentStorageContext {
+  signal: AbortSignal;
+  /** Renew/check the Session erasure fence immediately before external I/O. */
+  assertActive(): Promise<void>;
+}
+export interface AttachmentStorageAdapter {
+  name: string;
+  /** Must be immutable/idempotent: never replace other bytes at an existing
+   * locator. A content-addressed path avoids cross-process retry races. */
+  write(input: AttachmentStorageMetadata & { content: string }, context: AttachmentStorageContext): Promise<AttachmentStorageReference>;
+  read(input: AttachmentStorageMetadata & { storageReference: AttachmentStorageReference }, context: AttachmentStorageContext): Promise<string>;
+}
+
+let storageAdapter: AttachmentStorageAdapter | null = null;
+
+/** Configure at server startup. Null restores the framework's default Mongo
+ * store; it does not migrate existing external metadata back into Mongo. */
+export function configureAttachmentStorage(adapter: AttachmentStorageAdapter | null): void {
+  if (adapter === null) { storageAdapter = null; return; }
+  if (!adapter || typeof adapter.name !== 'string' || !/^[a-z][a-z0-9_-]{0,63}$/.test(adapter.name)
+    || typeof adapter.write !== 'function' || typeof adapter.read !== 'function') {
+    throw new Meteor.Error('attachment-storage-invalid', 'Provide a named attachment storage adapter with write and read methods.');
+  }
+  storageAdapter = Object.freeze({ name: adapter.name, write: adapter.write.bind(adapter), read: adapter.read.bind(adapter) });
+}
+
+function safeReference(value: unknown): AttachmentStorageReference {
+  if (!value || typeof value !== 'object' || Array.isArray(value)
+    || ![Object.prototype, null].includes(Object.getPrototypeOf(value))) {
+    throw new Meteor.Error('attachment-storage-invalid', 'Attachment storage returned an invalid locator.');
+  }
+  const entries = Object.entries(value);
+  if (!entries.length || entries.length > 16 || entries.some(([key, item]) => !/^[a-zA-Z][a-zA-Z0-9_]{0,63}$/.test(key)
+    || /token|secret|password|authorization|cookie|credential|content|base64|payload|bytes/i.test(key)
+    || !['string', 'number', 'boolean'].includes(typeof item) && item !== null
+    || typeof item === 'number' && !Number.isFinite(item)
+    || typeof item === 'string' && (item.length > 1024 || /[\x00-\x1f\x7f]/.test(item) || /^[a-z][a-z0-9+.-]*:\/\//i.test(item)))) {
+    throw new Meteor.Error('attachment-storage-invalid', 'Attachment locators must contain only bounded, non-secret metadata.');
+  }
+  const reference = Object.fromEntries(entries) as AttachmentStorageReference;
+  if (Buffer.byteLength(JSON.stringify(reference)) > 4096) throw new Meteor.Error('attachment-storage-invalid', 'The attachment locator is too large.');
+  return reference;
+}
+
+const contentHash = (content: string): string => createHash('sha256').update(Buffer.from(content, 'base64')).digest('hex');
+const storageMetadata = (row: Pick<AgentAttachment, '_id' | 'sessionId' | 'name' | 'contentType' | 'size' | 'contentSha256'>): AttachmentStorageMetadata => ({
+  id: row._id, sessionId: row.sessionId, name: row.name, contentType: row.contentType, size: row.size, sha256: row.contentSha256 ?? '',
+});
+const storageContext = (operation: SessionOperation): AttachmentStorageContext => ({ signal: operation.signal, assertActive: () => operation.assertActive() });
+
+function verifiedContent(content: unknown, size: number, sha256?: string): string {
+  if (typeof content !== 'string' || !Number.isSafeInteger(size) || size < 0
+    || content.length > Math.ceil(size / 3) * 4 + 2 || decodedBase64Size(content) !== size) {
+    throw new Meteor.Error('attachment-storage-unavailable', 'Attachment bytes are unavailable or do not match their metadata.');
+  }
+  const normalized = content.replace(/[\r\n]/g, '');
+  if (Buffer.from(normalized, 'base64').toString('base64') !== normalized || (sha256 && contentHash(normalized) !== sha256)) {
+    throw new Meteor.Error('attachment-storage-unavailable', 'Attachment bytes do not match the saved file.');
+  }
+  return normalized;
+}
+
+async function writeExternal(
+  adapter: AttachmentStorageAdapter, row: AgentAttachment, content: string, operation: SessionOperation,
+): Promise<AttachmentStorageReference> {
+  const metadata = storageMetadata(row); const context = storageContext(operation);
+  await operation.assertActive();
+  let locator: AttachmentStorageReference;
+  try { locator = await adapter.write({ ...metadata, content }, context); }
+  catch (error) {
+    // Recognize the adapter's code, never forward its potentially secret-bearing
+    // reason/details into a transcript or public error.
+    if (error instanceof Meteor.Error && error.error === 'attachment-storage-required') {
+      throw new Meteor.Error('attachment-storage-required', 'Enable file storage for this conversation before saving attachments.');
+    }
+    throw new Meteor.Error('attachment-storage-write-failed', 'The attachment could not be saved to external storage. Its contents were not stored in Mongo.');
+  }
+  const reference = safeReference(locator);
+  await operation.assertActive();
+  try { verifiedContent(await adapter.read({ ...metadata, storageReference: reference }, context), row.size, row.contentSha256); }
+  catch { throw new Meteor.Error('attachment-storage-write-failed', 'The saved attachment could not be verified. Its contents were not stored in Mongo.'); }
+  await operation.assertActive();
+  if (storageAdapter !== adapter) throw new Meteor.Error('attachment-storage-changed', 'Attachment storage changed. Retry this operation.');
+  return reference;
+}
+
+/** Resolve only an authoritative row in the supplied Session. A forged locator
+ * or bytes on the caller's object are never used. Reads hold the lifecycle fence
+ * across remote I/O; callers remain responsible for their user authorization. */
+export async function readAttachmentContent(row: Pick<AgentAttachment, '_id' | 'sessionId'>): Promise<string> {
+  if (typeof row?._id !== 'string' || typeof row?.sessionId !== 'string') throw new Meteor.Error('attachment-invalid', 'Choose a stored attachment.');
+  const operation = await beginSessionMutationOperation(row.sessionId);
+  if (!operation) throw new Meteor.Error('attachment-unavailable', 'This attachment conversation is no longer available.');
+  try {
+    const stored = await AgentAttachments.findOneAsync({ _id: row._id, sessionId: row.sessionId });
+    if (!stored) throw new Meteor.Error('attachment-unavailable', 'This attachment is not available in this conversation.');
+    await operation.assertActive();
+    if (stored.storageProvider !== undefined || stored.storageReference !== undefined) {
+      const adapter = storageAdapter;
+      if (!adapter || adapter.name !== stored.storageProvider || !stored.storageReference
+        || typeof stored.contentSha256 !== 'string' || !/^[a-f0-9]{64}$/.test(stored.contentSha256)) {
+        throw new Meteor.Error('attachment-storage-unavailable', 'This attachment’s storage is not connected.');
+      }
+      let content: string;
+      try { content = verifiedContent(await adapter.read({ ...storageMetadata(stored), storageReference: safeReference(stored.storageReference) }, storageContext(operation)), stored.size, stored.contentSha256); }
+      catch { throw new Meteor.Error('attachment-storage-unavailable', 'This attachment could not be read from external storage.'); }
+      await operation.assertActive(); return content;
+    }
+    return verifiedContent(stored.content, stored.size, stored.contentSha256);
+  } finally { await operation.close(); }
+}
+
+/** Explicit host migration. Remote bytes are written and read back before the
+ * old bytes are atomically replaced by their locator; a failed verification,
+ * erasure fence or concurrent row change never removes the original content. */
+export async function migrateAttachmentContent(input: { id: string; sessionId: string }): Promise<AttachmentRef> {
+  const adapter = storageAdapter;
+  if (!adapter) throw new Meteor.Error('attachment-storage-required', 'Configure external attachment storage before migrating.');
+  if (typeof input?.id !== 'string' || typeof input?.sessionId !== 'string') throw new Meteor.Error('attachment-invalid', 'Choose a stored attachment.');
+  const operation = await beginSessionMutationOperation(input.sessionId);
+  if (!operation) throw new Meteor.Error('attachment-unavailable', 'This attachment conversation is no longer available.');
+  try {
+    const row = await AgentAttachments.findOneAsync({ _id: input.id, sessionId: input.sessionId });
+    if (!row) throw new Meteor.Error('attachment-unavailable', 'This attachment is not available in this conversation.');
+    if (row.storageProvider || row.storageReference) {
+      await readAttachmentContent(row); return refOf(row);
+    }
+    const content = verifiedContent(row.content, row.size); const sha256 = contentHash(content);
+    const reference = await writeExternal(adapter, { ...row, contentSha256: sha256 }, content, operation);
+    let changed = false;
+    await withSessionOperationTransaction(operation, async (mongoSession) => {
+      const result = await AgentAttachments.rawCollection().updateOne({ _id: row._id, sessionId: row.sessionId, content: row.content,
+        storageProvider: { $exists: false }, storageReference: { $exists: false }, size: row.size },
+      { $set: { storageProvider: adapter.name, storageReference: reference, contentSha256: sha256 }, $unset: { content: 1 } }, { session: mongoSession });
+      changed = result.matchedCount === 1;
+    });
+    if (!changed) {
+      const current = await AgentAttachments.findOneAsync({ _id: row._id, sessionId: row.sessionId });
+      if (!current || current.storageProvider !== adapter.name || current.contentSha256 !== sha256 || current.content !== undefined) {
+        throw new Meteor.Error('attachment-storage-conflict', 'The attachment changed during migration. Its original contents were not removed.');
+      }
+      await readAttachmentContent(current);
+    }
+    return refOf(row);
+  } finally { await operation.close(); }
+}
 
 // ---- Caps ------------------------------------------------------------------
 
@@ -161,7 +323,7 @@ async function createAttachmentActive(
     if (decoded === null) {
       throw new Meteor.Error('attachment-invalid', `"${name}" is not valid base64 content`);
     }
-    content = b64.replace(/[\r\n]/g, '');
+    content = Buffer.from(b64.replace(/[\r\n]/g, ''), 'base64').toString('base64');
     size = decoded;
   }
 
@@ -171,6 +333,24 @@ async function createAttachmentActive(
       'attachment-too-large',
       `"${name}" is ${prettySize(size)}; the per-file limit is ${prettySize(caps.maxFileBytes)}`,
     );
+  }
+
+  // Derive before any external I/O: completed tool retries adopt their original
+  // immutable attachment without uploading or replacing it again.
+  const _id = toolCallId !== undefined
+    ? `att${createHash('sha256').update(`${sessionId}:${toolCallId}:${name}`).digest('hex').slice(0, 24)}`
+    : `att${Random.id()}`;
+  const adopt = async (existing: AgentAttachment): Promise<AttachmentRef> => {
+    if (attach && !existing.staged) {
+      await withSessionOperationTransaction(operation, async (mongoSession) => {
+        await AgentAttachments.rawCollection().updateOne({ _id, sessionId }, { $set: { staged: true } }, { session: mongoSession });
+      });
+    }
+    await operation.assertActive(); return refOf(existing);
+  };
+  if (toolCallId !== undefined) {
+    const existing = await AgentAttachments.findOneAsync({ _id, sessionId });
+    if (existing) return adopt(existing);
   }
   if (attach) {
     // Per-message caps against the staged set. Tolerant: two parallel calls
@@ -193,18 +373,18 @@ async function createAttachmentActive(
     }
   }
 
-  // Derived id for idempotency; session is in the hash because tool-call
-  // ids are only unique within one response.
-  const _id = toolCallId !== undefined
-    ? `att${createHash('sha256').update(`${sessionId}:${toolCallId}:${name}`).digest('hex').slice(0, 24)}`
-    : `att${Random.id()}`;
-
+  const adapter = storageAdapter;
   const doc: AgentAttachment = {
-    _id, sessionId, name, contentType, size, content,
+    _id, sessionId, name, contentType, size,
+    ...(adapter ? { contentSha256: contentHash(content) } : { content }),
     origin: toolCallId !== undefined ? 'tool' : 'inbound',
     ...(attach ? { staged: true as const } : {}),
     createdAt: new Date(),
   };
+  if (adapter) {
+    doc.storageReference = await writeExternal(adapter, doc, content, operation);
+    doc.storageProvider = adapter.name;
+  }
   if (await insertAttachmentOrLose(operation, doc)) return refOf(doc);
 
   // Race loser adopts. Re-stage if the existing row lost its staged flag
@@ -214,10 +394,7 @@ async function createAttachmentActive(
     // Hash collision — unreachable in practice; refuse loudly.
     throw new Meteor.Error('attachment-conflict', `attachment id collision for "${name}"`);
   }
-  if (attach && !existing.staged) {
-    await AgentAttachments.updateAsync({ _id, sessionId }, { $set: { staged: true } });
-  }
-  return refOf(existing);
+  return adopt(existing);
 }
 
 /** Insert one file and return its ref. Enforces per-file cap always, and
@@ -266,9 +443,11 @@ export async function hydrateRefs(
     // eslint-disable-next-line no-await-in-loop
     const row = await AgentAttachments.findOneAsync({ _id: ref.id, sessionId });
     if (row) {
-      attachments.push({
-        name: row.name, contentType: row.contentType, size: row.size, content: row.content,
-      });
+      try {
+        // eslint-disable-next-line no-await-in-loop
+        const content = await readAttachmentContent(row);
+        attachments.push({ name: row.name, contentType: row.contentType, size: row.size, content });
+      } catch { missing.push(ref); }
     } else {
       missing.push(ref);
     }
@@ -375,8 +554,12 @@ export async function hydrateImageRefs(
       // eslint-disable-next-line no-await-in-loop
       const stored = await AgentAttachments.findOneAsync({ _id: ref.id, sessionId });
       if (!stored) continue;
+      let content: string;
+      // Missing external storage must not break the entire conversation. As for
+      // an expired reference, omit the unavailable image instead of stale bytes.
+      try { content = await readAttachmentContent(stored); } catch { continue; }
       (target.images ??= []).push({
-        data: stored.content,
+        data: content,
         mimeType: stored.contentType.split(';')[0].trim(),
       });
       attached = true;
@@ -452,6 +635,10 @@ export const readTool: InlineTool = {
           reason: 'too-large',
         };
       }
+      if (row.storageProvider || row.storageReference) {
+        try { await readAttachmentContent(row); }
+        catch { return { unavailable: true, id: row._id, name: row.name, reason: 'storage-unavailable' }; }
+      }
       ctx.attachToResult({
         id: row._id, name: row.name, contentType: row.contentType, size: row.size,
       });
@@ -463,7 +650,10 @@ export const readTool: InlineTool = {
     if (!isTextLike(row.contentType)) {
       return { binary: true, name: row.name, contentType: row.contentType, size: row.size };
     }
-    const text = Buffer.from(row.content, 'base64').toString('utf8');
+    let content: string;
+    try { content = await readAttachmentContent(row); }
+    catch { return { unavailable: true, id: row._id, name: row.name, reason: 'storage-unavailable' }; }
+    const text = Buffer.from(content, 'base64').toString('utf8');
     if (text.length > READ_TEXT_CAP) {
       return {
         name: row.name,

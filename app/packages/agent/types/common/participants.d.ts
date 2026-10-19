@@ -34,6 +34,16 @@ export declare function participantByIdentity(session: Roster, kind: string, ext
 /** The human roster row an ACCOUNT matches, or undefined. Null never matches a
  *  member — the anonymous rule is the owner's alone (§4.2). */
 export declare function participantByUserId(session: Roster, userId: string | null): SessionParticipant | undefined;
+/** Friendly names are aliases, never new identities. Ambiguous names, names
+ * requiring escaping, and aliases that shadow another canonical agent fall
+ * back to the existing handle. Client suggestions and server routing share
+ * this exact rule, including case-insensitive friendly-name matching. */
+export declare function modelMentionHandles(session: Roster): Array<{
+    participant: SessionParticipant;
+    handle: string;
+}>;
+/** Exact canonical names retain priority and backwards compatibility. */
+export declare function modelParticipantByHandle(session: Roster, handle: string): SessionParticipant | undefined;
 /** Resolve addressee: explicit `to` wins, else leading `@`, else null.
  *  Only model participants resolve. */
 export declare function resolveAddressee(text: string | undefined, to: string | undefined, session: Roster): {

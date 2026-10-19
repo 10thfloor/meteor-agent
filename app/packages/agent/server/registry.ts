@@ -14,6 +14,7 @@ import type { RunConfig } from './loop';
 import { piAiProvider } from './providers/piai';
 import { resolveExperienceConfig, resolvePracticeConfig } from './learning';
 import { assertLearningNamesFree } from './learning-tools';
+import { assertHandoffNameFree } from './handoff';
 
 /** Stable identity configuration supplied by application code. The runtime
  * registry name is authoritative and is added by `buildRunConfig`; making it a
@@ -21,6 +22,8 @@ import { assertLearningNamesFree } from './learning-tools';
 export type AgentIdentityConfig = Omit<IdentityConfig, 'name'>;
 
 export interface AgentConfig {
+  /** Developer-published definition version used by pinned delegation edges. */
+  version?: string;
   /** `<pi-ai provider>/<model id>`, e.g. `anthropic/claude-sonnet-5`, unless a
    *  custom `provider` gives the string its own meaning. */
   model: string;
@@ -324,6 +327,8 @@ export function resolveMemory(memory?: MemoryConfig): ResolvedMemory | undefined
 }
 
 export function defineAgent(name: string, config: AgentConfig): void {
+  if (config.version !== undefined && (typeof config.version !== 'string'
+    || !config.version.trim() || config.version.length > 128)) throw new Error('Agent version must be 1-128 characters.');
   // Validate BEFORE registering, so a bad config leaves no half-usable agent
   // behind: a config error is a startup error, not a runtime one.
   resolveBudget(config.budget);
@@ -382,6 +387,7 @@ export function defineAgent(name: string, config: AgentConfig): void {
   // The three model-facing names are reserved the way SKILL_TOOL_NAME is: a
   // collision is decidable here, at define time, where the operator can see it.
   if (memory) assertMemoryNamesFree(config.tools);
+  assertHandoffNameFree(config.tools ?? []);
   if (experience || practice) assertLearningNamesFree(config.tools);
   registry.set(name, config);
   // Registering the UI caps is LATCHED, not per-agent: Meteor.methods throws
@@ -432,6 +438,7 @@ export function buildRunConfig(
   const practice: ResolvedPractice | undefined = resolvePracticeConfig(config.practice);
   return {
     model: config.model,
+    ...(config.version !== undefined ? { version: config.version } : {}),
     system: buildSystemPrompt(config, { userId }),
     tools: config.tools ?? [],
     provider: resolveProvider(config.provider),

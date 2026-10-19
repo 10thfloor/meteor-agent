@@ -1,0 +1,117 @@
+.mission-files { position: relative; container-type: inline-size; min-width: 0; min-height: 0; height: 100%; overflow: hidden; }
+.mission-file-browser { display: flex; flex-direction: column; min-width: 0; min-height: 0; height: 100%; }
+.mission-files .toolbar-button { height: 34px; min-height: 34px; gap: 7px; font-size: 12px; }
+.mission-files .toolbar-button.icon-only { width: 34px; padding: 0; justify-content: center; flex: none; }
+.mission-files svg { width: 16px; height: 16px; flex: none; fill: none; stroke: currentColor; stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; }
+.mission-files button:focus-visible,.mission-files input:focus-visible,.mission-files textarea:focus-visible { outline: 2px solid var(--signal); outline-offset: 2px; }
+.mission-files button:disabled { cursor: not-allowed; }
+.mission-files-sr { position: absolute; width: 1px; height: 1px; padding: 0; overflow: hidden; clip: rect(0,0,0,0); white-space: nowrap; }
+.mission-files-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px 16px; padding: 13px 18px; border-bottom: 1px solid var(--line); flex: none; }
+.mission-files-primary-controls { display: flex; align-items: center; gap: 7px; flex: none; }
+.mission-files-breadcrumbs { flex: 1; min-width: 160px; }
+.mission-files-breadcrumbs ol { display: flex; align-items: center; flex-wrap: wrap; gap: 2px; list-style: none; padding: 0; margin: 0; }
+.mission-files-breadcrumbs li { display: flex; align-items: center; min-width: 0; }
+.mission-files-breadcrumbs li + li::before { content: '›'; padding: 0 5px; color: var(--muted); font-size: 16px; }
+.mission-files-breadcrumbs .toolbar-button { height: 30px; min-height: 30px; padding: 0 5px; border-color: transparent; background: transparent; max-width: 240px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 13px; }
+.mission-files-breadcrumbs [aria-current] { color: var(--paper); opacity: 1; cursor: default; }
+.mission-files-manage-toolbar { display: flex; align-items: center; gap: 8px; padding: 10px 18px; flex: none; border-bottom: 1px solid var(--line); }
+.mission-files-search { display: flex; align-items: center; gap: 8px; min-width: 0; width: 260px; max-width: 100%; margin: 0 !important; color: var(--muted); }
+.mission-files-search input { min-width: 0; width: 100%; min-height: 30px; height: 30px; padding: 4px 0; font: inherit; font-size: 13px; color: var(--paper); background: transparent; border: 0; border-radius: 4px; }
+.mission-files-search input::placeholder { color: var(--muted); }
+.mission-files-footer { display: flex; align-items: center; flex-wrap: wrap; gap: 6px 14px; padding: 8px 16px; border-top: 1px solid var(--line); color: var(--muted); font-size: 12px; flex: none; }
+.mission-files-folder-path { min-width: 0; max-width: 45%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; }
+.mission-files-utilities { display: flex; align-items: center; gap: 4px; margin-left: auto; }
+.mission-files-utilities .toolbar-button { justify-content: flex-start; border-color: transparent; background: transparent; text-align: left; gap: 7px; padding: 0 7px; height: 30px; min-height: 30px; }
+.mission-files-utilities .toolbar-button:hover:not(:disabled) { background: var(--ink-3); border-color: var(--line); }
+.mission-files-notice,.mission-files-history { margin: 0; padding: 11px 18px; color: var(--muted); border-bottom: 1px solid var(--line); font-size: 13px; }
+.mission-files-history { display: flex; align-items: center; justify-content: space-between; gap: 14px; background: rgba(233,166,79,.05); }
+.mission-files-notice[role="alert"] { color: var(--amber, #efb76b); }
+.mission-files-split { display: grid; grid-template-columns: minmax(0,1fr); flex: 1; min-height: 0; }
+.mission-files-split[data-preview="true"] { grid-template-columns: minmax(220px,38%) minmax(0,1fr); }
+.mission-files-list-pane { overflow: auto; min-width: 0; padding: 8px 12px; }
+.mission-files-list { list-style: none; padding: 0; margin: 0; }
+.mission-files-list li { display: flex; align-items: center; min-width: 0; gap: 4px; border-radius: 7px; }
+.mission-files-list li:hover { background: rgba(255,255,255,.025); }
+.mission-files-list li > [data-file-key] { min-width: 0; flex: 1; display: flex; align-items: center; gap: 10px; padding: 9px 10px; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--paper); text-align: left; font: inherit; font-size: 13px; min-height: 40px; }
+.mission-files-list [data-file-key]:hover { background: rgba(255,255,255,.035); }
+.mission-files-list [aria-pressed="true"] { background: rgba(233,166,79,.08); border-color: rgba(233,166,79,.25); }
+.mission-file-row-actions { display: flex; align-items: center; justify-content: center; width: 30px; height: 32px; padding: 0; flex: none; border: 1px solid transparent; border-radius: 7px; background: transparent; color: var(--muted); }
+.mission-file-row-actions:hover,.mission-file-row-actions[aria-expanded="true"] { background: var(--ink-3); border-color: var(--line); color: var(--paper); }
+.mission-file-icon { display: flex; align-items: center; color: var(--muted); flex: none; }
+.mission-file-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mission-files-list small { color: var(--muted); white-space: nowrap; font-size: 12px; }
+.mission-files-more { width: 100%; margin-top: 10px; }
+.mission-files-menu { position: absolute; z-index: 35; width: 210px; max-width: calc(100% - 16px); padding: 5px; border: 1px solid var(--line); border-radius: 9px; background: var(--ink-2, #171c19); box-shadow: 0 8px 28px #0005; }
+.mission-files-menu button { display: flex; align-items: center; width: 100%; gap: 9px; padding: 8px 10px; height: 34px; border: 0; border-radius: 5px; background: transparent; color: var(--paper); text-align: left; font: inherit; font-size: 13px; }
+.mission-files-menu button:hover:not(:disabled) { background: var(--ink-3, #273029); }
+.mission-files-menu .mission-files-delete { color: var(--danger, #e58880); }
+.mission-files-menu hr { border: 0; border-top: 1px solid var(--line); margin: 5px 4px; }
+.mission-files-menu p { padding: 6px 10px; margin: 0; font-size: 12px; }
+.mission-file-rename { display: flex; align-items: center; flex-wrap: wrap; flex: 1; gap: 5px; padding: 4px 8px; }
+.mission-file-rename input { flex: 1; min-width: 70px; width: 100px; height: 32px; padding: 5px 8px; border: 1px solid var(--signal); border-radius: 6px; background: var(--ink-1, #101410); color: var(--paper); font: inherit; font-size: 13px; }
+.mission-file-rename p { flex-basis: 100%; margin: 4px 0; color: var(--amber, #efb76b); font-size: 12px; }
+.mission-file-viewer { min-width: 0; min-height: 0; display: flex; flex-direction: column; overflow: auto; border-left: 1px solid var(--line); }
+.mission-file-viewer > header { display: flex; flex-wrap: wrap; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--line); align-items: center; justify-content: space-between; }
+.mission-file-viewer > header > div { display: flex; gap: 7px; align-items: center; flex-wrap: wrap; }
+.mission-file-viewer > header > div:first-child { flex-direction: column; align-items: flex-start; gap: 3px; min-width: 0; overflow-wrap: anywhere; }
+.mission-file-viewer [data-files="viewer-name"] { font-size: 14px; font-weight: 600; line-height: 1.5; }
+.mission-file-viewer small { color: var(--muted); font-size: 12px; line-height: 1.5; }
+.mission-file-viewer [data-files="viewer-notice"] { margin: 0; padding: 12px 16px; color: var(--muted); font-size: 13px; }
+.mission-file-content { min-width: 0; padding: 16px; overflow: auto; }
+.mission-file-content pre { margin: 0; white-space: pre; font-size: 13px; line-height: 1.65; tab-size: 2; }
+.mission-file-content img { display: block; max-width: 100%; max-height: 65vh; object-fit: contain; }
+.mission-file-empty { color: var(--muted); margin: auto; padding: 36px 24px; text-align: center; font-size: 13px; }
+.mission-file-truncated { color: var(--amber, #efb76b); font-size: 12px; margin: 0 0 18px; }
+.mission-files-action-overlay { position: absolute; inset: 0; z-index: 40; display: flex; justify-content: center; align-items: center; padding: 18px; background: #080c0a9c; }
+.mission-files-action-panel { width: 410px; max-width: 100%; max-height: 100%; overflow: auto; padding: 18px; border: 1px solid var(--line); border-radius: 12px; background: var(--ink-2, #171c19); box-shadow: 0 12px 32px #0005; }
+.mission-files-action-panel > header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin-bottom: 14px; }
+.mission-files-action-panel h3 { margin: 0; font-size: 15px; font-weight: 600; line-height: 1.5; overflow-wrap: anywhere; }
+.mission-files-action-panel [data-files="close-action"] { width: 28px; height: 28px; min-height: 28px; background: transparent; border-color: transparent; }
+.mission-files-action-panel [data-files="action-error"] { color: var(--amber, #efb76b); font-size: 13px; line-height: 1.5; margin: 0 0 12px; }
+.mission-files-action-hint { color: var(--muted); font-size: 13px; line-height: 1.5; margin: 0 0 14px; }
+.mission-files-action-buttons { display: flex; justify-content: flex-end; flex-direction: row-reverse; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 16px; }
+.mission-files-action-field { display: flex; flex-direction: column; gap: 7px; font-size: 13px; margin: 0 0 16px !important; }
+.mission-files-action-field input { box-sizing: border-box; padding: 8px 10px; min-height: 36px; font: inherit; font-size: 13px; width: 100%; color: var(--paper); background: #0c110e80; border: 1px solid var(--line); border-radius: 7px; }
+.mission-files-action-panel .primary-action,.mission-files-editor-toolbar .primary-action,.mission-files-action-panel .danger-button { min-height: 34px; height: 34px; padding: 0 12px; font-size: 12px; }
+.mission-files-delete-target { display: block; overflow-wrap: anywhere; margin: 0 0 14px; color: var(--paper); font-size: 12px; }
+.mission-files-destination { border: 1px solid var(--line); border-radius: 8px; margin-bottom: 12px; padding: 10px; }
+.mission-files-destination-label { color: var(--muted); font-size: 12px; }
+.mission-files-destination nav { display: flex; align-items: center; flex-wrap: wrap; gap: 3px; padding: 5px 0; border-bottom: 1px solid var(--line); }
+.mission-files-destination nav .toolbar-button { border: 0; padding: 0 6px; background: transparent; height: 28px; min-height: 28px; }
+.mission-files-destination nav .toolbar-button + .toolbar-button::before { content: '›'; color: var(--muted); margin-right: 4px; }
+.mission-files-destination nav [aria-current] { opacity: 1; color: var(--paper); cursor: default; }
+.mission-files-destination-folders { max-height: 160px; overflow: auto; padding-top: 5px; }
+.mission-files-destination-folders .toolbar-button { width: 100%; border-color: transparent; background: transparent; justify-content: flex-start; }
+.mission-files-destination-folders .toolbar-button:hover { background: var(--ink-3); }
+.mission-files-destination p { color: var(--muted); font-size: 12px; margin: 8px 2px 2px; }
+.mission-files-destination p:empty { display: none; }
+.mission-files-enable { margin: auto; padding: 32px; max-width: 480px; text-align: center; }
+.mission-files-enable h3 { margin: 0 0 10px; font-size: 16px; }
+.mission-files-enable p { margin: 0 0 20px; color: var(--muted); font-size: 13px; line-height: 1.6; }
+.mission-files-enable .primary-action { min-height: 36px; height: 36px; padding: 0 14px; font-size: 13px; margin-inline: auto; justify-content: center; }
+.mission-files-draft-banner { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 10px 18px; padding: 10px 12px; background: #f0a35a08; border: 1px solid #f0a35a40; border-radius: 8px; font-size: 13px; }
+.mission-file-content:has(.mission-file-editor) { display: flex; flex: 1; min-height: 180px; padding: 14px; }
+.mission-file-editor { width: 100%; min-height: 200px; height: 100%; flex: 1; resize: none; padding: 12px 14px; border: 1px solid var(--line); border-radius: 8px; background: var(--ink-1, #101410); color: var(--paper); font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 13px; line-height: 1.65; tab-size: 2; white-space: pre; overflow-wrap: normal; }
+.mission-files-editor-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; padding: 12px 16px 0; font-size: 12px; color: var(--muted); }
+.mission-files-editor-toolbar > div { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+@container (max-width: 640px) {
+  .mission-files-toolbar { padding: 12px; }
+  .mission-files-breadcrumbs { flex-basis: 100%; }
+  .mission-files-primary-controls { width: 100%; }
+  .mission-files-primary-controls [data-files="refresh"] { margin-left: auto; }
+  .mission-files-split[data-preview="true"] { grid-template-columns: minmax(0,1fr); }
+  .mission-files-split[data-preview="true"] .mission-files-list-pane { display: none; }
+  .mission-file-viewer { border-left: 0; }
+  .mission-files-footer { padding: 8px 12px; }
+  .mission-files-folder-path { display: none; }
+  .mission-files-utilities .toolbar-button { font-size: 11px; }
+}
+@media (pointer: coarse) { .mission-files-menu button,.mission-file-row-actions,.mission-files-primary-controls .toolbar-button { min-height: 44px; height: 44px; } .mission-file-row-actions { width: 44px; } }
+.mission-files [hidden] { display: none !important; }
+.mission-files button[data-loading="true"] { color: var(--paper) !important; -webkit-text-fill-color: currentColor; }
+.mission-files [data-loading="true"]::before { content: ''; position: static; display: inline-block; width: 12px; height: 12px; margin: 0 8px 0 0; border: 1.5px solid currentColor; border-right-color: transparent; border-radius: 50%; vertical-align: -1px; animation: mission-files-spin .8s linear infinite; }
+.mission-files button[data-loading="true"]::after { content: none; display: none; }
+.mission-files [data-files="refresh"][data-loading="true"]::before { content: none; }
+.mission-files [data-files="refresh"][data-loading="true"] svg { animation: mission-files-spin .8s linear infinite; }
+@keyframes mission-files-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .mission-files [data-loading="true"]::before,.mission-files [data-files="refresh"][data-loading="true"] svg { animation: none; } .mission-files button { transition: none; } }

@@ -4,7 +4,7 @@ import { DECIDED_PHASES, type ResolvedMemory } from '../common/types';
 import { memoryBlock, memoryHint } from './memory';
 import type { IdentityConfig, ResolvedExperience, ResolvedPractice } from '../common/learning';
 import {
-  modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
+  assistantAnswers, modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
   unroutedMention,
 } from '../common/participants';
 import { systemRowId } from './system-turn';
@@ -51,11 +51,18 @@ import {
   LearningIntegrityError, prepareTurnLearning, type TurnLearningSnapshot,
 } from './learning-runtime';
 import { recordProviderRequestDigest } from './learning';
+import {
+  captureTurnManifest, evidenceTask, finishAgentTrace, startAgentTrace,
+} from './evidence';
+import { captureObservations, queueObservationReflection } from './observations';
+import { applySubagentBudget } from './subagent';
+import { getAgent } from './registry';
 
 // `runTurn` passes itself to `dispatchCalls`/`resumeParkedTurn` (see the RunTurn
 // note in `./dispatch`); `DispatchLimits` is the bundle it builds for them.
 
 export interface RunConfig {
+  version?: string;
   model: string;
   system: string;
   tools: ToolSpec[];
@@ -141,6 +148,8 @@ export async function runTurn(
   expected?: SessionQuery,
 ): Promise<void> {
   let owned = false;
+  let traceId: string | undefined;
+  let traceFailed = false;
   // Strip-and-degrade latch (§9): one retry with images stripped if a
   // provider refuses an image the byte gate passed.
   let imagesStripped = false;
@@ -158,9 +167,27 @@ export async function runTurn(
     }, HEARTBEAT_MS);
 
     try {
-      const config = typeof configOrFactory === 'function'
+      let config = typeof configOrFactory === 'function'
         ? configOrFactory()
         : configOrFactory;
+      const scopedSession = await AgentSessions.findOneAsync(sessionId);
+      const delegation = scopedSession?.delegation;
+      if (delegation?.version !== undefined && config.version !== delegation.version) {
+        await commitLeasedMessage(sessionId, { _id: Random.id(), role: 'note', kind: 'error',
+          error: { error: 'subagent-version-changed', reason: 'The delegated agent version changed. Start a new delegation.' },
+          createdAt: new Date() }, { set: { phase: 'error' }, unset: { pending: 1 }, unlessStopped: true });
+        return;
+      }
+      config = applySubagentBudget(config, delegation?.budget);
+      if (delegation?.version !== undefined && scopedSession) {
+        const originalCanUse = config.canUse;
+        const childAgent = scopedSession.agent;
+        const pinnedVersion = delegation.version;
+        config = { ...config, canUse: async (tool, context) => {
+          if (getAgent(childAgent)?.version !== pinnedVersion) return false;
+          return originalCanUse ? await originalCanUse(tool, context) : true;
+        } };
+      }
       const maxIterations = config.maxIterations ?? 10;
       const flushMs = config.flushMs ?? 60;
       // 256 KiB per Turn. Generous by design: the largest argument payload any
@@ -265,6 +292,7 @@ export async function runTurn(
       // built-in name precedence, so those two views cannot drift.
       const prepared = await prepareToolRuntime({
         specs: config.tools,
+        conversation: { session: entry, agent: selfAgent },
         skills: config.skills,
         memory: config.memory
           ? {
@@ -289,6 +317,15 @@ export async function runTurn(
         reserveLearningNames: !!(config.experience || config.practice),
       });
       const { tools, schemas } = prepared;
+      const trace = await evidenceTask(() => startAgentTrace({ sessionId, agent: selfAgent,
+        ...(learning ? { agentId: learning.agentId, memoryFrameId: learning.memoryFrameId,
+          triggerSeq: learning.triggerSeq } : {}) }));
+      traceId = trace?._id;
+      if (traceId) await evidenceTask(async () => captureTurnManifest({
+        traceId: traceId!, sessionId, agent: selfAgent, model: config.model, tools, skills: config.skills,
+        frame: learning?.frame,
+        messages: await AgentMessages.find({ sessionId }, { sort: { seq: 1 } }).fetchAsync(),
+      }));
       // Hint cached by user-row seq (§6) — recomputed only on interjection
       // or compaction, not per attempt.
       let hintSeq = -1;
@@ -364,6 +401,15 @@ export async function runTurn(
 
         let history = await AgentMessages
           .find({ sessionId }, { sort: { seq: 1 } }).fetchAsync();
+
+        // A queued explicit recipient can disappear while another tool batch
+        // waits for approval. Finishing that batch must not route the addressed
+        // request to the primary on the next iteration. Independent durable
+        // Relay/System causes retain their own routing priority.
+        const newestUser = [...history].reverse().find((m) => m.role === 'user' && m.kind !== 'crew-note');
+        if (!consumingRelayToken && !consumingSystemToken && newestUser?.to !== undefined
+          && !resolveAddressee(newestUser.content, newestUser.to, session)
+          && !history.some((m) => m.role === 'assistant' && assistantAnswers(m, newestUser.seq))) return;
 
         // Re-resolve addressed messages at the iteration top (§4.3) — a
         // colleague-addressed message can enter history without passing the
@@ -676,6 +722,13 @@ export async function runTurn(
         // The Message and charge committed together; later iterations must not bill again.
         systemUnbilled = false;
         relayStanding = undefined;
+        if (turnFinal && learning) {
+          const observation = await evidenceTask(() => captureObservations({
+            sessionId, agentId: learning.agentId, frameId: learning.memoryFrameId,
+            throughSeq: commitSeq, sourceMessageIds: [...history.map(({ _id }) => _id), messageId],
+          }));
+          if (observation) queueObservationReflection(observation._id);
+        }
 
         // Note-only near-miss: a model was named but not addressed.
         // See `unroutedMention` for why auto-addressing is the wrong fix.
@@ -773,11 +826,18 @@ export async function runTurn(
         error: { error: 'max-iterations', reason },
         createdAt: new Date(),
       }, { set: { phase: 'error' }, unlessStopped: true });
+    } catch (error) {
+      traceFailed = true;
+      throw error;
     } finally {
       clearInterval(beat);
       // `stopped`, `error`, and `awaiting` are deliberate terminal states —
       // idling them back would erase the decision they preserve.
       const current = await AgentSessions.findOneAsync(sessionId);
+      if (traceId) await evidenceTask(() => finishAgentTrace(traceId!,
+        traceFailed || current?.phase === 'error' ? 'failed' : current?.phase === 'awaiting' ? 'waiting'
+          : current?.phase === 'stopped' || !current || current.lease?.serverId !== SERVER_ID
+            ? 'stopped' : 'completed'));
       if (current && !DECIDED_PHASES.includes(current.phase)) {
         await guardedUpdate(sessionId, SERVER_ID, { $set: { phase: 'idle' } });
       }

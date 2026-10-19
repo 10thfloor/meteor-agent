@@ -8,6 +8,7 @@ export { toProviderMessages } from './transcript';
 export { assembleContext, estimateContext, findCompactionCut } from './compaction';
 import type { SessionQuery } from '../common/db';
 export interface RunConfig {
+    version?: string;
     model: string;
     system: string;
     tools: ToolSpec[];

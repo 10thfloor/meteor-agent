@@ -45,6 +45,9 @@ export interface SessionParticipant {
  *  refused. */
 export declare const MAX_PARTICIPANTS = 16;
 export interface AgentSession {
+    /** Last explicit execution interrupt. Kept across a later send so host
+     * continuations can distinguish cancelled work from a fresh human turn. */
+    stoppedAt?: Date;
     _id: string;
     agent: string;
     userId: string | null;
@@ -103,8 +106,19 @@ export interface AgentSession {
         sessionId: string;
         toolCallId: string;
     };
+    /** Runtime-owned constraints frozen when a delegated child is born. They
+     * apply again after crashes and approvals; clients cannot supply them. */
+    delegation?: {
+        version?: string;
+        requestDigest: string;
+        budget?: {
+            toolCalls?: number;
+            spend?: number;
+            maxIterations?: number;
+        };
+    };
     /** Live handle to an in-flight subagent child — a hint, not a contract
-     *  (can go stale on lease steal). Cleared when dispatch returns. */
+     *  (can go stale on lease steal). Cleared with the call's tool row. */
     activeChild?: {
         sessionId: string;
         toolCallId: string;
@@ -175,7 +189,7 @@ export type MessageSource = {
      * destination, and browser clients cannot choose it. */
     origin?: string;
 };
-/** File metadata on a message row — bytes live in `AgentAttachments`, never in
+/** File metadata on a message row — bytes live in attachment storage, never in
  *  the row itself (rows are read constantly). `size` is decoded byte count. */
 export interface AttachmentRef {
     id: string;
@@ -195,6 +209,10 @@ export interface AgentMessage {
      *  rows from before the field existed (falls back to the seq heuristic). */
     answeredThrough?: number;
     content?: string;
+    /** Tool rows: human-readable display and persistent transcript projections.
+     * `content` remains the model-facing serialized result for compatibility. */
+    displayContent?: string;
+    transcriptContent?: string;
     thinking?: string;
     toolCalls?: AgentToolCall[];
     toolCallId?: string;
@@ -208,7 +226,7 @@ export interface AgentMessage {
         reason?: string;
     };
     /** `orphan-child`: watcher recovered a child whose result row never landed. */
-    kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child' | 'unrouted-mention' | 'crew-note';
+    kind?: 'compaction' | 'error' | 'budget' | 'interrupted' | 'approval' | 'orphan-child' | 'unrouted-mention' | 'crew-note' | 'handoff';
     /** `kind: 'unrouted-mention'` notes only: the agent the text named but did
      *  not address. */
     mentioned?: string;

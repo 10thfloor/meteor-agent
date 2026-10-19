@@ -190,6 +190,40 @@ call never reaches `tools/call`; a revoked subagent never gets a child Session.
 Treat the callback as a read-only, idempotent predicate because one logical
 call is deliberately checked more than once.
 
+### Isolated execution providers
+
+Inline tools still run in the Meteor process; they are **not** a sandbox. A
+host can supply an optional `IsolatedExecutionProvider` and call
+`runIsolatedExecution(provider, request, { signal: ctx.signal, onOutput })`
+from a gated inline tool. The request contains an authorized `workspaceId`,
+`command` argv, optional `stdin`, `timeoutMs`, and `maxOutputBytes` (at most
+16 MiB). The framework never interprets a shell string or supplies host env.
+
+The provider owns isolation, credentials, network/filesystem grants, remote
+resource limits, and termination. `run(request, { signal, onOutput })` emits
+`{ stream: 'stdout' | 'stderr', text }` and resolves `{ exitCode }`. Output is
+bounded in combined UTF-8 bytes before reaching a callback. The runner returns
+`{ exitCode, stdout, stderr, outputBytes, truncated }`; timeout, cancellation,
+or overflow throws `IsolatedExecutionError` with `code` and a bounded partial
+`result`. Callbacks are synchronous; hosts that persist asynchronously must
+own and drain their bounded write queue.
+
+Dispatched inline tools receive optional `ctx.signal`, cancelled on Stop,
+Session/ancestor erasure, or loss of the worker lease. Pass it to the provider
+or other cooperative I/O. This does not forcibly kill arbitrary JavaScript or
+MCP processes. Providers **must terminate the actual execution before settling**;
+a closed connection is not confirmation. If cleanup cannot be confirmed,
+reject with `code: 'cleanup-unconfirmed'` (disposable teardown) or
+`code: 'stop-unconfirmed'` (retained workspace). These errors are preserved for
+host reconciliation rather than being presented as a successfully cancelled
+job. Stopping an execution does not authorize deleting retained working files.
+The runner intentionally does not race a timeout against still-running work.
+
+The host owns durable jobs, user grants, workspace lifecycle, and artifact
+exports. Existing `Agent.attachments.create` can publish bounded output files
+with Session and tool-call provenance. No execution provider is installed or
+network permission granted by the framework itself.
+
 **Co-registration** defines the method and the tool at once, so your UI and the
 model call the same code through the same schema:
 
@@ -817,6 +851,28 @@ run) had to remember to carry it — and the one that forgot would silently skip
 your redaction. `Agent.clearHooks()` clears **both** scopes;
 `agentInstance.clearHooks()` clears only that agent's.
 
+## Hand a shared conversation to a colleague
+
+Rostered conversations expose the built-in `handoff_to_agent` tool when another
+model participant is available. The model supplies `{ agent: '<exact handle>',
+message: '<request>' }` in a **single-tool response**. The colleague answers in
+the same Session and sees the conversation; unlike a subagent tool, this does
+not create a child Session or return control to the caller automatically.
+
+The framework atomically records an addressed `role:'tool', kind:'handoff'`
+receipt, the durable relay wake, and one tool-call/hop charge. UI consumers can
+render `from`, `to`, and `transcriptContent` as the visible handoff message.
+The source turn then ends. Normal `canUse` policy, Stop/lease fences, and the
+primary Agent's `budget.relay` (default 4) apply. A human message resets the hop
+count. Mixed handoff/tool batches are refused without executing any calls.
+
+Handoffs require a current, registered model colleague and are unavailable in
+delegated children and temporary `ask()` Sessions. App and MCP tools cannot
+shadow the reserved name. Hosts with a `canUse` allowlist should explicitly
+admit `handoff_to_agent` only for the appropriate conversation participants.
+Leading `@handle` replies still work for compatibility, but new prompts should
+prefer the structured tool. Ordinary mentions do not schedule a colleague.
+
 ## Use it from the client
 
 ```ts
@@ -941,6 +997,9 @@ framework never re-renders it.
 | `session-id` | The session to render. **Omit it and the element starts one** on connect. Changing it re-subscribes cleanly. |
 | `placeholder` | Composer hint. |
 | `composer-mode` | `ask` (default) calls `send` and wakes the addressed/default agent. `note` calls `contribute`, changes the default hint/button/ARIA label, and records shared context without a wake. The `composerMode` property mirrors the attribute. |
+| `multiline` | Opt-in textarea growth from two to six lines. Set `--agent-chat-input-min-rows: 1` for a compact one-line start (supported range: 1–6). Enter sends; Shift+Enter inserts a newline. IME composition never sends. Without this attribute the composer remains single-line. |
+| `composer-layout` | `panel` groups context above the text and toolbar/actions below it. Default layout remains inline. |
+| `submit-label` | Optional idle label for an app-owned action, such as `Run plan`. Pending labels remain `Sending…`/`Adding note…`. |
 | `verbosity` | `clean` is the default: tool calls/results become concise operational receipts, approvals use bounded human-readable argument summaries, embedded JSON-string escapes are decoded, and raw object/array payloads are hidden. `debug` restores exact assistant bytes, tool arguments, tool-result payloads, structured assistant content, and approval records. Legacy `quiet` aliases `clean`; legacy `full` aliases `debug`. It only changes what is drawn, so toggling it re-paints without touching the session. |
 
 In clean mode, assistant prose renders as semantic GFM/CommonMark-style
@@ -955,6 +1014,45 @@ disable, the label becomes `Sending…` or `Adding note…`, and duplicate submi
 are ignored until the method settles. A rejection restores the draft and the
 controls. A successful submit emits **`agent-chat:submitted`** with
 `detail: { sessionId, mode }`.
+
+Set `chat.submissionHandler = async ({ sessionId, text, mode }) => …` when an
+application method owns the write (for example, resolving authorized plan
+references before sending). This replaces `send`/`contribute`, but keeps the
+same pending state, duplicate guard, error display, and draft recovery. The
+handler must preserve `note` semantics and perform its authorization on the
+server. Leave it `null` for the default Agent methods.
+
+Optional slots place app-owned controls in normal layout flow: `activity`
+above the composer, `composer-header` for its recipient or mode control,
+`composer-context` above the text, and `composer-toolbar`
+plus `composer-actions` in the footer below the text when using panel layout.
+Slotted content remains app-owned; the element does not treat a run card as
+an assistant message.
+
+Use `chat.draftText` or `chat.setDraft(text, { selectionStart, selectionEnd,
+focus })` to edit a draft, `chat.focusComposer()` to return to its saved caret,
+and `chat.submitDraft()` for an explicit application action. Every draft
+change—including insertion, submit-clear, and error restore—emits
+`agent-chat:draft-change` with `{ text, sessionId }`. Application-owned
+attachments should not be removed merely because submission cleared the text.
+Setting `allowEmptySubmit = true` permits attachment-only submission only
+when `submissionHandler` is also supplied; default Agent writes still require
+text.
+
+Use `send-disabled="true"` while app-owned context (such as a file upload) is
+not ready. It blocks both Send and `submitDraft()` without disabling typing.
+Use `composer-disabled="true"` to disable both typing and submission; neither
+attribute disables Stop or approval controls. The app owns the explanatory hint
+and should recheck its context inside `submissionHandler` before forwarding.
+
+Set `chat.timelineItems` to `{ id, createdAt, afterMessageId?, element }[]` to
+place app-owned run cards among messages. Cards sort by timestamp and stable
+id, or immediately after their referenced message when that anchor exists.
+Supplied elements remain in light DOM (app CSS still applies); named slots in
+the transcript retain their DOM, focus, and expanded state on streaming
+repaints. Updating the list removes omitted elements. Changing the Session
+clears these cards along with the old draft. Cards have no fabricated agent
+attribution and never become model input.
 
 Re-pointing the element usually takes two attribute writes
 (`removeAttribute('session-id')`, then `setAttribute('agent', …)`), and
@@ -998,6 +1096,8 @@ For the first two, name the fields:
 | `label` | What the chip and the typeahead show. Defaults to the handle. Field name or function. |
 | `kind` | Free-form, becomes a `part` token: `::part(mention ticket)`. Model participants get `agent`. |
 | `detail` | A second line in the typeahead, and the chip's tooltip. |
+| `actionable` | Opt-in for non-`@` references: renders a keyboard-accessible button that emits `agent-chat:mention` with `{ prefix, handle, kind }`. The host can open details; no message is sent. Also supported per entry from `search`/`lookup`. |
+| `emptyText` | Optional visible feedback when the source has no suggestions, including loading or empty states. |
 | `limit` | How many the typeahead offers at once. Default 8. |
 | `max` | Ceiling on records read from a collection at once. Default 1000 — a guard against an unbounded publication, not a page size. |
 
@@ -1050,6 +1150,28 @@ Typing `@` opens the list; ↑/↓ move, Tab or Enter accepts, Escape dismisses.
 **Enter completes rather than sends** while the list is open — a composer that
 fires off `@pri` because someone pressed Enter to pick a name is the bug this
 behaviour exists to avoid.
+
+App-owned picker buttons can call `chat.openMentions('#')` to open the same
+typeahead or `chat.insertMention('#', handle)` after making their own selection.
+Insertion uses the composer's current caret (preserved while another control
+has focus), verifies that the source still resolves the handle, and never
+submits. Both return whether the operation was accepted. Successful selection
+through either picker emits `agent-chat:mention-selected` with
+`{ prefix, handle, kind }`, allowing the host to pin the selected record's
+version separately from its display name. Changing the rendered Session
+clears the old draft and pending picker.
+
+Two cancellable events let an application use a richer picker or named
+attachments while keeping the same keyboard/composer entry points:
+
+- `agent-chat:mention-query`: `{ prefix, query, range: { start, end }, rect }`.
+  Cancel to display an app-owned picker instead of the built-in suggestions.
+  The rectangle is the composer's viewport bounds; cancelling leaves the draft
+  unchanged.
+- `agent-chat:mention-select`: `{ prefix, handle, kind, range: { start, end } }`.
+  Fires before insertion from either picker API. Cancel to attach a record and
+  call `setDraft` to remove the typed token. Default insertion and the later
+  `mention-selected` event are skipped; merely selecting still never submits.
 
 ### Archiving a session
 
@@ -1141,7 +1263,7 @@ element you never theme still follows the OS light/dark setting.
 | `phase` | The badge; also carries the phase itself (`::part(phase awaiting)`) |
 | `message` | Every transcript row; also carries `user` / `assistant` / `note`, plus `operation` on a clean tool receipt, `streaming` on an in-flight row, and the note's `kind` (`::part(note error)`) |
 | `markdown` | Clean assistant content boundary. Descendants expose `markdown-heading`, `markdown-paragraph`, `markdown-list`, `markdown-list-item`, `markdown-strong`, `markdown-emphasis`, `markdown-strikethrough`, `markdown-code`, `markdown-inline-code`, `markdown-code-block`, `markdown-language`, `markdown-blockquote`, `markdown-rule`, `markdown-table`, and `markdown-link`. |
-| `crew-note-badge` | Visible `Crew note` label on a non-waking human contribution. Its leading `@agent` chips deliberately never carry `addressed`. |
+| `crew-note-header`, `speaker-crew-note`, `crew-note-badge` | Attribution and visible `Crew note` label grouped above a non-waking human contribution. The bubble carries `message user crew-note` for separate theming. Its leading `@agent` chips deliberately never carry `addressed`. |
 | `new-messages` | The transcript-tail affordance; also carries `pending` while newer rows are waiting below the reader. |
 | `operation`, `operations` | Clean-mode tool/delegation status, without arguments or result payloads |
 | `structured-hidden` | Clean-mode replacement for a whole JSON or JSON-fenced assistant message |
@@ -2045,6 +2167,23 @@ vision-capable model one way only: the model calls `read_attachment`, the
 provider's declared capability gates it (failing closed), the bytes ride the
 tool result at request time — after the compaction estimate, strippable by
 an `afterToolResult` hook, degradable when a provider refuses them.
+
+**Host-selected file storage.** Call `Agent.attachments.configureStorage(adapter)`
+at server startup to keep file contents outside Mongo. An adapter supplies a
+stable `name`, `write(metadata + base64 content, context)` returning a small,
+non-secret locator, and `read(metadata + storageReference, context)` returning
+base64. Metadata includes the attachment/session IDs, name, MIME type, byte count
+and SHA-256 hash. Honor `context.signal` and `context.assertActive()` around I/O;
+writes must be immutable and idempotent. The framework verifies a read-back
+before committing a metadata-only row. Failed external writes never fall back
+to Mongo. Provisioning and remote-object cleanup remain host responsibilities.
+
+Use `Agent.attachments.readContent(row)` rather than reading `row.content`:
+downloads, image hydration and channel delivery use this same boundary. To
+move a legacy row, explicitly call `Agent.attachments.migrateContent({ id,
+sessionId })`; original bytes are removed only after verified external storage.
+The default (or `configureStorage(null)`) preserves Mongo storage for hosts that
+have not selected an adapter. Constellation always selects its mission Sprite.
 
 Full design: `docs/superpowers/specs/2026-08-23-participants-and-closing-the-loops.md`.
 

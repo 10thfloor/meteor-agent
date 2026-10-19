@@ -10,6 +10,7 @@ import {
   type ResolvedTool, type Skill, type ToolSpec,
 } from './tools';
 import { withMemoryTools } from './memory-tools';
+import { assertHandoffNameFree, HANDOFF_TOOL_NAME, withHandoffTool } from './handoff';
 import {
   assertLearningNamesFree, LEARNING_TOOL_NAMES, withLearningTools,
 } from './learning-tools';
@@ -25,6 +26,7 @@ export interface PreparedToolRuntime {
 export interface PrepareToolRuntimeOptions {
   specs: ToolSpec[];
   skills?: Skill[];
+  conversation?: { session: Pick<AgentSession, 'agent' | 'participants' | 'parent' | 'ephemeral'>; agent: string };
   /** Configured Memory and the facts that decide whether this Session may
    * expose it. Presence protects the reserved names even for an ineligible
    * child/throwaway Session. */
@@ -79,6 +81,7 @@ function assertUniquePrepared(tools: ResolvedTool[]): void {
 export async function prepareToolRuntime(
   options: PrepareToolRuntimeOptions,
 ): Promise<PreparedToolRuntime> {
+  assertHandoffNameFree(options.specs);
   if (options.memory) assertMemoryNamesFree(options.specs);
   if (options.learning || options.reserveLearningNames) {
     assertLearningNamesFree(options.specs);
@@ -86,6 +89,7 @@ export async function prepareToolRuntime(
   const resolved = resolveTools(options.specs);
   assertUniqueAuthored(resolved);
   const reserved = [
+    HANDOFF_TOOL_NAME,
     ...(options.memory ? MEMORY_TOOL_NAMES : []),
     ...(options.learning || options.reserveLearningNames ? LEARNING_TOOL_NAMES : []),
   ];
@@ -100,10 +104,10 @@ export async function prepareToolRuntime(
       userId: options.memory.session.userId,
     }
     : undefined;
-  const tools = withLearningTools(
+  const tools = withHandoffTool(withLearningTools(
     withMemoryTools(withSkillTool(discovered, options.skills), memory),
     options.learning,
-  );
+  ), options.conversation);
   assertUniquePrepared(tools);
   return { tools, schemas: toolSchemas(tools) };
 }

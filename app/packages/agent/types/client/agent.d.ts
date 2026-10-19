@@ -2,6 +2,11 @@ import { Meteor } from 'meteor/meteor';
 import { Mongo } from 'meteor/mongo';
 import type { Phase, ViewMessage } from '../common/types';
 import type { SessionQuery } from '../common/db';
+export interface SendOptions {
+    /** Explicit model participant ID. When supplied, it takes precedence over
+     * a leading @mention and fails if that participant is unavailable. */
+    to?: string;
+}
 /** Client-side handle on one agent. Uses minimongo's synchronous API
  *  (the async-only rule is server-side). */
 export declare class Agent {
@@ -33,7 +38,7 @@ export declare class Agent {
     start(opts?: {
         title?: string;
     }): Promise<string>;
-    send(sessionId: string, text: string): Promise<string>;
+    send(sessionId: string, text: string, options?: SendOptions): Promise<string>;
     /** Commit human-to-crew context without waking an agent. The stable retry
      * key makes Meteor's transparent reconnect retry exactly-once. */
     contribute(sessionId: string, text: string): Promise<string>;

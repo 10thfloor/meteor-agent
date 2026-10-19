@@ -2,7 +2,7 @@ import { Meteor } from 'meteor/meteor';
 import { Mongo, MongoInternals } from 'meteor/mongo';
 import { Random } from 'meteor/random';
 import { createHash } from 'crypto';
-import type { ClientSession } from 'mongodb';
+import type { ClientSession, Filter } from 'mongodb';
 import { AgentDeltas, AgentMessages, AgentSessions } from '../common/collections';
 import type {
   AgentMessage, AgentSession, AttachmentRef, MessageSource, SessionInc, SessionParticipant,
@@ -126,10 +126,12 @@ export async function createInitialTranscript(
 export interface LeasedMessageMutation {
   inc?: SessionInc;
   set?: SessionSet;
-  unset?: { pending?: 1; pendingRelay?: 1; pendingSystem?: 1 };
+  unset?: { pending?: 1; pendingRelay?: 1; pendingSystem?: 1; activeChild?: 1 };
   unlessStopped?: boolean;
   pendingRelayToken?: string;
   pendingSystemToken?: string;
+  /** Additional server-owned compare-and-set guards for control actions. */
+  expected?: Filter<AgentSession>;
 }
 
 /** @internal Atomically mutate the Lease-owned Session and insert its Message.
@@ -165,6 +167,7 @@ export async function commitLeasedMessage(
           'lease.until': { $gt: committedAt },
           erasingAt: { $exists: false },
           purgingAt: { $exists: false },
+          ...(mutation.expected ? { $and: [mutation.expected] } : {}),
           ...(mutation.unlessStopped ? { phase: { $ne: 'stopped' as const } } : {}),
           ...(mutation.pendingRelayToken
             ? { 'pendingRelay.token': mutation.pendingRelayToken } : {}),
@@ -586,6 +589,10 @@ export function toProviderMessages(
       const author = m.from?.participant ?? view.primary;
       const foreign = view.self !== undefined && author !== view.self;
       if (foreign) {
+        if (m.role === 'tool' && m.kind === 'handoff' && !m.error && m.to && m.transcriptContent) {
+          out.push({ role: 'user', content: `[${nameOf!(author, m.from?.name)} → ${nameOf!(m.to)}]: ${m.transcriptContent}` });
+          continue;
+        }
         const turnFinal = m.role === 'assistant'
           && (!m.toolCalls || m.toolCalls.length === 0)
           && (m.content ?? '') !== '';

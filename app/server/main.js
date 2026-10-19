@@ -3,6 +3,7 @@ import { check } from 'meteor/check';
 import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import { Mongo } from 'meteor/mongo';
 import { Random } from 'meteor/random';
+import { WebApp } from 'meteor/webapp';
 import {
   createCipheriv, createDecipheriv, createHash, randomBytes,
 } from 'node:crypto';
@@ -13,6 +14,7 @@ import {
   AgentSessions,
   abandonPendingAgentTurns,
   assertLearningReviewTarget,
+  assertWorkflowSessionExecution,
   assertPracticeTransitionEvidence,
   ChannelBindings,
   ChannelIdentities,
@@ -30,6 +32,8 @@ import {
   hostLearningSource,
   loadPiAi,
   LEARNING_TOOL_NAMES,
+  HANDOFF_TOOL_NAME,
+  HANDOFF_ARGS,
   EXPERIENCE_RECALL_MAX,
   MAX_PARTICIPANTS,
   MEMORY_TEXT_MAX,
@@ -43,6 +47,8 @@ import {
   redeemLinkToken,
   redeemVerdictToken,
   startEgress,
+  startSystemTurn,
+  startupComplete,
   SKILL_TOOL_NAME,
   SUBAGENT_ARGS,
   unregisterMcpServer,
@@ -70,11 +76,36 @@ import {
 } from '../imports/constellation/models';
 import { refreshRadiusModels } from './model-providers';
 import { detectOllamaModels, OLLAMA_OPENAI_URL } from './ollama';
+import { installConstellationEvidence } from './constellation-evidence';
+import { installMissionWorkflows, planContextForRequest } from './mission-workflows';
+import { planReferenceHandles } from '../imports/constellation/plan-references';
+import { installConstellationLab } from './constellation-lab';
+import { installConstellationFederation } from './constellation-federation';
+import { installConstellationDecisions } from './constellation-decisions';
+import { installConstellationExecution } from './constellation-execution';
+import { executionToolAccess } from '../imports/constellation/execution';
+import { MISSION_FILE_TOOL_NAMES, missionFileAccess } from '../imports/constellation/mission-files';
+import { SPRITES_WORKFLOW_SKILL } from '../imports/constellation/sprites-skill';
+import { installConstellationAgentWork } from './constellation-agent-work';
+import { installConstellationAgentCapabilities } from './constellation-agent-capabilities';
+import { mcpAgentCanUseTool, mcpToolCatalogAccess } from '../imports/constellation/agent-capabilities';
+import { DECISION_TOOL_NAMES } from '../imports/constellation/decisions';
+import { decisionToolAccess } from '../imports/constellation/decision-access';
+import { createDesktopHealthHandler } from './desktop-health';
 
 const offline = process.env.CONSTELLATION_OFFLINE === '1';
 let live = false;
 let model = LOCAL_MODEL;
+export let constellationDecisions;
+export let constellationExecution;
 export const WorkspaceState = new Mongo.Collection('constellation_workspace_state');
+let desktopReady = false;
+WebApp.handlers.use(createDesktopHealthHandler({
+  ready: () => desktopReady,
+  probe: () => WorkspaceState.rawCollection().findOne({ _id: 'local' }, {
+    projection: { _id: 1 }, maxTimeMS: 1000, timeoutMS: 1200,
+  }),
+}));
 export const MissionConfigs = new Mongo.Collection('constellation_mission_configs');
 export const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
 const CrewStates = new Mongo.Collection('constellation_crew_states');
@@ -250,6 +281,7 @@ const DEFAULT_CONSTITUTION_BY_AGENT = new Map(
   DEFAULT_CREW_CONFIGS.map((config) => [config.agent, config.constitution]),
 );
 const DEFAULT_SKILLS = [
+  SPRITES_WORKFLOW_SKILL,
   {
     name: 'Mission framing',
     slug: 'mission-framing',
@@ -441,6 +473,7 @@ function specialistScript(name, profile) {
 /** Private request marker shared only by this app's hook and Provider wrapper.
  *  The wrapper removes it before delegating to the real Provider. */
 export const MISSION_EXECUTION_SESSION = Symbol('constellation.missionSession');
+const MISSION_PLAN_CONTEXT = Symbol('constellation.planContext');
 
 export function withMissionExecutionContext(request, context) {
   return { ...request, [MISSION_EXECUTION_SESSION]: context.sessionId };
@@ -449,7 +482,7 @@ export function withMissionExecutionContext(request, context) {
 /** Paid work is fenced at the Provider boundary, after the framework has
  *  assembled the request and immediately before the underlying adapter runs.
  *  Generic framework hooks intentionally fail open; this app policy does not. */
-export function missionScopedProvider(provider, agent) {
+export function missionScopedProvider(provider, agent, { reflection = false, scripted = false } = {}) {
   return {
     ...(provider.capabilities ? { capabilities: provider.capabilities } : {}),
     async *stream(request) {
@@ -460,9 +493,29 @@ export function missionScopedProvider(provider, agent) {
           'Mission execution context is unavailable; provider work was not started.',
         );
       }
-      await requireActiveMissionExecution(sessionId, agent);
+      // Reflection authority is a trusted construction-time closure, never a
+      // request field the agent can invent. It cannot grant Tool execution.
+      if (reflection && request.tools?.length) {
+        throw new Meteor.Error('reflection-tools-forbidden', 'Reflection cannot execute tools.');
+      }
+      await requireActiveMissionExecution(sessionId, agent, { reflection });
       const providerRequest = { ...request };
       delete providerRequest[MISSION_EXECUTION_SESSION];
+      const planContext = reflection ? '' : request[MISSION_PLAN_CONTEXT];
+      delete providerRequest[MISSION_PLAN_CONTEXT];
+      const latestUserMessage = [...request.messages].reverse().find((entry) => entry.role === 'user');
+      if (!reflection && planReferenceHandles(latestUserMessage?.content).length && planContext === undefined) {
+        throw new Meteor.Error('plan-context-unavailable', 'Could not load the referenced plan. Try sending again.');
+      }
+      // Test mode can show the referenced definition but must not pretend to
+      // review it or fall into a keyword-driven demo that delegates live work.
+      if (scripted && planContext && planReferenceHandles(latestUserMessage?.content).length) {
+        const handle = planReferenceHandles(latestUserMessage.content)[0];
+        yield* mockProvider(() => ({ text: 'This is a scripted test response, not an agent review. Choose a live model to review this plan.\n\n'
+          + planContext.slice(planContext.indexOf('\n\n') + 2)
+          + `\n\nTo run the saved plan, send \`Run #${handle}\`.` })).stream(providerRequest);
+        return;
+      }
       yield* provider.stream(providerRequest);
     },
   };
@@ -494,7 +547,7 @@ function contextForModel(configuredModel) {
 }
 
 const liveProvider = offline ? null : piAiProvider();
-const providerFor = (name, profile) => {
+const providerFor = (name, profile, policy) => {
   const requestedModel = profile?.model === 'default' ? model : profile?.model;
   if (requestedModel !== LOCAL_MODEL && !availableRuntimeModelIds.has(requestedModel)) {
     return missionScopedProvider({
@@ -507,14 +560,14 @@ const providerFor = (name, profile) => {
         error.retryable = false;
         throw error;
       },
-    }, name);
+    }, name, policy);
   }
   const localOllama = requestedModel?.startsWith('ollama/') ? ollamaProvider : null;
-  if (localOllama) return missionScopedProvider(localOllama, name);
+  if (localOllama) return missionScopedProvider(localOllama, name, policy);
   const scripted = requestedModel === LOCAL_MODEL || !liveProvider;
   return missionScopedProvider(scripted ? mockProvider(
     name === 'orchestrator' ? (request) => orchestratorScript(request, profile) : specialistScript(name, profile),
-  ) : liveProvider, name);
+  ) : liveProvider, name, { ...policy, scripted });
 };
 
 const commonBudget = {
@@ -585,6 +638,14 @@ function publishBriefTool() {
     },
     describe: ({ title, audience }) => `Publish “${title}” for ${audience} as a downloadable mission brief`,
     run: async ({ title, audience, summary }, context) => {
+      const root = await rootMissionSession(context.sessionId);
+      const environment = root && await constellationExecution.getEnvironment(context.userId, { missionId: root._id });
+      if (!environment?.keepFiles || !environment.workspaceId) {
+        throw new Meteor.Error('mission-filesystem-required', 'Enable the mission filesystem from Files or Mission settings before saving a brief.');
+      }
+      if (!environment.allowedAgents?.includes(context.agent ?? root.agent)) {
+        throw new Meteor.Error('mission-file-access-off', 'Give this agent access to the mission filesystem before saving a brief.');
+      }
       const markdown = [
         `# ${title}`,
         '',
@@ -634,9 +695,13 @@ function defineCrewAgent(config, skills = runtimeSkills) {
   if (config.capabilities?.inspect) tools.push(workspaceInspectionTool());
   if (config.capabilities?.publish) tools.push(publishBriefTool());
   tools.push(...mcpToolsForAgent(config.agent));
+  tools.push(...(constellationDecisions?.toolDefinitions(config.agent) ?? []));
+  tools.push(...(constellationExecution?.toolDefinitions(config.agent) ?? []));
+  tools.push(...(constellationExecution?.fileToolDefinitions(config.agent) ?? []));
   const provider = providerFor(config.agent, config);
   const assignedSkills = skillsForAgent(skills, config);
   new Agent(config.agent, {
+    version: String(config.revision ?? 1),
     model: config.model && config.model !== 'default' ? config.model : model,
     instructions: config.instructions,
     identity: {
@@ -668,8 +733,6 @@ function defineCrewAgent(config, skills = runtimeSkills) {
   });
 }
 
-for (const config of DEFAULT_CREW) defineCrewAgent(config, DEFAULT_SKILLS);
-
 const orchestrator = new Agent('orchestrator');
 function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSkills) {
   const provider = providerFor('orchestrator', primary);
@@ -678,6 +741,7 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
   if (primary.capabilities?.publish) coreTools.push(publishBriefTool());
   const assignedSkills = skillsForAgent(skills, primary);
   orchestrator.define({
+    version: String(primary.revision ?? 1),
     model: primary.model && primary.model !== 'default' ? primary.model : model,
     instructions: primary.instructions,
     identity: {
@@ -693,6 +757,7 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
         (config) => config.enabled && config.status !== 'archived',
       ).map((config) => ({
         subagent: config.agent,
+        version: String(config.revision ?? 1),
         description: `Delegate a focused ${config.role.toLowerCase()} run to ${config.displayName}.`,
         // Agent definitions are process-wide, while Mission Crew membership is
         // per root session. The gate is the runtime fence that keeps an archived
@@ -700,6 +765,9 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
         gate: (context) => missionAllowsAgent(context, config.agent),
       })),
       ...coreTools,
+      ...(constellationDecisions?.toolDefinitions('orchestrator') ?? []),
+      ...(constellationExecution?.toolDefinitions('orchestrator') ?? []),
+      ...(constellationExecution?.fileToolDefinitions('orchestrator') ?? []),
       ...mcpToolsForAgent('orchestrator'),
     ],
     ...(assignedSkills.length ? { skills: assignedSkills } : {}),
@@ -721,7 +789,6 @@ function defineOrchestrator(crew, primary = DEFAULT_PRIMARY, skills = runtimeSki
     ...(provider ? { provider } : {}),
   });
 }
-defineOrchestrator(DEFAULT_CREW, DEFAULT_PRIMARY, DEFAULT_SKILLS);
 
 export async function workspaceOwnerCanApprove({ userId }) {
   if (!userId) return false;
@@ -906,6 +973,13 @@ async function ensureSkillConfigs(userId) {
     }
     await SkillStates.insertAsync({ userId, initializedAt: new Date() });
   }
+  // Offer the new workflow once to existing workspaces, unassigned. A user edit
+  // or deletion is never overwritten by later catalog refreshes.
+  if (!state?.spritesWorkflowOfferedAt) {
+    const existing = await SkillConfigs.findOneAsync({ userId, slug: SPRITES_WORKFLOW_SKILL.slug });
+    if (!existing) await SkillConfigs.insertAsync({ ...SPRITES_WORKFLOW_SKILL, userId, revision: 1, createdAt: new Date(), updatedAt: new Date() });
+    await SkillStates.updateAsync({ userId }, { $set: { spritesWorkflowOfferedAt: new Date() } });
+  }
   runtimeSkills = await SkillConfigs.find(
     { userId }, { sort: { name: 1, createdAt: 1 } },
   ).fetchAsync();
@@ -924,6 +998,7 @@ function crewExperienceConfig(value) {
     ? source.recent : DEFAULT_CREW_EXPERIENCE.recent;
   return {
     record: source.record !== false,
+    reflect: source.reflect === true,
     recall: source.recall !== false && recent > 0,
     recent,
     scope: EXPERIENCE_SCOPES.has(source.scope)
@@ -1193,14 +1268,15 @@ async function finalizeCrewArchive(userId, config) {
       { multi: true },
     ),
     McpConfigs.updateAsync(
-      { userId, managed: 'workspace', agents: config.agent },
-      { $pull: { agents: config.agent }, $inc: { revision: 1 }, $set: { updatedAt: new Date() } },
+      { userId, $or: [{ agents: config.agent }, { 'agentToolPolicies.agent': config.agent }] },
+      { $pull: { agents: config.agent, agentToolPolicies: { agent: config.agent } },
+        $inc: { revision: 1 }, $set: { updatedAt: new Date() } },
       { multi: true },
     ),
     ToolCatalog.updateAsync(
       {
         userId,
-        source: 'workspace-mcp',
+        source: { $in: ['workspace-mcp', 'app-mcp'] },
         $or: [{ agents: config.agent }, { assignedAgents: config.agent }],
       },
       {
@@ -1854,7 +1930,7 @@ function hasMongoUnsafeCatalogKey(value) {
   ));
 }
 
-function boundedCatalogSchema(value) {
+function boundedCatalogSchema(value, maxDepth = 8) {
   let nodes = 0;
   const safeKey = (rawKey) => {
     // Mongo/Minimongo reject dotted keys and keys beginning with `$` anywhere
@@ -1868,7 +1944,7 @@ function boundedCatalogSchema(value) {
   };
   function visit(input, depth = 0) {
     nodes += 1;
-    if (nodes > 240 || depth > 8) return undefined;
+    if (nodes > 240 || depth > maxDepth) return undefined;
     if (input === null || typeof input === 'boolean' || typeof input === 'number') return input;
     if (typeof input === 'string') return input.slice(0, 500);
     if (Array.isArray(input)) return input.slice(0, 48).map((item) => visit(item, depth + 1));
@@ -1924,6 +2000,7 @@ const MCP_PUBLIC_FIELDS = Object.freeze({
   agents: 1,
   toolMode: 1,
   selectedTools: 1,
+  agentToolPolicies: 1,
   approval: 1,
   timeoutMs: 1,
   cooldownMs: 1,
@@ -2104,11 +2181,13 @@ async function ensureAppMcpConfigs(userId) {
           command: source.displayCommand,
           args: source.displayArgs,
           envKeys: [],
-          agents: source.agents,
+          // Connection details stay app-managed; existing access is owned by
+          // the workspace and must not be reset to source defaults on restart.
           approval: source.approval,
         } },
       );
-      row = { ...row, ...source, enabled: true, trusted: true, locked: true };
+      row = { ...row, ...source, agents: row.agents ?? source.agents,
+        enabled: true, trusted: true, locked: true };
     }
     rows.push(row);
   }
@@ -2134,14 +2213,14 @@ async function assertMcpMutationAllowed(userId, agents) {
   }
 }
 
-async function authorizeMcpTool(configId, agent, sessionId) {
+async function authorizeMcpTool(configId, agent, sessionId, remoteName) {
   const [config, session] = await Promise.all([
     McpConfigs.findOneAsync({ _id: configId }),
     AgentSessions.findOneAsync({ _id: sessionId }),
   ]);
   if (!config || !session || !config.enabled || !config.trusted
     || config.status !== 'ready' || config.userId !== session.userId
-    || !config.agents?.includes(agent) || config.approval === 'blocked') {
+    || !mcpAgentCanUseTool(config, agent, remoteName) || config.approval === 'blocked') {
     return false;
   }
   const crew = await CrewConfigs.findOneAsync({
@@ -2174,7 +2253,7 @@ async function writeCodeToolCatalog(userId, crew, skills) {
   const add = (
     name, displayName, description, agents, approval, inputSchema, metadata = {},
   ) => {
-    if (!agents.length) return;
+    if (!agents.length && !['decisions', 'execution'].includes(metadata.category)) return;
     rows.push(catalogToolDoc(userId, {
       _id: `app:${userId}:${name}`,
       source: 'app',
@@ -2184,7 +2263,9 @@ async function writeCodeToolCatalog(userId, crew, skills) {
       agents: [...new Set(agents)],
       approval,
       status: 'ready',
-      inputSchema: boundedCatalogSchema(inputSchema),
+      // The built-in decision authoring schema nests typed questions. Keep
+      // their criteria intact while retaining the catalog's size/node caps.
+      inputSchema: boundedCatalogSchema(inputSchema, metadata.category === 'decisions' ? 12 : 8),
       ...metadata,
     }));
   };
@@ -2231,6 +2312,48 @@ async function writeCodeToolCatalog(userId, crew, skills) {
     { approvalSummary: 'Mission approvals on: Ask · off: Auto' },
   );
 
+  if (constellationDecisions) {
+    const settings = await constellationDecisions.getSettings(userId);
+    const labels = ['Find decision nodes', 'Create decision node', 'Evaluate decision node'];
+    const descriptions = [
+      'Find decisions shared with this agent and available in the current mission.',
+      'Create a reusable judgment for this mission. The agent’s creation permission determines whether it needs your approval.',
+      'Evaluate a saved decision using its named inputs. Inputs go to TypeSafe; action approvals still apply.',
+    ];
+    for (const [index, tool] of constellationDecisions.toolDefinitions('orchestrator').entries()) {
+      const access = decisionToolAccess(tool.name, crew, settings);
+      add(tool.name, labels[index] ?? tool.name, descriptions[index] ?? tool.description, access.agents,
+        tool.name === 'create_decision_node' ? 'conditional' : 'auto', tool.args,
+        { ...access, category: 'decisions', origin: 'app', runtimeKind: 'inline',
+          approvalSummary: tool.name === 'create_decision_node' ? 'Per-agent: Ask or Auto' : 'Assigned decisions only',
+        });
+    }
+  }
+
+  if (constellationExecution) {
+    const settings = await constellationExecution.getSettings(userId);
+    const access = executionToolAccess(crew, settings);
+    for (const tool of constellationExecution.toolDefinitions('orchestrator')) {
+      const inspection = tool.name === 'inspect_code_run';
+      const effective = inspection ? { ...access, agents: access.assignedAgents, status: access.assignedAgents.length ? 'ready' : 'unavailable', statusLabel: access.assignedAgents.length ? 'Available' : 'Access off', availabilityNote: 'Recorded results only · no cloud request' } : access;
+      add(tool.name, inspection ? 'Inspect code run' : 'Run code', inspection ? 'Read this mission’s recorded code-run status, output, and files without running code.' : 'Run Python, JavaScript, or shell code in a remote mission environment. Return files to the mission.', effective.agents,
+        inspection ? 'auto' : 'conditional', tool.args, { ...effective, category: 'execution', origin: 'app', runtimeKind: 'inline',
+          availabilitySummary: effective.availabilityNote,
+          approvalSummary: inspection ? 'Read-only · code access required' : 'Per-agent: Ask every time or Allowed',
+        });
+    }
+    const fileAgents = enabled.filter(missionFileAccess).map((row) => row.agent);
+    const fileLabels = { list_mission_files: 'Browse mission files', read_mission_file: 'Read mission file', manage_mission_files: 'Manage mission files' };
+    for (const tool of constellationExecution.fileToolDefinitions('orchestrator')) {
+      const mutation = tool.name === 'manage_mission_files';
+      add(tool.name, fileLabels[tool.name], tool.description, fileAgents, mutation ? 'conditional' : 'auto', tool.args, {
+        category: 'files', origin: 'app', runtimeKind: 'inline',
+        approvalSummary: mutation ? 'Mission approvals apply · deletion always requires confirmation' : 'Read-only',
+        availabilitySummary: 'Current mission only · filesystem access required for Sprite files',
+      });
+    }
+  }
+
   const primary = enabled.find((config) => config.agent === 'orchestrator');
   if (primary) {
     for (const target of enabled.filter((config) => config.agent !== 'orchestrator')) {
@@ -2258,6 +2381,13 @@ async function writeCodeToolCatalog(userId, crew, skills) {
     agent: config.agent,
     skills: skillsForAgent(skills, config).map((skill) => skill.name),
   })).filter((assignment) => assignment.skills.length > 0);
+  addFramework(
+    HANDOFF_TOOL_NAME, HANDOFF_TOOL_NAME, 'Hand off conversation',
+    'Ask a rostered colleague to take the next turn in this mission chat. Keeps the same conversation; does not create a delegated task.',
+    enabled.map((config) => config.agent), 'auto', HANDOFF_ARGS,
+    { category: 'coordination', origin: 'framework-built-in', runtimeKind: 'inline',
+      approvalSummary: 'Auto · mission crew only · relay limit applies' },
+  );
   const skillNames = [...new Set(skillAssignments.flatMap((assignment) => assignment.skills))]
     .sort((left, right) => left.localeCompare(right));
   addFramework(
@@ -2542,15 +2672,7 @@ async function syncCodeToolCatalog(userId) {
 }
 
 function mcpCatalogAccess(config, remoteName, status) {
-  const selected = config.toolMode !== 'selected'
-    || !!config.selectedTools?.includes(remoteName);
-  const available = status === 'ready' && config.enabled && config.trusted
-    && config.approval !== 'blocked' && selected;
-  return {
-    agents: available ? (config.agents ?? []) : [],
-    assignedAgents: config.agents ?? [],
-    selected,
-  };
+  return mcpToolCatalogAccess(config, remoteName, status);
 }
 
 async function updateMcpCatalogAccess(config, status) {
@@ -2608,12 +2730,13 @@ async function rebuildMcpToolAssignments(userId, { reconcileArchives = true } = 
     for (const agent of config.agents ?? []) {
       const specs = runtimeMcpToolsByAgent.get(agent) ?? [];
       for (const tool of allowed) {
+        if (!mcpAgentCanUseTool(config, agent, tool.remoteName)) continue;
         specs.push({
           mcp: { server: mcpRuntimeName(config._id), tool: tool.remoteName },
           name: tool.name,
           description: tool.description || `${tool.remoteName} on ${config.name}`,
           args: executableCatalogSchema(tool.inputSchema ?? { type: 'object' }),
-          gate: ({ sessionId }) => authorizeMcpTool(config._id, agent, sessionId),
+          gate: ({ sessionId }) => authorizeMcpTool(config._id, agent, sessionId, tool.remoteName),
         });
       }
       runtimeMcpToolsByAgent.set(agent, specs);
@@ -2780,12 +2903,12 @@ function normalizeCrewPatch(current, patch, availableModelIds) {
   const requestedColor = patch.color ?? current.color;
   if (!CREW_COLORS.has(requestedColor)) throw new Meteor.Error('invalid-crew', 'Unknown agent color.');
   const capabilities = {};
-  for (const key of ['inspect', 'framing', 'memory', 'publish']) {
+  for (const key of ['inspect', 'framing', 'memory', 'publish', 'files']) {
     const next = patch.capabilities?.[key];
     if (next !== undefined && typeof next !== 'boolean') {
       throw new Meteor.Error('invalid-crew', `${key} must be true or false.`);
     }
-    capabilities[key] = next ?? current.capabilities?.[key] ?? false;
+    capabilities[key] = next ?? current.capabilities?.[key] ?? (key === 'files');
   }
   const requestedModel = cleanCrewModel(patch.model, current.model);
   if (availableModelIds) {
@@ -2802,11 +2925,14 @@ function normalizeCrewPatch(current, patch, availableModelIds) {
   }
   if (patch.experience !== undefined) {
     assertOnlyKeys(
-      patch.experience, ['record', 'recall', 'recent', 'scope', 'approval'], 'invalid-crew',
+      patch.experience, ['record', 'reflect', 'recall', 'recent', 'scope', 'approval'], 'invalid-crew',
     );
     if (patch.experience.record !== undefined
       && typeof patch.experience.record !== 'boolean') {
       throw new Meteor.Error('invalid-crew', 'Experience recording must be true or false.');
+    }
+    if (patch.experience.reflect !== undefined && typeof patch.experience.reflect !== 'boolean') {
+      throw new Meteor.Error('invalid-crew', 'Reflection must be true or false.');
     }
     if (patch.experience.recall !== undefined
       && typeof patch.experience.recall !== 'boolean') {
@@ -3101,9 +3227,26 @@ export async function missionAllowsAgent(context, agent) {
  * any consequential implementation starts.
  */
 export async function configuredToolEntitlement(tool, context, agent) {
+  try { await assertWorkflowSessionExecution(context.sessionId, { toolCall: true }); } catch { return false; }
   const authority = await authorizedMissionAgent(context, agent);
   if (!authority) return false;
   const { root, config } = authority;
+
+  if (tool === HANDOFF_TOOL_NAME) {
+    const target = context.args?.agent;
+    if (typeof target !== 'string' || target === agent) return false;
+    const session = await AgentSessions.findOneAsync(context.sessionId);
+    return !!session && !session.parent && !session.ephemeral
+      && session.participants?.some((participant) => participant.kind === 'model' && participant.agent === target)
+      && await missionAllowsAgent(context, target);
+  }
+
+  if (DECISION_TOOL_NAMES.includes(tool)) {
+    return constellationDecisions?.toolEntitlement(tool, context, agent) ?? false;
+  }
+  if (tool === 'run_code') return constellationExecution?.toolEntitlement(context, agent) ?? false;
+  if (tool === 'inspect_code_run') return constellationExecution?.inspectionEntitlement(context, agent) ?? false;
+  if (MISSION_FILE_TOOL_NAMES.includes(tool)) return constellationExecution?.fileToolEntitlement(tool, context, agent) ?? false;
 
   if (tool === 'inspect_workspace') return config.capabilities?.inspect === true;
   if (tool === 'publish_brief') return config.capabilities?.publish === true;
@@ -3171,14 +3314,21 @@ export async function configuredToolEntitlement(tool, context, agent) {
     status: 'ready',
     approval: { $ne: 'blocked' },
     agents: agent,
-  }, { fields: { toolMode: 1, selectedTools: 1 } });
+  }, { fields: { agents: 1, toolMode: 1, selectedTools: 1, agentToolPolicies: 1 } });
   if (!mcp) return false;
-  return mcp.toolMode !== 'selected' || mcp.selectedTools?.includes(catalog.remoteName);
+  return mcpAgentCanUseTool(mcp, agent, catalog.remoteName);
 }
 
-export async function requireActiveMissionExecution(sessionId, agent) {
+export async function requireActiveMissionExecution(sessionId, agent, { reflection = false } = {}) {
+  await assertWorkflowSessionExecution(sessionId, { reflection });
   const root = await rootMissionSession(sessionId);
   if (!root) return;
+  // A delayed specialist continuation must not outrun a stop on its parent
+  // mission. Rechecked at provider entry as well as at approval dispatch.
+  if (sessionId !== root._id && ['stopped', 'error'].includes(root.phase) && !reflection) {
+    throw new Meteor.Error('mission-stopped', 'The mission is stopped. Send a message in its chat to continue.');
+  }
+  if (!reflection) await constellationDecisions?.assertContinuationExecution(sessionId, agent);
   // `Agent.ask()` uses an intentionally ephemeral root and has no Mission
   // control-plane record. Every durable app root must have one; initialize the
   // normal active default rather than silently treating a missing row as allow.
@@ -3204,6 +3354,29 @@ export async function requireActiveMissionExecution(sessionId, agent) {
 // deliberately separate from optional prompt enrichment: if enrichment fails,
 // the framework keeps the already-tagged request and the paid-work fence holds.
 Agent.hook('beforeProviderRequest', withMissionExecutionContext);
+
+// Add saved references before the framework freezes/audits the effective
+// request and neutralizes forged memory-frame markers. Provider adapters must
+// not append unaudited context after that protected boundary.
+export async function withPlanReferences(request, context) {
+  if (context.purpose !== 'think') return { ...request, [MISSION_PLAN_CONTEXT]: '' };
+  const planContext = await planContextForRequest(request, context.sessionId);
+  return { ...request, [MISSION_PLAN_CONTEXT]: planContext,
+    ...(planContext ? { system: `${request.system}\n\n${planContext}` } : {}) };
+}
+Agent.hook('beforeProviderRequest', withPlanReferences);
+
+Agent.hook('beforeProviderRequest', async (request, context) => {
+  if (context.purpose !== 'think' || !constellationDecisions) return;
+  if (request.system.includes('## Decision nodes\nUse find_decision_nodes')) return;
+  const session = await AgentSessions.findOneAsync(context.sessionId, { fields: { userId: 1, agent: 1 } });
+  if (!session?.userId || !await workspaceOwnerCanApprove({ userId: session.userId })) return;
+  if (!(await constellationDecisions.getSettings(session.userId)).enabled) return;
+  const agent = context.agent ?? session.agent;
+  const policy = await constellationDecisions.getPolicy(session.userId, agent);
+  if (!policy.use) return;
+  return { ...request, system: `${request.system}\n\n## Decision nodes\nUse find_decision_nodes to reuse an assigned decision before creating one. Use evaluate_decision_node for typed semantic judgments (choose an option, yes/no probability, or a described scale); ordinary calculations and actions belong in code and existing tools. Send only the relevant task context in the node's declared input fields, never the whole transcript, secrets, or unrelated memory. Independent questions over the same context belong in one node so they are evaluated together. ${policy.create === 'disabled' ? 'You cannot create nodes.' : 'Use create_decision_node when no existing decision fits; describe one coherent judgment per question, concrete criteria, and a no-match option where appropriate. A pending node requires human review; wait rather than bypassing review.'} Results are judgments, not verified facts or permission to act. Preserve existing action approvals. Tell the user the meaningful outcome in plain language; do not print tool JSON.` };
+});
 
 Agent.hook('beforeProviderRequest', async (request, context) => {
   if (context.purpose !== 'think') return;
@@ -3253,7 +3426,7 @@ async function stopMissionExecution(userId, session) {
     await AgentSessions.updateAsync(
       { _id: current._id, userId, erasingAt: { $exists: false } },
       {
-        $set: { phase: 'stopped', updatedAt: new Date() },
+        $set: { phase: 'stopped', stoppedAt: new Date(), updatedAt: new Date() },
         $unset: { pendingSystem: '', pendingRelay: '' },
       },
     );
@@ -3261,6 +3434,8 @@ async function stopMissionExecution(userId, session) {
       ? await AgentSessions.findOneAsync({ _id: nextId, userId })
       : null;
   }
+  await constellationDecisions?.stopMissionContinuations(userId, session._id);
+  await constellationExecution?.stopMissionExecutions(userId, session._id);
 }
 
 const MISSION_STOP_WAIT_MS = 3_000;
@@ -3331,7 +3506,8 @@ export async function waitForMissionQuiescence(
         );
         continue;
       }
-    } else {
+    } else if ((!constellationDecisions || await constellationDecisions.missionContinuationsQuiescent(userId, sessionId))
+      && (!constellationExecution || await constellationExecution.missionExecutionsQuiescent(userId, sessionId))) {
       return session;
     }
     if (Date.now() >= deadline) {
@@ -3581,14 +3757,17 @@ async function dispatchPulse(pulse, scheduledFor, manual = false) {
 }
 
 let scanningPulses = false;
-async function scanDuePulses() {
+export async function scanDuePulses({
+  findDue = (now) => PulseConfigs.find(
+    { enabled: true, nextRunAt: { $lte: now } }, { sort: { nextRunAt: 1 }, limit: 20 },
+  ).fetchAsync(),
+  warn = (message) => console.warn(message),
+} = {}) {
   if (scanningPulses) return;
   scanningPulses = true;
   try {
     const now = new Date();
-    const due = await PulseConfigs.find(
-      { enabled: true, nextRunAt: { $lte: now } }, { sort: { nextRunAt: 1 }, limit: 20 },
-    ).fetchAsync();
+    const due = await findDue(now);
     for (const pulse of due) {
       const scheduledFor = pulse.nextRunAt;
       let nextRunAt;
@@ -3608,6 +3787,14 @@ async function scanDuePulses() {
       );
       if (claimed === 1) await dispatchPulse(pulse, scheduledFor);
     }
+  } catch (error) {
+    // This runs detached from a request. A transient Mongo outage must not
+    // become an unhandled rejection that terminates every mission's server.
+    // Read failures leave due work for the next scan. Never replay an already
+    // claimed dispatch here: its outcome may be uncertain after a disconnect.
+    const kind = typeof error?.name === 'string' && /^[A-Za-z][A-Za-z0-9]{0,79}$/.test(error.name)
+      ? error.name : 'Error';
+    warn(`[constellation] Pulse check failed (${kind}); the scheduler will check again at the next scheduled check.`);
   } finally {
     scanningPulses = false;
   }
@@ -4450,6 +4637,105 @@ DDPRateLimiter.addRule(
   60_000,
 );
 
+/** The only host construction path that grants post-completion, tool-free
+ * reflection. Both selection and actual Provider entry retain live fences. */
+export async function reflectionProviderFor(config, sessionId) {
+  await requireActiveMissionExecution(sessionId, config.agent, { reflection: true });
+  const selectedModel = config.model === 'default' ? model : config.model;
+  return { provider: providerFor(config.agent, config, { reflection: true }), model: selectedModel,
+    scripted: selectedModel === LOCAL_MODEL,
+    request: (request) => ({ ...request, [MISSION_EXECUTION_SESSION]: sessionId }) };
+}
+installConstellationEvidence({ requireUser: claimWorkspace, MissionConfigs, CrewConfigs,
+  reflectionProvider: reflectionProviderFor,
+});
+installConstellationAgentWork({
+  CrewConfigs,
+  requireUser: async (userId) => {
+    if (!await workspaceOwnerCanApprove({ userId })) {
+      throw new Meteor.Error('not-authorized', 'Sign in as the workspace owner to view agent work.');
+    }
+  },
+});
+installConstellationAgentCapabilities({
+  CrewConfigs, SkillConfigs, McpConfigs, ToolCatalog,
+  requireUser: async (userId) => {
+    if (!await workspaceOwnerCanApprove({ userId })) {
+      throw new Meteor.Error('not-authorized', 'Sign in as the workspace owner to change agent access.');
+    }
+  },
+  withMutation: withWorkspaceConfigMutation,
+  refreshSkills: ensureCrewConfigs,
+  assertMcpMutationAllowed,
+  publicMcpConfig,
+  refreshMcp: async (userId, config) => {
+    // Access-only edits never restart a server or connect to a new endpoint.
+    await updateMcpCatalogAccess(config, config.status);
+    await rebuildMcpToolAssignments(userId);
+  },
+});
+constellationDecisions = installConstellationDecisions({
+  CrewConfigs, MissionConfigs, AgentSessions,
+  requireUser: async (userId) => {
+    if (!await workspaceOwnerCanApprove({ userId })) {
+      throw new Meteor.Error('not-authorized', 'Sign in as the workspace owner to manage decisions.');
+    }
+  },
+  rootMissionSession, missionAllowsAgent, requireActiveMissionExecution,
+  startDecisionContinuation: startSystemTurn,
+  encryptSecret: (userId, value) => encryptChannelSecret(userId, 'typesafe', 'apiKey', value),
+  decryptSecret: (userId, box) => decryptChannelSecret(userId, 'typesafe', 'apiKey', box),
+  canStoreSecret: () => !!configKeyBytes,
+  onPolicyChange: (userId) => syncCodeToolCatalog(userId),
+});
+constellationExecution = installConstellationExecution({
+  CrewConfigs, MissionConfigs, AgentSessions,
+  requireUser: async (userId) => {
+    if (!await workspaceOwnerCanApprove({ userId })) {
+      throw new Meteor.Error('not-authorized', 'Sign in as the workspace owner to manage code execution.');
+    }
+  },
+  rootMissionSession, missionAllowsAgent, requireActiveMissionExecution,
+  encryptSecret: (userId, value) => encryptChannelSecret(userId, 'sprites', 'token', value),
+  decryptSecret: (userId, box) => decryptChannelSecret(userId, 'sprites', 'token', box),
+  canStoreSecret: () => !!configKeyBytes,
+  onPolicyChange: (userId) => syncCodeToolCatalog(userId),
+});
+// Resolve the authoritative workspace before registering a Crew. Eager default
+// definitions can race recovery after a restart and claim a different Identity
+// id for an existing Agent name. Until restoration finishes, core activation
+// keeps unregistered Agents' durable work pending.
+// Meteor awaits startup callbacks in registration order: restore before the
+// workflow engine's recovery callback can resume an Agent step.
+let resolveWorkspaceRuntime;
+let rejectWorkspaceRuntime;
+export const workspaceRuntimeReady = new Promise((resolve, reject) => {
+  resolveWorkspaceRuntime = resolve;
+  rejectWorkspaceRuntime = reject;
+});
+workspaceRuntimeReady.catch(() => {});
+Meteor.startup(async () => {
+  try {
+    await restoreWorkspaceCrewRuntime();
+    resolveWorkspaceRuntime();
+  } catch (error) {
+    rejectWorkspaceRuntime(error);
+    throw error;
+  }
+});
+installMissionWorkflows({ MissionConfigs, CrewConfigs, requireUser: async (userId) => {
+  // Runtime reads and recovery may check ownership, never establish it.
+  // Claiming the desktop belongs exclusively to the explicit bootstrap path.
+  if (!await workspaceOwnerCanApprove({ userId })) {
+    throw new Meteor.Error('workspace-owned', 'This desktop workspace belongs to another local account.');
+  }
+},
+  ensureMissionConfig, missionAllowsAgent, requireActiveMissionExecution, decisions: constellationDecisions });
+installConstellationLab({ requireUser: claimWorkspace, CrewConfigs });
+installConstellationFederation({ requireUser: claimWorkspace, CrewConfigs, MissionConfigs, McpConfigs,
+  mcpRuntimeName, mcpDefinition: async (config) => config.managed === 'app' ? appMcpDefinition(config) : workspaceMcpDefinition(config),
+});
+
 Meteor.methods({
   async 'constellation.constitutionRevise'(agentId, expectedGeneration, body, reason) {
     check(agentId, String);
@@ -4636,6 +4922,7 @@ Meteor.methods({
       );
     }
     await setMissionPulseState(this.userId, sessionId, next.status === 'active');
+    if (next.status === 'completed') await constellationExecution?.onMissionCompleted(this.userId, sessionId);
     await reconcileConfiguredMissionCrew(this.userId, sessionId);
     return MissionConfigs.findOneAsync(
       { _id: sessionId, userId: this.userId }, { fields: { userId: 0 } },
@@ -4702,6 +4989,7 @@ Meteor.methods({
           { $set: { archived: new Date() } },
         );
       }
+      await constellationExecution?.onMissionCompleted(userId, sessionId);
       return MissionConfigs.findOneAsync(
         { _id: sessionId, userId }, { fields: { userId: 0 } },
       );
@@ -5736,6 +6024,33 @@ if (Meteor.isTest || Meteor.isAppTest) {
   });
 }
 
+export async function restoreWorkspaceCrewRuntime({
+  ready = startupComplete,
+  readWorkspace = () => WorkspaceState.findOneAsync('local'),
+  mutate = withWorkspaceConfigMutation,
+  restoreCrew = ensureCrewConfigs,
+  initializeDefaults = () => {
+    for (const config of DEFAULT_CREW) defineCrewAgent(config, DEFAULT_SKILLS);
+    defineOrchestrator(DEFAULT_CREW, DEFAULT_PRIMARY, DEFAULT_SKILLS);
+  },
+} = {}) {
+  await ready;
+  const workspace = await readWorkspace();
+  if (!workspace?.ownerUserId) {
+    // A genuinely new workspace needs its baseline runtime (including the
+    // shared Fact Memory store). This is never a fallback for failed recovery.
+    initializeDefaults();
+    return false;
+  }
+  const userId = workspace.ownerUserId;
+  return mutate(userId, async () => {
+    // Recovery observes ownership; only explicit bootstrap may claim it.
+    if ((await readWorkspace())?.ownerUserId !== userId) return false;
+    await restoreCrew(userId);
+    return true;
+  });
+}
+
 Meteor.startup(async () => {
   await MissionConfigs.rawCollection().createIndex({ userId: 1, updatedAt: -1 });
   await MissionConfigs.rawCollection().createIndex({ userId: 1, sessionId: 1 }, { unique: true });
@@ -5806,4 +6121,5 @@ Meteor.startup(async () => {
     .find((provider) => provider.id === 'ollama')?.models.length ?? 0;
   console.log(`[constellation] ready — ${live ? `live provider (${model})` : 'deterministic local provider'}${ollamaCount ? ` · Ollama (${ollamaCount})` : ''}`);
   console.log(`[constellation] credential store: ${configKeyBytes ? 'OS-protected key loaded' : 'locked (launch from Electron)'}`);
+  desktopReady = true;
 });

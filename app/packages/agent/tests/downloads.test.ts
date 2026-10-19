@@ -194,7 +194,7 @@ describe('attachment downloads', () => {
     assert.equal((await handleDownload(token)).status, 404);
   });
 
-  it('releases the Session operation when attachment decoding throws', async function () {
+  it('releases the Session operation and refuses malformed attachment bytes', async function () {
     this.timeout(20000);
     await clean();
     await seed();
@@ -203,17 +203,9 @@ describe('attachment downloads', () => {
     const { issueAttachmentToken, redeemAttachmentToken } = await import('../server/downloads');
     const token = (await issueAttachmentToken('dl1', 'attD1'))!;
 
-    // Simulate a corrupted legacy row. Buffer.from(null, 'base64') throws only
-    // after redemption has acquired its Session operation.
+    // Simulate a corrupted legacy row after redemption's token was minted.
     await (AgentAttachments as any).updateAsync('attD1', { $set: { content: null } });
-    let threw = false;
-    try {
-      await redeemAttachmentToken(token);
-    } catch {
-      threw = true;
-    }
-
-    assert.isTrue(threw, 'the malformed stored bytes exercise the failure path');
+    assert.isNull(await redeemAttachmentToken(token), 'corrupted bytes are refused without a public exception');
     assert.deepEqual(
       (await AgentSessions.findOneAsync('dl1'))?.operations ?? [],
       [],

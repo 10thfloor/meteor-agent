@@ -4,6 +4,7 @@ import {
   defineAgentChat,
   isStructuredAssistantContent,
   sanitizeCleanAssistantContent,
+  type ComposerSubmissionHandler,
 } from '../client/element';
 
 /**
@@ -42,10 +43,12 @@ const waitFor = (
 type ChatElement = HTMLElement & {
   sessionId: string | null;
   composerMode: 'ask' | 'note';
+  recipient: string | undefined;
+  submissionHandler: ComposerSubmissionHandler | null;
   agentInstance: {
     messages(sessionId: string): { fetch(): any[] };
     session(sessionId: string): any;
-    send(sessionId: string, text: string): Promise<string>;
+    send(sessionId: string, text: string, options?: { to?: string }): Promise<string>;
     contribute(sessionId: string, text: string): Promise<string>;
     approve(sessionId: string, expectedToolCallId?: string): Promise<void>;
     deny(sessionId: string, reason?: string, expectedToolCallId?: string): Promise<void>;
@@ -400,6 +403,83 @@ describe('<agent-chat>', () => {
       client.send = liveSend;
       client.contribute = liveContribute;
     }
+  });
+
+  it('captures the explicit recipient for sends and receipts, never for crew notes', async function () {
+    const el = mountTranscript([]);
+    const client = el.agentInstance!;
+    const send = part<HTMLButtonElement>(el, 'send');
+    const calls: any[] = [];
+    const receipts: any[] = [];
+    let finish!: () => void;
+    client.send = (sessionId, text, options) => {
+      calls.push({ sessionId, text, options });
+      return new Promise<string>((resolve) => { finish = () => resolve(sessionId); });
+    };
+    client.contribute = async (sessionId, text) => {
+      calls.push({ sessionId, text, note: true });
+      return sessionId;
+    };
+    el.addEventListener('agent-chat:submitted', (event) => {
+      receipts.push((event as CustomEvent).detail);
+    });
+    assert.isUndefined(el.recipient, 'old hosts retain default routing');
+    el.recipient = 'm:relay';
+    say(el, 'Please review this with @atlas');
+    assert.deepEqual(calls[0], {
+      sessionId: el.sessionId, text: 'Please review this with @atlas', options: { to: 'm:relay' },
+    });
+    el.recipient = 'm:signal';
+    finish();
+    await waitFor('the addressed send to settle', 1000, () => !send.disabled);
+    assert.equal(receipts[0].recipient, 'm:relay', 'selection churn cannot rewrite a sent receipt');
+    el.composerMode = 'note';
+    say(el, '@relay No reply needed');
+    await waitFor('the note to settle', 1000, () => !send.disabled);
+    assert.isTrue(calls[1].note);
+    assert.isUndefined(receipts[1].recipient, 'notes never claim to address an agent');
+    assert.equal(el.recipient, 'm:signal', 'notes preserve the next ask recipient');
+    el.recipient = undefined;
+    assert.isFalse(el.hasAttribute('recipient'));
+  });
+
+  it('passes the selected recipient through application-owned submission handlers', async function () {
+    const el = mountTranscript([]);
+    const submissions: any[] = [];
+    el.submissionHandler = async (submission) => { submissions.push(submission); };
+    el.recipient = 'm:relay';
+    say(el, 'Review #release');
+    await waitFor('the custom ask to settle', 1000, () => !part<HTMLButtonElement>(el, 'send').disabled);
+    assert.deepEqual(submissions[0], {
+      sessionId: el.sessionId, text: 'Review #release', mode: 'ask', recipient: 'm:relay',
+    });
+    el.composerMode = 'note';
+    say(el, 'Shared context');
+    await waitFor('the custom note to settle', 1000, () => !part<HTMLButtonElement>(el, 'send').disabled);
+    assert.equal(submissions[1].mode, 'note');
+    assert.isUndefined(submissions[1].recipient);
+  });
+
+  it('renders a structured handoff as a clear receipt without exposing its machine result', () => {
+    const el = mountTranscript([{
+      _id: 'handoff-receipt', sessionId: 'handoff-fixture', seq: 1,
+      role: 'tool', kind: 'handoff', from: { participant: 'm:orchestrator', name: 'orchestrator' },
+      to: 'm:operator', content: '{"ok":true,"agent":"operator"}',
+      displayContent: 'Sent to Relay', transcriptContent: 'Please **review** this. Payload: {"internal":true}',
+    }]);
+    el.agentInstance!.session = () => ({ participants: [
+      { kind: 'model', agent: 'orchestrator', displayName: 'Atlas' },
+      { kind: 'model', agent: 'operator', displayName: 'Relay' },
+    ] });
+    el.mentionSources = el.mentionSources;
+    assert.equal(part(el, 'handoff-route').textContent, 'Atlas → Relay');
+    assert.equal(part(el, 'handoff-status').textContent, 'Sent');
+    assert.include(part(el, 'handoff-message').textContent, 'Please review this.');
+    assert.isNotNull(part(el, 'handoff-message').querySelector('strong'));
+    assert.notInclude(part(el, 'handoff').textContent, '"ok"');
+    assert.notInclude(part(el, 'handoff').textContent, '"internal"');
+    el.setAttribute('verbosity', 'debug');
+    assert.include(part(el, 'tool-content').textContent, '"ok"', 'raw output remains explicitly opt-in');
   });
 
   it('parks on a gated tool and resolves it through the approval bar buttons', async function () {

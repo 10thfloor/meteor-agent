@@ -4,7 +4,9 @@ import { ACTIVE_PHASES, type AgentSession } from '../common/types';
 import { modelFrom } from '../common/participants';
 import { buildRunConfig, getAgent } from './registry';
 import { guardedUpdate, SERVER_ID } from './lease';
-import { validateToolArgs, type ResolvedTool, type ToolContext, type ToolResult } from './tools';
+import { validateToolArgs, validateSubagentBudget, type ResolvedTool, type ToolContext,
+  type ToolResult, type SubagentBudget, type DelegationContext } from './tools';
+import { evidenceDigest } from './evidence';
 // Type-only: runTurn is passed in by the loop to avoid a cyclic import.
 import type { RunConfig } from './loop';
 import {
@@ -76,6 +78,56 @@ export interface SubagentDispatch {
 
 type RunTurn = (sessionId: string, config: RunConfig) => Promise<void>;
 
+/** Persisted per-edge ceilings can only tighten the current Agent definition.
+ * The Turn invokes this again on every approval/resume/recovery entry. */
+export function applySubagentBudget(config: RunConfig, budget?: SubagentBudget): RunConfig {
+  validateSubagentBudget(budget);
+  if (!budget) return config;
+  return { ...config,
+    maxIterations: Math.min(config.maxIterations ?? 10, budget.maxIterations ?? Infinity),
+    budget: { ...config.budget,
+      ...(budget.toolCalls !== undefined ? { toolCalls: Math.min(config.budget?.toolCalls ?? Infinity, budget.toolCalls) } : {}),
+      ...(budget.spend !== undefined ? { spend: Math.min(config.budget?.spend ?? Infinity, budget.spend) } : {}),
+    },
+  };
+}
+
+function tighterBudget(left?: SubagentBudget, right?: SubagentBudget): SubagentBudget | undefined {
+  validateSubagentBudget(left); validateSubagentBudget(right);
+  if (!left && !right) return undefined;
+  const result: SubagentBudget = {};
+  for (const key of ['toolCalls', 'spend', 'maxIterations'] as const) {
+    const value = Math.min(left?.[key] ?? Infinity, right?.[key] ?? Infinity);
+    if (Number.isFinite(value)) result[key] = value;
+  }
+  return result;
+}
+
+async function completeDelegation(tool: ResolvedTool, context: DelegationContext,
+  dispatch: SubagentDispatch): Promise<SubagentDispatch> {
+  if (!tool.delegation?.afterDelegate || !dispatch.childSessionId) return dispatch;
+  try {
+    const projection = await tool.delegation.afterDelegate({ ...context,
+      childSessionId: dispatch.childSessionId, ok: dispatch.result.ok,
+      ...(dispatch.result.ok ? { text: String(dispatch.result.value ?? '') } : { error: dispatch.result.error }),
+    });
+    if (projection === false) return { ...dispatch, result: failure('delegation-rejected', 'The delegated result did not meet the completion policy.') };
+    if (!projection || typeof projection !== 'object' || typeof projection.model !== 'string'
+      || projection.model.length > 100_000
+      || (projection.display !== undefined && typeof projection.display !== 'string')
+      || (projection.transcript !== undefined && typeof projection.transcript !== 'string')) {
+      throw new Error('Invalid completion projection');
+    }
+    // A projection cannot turn a failed or parked child into a successful one.
+    if (!dispatch.result.ok) return dispatch;
+    return { ...dispatch, result: { ok: true, value: projection.model,
+      display: projection.display, transcript: projection.transcript ?? projection.display,
+      auditValue: dispatch.result.value } };
+  } catch {
+    return { ...dispatch, result: failure('delegation-policy-failed', 'The delegation completion policy could not be applied.') };
+  }
+}
+
 const failure = (error: string, reason: string): ToolResult =>
   ({ ok: false, error: { error, reason } });
 
@@ -110,7 +162,7 @@ function dispatchFromOutcome(
 /** Find an unclaimed child from a prior abandoned dispatch of the same
  *  logical call. Misses gracefully — a fresh child is created instead. */
 async function findReusableChild(
-  parentSessionId: string, toolCallId: string, agent: string, prompt: string,
+  parentSessionId: string, toolCallId: string, agent: string, prompt: string, requestDigest: string,
 ): Promise<AgentSession | null> {
   const candidates = await AgentSessions.find(
     {
@@ -133,7 +185,9 @@ async function findReusableChild(
     const first = await AgentMessages.findOneAsync(
       { sessionId: child._id, seq: 0 },
     );
-    if (first?.content !== prompt) continue;
+    if (child.delegation?.requestDigest !== undefined) {
+      if (child.delegation.requestDigest !== requestDigest || !first) continue;
+    } else if (first?.content !== prompt) continue;
     return child;
   }
   return null;
@@ -188,19 +242,75 @@ export async function runSubagent(
   if (!config) {
     return { result: failure('unknown-agent', `No agent named "${name}" is registered.`) };
   }
+  const pin = tool.delegation?.version;
+  if (pin !== undefined && config.version !== pin) {
+    return { result: failure('subagent-version-changed', 'The delegated agent version changed. Update its configured version before running.') };
+  }
 
   // Read off the parent doc so child authorization matches the parent's.
   const userId = parent.userId ?? null;
-  const prompt = subagentPrompt(args);
+  let prompt = subagentPrompt(args);
+  const requestDigest = evidenceDigest({ agent: name, args });
+  let context: DelegationContext = { prompt, userId, sessionId: ctx.sessionId, agent: name,
+    ...(ctx.toolCallId ? { toolCallId: ctx.toolCallId } : {}) };
 
   // Idempotency: reuse a child from a prior abandoned dispatch if available.
   if (ctx.toolCallId) {
-    const existing = await findReusableChild(ctx.sessionId, ctx.toolCallId, name, prompt);
+    const existing = await findReusableChild(ctx.sessionId, ctx.toolCallId, name, prompt, requestDigest);
     if (existing) {
+      if (pin !== undefined && existing.delegation?.version !== pin) return {
+        result: failure('subagent-version-changed', 'This delegation already ran under another agent version. Start a new delegation.'),
+        childSessionId: existing._id,
+      };
       const reused = await reuseChild(existing, name);
-      if (reused) return (await authorized()) ? reused : denied();
+      if (!(await authorized())) return denied();
+      // Adopt the already transformed prompt. Nondeterministic before hooks
+      // must never create a second child for an already executed logical call.
+      const original = await AgentMessages.findOneAsync({ sessionId: existing._id, seq: 0 });
+      context = { ...context, prompt: original?.content ?? prompt };
+      if (reused) return completeDelegation(tool, context, reused);
+      return { result: failure('subagent-running', 'The delegated agent is still working. Its conversation remains open.'),
+        childSessionId: existing._id };
     }
   }
+
+  let budget = tool.delegation?.budget;
+  try {
+    validateSubagentBudget(budget);
+    if (!(await authorized())) return denied();
+    if (tool.delegation?.context) {
+      prompt = await tool.delegation.context(context);
+      if (typeof prompt !== 'string' || !prompt.trim() || prompt.length > 100_000) throw new Error('Invalid delegated context');
+      context = { ...context, prompt };
+    }
+    if (tool.delegation?.beforeDelegate) {
+      const decision = await tool.delegation.beforeDelegate(context);
+      if (decision === false) return { result: failure('delegation-rejected', 'The delegation was declined by its configured policy.') };
+      if (decision !== true) {
+        if (!decision || typeof decision !== 'object'
+          || Object.keys(decision).some((key) => !['prompt', 'budget'].includes(key))) throw new Error('Invalid delegation decision');
+        if (decision.prompt !== undefined) {
+          if (typeof decision.prompt !== 'string' || !decision.prompt.trim() || decision.prompt.length > 100_000) throw new Error('Invalid delegation prompt');
+          prompt = decision.prompt;
+        }
+        budget = tighterBudget(budget, decision.budget);
+        context = { ...context, prompt };
+      }
+    }
+  } catch {
+    return { result: failure('delegation-policy-failed', 'The delegation policy could not be applied.') };
+  }
+  // Freeze the actual resulting ceilings, including the child's stricter
+  // definition, so later configuration edits cannot enlarge a parked child.
+  let childRunConfig: RunConfig;
+  try { childRunConfig = applySubagentBudget(buildRunConfig(config, userId), budget); } catch {
+    return { result: failure('delegation-policy-failed', 'The delegated configuration could not be prepared.') };
+  }
+  const frozenBudget: SubagentBudget = {
+    maxIterations: childRunConfig.maxIterations ?? 10,
+    ...(childRunConfig.budget?.toolCalls !== undefined ? { toolCalls: childRunConfig.budget.toolCalls } : {}),
+    ...(childRunConfig.budget?.spend !== undefined ? { spend: childRunConfig.budget.spend } : {}),
+  };
 
   const childSessionId = Random.id();
   const childMessageId = Random.id();
@@ -216,6 +326,7 @@ export async function runSubagent(
     budgetSpent: { turns: 0, toolCalls: 0 },
     // Fallback '' keeps the field a string for direct callers with no call id.
     parent: { sessionId: ctx.sessionId, toolCallId: ctx.toolCallId ?? '' },
+    delegation: { requestDigest, ...(pin !== undefined ? { version: pin } : {}), budget: frozenBudget },
     depth,
     // Copy human participants from parent; seed the child's own model only.
     ...(parent.participants?.length ? {
@@ -241,6 +352,9 @@ export async function runSubagent(
     // may all await. Re-read host authorization immediately before the atomic
     // child birth; a child born after this boundary may finish its turn.
     if (!(await authorized())) return denied();
+    if (pin !== undefined && getAgent(name)?.version !== pin) return {
+      result: failure('subagent-version-changed', 'The delegated agent version changed before work started.'),
+    };
     born = await withSessionOperationTransaction(parentOperation, async (mongoSession) => {
       // Parent Lease, active-child marker, child Session, and first Message are
       // one birth transaction. A crash cannot strand an unowned child or an
@@ -294,9 +408,13 @@ export async function runSubagent(
     return { result: failure('subagent-failed', 'The calling session is no longer writable.') };
   }
 
-  try { // outer: the finally at the end clears activeChild on every exit
+  // A returned dispatch leaves activeChild in place: the dispatcher clears it in
+  // the transaction that commits this call's tool row, so the child is never
+  // without both handles (the watcher would re-link it as an orphan). Only a
+  // throw, which commits no row, clears it here.
+  try { // outer: clears activeChild if this throws
   try {
-    await runTurn(childSessionId, buildRunConfig(config, userId));
+    await runTurn(childSessionId, childRunConfig);
   } catch {
     // Harness failure — never expose the raw message in the transcript.
     console.error(`[10thfloor:agent] subagent "${name}" failed`);
@@ -306,9 +424,11 @@ export async function runSubagent(
     };
   }
 
-  return dispatchFromOutcome(await readTurnOutcome(childSessionId), name, childSessionId);
-  } finally {
+  return completeDelegation(tool, context,
+    dispatchFromOutcome(await readTurnOutcome(childSessionId), name, childSessionId));
+  } catch (error) {
     // Clear live-child marker so it doesn't shadow the next call's.
     await guardedUpdate(ctx.sessionId, SERVER_ID, { $unset: { activeChild: 1 } });
+    throw error;
   }
 }

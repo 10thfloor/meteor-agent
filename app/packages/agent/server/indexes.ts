@@ -1,5 +1,5 @@
 import { Meteor } from 'meteor/meteor';
-import type { Mongo } from 'meteor/mongo';
+import { MongoInternals, type Mongo } from 'meteor/mongo';
 import { AgentMemories, AgentMessages, AgentSessions } from '../common/collections';
 import {
   ChannelBindings, ChannelLinkTokens, ChannelVerdictTokens,
@@ -11,6 +11,7 @@ import { NAMES } from '../common/names';
 import {
   MESSAGE_RESERVATIONS_NAME, UserMessageReservations,
 } from './transcript';
+import { ensureInboundReplayTtl, INBOUND_REPLAY_TTL_SECONDS } from './inbound-ttl';
 
 /* Startup indexes for this package's queries. Idempotent and non-fatal:
  * a failure warns and moves on — the queries work unindexed, just slower. */
@@ -25,6 +26,7 @@ export async function ensureIndexes(): Promise<void> {
     // `'text'` for the memory search ladder's middle rung.
     keys: Record<string, 1 | -1 | 'text'>;
     options?: Record<string, unknown>;
+    ensure?: () => Promise<unknown>;
   }> = [
     {
       collection: AgentMessages,
@@ -117,7 +119,11 @@ export async function ensureIndexes(): Promise<void> {
       collection: InboundSubmissions,
       name: NAMES.inboundSubmissions,
       keys: { at: 1 },
-      options: { expireAfterSeconds: 7 * 24 * 60 * 60 },
+      options: { expireAfterSeconds: INBOUND_REPLAY_TTL_SECONDS },
+      ensure: () => ensureInboundReplayTtl(
+        InboundSubmissions.rawCollection(),
+        MongoInternals.defaultRemoteCollectionDriver().mongo.db,
+      ),
     },
     {
       collection: ChannelLinkTokens,
@@ -193,13 +199,20 @@ export async function ensureIndexes(): Promise<void> {
   for (const spec of specs) {
     try {
       // eslint-disable-next-line no-await-in-loop
-      await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
+      if (spec.ensure) await spec.ensure();
+      else await spec.collection.createIndexAsync(spec.keys, spec.options ?? {});
     } catch (e: any) {
       const errorKind = typeof e?.codeName === 'string'
         ? e.codeName
         : (typeof e?.name === 'string' ? e.name : 'Error');
       // Unique index failure is not just a perf issue — the race stays open.
-      if (spec.options?.unique) {
+      if (spec.name === NAMES.inboundSubmissions) {
+        console.warn(
+          `[10thfloor:agent] could not verify the seven-day admission replay retention index. `
+          + 'The existing index and records were left in place; check listIndexes/createIndex/collMod permissions '
+          + `and retry startup. Error kind: ${errorKind}`,
+        );
+      } else if (spec.options?.unique) {
         console.warn(
           `[10thfloor:agent] could not create the UNIQUE ${spec.name} index `
           + `${JSON.stringify(spec.keys)} — keyed memory saves are NOT race-safe until `

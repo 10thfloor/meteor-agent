@@ -67,12 +67,82 @@ export interface McpCallResult {
   [k: string]: unknown;
 }
 
+/** Secret-safe, allowlisted views for operator UIs. MCP metadata is supplied
+ * by an untrusted subprocess, so arbitrary `_meta`, annotations, icons, and
+ * document keys never cross this boundary. */
+export interface McpResourceInfo {
+  uri: string;
+  name: string;
+  title?: string;
+  description?: string;
+  mimeType?: string;
+  size?: number;
+}
+
+export interface McpResourceContent {
+  uri: string;
+  mimeType?: string;
+  text?: string;
+  /** Binary bytes are intentionally not returned through DDP/operator views. */
+  blob?: '[binary content omitted]';
+}
+
+export interface McpPromptInfo {
+  name: string;
+  title?: string;
+  description?: string;
+  arguments?: Array<{ name: string; description?: string; required?: boolean }>;
+}
+
+export interface McpPromptContent {
+  type: string;
+  text?: string;
+  mimeType?: string;
+  uri?: string;
+}
+
+export interface McpPromptMessage {
+  role: 'user' | 'assistant';
+  content: McpPromptContent;
+}
+
+interface McpResourceListResult {
+  resources?: unknown[];
+  nextCursor?: string;
+}
+
+interface McpResourceReadResult {
+  contents?: unknown[];
+}
+
+interface McpPromptListResult {
+  prompts?: unknown[];
+  nextCursor?: string;
+}
+
+interface McpPromptGetResult {
+  description?: string;
+  messages?: unknown[];
+}
+
 /** Test seam for the MCP client. Connecting is the factory's job. */
 export interface McpClient {
   listTools(
     params?: Record<string, unknown>, options?: McpRequestOptions,
   ): Promise<{ tools?: McpToolInfo[] } | undefined>;
   callTool(params: { name: string; arguments?: Record<string, unknown> }): Promise<McpCallResult>;
+  listResources?(
+    params?: { cursor?: string }, options?: McpRequestOptions,
+  ): Promise<McpResourceListResult | undefined>;
+  readResource?(
+    params: { uri: string }, options?: McpRequestOptions,
+  ): Promise<McpResourceReadResult | undefined>;
+  listPrompts?(
+    params?: { cursor?: string }, options?: McpRequestOptions,
+  ): Promise<McpPromptListResult | undefined>;
+  getPrompt?(
+    params: { name: string; arguments?: Record<string, string> }, options?: McpRequestOptions,
+  ): Promise<McpPromptGetResult | undefined>;
   close(): Promise<void>;
 }
 
@@ -239,6 +309,12 @@ export function mcpChildEnvironment(extra?: Record<string, string>): Record<stri
   return { ...env, ...extra };
 }
 
+/** The seam's per-request deadline, as pi-mcp spells it. Absent or zero leaves
+ *  the client's own default in force. */
+const deadline = (options?: McpRequestOptions): { timeoutMs?: number } => (
+  options?.timeout !== undefined && options.timeout > 0 ? { timeoutMs: options.timeout } : {}
+);
+
 /** The default factory, over `@earendil-works/pi-mcp`. Probed at 1.0.0
  *  (`dist/client.d.ts`, `dist/transports/stdio.d.ts`). Three of its defaults
  *  are overridden on purpose:
@@ -279,14 +355,24 @@ const defaultFactory: McpClientFactory = async (_name, def) => {
   // options)`. `readResource` takes the uri itself. There are no prompt
   // helpers: use `request('prompts/list' | 'prompts/get', params, options)`.
   return {
-    listTools: async (_params, options) => ({
-      tools: await client.listTools(
-        options?.timeout !== undefined && options.timeout > 0 ? { timeoutMs: options.timeout } : {},
-      ),
-    }),
+    listTools: async (_params, options) => ({ tools: await client.listTools(deadline(options)) }),
     callTool: (params) => client.callTool(
       params.name, params.arguments, { timeoutMs: MCP_CALL_TIMEOUT_MS },
     ),
+    // Raw requests, on purpose. The catalog code pages by hand under its own
+    // caps and allowlists every entry itself, so one malformed entry costs that
+    // entry. pi-mcp's typed helpers (`listResourcesPage`, `readResource`) would
+    // reject the whole answer, and the catalog would then drop the connection.
+    listResources: (params, options) => client.request(
+      'resources/list', params?.cursor ? { cursor: params.cursor } : undefined, deadline(options),
+    ),
+    readResource: (params, options) => client.request(
+      'resources/read', { uri: params.uri }, deadline(options),
+    ),
+    listPrompts: (params, options) => client.request(
+      'prompts/list', params?.cursor ? { cursor: params.cursor } : undefined, deadline(options),
+    ),
+    getPrompt: (params, options) => client.request('prompts/get', params, deadline(options)),
     close: () => client.close(),
   };
 };
@@ -554,6 +640,327 @@ export type DiscoveryResult =
 export async function discoverMcpTools(server: string): Promise<DiscoveryResult> {
   const c = await connect(server);
   return c.ok ? { ok: true, tools: c.conn.tools } : { ok: false, reason: c.reason };
+}
+
+export type McpCatalogError = 'mcp-unavailable' | 'mcp-unsupported' | 'not-allowed' | 'invalid-request';
+
+export type McpResourcesResult =
+  | { ok: true; resources: McpResourceInfo[] }
+  | { ok: false; error: McpCatalogError; reason: string };
+
+export type McpResourceResult =
+  | { ok: true; contents: McpResourceContent[] }
+  | { ok: false; error: McpCatalogError; reason: string };
+
+export type McpPromptsResult =
+  | { ok: true; prompts: McpPromptInfo[] }
+  | { ok: false; error: McpCatalogError; reason: string };
+
+export type McpPromptResult =
+  | { ok: true; description?: string; messages: McpPromptMessage[] }
+  | { ok: false; error: McpCatalogError; reason: string };
+
+type McpAuthorize = () => boolean | Promise<boolean>;
+
+const MCP_CATALOG_MAX = 500;
+const MCP_CATALOG_PAGES_MAX = 20;
+const MCP_RESOURCE_TEXT_MAX = 100_000;
+const MCP_RESOURCE_CONTENT_MAX = 32;
+const MCP_PROMPT_MESSAGE_MAX = 64;
+
+function catalogText(value: unknown, max: number): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.replace(/[\u0000-\u001f\u007f]+/g, ' ').replace(/\s+/g, ' ').trim();
+  return clean ? clean.slice(0, max) : undefined;
+}
+
+function contentText(value: unknown): string | undefined {
+  if (typeof value !== 'string') return undefined;
+  const clean = value.replace(/\u0000/g, '');
+  return clean.slice(0, MCP_RESOURCE_TEXT_MAX);
+}
+
+function catalogUri(value: unknown): string | undefined {
+  if (typeof value !== 'string' || !value || value.length > 4_096
+    || /[\u0000-\u001f\u007f]/.test(value)) return undefined;
+  return value;
+}
+
+function catalogName(value: unknown): string | undefined {
+  return catalogText(value, 200);
+}
+
+function methodNotFound(error: unknown): boolean {
+  const candidate = error as { code?: unknown; error?: { code?: unknown } } | null;
+  return candidate?.code === -32601 || candidate?.error?.code === -32601;
+}
+
+async function catalogAllowed(authorize?: McpAuthorize): Promise<boolean> {
+  if (!authorize) return true;
+  try { return (await authorize()) === true; } catch { return false; }
+}
+
+function notAllowed(): { ok: false; error: 'not-allowed'; reason: string } {
+  return { ok: false, error: 'not-allowed', reason: 'MCP content access is not allowed.' };
+}
+
+function unsupported(kind: string): { ok: false; error: 'mcp-unsupported'; reason: string } {
+  return { ok: false, error: 'mcp-unsupported', reason: `This MCP server has no ${kind} capability.` };
+}
+
+function catalogFailure(
+  server: string, conn: Connection, error: unknown,
+): { ok: false; error: 'mcp-unavailable'; reason: string } {
+  dropConnection(server, conn);
+  return { ok: false, error: 'mcp-unavailable', reason: unavailable(server, error) };
+}
+
+function cleanResource(value: unknown): McpResourceInfo | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const uri = catalogUri(source.uri);
+  if (!uri) return null;
+  const name = catalogName(source.name) ?? uri.slice(0, 200);
+  const title = catalogText(source.title, 200);
+  const description = catalogText(source.description, 1_000);
+  const mimeType = catalogText(source.mimeType, 200);
+  const size = typeof source.size === 'number' && Number.isSafeInteger(source.size) && source.size >= 0
+    ? source.size : undefined;
+  return {
+    uri, name,
+    ...(title ? { title } : {}),
+    ...(description ? { description } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(size !== undefined ? { size } : {}),
+  };
+}
+
+function cleanPrompt(value: unknown): McpPromptInfo | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const name = catalogName(source.name);
+  if (!name) return null;
+  const title = catalogText(source.title, 200);
+  const description = catalogText(source.description, 1_000);
+  const args = Array.isArray(source.arguments)
+    ? source.arguments.slice(0, 64).flatMap((entry): Array<{
+      name: string; description?: string; required?: boolean;
+    }> => {
+      if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return [];
+      const raw = entry as Record<string, unknown>;
+      const argName = catalogName(raw.name);
+      if (!argName) return [];
+      const argDescription = catalogText(raw.description, 500);
+      return [{
+        name: argName,
+        ...(argDescription ? { description: argDescription } : {}),
+        ...(typeof raw.required === 'boolean' ? { required: raw.required } : {}),
+      }];
+    })
+    : undefined;
+  return {
+    name,
+    ...(title ? { title } : {}),
+    ...(description ? { description } : {}),
+    ...(args?.length ? { arguments: args } : {}),
+  };
+}
+
+/** Discover every bounded resource page. Catalog metadata is reduced to an
+ * allowlist before it can reach a DDP method or operator UI. */
+export async function discoverMcpResources(
+  server: string, authorize?: McpAuthorize,
+): Promise<McpResourcesResult> {
+  const connected = await connect(server);
+  if (!connected.ok) return { ok: false, error: 'mcp-unavailable', reason: connected.reason };
+  const { conn } = connected;
+  if (!conn.client.listResources) return { ok: true, resources: [] };
+  const resources: McpResourceInfo[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  try {
+    for (let page = 0; page < MCP_CATALOG_PAGES_MAX && resources.length < MCP_CATALOG_MAX; page += 1) {
+      // Recheck before every external catalog request, not only before page 1.
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await catalogAllowed(authorize))) return notAllowed();
+      // eslint-disable-next-line no-await-in-loop
+      const listed = await conn.client.listResources(
+        cursor ? { cursor } : undefined,
+        { timeout: budgetFor(servers.get(server)!) },
+      );
+      for (const raw of listed?.resources ?? []) {
+        const resource = cleanResource(raw);
+        if (!resource || seen.has(resource.uri)) continue;
+        seen.add(resource.uri);
+        resources.push(resource);
+        if (resources.length >= MCP_CATALOG_MAX) break;
+      }
+      if (!listed?.nextCursor || listed.nextCursor === cursor) break;
+      cursor = listed.nextCursor;
+    }
+    return { ok: true, resources };
+  } catch (error) {
+    if (methodNotFound(error)) return { ok: true, resources: [] };
+    return catalogFailure(server, conn, error);
+  }
+}
+
+function cleanResourceContent(value: unknown): McpResourceContent | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const uri = catalogUri(source.uri);
+  if (!uri) return null;
+  const mimeType = catalogText(source.mimeType, 200);
+  const text = contentText(source.text);
+  return {
+    uri,
+    ...(mimeType ? { mimeType } : {}),
+    ...(text !== undefined ? { text } : {}),
+    ...(typeof source.blob === 'string' ? { blob: '[binary content omitted]' as const } : {}),
+  };
+}
+
+/** Read one resource after authorization. URI validation happens before any
+ * subprocess call, and binary bodies never cross the operator boundary. */
+export async function readMcpResource(
+  server: string, uri: string, authorize?: McpAuthorize,
+): Promise<McpResourceResult> {
+  const cleanUri = catalogUri(uri);
+  if (!cleanUri) {
+    return { ok: false, error: 'invalid-request', reason: 'Resource URI is invalid.' };
+  }
+  const connected = await connect(server);
+  if (!connected.ok) return { ok: false, error: 'mcp-unavailable', reason: connected.reason };
+  const { conn } = connected;
+  if (!conn.client.readResource) return unsupported('resources');
+  if (!(await catalogAllowed(authorize))) return notAllowed();
+  try {
+    const read = await conn.client.readResource(
+      { uri: cleanUri }, { timeout: budgetFor(servers.get(server)!) },
+    );
+    const contents = (read?.contents ?? []).slice(0, MCP_RESOURCE_CONTENT_MAX)
+      .map(cleanResourceContent).filter((row): row is McpResourceContent => row !== null);
+    return { ok: true, contents };
+  } catch (error) {
+    if (methodNotFound(error)) return unsupported('resources');
+    return catalogFailure(server, conn, error);
+  }
+}
+
+/** Discover every bounded prompt page with the same allowlist discipline. */
+export async function discoverMcpPrompts(
+  server: string, authorize?: McpAuthorize,
+): Promise<McpPromptsResult> {
+  const connected = await connect(server);
+  if (!connected.ok) return { ok: false, error: 'mcp-unavailable', reason: connected.reason };
+  const { conn } = connected;
+  if (!conn.client.listPrompts) return { ok: true, prompts: [] };
+  const prompts: McpPromptInfo[] = [];
+  const seen = new Set<string>();
+  let cursor: string | undefined;
+  try {
+    for (let page = 0; page < MCP_CATALOG_PAGES_MAX && prompts.length < MCP_CATALOG_MAX; page += 1) {
+      // eslint-disable-next-line no-await-in-loop
+      if (!(await catalogAllowed(authorize))) return notAllowed();
+      // eslint-disable-next-line no-await-in-loop
+      const listed = await conn.client.listPrompts(
+        cursor ? { cursor } : undefined,
+        { timeout: budgetFor(servers.get(server)!) },
+      );
+      for (const raw of listed?.prompts ?? []) {
+        const prompt = cleanPrompt(raw);
+        if (!prompt || seen.has(prompt.name)) continue;
+        seen.add(prompt.name);
+        prompts.push(prompt);
+        if (prompts.length >= MCP_CATALOG_MAX) break;
+      }
+      if (!listed?.nextCursor || listed.nextCursor === cursor) break;
+      cursor = listed.nextCursor;
+    }
+    return { ok: true, prompts };
+  } catch (error) {
+    if (methodNotFound(error)) return { ok: true, prompts: [] };
+    return catalogFailure(server, conn, error);
+  }
+}
+
+function cleanPromptContent(value: unknown): McpPromptContent | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const source = value as Record<string, unknown>;
+  const type = catalogText(source.type, 40);
+  if (!type) return null;
+  if (type === 'resource' && source.resource && typeof source.resource === 'object') {
+    const resource = source.resource as Record<string, unknown>;
+    const uri = catalogUri(resource.uri);
+    if (!uri) return null;
+    const text = contentText(resource.text);
+    const mimeType = catalogText(resource.mimeType, 200);
+    return {
+      type, uri,
+      ...(text !== undefined ? { text } : {}),
+      ...(mimeType ? { mimeType } : {}),
+    };
+  }
+  const text = type === 'text' ? contentText(source.text) : undefined;
+  const mimeType = catalogText(source.mimeType, 200);
+  const uri = catalogUri(source.uri);
+  return {
+    type,
+    ...(text !== undefined ? { text } : {}),
+    ...(mimeType ? { mimeType } : {}),
+    ...(uri ? { uri } : {}),
+  };
+}
+
+function cleanPromptArguments(value: unknown): Record<string, string> | null {
+  if (value === undefined) return {};
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+  const result: Record<string, string> = Object.create(null);
+  const entries = Object.entries(value as Record<string, unknown>);
+  if (entries.length > 64) return null;
+  for (const [key, raw] of entries) {
+    if (!/^[A-Za-z0-9_-]{1,200}$/.test(key)
+      || ['__proto__', 'prototype', 'constructor'].includes(key)
+      || typeof raw !== 'string' || raw.length > 4_000 || raw.includes('\u0000')) return null;
+    result[key] = raw;
+  }
+  return result;
+}
+
+/** Resolve a server-authored prompt after an authorization recheck. Binary
+ * prompt bodies are represented by metadata only; text is bounded. */
+export async function getMcpPrompt(
+  server: string, name: string, args: unknown, authorize?: McpAuthorize,
+): Promise<McpPromptResult> {
+  const cleanName = catalogName(name);
+  const cleanArgs = cleanPromptArguments(args);
+  if (!cleanName || !cleanArgs) {
+    return { ok: false, error: 'invalid-request', reason: 'Prompt request is invalid.' };
+  }
+  const connected = await connect(server);
+  if (!connected.ok) return { ok: false, error: 'mcp-unavailable', reason: connected.reason };
+  const { conn } = connected;
+  if (!conn.client.getPrompt) return unsupported('prompts');
+  if (!(await catalogAllowed(authorize))) return notAllowed();
+  try {
+    const got = await conn.client.getPrompt(
+      { name: cleanName, arguments: cleanArgs },
+      { timeout: budgetFor(servers.get(server)!) },
+    );
+    const messages: McpPromptMessage[] = [];
+    for (const raw of (got?.messages ?? []).slice(0, MCP_PROMPT_MESSAGE_MAX)) {
+      if (!raw || typeof raw !== 'object' || Array.isArray(raw)) continue;
+      const source = raw as Record<string, unknown>;
+      if (source.role !== 'user' && source.role !== 'assistant') continue;
+      const content = cleanPromptContent(source.content);
+      if (content) messages.push({ role: source.role, content });
+    }
+    const description = catalogText(got?.description, 1_000);
+    return { ok: true, ...(description ? { description } : {}), messages };
+  } catch (error) {
+    if (methodNotFound(error)) return unsupported('prompts');
+    return catalogFailure(server, conn, error);
+  }
 }
 
 /** Close this server's current and in-flight clients while retaining its

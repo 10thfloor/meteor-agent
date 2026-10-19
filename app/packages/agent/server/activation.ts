@@ -99,6 +99,9 @@ async function inputState(session: AgentSession): Promise<InputState> {
         } else {
           answered.push(link);
         }
+      } else if (message.to !== undefined) {
+        // A departed explicit recipient must not silently become the primary.
+        answered.push(link);
       } else if (!lastAssistant || !assistantAnswers(lastAssistant, link.seq)) {
         owed ??= { seq: link.seq, agent: session.agent };
       } else {
@@ -112,6 +115,7 @@ async function inputState(session: AgentSession): Promise<InputState> {
     { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
   if (!lastUser) return { owed: null, answered: [] };
+  if (!session.participants?.length && lastUser.to !== undefined) return { owed: null, answered: [] };
 
   if (session.participants?.length) {
     const owed = await unansweredAddressee(session);
@@ -219,6 +223,10 @@ async function candidateFor(
     purgingAt: { $exists: false },
   });
   if (!session || DECIDED_PHASES.includes(session.phase) || running.has(sessionId)) return null;
+  // Preserve an unavailable addressee's durable handoff instead of waking a
+  // removed participant or silently replacing them with the primary.
+  if (session.pendingRelay && !session.participants?.some((p) => p.kind === 'model'
+    && p.agent === session.pendingRelay!.agent)) return null;
 
   const now = new Date();
   if (liveLease(session, now)) return null;

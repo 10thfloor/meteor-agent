@@ -15,6 +15,7 @@ import {
   DeliveryReceipts, InboundSubmissions,
 } from './channels/collections';
 import { AgentAttachments } from './attachments';
+export { HANDOFF_TOOL_NAME, HANDOFF_ARGS } from './handoff';
 import { AttachmentDownloadTokens, mountDownloadRoute } from './downloads';
 import { listChannels } from './channels/registry';
 import { mountChannelRoutes } from './channels/ingress';
@@ -28,6 +29,17 @@ import {
   AgentMemoryFrames, AgentPractices,
 } from './learning-collections';
 import { ensureLearningIndexes } from './learning';
+import { ensureEvidenceIndexes } from './evidence';
+import { ensureObservationIndexes } from './observations';
+
+export * from './evidence';
+export * from './observations';
+export * from './workflows';
+export * from './evaluations';
+export * from './federation';
+export * from './execution';
+export { workflowAgentPrimitive, workflowApprovalPrimitive, assertWorkflowSessionExecution } from './workflows-agent';
+export { canonicalDigest } from './learning';
 
 export * from '../common/types';
 export * from '../common/learning';
@@ -68,6 +80,8 @@ export {
   type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult,
   type ArgsValidator, type TypeboxValue, type TypeboxCompile,
   type TypeboxValidator, type Skill, type ToolResult,
+  toolOutput, type SubagentBudget, type DelegationContext, type DelegationDecision,
+  type DelegationCompletion, type DelegationProjection,
   type Gate, type GateContext, type GatePredicate,
   // Typed arguments (opt-in via `tool()` / `methodTool()`).
   tool, methodTool, type TypedInlineTool, type TypedAdoptedTool,
@@ -82,6 +96,10 @@ export { MAX_SUBAGENT_DEPTH } from './subagent';
 export {
   discoverMcpTools, disconnectMcpServer, unregisterMcpServer,
   getMcpServerStatus, stopMcp,
+  discoverMcpResources, readMcpResource, discoverMcpPrompts, getMcpPrompt,
+  type McpResourceInfo, type McpResourceContent, type McpPromptInfo,
+  type McpPromptContent, type McpPromptMessage, type McpResourcesResult,
+  type McpResourceResult, type McpPromptsResult, type McpPromptResult, type McpCatalogError,
   type DiscoveryResult, type McpServerState, type McpServerStatus,
   type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory,
 } from './mcp/client';
@@ -135,8 +153,9 @@ export {
 // Blessed doors are `Agent.attachments.create`/`.readTool` (agent.ts).
 export {
   AgentAttachments, DEFAULT_ATTACHMENT_CAPS,
-  sanitizeAttachmentName, prettySize,
+  sanitizeAttachmentName, prettySize, configureAttachmentStorage, readAttachmentContent, migrateAttachmentContent,
   type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions,
+  type AttachmentStorageAdapter, type AttachmentStorageReference, type AttachmentStorageMetadata, type AttachmentStorageContext,
 } from './attachments';
 // Participants: pure helpers for channel packages and hosts; `Agent.participants`
 // is the blessed door. `ViaIdentity` is for trusted `sendToSession` callers.
@@ -254,6 +273,8 @@ async function startupPrelude(): Promise<void> {
   // startup before methods/publications become reachable if Mongo cannot
   // enforce them.
   await ensureLearningIndexes();
+  await ensureEvidenceIndexes();
+  await ensureObservationIndexes();
   // Watcher sweeps and transcript reads depend on these indexes.
   await ensureIndexes();
   // A crash may leave only the root fence durable. Close its child graph

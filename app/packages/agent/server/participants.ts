@@ -149,6 +149,9 @@ export async function unansweredMessageAddressee(
   if (user.kind === 'crew-note') return null;
   if (!session.participants?.length) return null;
   const hit = resolveAddressee(user.content, user.to, session);
+  // A removed explicit recipient is unavailable, not an invitation for the
+  // primary to answer a message addressed to someone else.
+  if (user.to !== undefined && !hit) return null;
   if (hit) {
     const primaryId = modelParticipantId(session.agent);
     // Newest reply from the addressee: watermarks are monotone per session,

@@ -3,6 +3,7 @@ import { Agent } from './agent';
 import { renderAssistantMarkdown } from './markdown';
 import { ACTIVE_PHASES, type Phase, type ViewMessage } from '../common/types';
 import { prettySize } from '../common/format';
+import { modelMentionHandles, modelParticipantByHandle } from '../common/participants';
 
 /** `<agent-chat>` — a custom element rendering a whole session. Never
  *  auto-registered (a second `customElements.define` is a DOMException);
@@ -12,6 +13,46 @@ const DEFAULT_TAG = 'agent-chat';
 const DEFAULT_PLACEHOLDER = 'Message the agent…';
 const DEFAULT_NOTE_PLACEHOLDER = 'Add a crew note…';
 export type ComposerMode = 'ask' | 'note';
+export interface ComposerSubmission {
+  sessionId: string;
+  text: string;
+  mode: ComposerMode;
+  /** Explicit model participant selected by the host. Crew notes omit it. */
+  recipient?: string;
+}
+/** Optional application-owned write boundary. Throw to preserve the draft. */
+export type ComposerSubmissionHandler = (submission: ComposerSubmission) => Promise<unknown>;
+export interface ComposerDraftOptions {
+  selectionStart?: number;
+  selectionEnd?: number;
+  focus?: boolean;
+}
+export interface ChatTimelineItem {
+  id: string;
+  createdAt: Date | number;
+  afterMessageId?: string;
+  element: HTMLElement;
+}
+/** Public property/method surface for typed app-owned custom elements. */
+export interface AgentChatElement extends HTMLElement {
+  readonly sessionId: string | null;
+  readonly agentInstance: Agent | null;
+  composerMode: ComposerMode;
+  /** Model participant ID for asks. Undefined preserves leading-@/primary routing. */
+  recipient: string | undefined;
+  submissionHandler: ComposerSubmissionHandler | null;
+  allowEmptySubmit: boolean;
+  draftText: string;
+  mentionSources: Record<string, MentionSource>;
+  timelineItems: ChatTimelineItem[];
+  setDraft(text: string, options?: ComposerDraftOptions): void;
+  focusComposer(): void;
+  submitDraft(): Promise<void>;
+  insertMention(prefix: string, handle: string): boolean;
+  openMentions(prefix: string): boolean;
+  /** Reveal an already rendered, visible message without changing the session. */
+  revealMessage(messageId: string): boolean;
+}
 
 function composerMode(value: string | null): ComposerMode {
   return value === 'note' ? 'note' : 'ask';
@@ -28,6 +69,8 @@ export interface Mentionable {
   kind?: string;
   /** A second line in the typeahead — an address, a role, a price, a date. */
   detail?: string;
+  /** Non-@ references can open an app-owned detail view without sending. */
+  actionable?: boolean;
 }
 
 /** A field name or a function derived from the record. */
@@ -41,6 +84,9 @@ export interface MentionCollection {
 interface MentionShape {
   /** The `part` token every entry from this source carries. */
   kind?: string;
+  actionable?: boolean;
+  /** Visible feedback while a source is loading or has no matching entries. */
+  emptyText?: string;
   /** What follows the symbol. Required — nothing else identifies the record. */
   handle: Field<string>;
   /** Defaults to the handle. */
@@ -60,6 +106,8 @@ export type MentionSource =
   | (MentionShape & { list: unknown[] | (() => unknown[]); collection?: never })
   | {
     kind?: string;
+    actionable?: boolean;
+    emptyText?: string;
     /** Everything matching what has been typed so far. `''` means "the symbol
      *  was just typed" — answer with a sensible opening set, not everything. */
     search(query: string): Mentionable[];
@@ -72,6 +120,7 @@ export type MentionSource =
 interface ResolvedSource {
   search(query: string): Mentionable[];
   lookup(handle: string): Mentionable | null;
+  emptyText?: string;
 }
 
 const DEFAULT_PREFIX = '@';
@@ -92,12 +141,18 @@ function matches(m: Mentionable, needle: string): boolean {
  *  materialize once per resolver and cache (resolver is per-paint/keystroke). */
 function normalizeSource(src: MentionSource): ResolvedSource {
   if ('search' in src && typeof src.search === 'function') {
-    const ok = (list: Mentionable[] | undefined) => (list ?? []).filter((m) => m && m.handle);
+    const decorate = (m: Mentionable): Mentionable => ({
+      ...m, kind: m.kind ?? src.kind, actionable: m.actionable ?? src.actionable,
+    });
+    const ok = (list: Mentionable[] | undefined) => (list ?? [])
+      .filter((m) => m && m.handle).map(decorate);
     return {
       search: (q) => ok(src.search(q)),
-      lookup: (h) => (src.lookup
-        ? src.lookup(h) ?? null
-        : ok(src.search(h)).find((m) => m.handle === h) ?? null),
+      lookup: (h) => {
+        const found = src.lookup ? src.lookup(h) : ok(src.search(h)).find((m) => m.handle === h);
+        return found ? decorate(found) : null;
+      },
+      emptyText: src.emptyText,
     };
   }
   const cfg = src as MentionShape & {
@@ -115,6 +170,7 @@ function normalizeSource(src: MentionSource): ResolvedSource {
         label: fieldOf<string>(r, cfg.label),
         detail: fieldOf<string>(r, cfg.detail),
         kind: cfg.kind,
+        actionable: cfg.actionable,
       }))
       .filter((m) => m.handle !== '');
     return cache;
@@ -122,6 +178,7 @@ function normalizeSource(src: MentionSource): ResolvedSource {
   return {
     search: (q) => all().filter((m) => matches(m, q.toLowerCase())).slice(0, cfg.limit ?? DEFAULT_LIMIT),
     lookup: (h) => all().find((m) => m.handle === h) ?? null,
+    emptyText: cfg.emptyText,
   };
 }
 /** Same character class as `LEADING_MENTION` in common/participants.ts. The two
@@ -136,11 +193,12 @@ function tokenPattern(prefixes: string[], trailing: boolean): RegExp {
   const set = `[${prefixes.map(escapeForClass).join('')}]`;
   return trailing
     ? new RegExp(`(${set})(${HANDLE_CLASS}{0,64})$`)
-    : new RegExp(`(${set})(${HANDLE_CLASS}{1,64})`, 'g');
+    : new RegExp(`(${set})(${HANDLE_CLASS}{1,64})(?!${HANDLE_CLASS})`, 'g');
 }
 /** Default deny reason — reaches the model as the tool result text. */
 const DENY_REASON = 'denied by the user';
 const DENY_GUIDANCE_MAX = 400;
+const MESSAGE_TARGET_DURATION = 2_000;
 
 /** Static markup only — transcript content never reaches `innerHTML`; assistant
  *  Markdown is an allowlisted DOM tree whose leaves are Text nodes.
@@ -192,6 +250,10 @@ const FRAME = `
   .message {
     max-width: 85%; padding: 0.5rem 0.75rem; border-radius: var(--_radius);
     white-space: pre-wrap; word-break: break-word;
+  }
+  .message.message-target {
+    outline: 2px solid var(--_accent); outline-offset: 3px;
+    box-shadow: 0 0 0 5px color-mix(in srgb, var(--_accent) 14%, transparent);
   }
   .message.user { align-self: flex-end; background: var(--_accent); color: #fff; }
   .message.assistant { align-self: flex-start; background: color-mix(in srgb, var(--_fg) 8%, var(--_bg)); }
@@ -269,6 +331,27 @@ const FRAME = `
     align-self: flex-start; max-width: 100%; font-size: 0.8rem; opacity: 0.72;
   }
   .message.operation.error { color: var(--_danger); opacity: 0.9; }
+  .message.operation.handoff {
+    display: grid; gap: 0.4rem; max-width: 86%; opacity: 1;
+    padding: 0.7rem 0.9rem; border: 1px solid color-mix(in srgb, var(--_accent) 22%, transparent);
+    border-radius: var(--_radius); background: color-mix(in srgb, var(--_accent) 5%, var(--_bg));
+  }
+  .handoff-header { display: flex; align-items: baseline; flex-wrap: wrap; gap: 0.35rem 0.7rem; }
+  .handoff-route { font-weight: 650; }
+  .handoff-status { color: color-mix(in srgb, var(--_fg) 70%, transparent); font-size: 0.75rem; }
+  .handoff-message { min-width: 0; font-size: 0.9rem; }
+  .message.operation.delegation, .message.note.delegation {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem 1rem; opacity: 1;
+  }
+  .delegation-status { opacity: 0.72; }
+  .delegation-link {
+    display: inline-flex; align-items: center; min-height: 2rem; padding: 0.3rem 0.55rem;
+    border: 1px solid color-mix(in srgb, var(--_accent) 28%, transparent); border-radius: 0.45rem;
+    background: color-mix(in srgb, var(--_accent) 7%, var(--_bg)); color: var(--_accent);
+    font: inherit; font-weight: 600; cursor: pointer; text-align: left;
+  }
+  .delegation-link:hover { background: color-mix(in srgb, var(--_accent) 15%, var(--_bg)); }
+  .delegation-link:focus-visible { outline: 2px solid var(--_accent); outline-offset: 3px; }
   .tool-name { white-space: nowrap; }
   /* Tool output is unbounded (a page of JSON is normal); clamp it here and let
      a host that wants it whole say ::part(tool-content) { -webkit-line-clamp: none }. */
@@ -284,13 +367,18 @@ const FRAME = `
   /* Attribution (participants spec §4.1): the speaker line a rostered row
      carries. Absent on 1:1 rows, so nothing changes for the classic pair. */
   .speaker { display: block; font-size: 0.72rem; opacity: 0.65; font-weight: 600; }
-  .source { font-weight: 500; }
+  .source, .recipient { font-weight: 500; }
+  .crew-note-header {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem 0.65rem;
+    margin-bottom: 0.5rem; white-space: normal;
+  }
+  .crew-note-header .speaker { min-width: 0; margin: 0; overflow-wrap: anywhere; }
   .crew-note-badge {
     display: inline-flex; align-items: center; width: fit-content;
-    margin: 0 0.4rem 0.25rem 0; padding: 0.08rem 0.38rem;
+    flex-shrink: 0; margin: 0; padding: 0.12rem 0.4rem;
     border: 1px solid color-mix(in srgb, currentColor 25%, transparent);
-    border-radius: 999px; font-size: 0.65rem; font-weight: 700;
-    letter-spacing: 0.045em; line-height: 1.35; text-transform: uppercase;
+    border-radius: 0.35rem; font-size: 0.7rem; font-weight: 600;
+    letter-spacing: 0.01em; line-height: 1.35; white-space: nowrap;
   }
   /* Attachment chips (participants spec §7.3): one per ref, click-to-mint. */
   .attachments { display: flex; flex-wrap: wrap; gap: 0.35rem; margin-top: 0.35rem; }
@@ -310,6 +398,14 @@ const FRAME = `
     border-radius: 0.35rem; padding: 0 0.2rem; font-weight: 500;
     background: color-mix(in srgb, var(--_fg) 13%, transparent);
   }
+  button.mention {
+    display: inline; color: inherit; font: inherit; font-weight: 600;
+    padding: 0 0.2rem; border-radius: 0.35rem; line-height: inherit;
+    text-decoration: underline; text-underline-offset: 0.15em;
+    background: color-mix(in srgb, var(--_fg) 13%, transparent);
+  }
+  button.mention:hover { background: color-mix(in srgb, var(--_accent) 28%, transparent); }
+  button.mention:focus-visible { outline: 2px solid currentColor; outline-offset: 2px; }
   /* ADDRESSED: a leading @-mention that schedules a turn. */
   .mention.addressed {
     background: color-mix(in srgb, var(--_accent) 22%, transparent);
@@ -341,6 +437,7 @@ const FRAME = `
   }
   .suggestion-handle { font-weight: 600; }
   .suggestion-detail { font-size: 0.8rem; opacity: 0.65; margin-left: auto; }
+  .suggestion-empty { padding: 0.6rem 0.75rem; font-size: 0.85rem; opacity: 0.75; }
 
   .approval {
     display: grid; grid-template-columns: auto minmax(0, 1fr) auto;
@@ -433,16 +530,31 @@ const FRAME = `
     /* The typeahead anchors to this. */
     position: relative;
   }
+  slot[name="composer-actions"] { display: contents; }
+  slot[name="composer-header"], slot[name="composer-context"], slot[name="composer-toolbar"] { display: contents; }
+  .composer-footer, .composer-buttons { display: contents; }
+  :host([composer-layout="panel"]) .composer { flex-direction: column; }
+  :host([composer-layout="panel"]) .input { flex: none; width: 100%; }
+  :host([composer-layout="panel"]) .composer-footer {
+    display: flex; align-items: center; flex-wrap: wrap; gap: 0.5rem;
+  }
+  :host([composer-layout="panel"]) .composer-buttons {
+    display: flex; gap: 0.5rem; margin-left: auto; align-items: center;
+  }
+  slot[name="activity"]::slotted(*) { flex-shrink: 0; max-height: 35%; overflow-y: auto; }
   :host([composer-mode="note"]) .composer {
     background: color-mix(in srgb, var(--_fg) 4%, var(--_bg));
   }
   .message.user.crew-note {
-    background: color-mix(in srgb, var(--_accent) 72%, var(--_bg));
+    background: color-mix(in srgb, var(--_fg) 8%, var(--_bg));
+    border: 1px solid color-mix(in srgb, var(--_fg) 22%, transparent);
+    color: var(--_fg);
   }
   .input {
-    flex: 1; padding: 0.5rem 0.75rem; border-radius: 0.5rem; font: inherit;
+    flex: 1; min-width: 0; padding: 0.5rem 0.75rem; border-radius: 0.5rem; font: inherit;
     border: 1px solid color-mix(in srgb, var(--_fg) 25%, transparent);
     background: var(--_bg); color: var(--_fg);
+    box-sizing: border-box; resize: none; line-height: 1.5; overflow-y: hidden;
   }
   .input:disabled { opacity: 0.7; cursor: progress; }
   .recovery {
@@ -512,13 +624,22 @@ const FRAME = `
     </div>
   </div>
   <div class="recovery" part="recovery" role="status" aria-live="polite" hidden></div>
+  <slot name="activity"></slot>
   <form class="composer" part="composer ask">
-    <div class="typeahead" part="typeahead" role="listbox" hidden></div>
-    <input class="input" part="input" autocomplete="off" role="combobox"
-           aria-expanded="false" aria-autocomplete="list" />
-    <button type="submit" class="send" part="button send ask">Send</button>
-    <button type="button" class="stop secondary" part="button stop"
-            title="Interrupt the turn" hidden disabled>Stop</button>
+    <div class="typeahead" id="agent-chat-typeahead" part="typeahead" role="listbox" hidden></div>
+    <slot name="composer-header"></slot>
+    <slot name="composer-context"></slot>
+    <textarea class="input" part="input" rows="1" autocomplete="off" role="combobox"
+           aria-expanded="false" aria-autocomplete="list" aria-controls="agent-chat-typeahead"></textarea>
+    <div class="composer-footer" part="composer-footer">
+      <slot name="composer-toolbar"></slot>
+      <slot name="composer-actions"></slot>
+      <div class="composer-buttons" part="composer-buttons">
+        <button type="submit" class="send" part="button send ask">Send</button>
+        <button type="button" class="stop secondary" part="button stop"
+                title="Interrupt the turn" hidden disabled>Stop</button>
+      </div>
+    </div>
   </form>
 </div>
 `;
@@ -813,6 +934,7 @@ function renderRow(
   download?: (attachmentId: string) => void,
   mode: TranscriptMode = 'clean',
   mentions: Map<string, ResolvedSource> = new Map(),
+  agentNames: Map<string, string> = new Map(),
 ): HTMLElement | null {
   const debug = mode === 'debug';
   if (!debug) {
@@ -820,6 +942,8 @@ function renderRow(
     if (m.role === 'note' && m.kind === 'compaction') return null;
   }
   const row = document.createElement('div');
+  row.dataset.messageId = m._id;
+  row.tabIndex = -1;
   // `part` and `class` carry the same tokens: the class drives the sheet
   // above, the part exposes the identical hook to the host page. Note rows add
   // their `kind`, so `::part(note error)` is addressable without piercing.
@@ -828,27 +952,84 @@ function renderRow(
     renderedRole,
     m.streaming ? 'streaming' : '',
     !debug && m.role === 'tool' && m.error ? 'error' : '',
-    !debug && m.role === 'tool' && m.childSessionId ? 'delegation' : '',
+    m.childSessionId && (m.role === 'tool' || m.kind === 'orphan-child') ? 'delegation' : '',
     m.role === 'note' && m.kind ? m.kind : '',
     m.kind === 'crew-note' ? 'crew-note' : '',
+    !debug && m.role === 'tool' && m.kind === 'handoff' && !m.error ? 'handoff' : '',
+    // Application-owned system sources can style their operational receipts
+    // without rewriting the durable, model-facing message content.
+    m.role === 'system' && /^s:[a-z0-9][a-z0-9-]{0,63}$/.test(m.from?.participant ?? '')
+      ? `system-source-${m.from!.participant.slice(2)}` : '',
   ].filter(Boolean) as string[];
   row.className = ['message', ...flags].join(' ');
   row.setAttribute('part', ['message', ...flags].join(' '));
 
+  const rawTool = (m.toolCallId && names.get(m.toolCallId)) || undefined;
+  const childAgent = m.childAgent || (rawTool && agentNames.has(rawTool) ? rawTool : undefined);
+  const childName = (childAgent && agentNames.get(childAgent))
+    || (rawTool && agentNames.get(rawTool)) || humanizeIdentifier(childAgent || rawTool, 'Agent');
+  const appendWorkLink = () => {
+    if (!m.childSessionId) return;
+    const link = document.createElement('button');
+    link.type = 'button';
+    link.className = 'delegation-link';
+    link.setAttribute('part', 'delegation-link');
+    link.textContent = `View ${childName}’s work`;
+    link.addEventListener('click', () => {
+      link.dispatchEvent(new CustomEvent('agent-chat:open-run', {
+        detail: { sessionId: m.childSessionId, ...(childAgent ? { agent: childAgent } : {}) },
+        bubbles: true, composed: true,
+      }));
+    });
+    row.append(link);
+  };
+
   if (m.role === 'note') {
-    row.textContent = noteText(m, names);
+    row.textContent = m.kind === 'orphan-child' && m.childSessionId
+      ? `${childName}’s work recovered` : noteText(m, names);
+    if (m.kind === 'orphan-child') appendWorkLink();
     return row;
   }
 
   if (m.role === 'tool') {
-    const tool = humanizeIdentifier(
-      (m.toolCallId && names.get(m.toolCallId)) || undefined,
-    );
+    const tool = (rawTool && agentNames.get(rawTool)) || humanizeIdentifier(rawTool);
     if (!debug) {
+      if (m.kind === 'handoff' && !m.error) {
+        const source = (m.from?.participant?.startsWith('m:')
+          ? agentNames.get(m.from.participant.slice(2)) : undefined) || m.from?.name || 'Agent';
+        const target = m.to?.startsWith('m:')
+          ? agentNames.get(m.to.slice(2)) || humanizeIdentifier(m.to.slice(2)) : 'Agent';
+        const header = document.createElement('div');
+        header.className = 'handoff-header';
+        header.setAttribute('part', 'handoff-header');
+        const route = document.createElement('span');
+        route.className = 'handoff-route';
+        route.setAttribute('part', 'handoff-route');
+        route.textContent = `${source} → ${target}`;
+        const status = document.createElement('span');
+        status.className = 'handoff-status';
+        status.setAttribute('part', 'handoff-status');
+        status.textContent = 'Sent';
+        header.append(route, status);
+        row.append(header);
+        if (m.transcriptContent) {
+          const body = document.createElement('div');
+          body.className = 'handoff-message';
+          body.setAttribute('part', 'handoff-message');
+          body.append(renderAssistantMarkdown(sanitizeCleanAssistantContent(m.transcriptContent)));
+          row.append(body);
+        }
+        return row;
+      }
       const outcome = m.error ? 'failed' : 'completed';
-      row.textContent = m.childSessionId
-        ? `Delegation to ${tool} ${outcome}`
-        : `${tool} ${outcome}`;
+      const projected = m.transcriptContent ?? m.displayContent;
+      const status = document.createElement('span');
+      if (m.childSessionId) status.className = 'delegation-status';
+      status.textContent = projected && !isStructuredAssistantStream(projected, false)
+        ? projected
+        : m.childSessionId ? `${childName}’s work ${outcome}` : `${tool} ${outcome}`;
+      row.append(status);
+      appendWorkLink();
       return row;
     }
     const name = document.createElement('span');
@@ -860,33 +1041,50 @@ function renderRow(
     body.setAttribute('part', 'tool-content');
     body.textContent = m.content ?? '';
     row.append(name, body);
+    appendWorkLink();
     return row;
   }
 
   // Speaker attribution — only shown in rostered sessions where names
   // disambiguate (1:1 carries no `from`).
-  if (m.from && (m.role === 'user' || m.role === 'assistant')) {
+  const noteHeader = m.kind === 'crew-note' ? document.createElement('div') : null;
+  if (noteHeader) {
+    noteHeader.className = 'crew-note-header';
+    noteHeader.setAttribute('part', 'crew-note-header');
+  }
+  const addressedUser = m.role === 'user' && m.kind !== 'crew-note' && !!m.to;
+  if ((m.from && (m.role === 'user' || m.role === 'assistant')) || addressedUser) {
     const speaker = document.createElement('span');
     speaker.className = 'speaker';
-    speaker.setAttribute('part', `speaker speaker-${m.role}`);
-    speaker.textContent = m.from.name;
+    speaker.setAttribute('part', `speaker speaker-${m.role}${noteHeader ? ' speaker-crew-note' : ''}`);
+    speaker.textContent = m.from?.participant?.startsWith('m:')
+      ? agentNames.get(m.from.participant.slice(2)) || m.from.name : m.from?.name || '';
     if (m.source) {
       const source = document.createElement('span');
       source.className = 'source';
       source.setAttribute('part', `source source-${m.source.kind}`);
-      source.textContent = ` · ${m.source.kind === 'desktop'
+      source.textContent = `${speaker.hasChildNodes() ? ' · ' : ''}${m.source.kind === 'desktop'
         ? 'Desktop'
         : humanizeIdentifier(m.source.channel, 'Channel')}`;
       speaker.append(source);
     }
-    row.append(speaker);
+    if (addressedUser) {
+      const agent = m.to!.startsWith('m:') ? m.to!.slice(2) : m.to!;
+      const recipient = document.createElement('span');
+      recipient.className = 'recipient';
+      recipient.setAttribute('part', 'recipient recipient-user');
+      recipient.textContent = `${speaker.hasChildNodes() ? ' · ' : ''}To ${agentNames.get(agent) || humanizeIdentifier(agent, 'Agent')}`;
+      speaker.append(recipient);
+    }
+    (noteHeader ?? row).append(speaker);
   }
-  if (m.kind === 'crew-note') {
+  if (noteHeader) {
     const badge = document.createElement('span');
     badge.className = 'crew-note-badge';
     badge.setAttribute('part', 'crew-note-badge');
     badge.textContent = 'Crew note';
-    row.append(badge);
+    noteHeader.append(badge);
+    row.append(noteHeader);
   }
   // `truncatedHead` means compaction (or a capped-collection gap) dropped the
   // start of this row's text; the ellipsis says so rather than silently
@@ -930,7 +1128,7 @@ function renderRow(
       const operation = document.createElement('span');
       operation.className = 'operation-status';
       operation.setAttribute('part', 'operation');
-      operation.textContent = `${humanizeIdentifier(call.name)} requested`;
+      operation.textContent = `${agentNames.get(call.name) || humanizeIdentifier(call.name)} requested`;
       operations.append(operation);
     }
     row.append(operations);
@@ -970,6 +1168,8 @@ function renderText(
   const scan = tokenPattern(prefixes, false);
   let hit: RegExpExecArray | null = scan.exec(text);
   while (hit !== null) {
+    const before = hit.index === 0 ? '' : text[hit.index - 1];
+    if (before && /[\w@]/.test(before)) { hit = scan.exec(text); continue; }
     // Retry with trailing punctuation trimmed — same two-step as resolveAddressee.
     const prefix = hit[1];
     const raw = hit[2];
@@ -980,7 +1180,17 @@ function renderText(
     if (found) {
       const handle = exact ? raw : trimmed;
       if (hit.index > cursor) nodes.push(document.createTextNode(text.slice(cursor, hit.index)));
-      const chip = document.createElement('span');
+      const actionable = found.actionable === true && prefix !== DEFAULT_PREFIX;
+      const chip = document.createElement(actionable ? 'button' : 'span');
+      if (chip instanceof HTMLButtonElement) {
+        chip.type = 'button';
+        chip.setAttribute('aria-label', `View ${found.kind ?? 'reference'}: ${found.label ?? handle}`);
+        chip.addEventListener('click', () => {
+          chip.dispatchEvent(new CustomEvent('agent-chat:mention', {
+            detail: { prefix, handle, kind: found.kind ?? 'subject' }, bubbles: true, composed: true,
+          }));
+        });
+      }
       const kind = found.kind ?? 'subject';
       // Only a leading @-mention is ADDRESSED; mid-text is merely named.
       // Different styling prevents a chip that promises routing it cannot deliver.
@@ -993,7 +1203,7 @@ function renderText(
       chip.setAttribute('part', `mention ${flags}`);
       chip.textContent = `${prefix}${found.label ?? handle}`;
       chip.title = addressed
-        ? `Addressed to ${handle} — schedules their turn`
+        ? `Addressed to ${found.label ?? handle} — schedules their turn`
         : (found.detail ?? '');
       nodes.push(chip);
       cursor = hit.index + prefix.length + handle.length;
@@ -1027,7 +1237,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
   class AgentChat extends HTMLElement {
     static get observedAttributes() {
-      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode'];
+      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode', 'recipient', 'composer-disabled', 'send-disabled', 'aria-disabled', 'multiline', 'composer-layout', 'submit-label'];
     }
 
     private ui!: {
@@ -1050,7 +1260,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       stop: HTMLButtonElement;
       recovery: HTMLElement;
       composer: HTMLFormElement;
-      input: HTMLInputElement;
+      input: HTMLTextAreaElement;
       send: HTMLButtonElement;
       typeahead: HTMLElement;
     };
@@ -1058,12 +1268,23 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  list of objects, and a JSON attribute would make every roster change a
      *  re-parse of a string the host already had in hand. */
     private sources: Record<string, MentionSource> = {};
+    /** Hosts may intercept a write, but never bypass composer busy/error state. */
+    submissionHandler: ComposerSubmissionHandler | null = null;
+    /** Attachment-only writes require an application handler to interpret them. */
+    allowEmptySubmit = false;
     /** The suggestions currently offered, and which one Enter would take. */
     private suggestions: Mentionable[] = [];
     /** The symbol that opened the list. Carried separately because a record no
      *  longer knows its own symbol — the source it came from is keyed by one. */
     private suggestPrefix: string = DEFAULT_PREFIX;
     private cursorAt = -1;
+    private composing = false;
+    /** Modal focus restoration can reset a native input's caret before an
+     * app picker inserts. Keep the last deliberate selection across blur. */
+    private composerSelection: { text: string; start: number; end: number } | null = null;
+    private timeline: ChatTimelineItem[] = [];
+    private timelineSlots = new Map<string, HTMLSlotElement>();
+    private timelineSequence = 0;
     private client: Agent | null = null;
     private sid: string | null = null;
     private computation: Tracker.Computation | null = null;
@@ -1079,11 +1300,13 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     private failure: string | null = null;
     /** One composer write at a time. Captures mode/text so attribute churn
      *  cannot relabel an already-issued request or allow a duplicate submit. */
-    private submission: { mode: ComposerMode; text: string } | null = null;
+    private submission: { mode: ComposerMode; text: string; recipient?: string } | null = null;
     /** Transcript scrolling is reader-owned once they leave the bottom. */
     private transcriptSignature: string | null = null;
     private renderedTranscriptRows = 0;
     private newMessagesPending = false;
+    /** A reveal belongs to this attachment, and expires even during streaming. */
+    private messageTarget: { id: string; expiresAt: number; timer: number } | null = null;
     private approvalAction: { action: 'approve' | 'deny'; toolCallId: string } | null = null;
     private approvalError: { toolCallId: string; message: string } | null = null;
     /** Input belongs to one rendered Gate and must never bleed into the next. */
@@ -1114,7 +1337,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         stop: q<HTMLButtonElement>('.stop'),
         recovery: q<HTMLElement>('.recovery'),
         composer: q<HTMLFormElement>('.composer'),
-        input: q<HTMLInputElement>('.input'),
+        input: q<HTMLTextAreaElement>('.input'),
         send: q<HTMLButtonElement>('.send'),
         typeahead: q<HTMLElement>('.typeahead'),
       };
@@ -1126,14 +1349,50 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         if (this.suggestions.length > 0) { this.acceptSuggestion(); return; }
         void this.submit();
       });
-      this.ui.input.addEventListener('input', () => this.refreshSuggestions());
+      this.ui.input.addEventListener('input', (event: Event) => {
+        this.composerSelection = null;
+        if (!this.hasAttribute('multiline') && /[\r\n]/.test(this.ui.input.value)) {
+          this.ui.input.value = this.ui.input.value.replace(/[\r\n]+/g, ' ');
+        }
+        this.draftChanged();
+        if (this.composing || (event instanceof InputEvent && event.isComposing)) {
+          this.closeSuggestions(); return;
+        }
+        this.refreshSuggestions();
+      });
+      this.ui.input.addEventListener('compositionstart', () => {
+        this.composing = true; this.closeSuggestions();
+      });
+      this.ui.input.addEventListener('compositionend', () => {
+        this.composing = false;
+        // Some browsers emit the final input after compositionend. Only
+        // refresh here if that input did not already transfer focus to a picker.
+        queueMicrotask(() => {
+          if (!this.composing && this.shadowRoot?.activeElement === this.ui.input) this.refreshSuggestions();
+        });
+      });
       // `click` rather than `mousedown`: the input keeps focus because the
       // button lives in the same shadow root and we never blur it.
-      this.ui.input.addEventListener('keydown', (e: KeyboardEvent) => this.onKeyDown(e));
+      this.ui.input.addEventListener('keydown', (e: KeyboardEvent) => {
+        this.composerSelection = null;
+        this.onKeyDown(e);
+      });
       // Any caret move can leave or enter a token, so the offered list has to
       // follow the caret and not only the keystrokes that changed the text.
-      this.ui.input.addEventListener('click', () => this.refreshSuggestions());
-      this.ui.input.addEventListener('blur', () => this.closeSuggestions());
+      this.ui.input.addEventListener('mousedown', () => { this.composerSelection = null; });
+      this.ui.input.addEventListener('click', () => {
+        this.composerSelection = null;
+        this.refreshSuggestions();
+      });
+      this.ui.input.addEventListener('blur', () => {
+        const { input } = this.ui;
+        this.composerSelection = {
+          text: input.value,
+          start: input.selectionStart ?? input.value.length,
+          end: input.selectionEnd ?? input.value.length,
+        };
+        this.closeSuggestions();
+      });
       this.ui.messages.addEventListener('scroll', () => {
         if (!this.nearTranscriptBottom()) return;
         this.newMessagesPending = false;
@@ -1148,7 +1407,8 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         // Re-check at action time as well as paint time. A stale/programmatic
         // click must not turn an idle, parked, or terminal session into stopped.
         const { client, sid } = this;
-        if (!client || !sid || !ACTIVE_PHASES.includes(client.status(sid))) return;
+        if (this.getAttribute('aria-disabled') === 'true'
+          || !client || !sid || !ACTIVE_PHASES.includes(client.status(sid))) return;
         void this.act((a, s) => a.interrupt(s));
       });
       this.ui.approve.addEventListener('click', () => { void this.decide('approve'); });
@@ -1164,10 +1424,98 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     set composerMode(next: ComposerMode) { this.setAttribute('composer-mode', next); }
 
+    /** The host owns the recipient picker and persistence. Capture this value
+     * once per submission so a later selection cannot redirect an issued send. */
+    get recipient(): string | undefined { return this.getAttribute('recipient') ?? undefined; }
+
+    set recipient(next: string | undefined) {
+      if (next === undefined) this.removeAttribute('recipient');
+      else this.setAttribute('recipient', next);
+    }
+
     /** The underlying client `Agent`, for anything the element does not do
      *  itself (`fork`, `usage`, a denial with a typed reason). Null while
      *  detached. */
     get agentInstance(): Agent | null { return this.client; }
+
+    get draftText(): string { return this.ui.input.value; }
+    set draftText(text: string) { this.setDraft(text); }
+
+    setDraft(text: string, options: ComposerDraftOptions = {}) {
+      const { input } = this.ui;
+      input.value = this.hasAttribute('multiline') ? String(text) : String(text).replace(/[\r\n]+/g, ' ');
+      this.composerSelection = null;
+      const start = options.selectionStart ?? input.value.length;
+      this.closeSuggestions();
+      if (options.focus) input.focus({ preventScroll: true });
+      input.setSelectionRange(start, options.selectionEnd ?? start);
+      this.draftChanged();
+    }
+
+    focusComposer() {
+      this.restoreComposerSelection();
+      const { input } = this.ui;
+      const start = input.selectionStart; const end = input.selectionEnd;
+      input.focus({ preventScroll: true });
+      input.setSelectionRange(start, end);
+    }
+
+    async submitDraft(): Promise<void> { await this.submit(); }
+
+    private draftChanged() {
+      this.resizeComposer();
+      this.dispatchEvent(new CustomEvent('agent-chat:draft-change', {
+        detail: { text: this.ui.input.value, sessionId: this.sid }, bubbles: true, composed: true,
+      }));
+    }
+
+    private resizeComposer() {
+      const { input } = this.ui;
+      const multiline = this.hasAttribute('multiline');
+      if (!multiline) { input.rows = 1; input.style.height = ''; input.style.overflowY = ''; return; }
+      const style = getComputedStyle(input);
+      const configuredRows = parseFloat(style.getPropertyValue('--agent-chat-input-min-rows'));
+      const minimumRows = Number.isFinite(configuredRows) ? Math.max(1, Math.min(6, Math.round(configuredRows))) : 2;
+      input.rows = minimumRows;
+      const line = parseFloat(style.lineHeight) || parseFloat(style.fontSize) * 1.5 || 24;
+      const inset = (parseFloat(style.paddingTop) || 0) + (parseFloat(style.paddingBottom) || 0)
+        + (parseFloat(style.borderTopWidth) || 0) + (parseFloat(style.borderBottomWidth) || 0);
+      input.style.height = 'auto';
+      const ceiling = 6 * line + inset;
+      const height = Math.max(minimumRows * line + inset, Math.min(input.scrollHeight + 2, ceiling));
+      input.style.height = `${height}px`;
+      input.style.overflowY = input.scrollHeight > ceiling ? 'auto' : 'hidden';
+    }
+
+    get timelineItems(): ChatTimelineItem[] { return [...this.timeline]; }
+    set timelineItems(next: ChatTimelineItem[]) {
+      const items = Array.isArray(next) ? next : [];
+      const ids = new Set<string>();
+      const valid = items.filter((item) => {
+        if (!item?.id || ids.has(item.id) || !(item.element instanceof HTMLElement)) return false;
+        ids.add(item.id); return true;
+      });
+      for (const previous of this.timeline) {
+        if (!valid.some((item) => item.id === previous.id && item.element === previous.element)) previous.element.remove();
+      }
+      for (const [id, slot] of this.timelineSlots) {
+        if (!ids.has(id)) { slot.remove(); this.timelineSlots.delete(id); }
+      }
+      this.timeline = valid.map((item) => ({ ...item }));
+      for (const item of this.timeline) {
+        let slot = this.timelineSlots.get(item.id);
+        if (!slot) {
+          slot = document.createElement('slot');
+          slot.name = `agent-chat-timeline-${++this.timelineSequence}`;
+          slot.dataset.timelineId = item.id;
+          slot.setAttribute('part', 'timeline-item');
+          this.timelineSlots.set(item.id, slot);
+        }
+        item.element.slot = slot.name;
+        if (item.element.parentElement !== this) this.append(item.element);
+      }
+      this.paint();
+    }
 
     /** Mention sources keyed by symbol. `@` always includes model participants
      *  underneath; other symbols are inert (no routing). */
@@ -1176,6 +1524,126 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     set mentionSources(next: Record<string, MentionSource>) {
       this.sources = next && typeof next === 'object' ? { ...next } : {};
       this.paint();
+      if (this.shadowRoot?.activeElement === this.ui.input) this.refreshSuggestions();
+      else this.closeSuggestions();
+    }
+
+    /** A local navigation action: never fetch, switch verbosity, or write. */
+    revealMessage(messageId: string): boolean {
+      if (typeof messageId !== 'string' || !messageId || !this.live) return false;
+      const row = this.visibleMessageRow(messageId);
+      if (!row) return false;
+      this.clearMessageTarget();
+      this.messageTarget = {
+        id: messageId,
+        expiresAt: Date.now() + MESSAGE_TARGET_DURATION,
+        timer: window.setTimeout(() => this.clearMessageTarget(), MESSAGE_TARGET_DURATION),
+      };
+      this.markMessageTarget(row);
+      const { messages } = this.ui;
+      const bounds = row.getBoundingClientRect();
+      const viewport = messages.getBoundingClientRect();
+      const top = messages.scrollTop + bounds.top - viewport.top - messages.clientTop
+        - Math.max(0, (messages.clientHeight - bounds.height) / 2);
+      messages.scrollTo({
+        top: Math.max(0, Math.min(top, messages.scrollHeight - messages.clientHeight)),
+        behavior: window.matchMedia('(prefers-reduced-motion: reduce)').matches ? 'instant' : 'smooth',
+      });
+      row.focus({ preventScroll: true });
+      return true;
+    }
+
+    private visibleMessageRow(messageId: string): HTMLElement | null {
+      // Only renderer-owned direct rows count. IDs are data, never selectors;
+      // host-owned timeline content cannot impersonate a transcript message.
+      const row = [...this.ui.messages.children].find((node) => (
+        node instanceof HTMLElement && node.classList.contains('message')
+          && node.dataset.messageId === messageId
+      )) as HTMLElement | undefined;
+      if (!row || !row.getClientRects().length) return null;
+      const style = getComputedStyle(row);
+      return style.display === 'none' || style.visibility !== 'visible' || style.opacity === '0'
+        ? null : row;
+    }
+
+    private markMessageTarget(row: HTMLElement) {
+      row.classList.add('message-target');
+      row.part.add('message-target');
+    }
+
+    private clearMessageTarget() {
+      if (this.messageTarget) window.clearTimeout(this.messageTarget.timer);
+      this.messageTarget = null;
+      for (const row of this.ui.messages.querySelectorAll<HTMLElement>('.message-target')) {
+        row.classList.remove('message-target');
+        row.part.remove('message-target');
+      }
+    }
+
+    /** Insert a resolved reference at the current (also preserved on blur)
+     * caret. This only edits the draft; the host still owns access checks. */
+    insertMention(prefix: string, handle: string): boolean {
+      if (this.submission || this.getAttribute('aria-disabled') === 'true') return false;
+      const found = this.mentionMap().get(prefix)?.lookup(handle);
+      if (!found) return false;
+      this.restoreComposerSelection();
+      if (!this.requestMentionSelection(prefix, found)) { this.closeSuggestions(); return true; }
+      this.insertComposerToken(`${prefix}${found.handle} `, prefix);
+      this.closeSuggestions();
+      this.mentionSelected(prefix, found);
+      return true;
+    }
+
+    private mentionSelected(prefix: string, mention: Mentionable) {
+      this.dispatchEvent(new CustomEvent('agent-chat:mention-selected', {
+        detail: { prefix, handle: mention.handle, kind: mention.kind ?? 'subject' },
+        bubbles: true, composed: true,
+      }));
+    }
+
+    private requestMentionSelection(prefix: string, mention: Mentionable): boolean {
+      const { input } = this.ui;
+      const token = this.tokenAtCaret();
+      return this.dispatchEvent(new CustomEvent('agent-chat:mention-select', {
+        detail: { prefix, handle: mention.handle, kind: mention.kind ?? 'subject', range: {
+          start: token?.prefix === prefix ? token.start : input.selectionStart ?? input.value.length,
+          end: input.selectionEnd ?? input.value.length,
+        } }, bubbles: true, composed: true, cancelable: true,
+      }));
+    }
+
+    /** Opens the same picker as typing its symbol, so discoverable app actions
+     * and keyboard shortcuts share one selection path. Never submits. */
+    openMentions(prefix: string): boolean {
+      if (this.submission || this.getAttribute('aria-disabled') === 'true'
+        || !this.mentionMap().has(prefix)) return false;
+      this.restoreComposerSelection();
+      const token = this.tokenAtCaret();
+      if (token?.prefix !== prefix) this.insertComposerToken(prefix, prefix);
+      this.ui.input.focus();
+      this.refreshSuggestions();
+      return true;
+    }
+
+    private restoreComposerSelection() {
+      const { input } = this.ui;
+      const saved = this.composerSelection;
+      this.composerSelection = null;
+      if (saved?.text === input.value) input.setSelectionRange(saved.start, saved.end);
+    }
+
+    private insertComposerToken(value: string, prefix: string) {
+      const { input } = this.ui;
+      const token = this.tokenAtCaret();
+      const start = token?.prefix === prefix ? token.start : input.selectionStart ?? input.value.length;
+      const end = input.selectionEnd ?? start;
+      const before = input.value.slice(0, start);
+      const insert = `${before && !/\s$/.test(before) ? ' ' : ''}${value}`;
+      input.value = before + insert + input.value.slice(end);
+      const caret = start + insert.length;
+      input.focus();
+      input.setSelectionRange(caret, caret);
+      this.draftChanged();
     }
 
     /** Symbol to resolved source. Built fresh per read for Tracker reactivity. */
@@ -1186,11 +1654,15 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       }
 
       const session = this.client && this.sid ? this.client.session(this.sid) : null;
-      const roster: Mentionable[] = [];
-      for (const p of session?.participants ?? []) {
-        if (p.kind !== 'model' || !p.agent) continue;
-        roster.push({ handle: p.agent, label: p.agent, kind: 'agent', detail: p.displayName });
-      }
+      const entries = session ? modelMentionHandles(session) : [];
+      const roster: Mentionable[] = entries.map(({ participant: p, handle }) => ({
+        handle, label: p.displayName, kind: 'agent',
+        ...(handle !== p.displayName ? { detail: `Use @${handle}` } : {}),
+      }));
+      const resolveRoster = (handle: string) => {
+        const participant = session ? modelParticipantByHandle(session, handle) : undefined;
+        return participant ? roster[entries.findIndex((entry) => entry.participant.id === participant.id)] : undefined;
+      };
       if (roster.length === 0 && !out.has(DEFAULT_PREFIX)) return out;
 
       // The roster goes FIRST in both directions, so a real addressee always
@@ -1199,13 +1671,14 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       out.set(DEFAULT_PREFIX, {
         search: (q) => {
           const needle = q.toLowerCase();
-          const hits = roster.filter((m) => matches(m, needle));
+          const hits = roster.filter((m, index) => matches(m, needle)
+            || entries[index].participant.agent!.toLowerCase().includes(needle));
           const extra = (app?.search(q) ?? []).filter(
-            (m) => !roster.some((r) => r.handle === m.handle),
+            (m) => !resolveRoster(m.handle),
           );
           return [...hits, ...extra];
         },
-        lookup: (h) => roster.find((m) => m.handle === h) ?? app?.lookup(h) ?? null,
+        lookup: (h) => resolveRoster(h) ?? app?.lookup(h) ?? null,
       });
       return out;
     }
@@ -1223,10 +1696,24 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     attributeChangedCallback(name: string, before: string | null, after: string | null) {
       if (before === after || !this.live) return;
-      if (name === 'placeholder' || name === 'composer-mode') {
+      if (['placeholder', 'composer-mode', 'recipient', 'multiline', 'composer-layout', 'submit-label'].includes(name)) {
+        this.applyComposerMode();
+        this.resizeComposer();
+        return;
+      }
+      if (name === 'aria-disabled') {
+        if (after === 'true') this.closeSuggestions();
+        this.paint();
+        return;
+      }
+      // Recipient availability gates a new message, not the ability to stop
+      // work already running or answer an approval from another crew member.
+      if (name === 'composer-disabled') {
+        if (after === 'true') this.closeSuggestions();
         this.applyComposerMode();
         return;
       }
+      if (name === 'send-disabled') { this.applyComposerMode(); return; }
       // `verbosity` changes only what is DRAWN. Re-subscribing for it would
       // tear down a live session to change a privacy/display boundary.
       if (name === 'verbosity') { this.paint(); return; }
@@ -1240,6 +1727,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     private queueReattach() {
       this.detach();
       this.failure = null;
+      // A draft refers to its original Session. Moving the same element to
+      // another conversation must not carry a selected subject across scopes.
+      this.ui.input.value = '';
+      this.draftChanged();
+      this.timelineItems = [];
       // On a field (not a closure local) so a second detach updates the guard
       // the already-queued microtask will check.
       this.reattachGeneration = this.generation;
@@ -1256,19 +1748,27 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const busy = !!this.submission;
       const mode = this.submission?.mode ?? this.composerMode;
       const note = mode === 'note';
+      const recipient = this.submission ? this.submission.recipient : this.recipient;
+      const session = this.client && this.sid ? this.client.session(this.sid) : undefined;
+      const participant = session?.participants?.find((entry) => entry.kind === 'model'
+        && (entry.id === recipient || entry.agent === recipient));
+      const recipientLabel = recipient === undefined ? 'the agent'
+        : participant?.displayName || participant?.agent || (session ? 'unavailable agent' : 'selected agent');
       const hostDisabled = this.getAttribute('aria-disabled') === 'true';
+      const composerDisabled = hostDisabled || this.getAttribute('composer-disabled') === 'true';
       this.ui.input.placeholder = this.getAttribute('placeholder')
-        ?? (note ? DEFAULT_NOTE_PLACEHOLDER : DEFAULT_PLACEHOLDER);
-      this.ui.input.setAttribute('aria-label', note ? 'Add a crew note' : 'Message the agent');
-      this.ui.input.disabled = busy || hostDisabled;
-      this.ui.send.disabled = busy || hostDisabled;
+        ?? (note ? DEFAULT_NOTE_PLACEHOLDER : recipient === undefined ? DEFAULT_PLACEHOLDER : `Message ${recipientLabel}…`);
+      this.ui.input.setAttribute('aria-label', note ? 'Add a crew note' : `Message ${recipientLabel}`);
+      this.ui.input.disabled = busy || composerDisabled;
+      this.ui.send.disabled = busy || composerDisabled || this.getAttribute('send-disabled') === 'true';
       this.ui.send.textContent = busy
         ? (note ? 'Adding note…' : 'Sending…')
-        : (note ? 'Add note' : 'Send');
+        : (this.getAttribute('submit-label') || (note ? 'Add note' : 'Send'));
       this.ui.send.dataset.loading = String(busy);
       this.ui.composer.setAttribute('aria-busy', String(busy));
       this.ui.composer.setAttribute('part', `composer ${mode}${busy ? ' submitting' : ''}`);
       this.ui.send.setAttribute('part', `button send ${mode}${busy ? ' loading' : ''}`);
+      this.resizeComposer();
     }
 
     private attach() {
@@ -1307,7 +1807,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     private detach() {
       this.generation++;
+      this.clearMessageTarget();
       this.submission = null;
+      this.composing = false;
+      this.closeSuggestions();
+      this.composerSelection = null;
       this.approvalAction = null;
       this.approvalError = null;
       this.transcriptSignature = null;
@@ -1339,13 +1843,42 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  the merged live tail, whose lengths/streaming flag change per delta. */
     private signatureFor(rows: ViewMessage[]): string {
       const tail = rows.at(-1);
-      return tail
+      const signature = tail
         ? [
           rows.length, tail._id, tail.content?.length ?? 0,
           tail.thinking?.length ?? 0, tail.streaming ? 1 : 0,
           tail.toolCalls?.length ?? 0, tail.kind ?? '', this.failure ?? '',
         ].join(':')
         : `0:${this.failure ?? ''}`;
+      return `${signature}:${this.timeline.map((item) => `${item.id}:${item.afterMessageId ?? ''}`).join(',')}`;
+    }
+
+    private timelineNodes(rows: ViewMessage[], render: (row: ViewMessage) => HTMLElement | null): HTMLElement[] {
+      const at = (value: Date | number | undefined) => {
+        const number = value instanceof Date ? value.getTime() : value;
+        return typeof number === 'number' && Number.isFinite(number) ? number : Number.POSITIVE_INFINITY;
+      };
+      const sorted = [...this.timeline].sort((a, b) => at(a.createdAt) - at(b.createdAt)
+        || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
+      const buckets = new Map<number, HTMLElement[]>();
+      for (const item of sorted) {
+        const anchor = item.afterMessageId ? rows.findIndex((row) => row._id === item.afterMessageId) : -1;
+        const following = rows.findIndex((row) => at(row.createdAt) > at(item.createdAt)
+          || (at(row.createdAt) === at(item.createdAt) && row._id > item.id));
+        const position = anchor >= 0 ? anchor + 1 : following >= 0 ? following : rows.length;
+        const nodes = buckets.get(position) ?? [];
+        nodes.push(this.timelineSlots.get(item.id)!);
+        buckets.set(position, nodes);
+      }
+      const nodes: HTMLElement[] = [];
+      for (let index = 0; index <= rows.length; index += 1) {
+        nodes.push(...(buckets.get(index) ?? []));
+        if (index < rows.length) {
+          const row = render(rows[index]);
+          if (row) nodes.push(row);
+        }
+      }
+      return nodes;
     }
 
     private paint() {
@@ -1367,19 +1900,40 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       // Exact machine records are opt-in. Legacy quiet/full map to clean/debug.
       const mode = transcriptMode(this.getAttribute('verbosity'));
       const mentions = this.mentionMap();
-      const nodes: HTMLElement[] = rows
-        .map((m) => renderRow(m, names, download, mode, mentions))
-        .filter((n): n is HTMLElement => n !== null);
+      const session = client && sid ? client.session(sid) : null;
+      const agentNames = new Map((session?.participants ?? [])
+        .filter((p) => p.kind === 'model' && p.agent)
+        .map((p) => [p.agent!, p.displayName]));
+      const nodes = this.timelineNodes(rows, (m) => renderRow(m, names, download, mode, mentions, agentNames));
       if (this.failure) nodes.push(failureRow(this.failure));
       // Subscription hydration starts from an empty collection. Treat the
       // first durable rows as pinned even if layout has not established a
       // useful scrollHeight yet; after that, actual reader position wins.
-      const wasPinned = this.renderedTranscriptRows === 0 || this.nearTranscriptBottom();
+      const wasPinned = !this.messageTarget
+        && (this.renderedTranscriptRows === 0 || this.nearTranscriptBottom());
       const previousScrollTop = this.ui.messages.scrollTop;
+      const targetWasFocused = !!this.messageTarget
+        && (this.shadowRoot?.activeElement as HTMLElement | null)?.dataset.messageId === this.messageTarget.id;
       const signature = this.signatureFor(rows);
       const changed = this.transcriptSignature !== null
         && signature !== this.transcriptSignature;
-      this.ui.messages.replaceChildren(...nodes);
+      // Keep app-owned timeline slots mounted so expanding a card or focusing
+      // one of its controls survives unrelated message/stream paints.
+      const keep = new Set(nodes);
+      for (const old of [...this.ui.messages.children]) if (!keep.has(old as HTMLElement)) old.remove();
+      let cursor: ChildNode | null = this.ui.messages.firstChild;
+      for (const node of nodes) {
+        if (node === cursor) cursor = cursor.nextSibling;
+        else this.ui.messages.insertBefore(node, cursor);
+      }
+      if (this.messageTarget) {
+        const target = this.visibleMessageRow(this.messageTarget.id);
+        if (!target || this.messageTarget.expiresAt <= Date.now()) this.clearMessageTarget();
+        else {
+          this.markMessageTarget(target);
+          if (targetWasFocused) target.focus({ preventScroll: true });
+        }
+      }
       if (wasPinned) {
         this.ui.messages.scrollTop = this.ui.messages.scrollHeight;
         this.newMessagesPending = false;
@@ -1390,11 +1944,10 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         if (changed) this.newMessagesPending = true;
       }
       this.transcriptSignature = signature;
-      this.renderedTranscriptRows = rows.length;
+      this.renderedTranscriptRows = rows.length + this.timeline.length;
       this.syncNewMessages();
       this.applyComposerMode();
 
-      const session = client && sid ? client.session(sid) : undefined;
       const phase: Phase = session?.phase ?? 'idle';
       this.ui.phase.textContent = phase;
       this.ui.phase.dataset.phase = phase;
@@ -1537,14 +2090,37 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
     }
 
     private refreshSuggestions() {
+      if (this.composing) { this.closeSuggestions(); return; }
       const token = this.tokenAtCaret();
       if (!token) { this.closeSuggestions(); return; }
+      const bounds = this.ui.input.getBoundingClientRect();
+      const proceed = this.dispatchEvent(new CustomEvent('agent-chat:mention-query', {
+        detail: { prefix: token.prefix, query: token.query,
+          range: { start: token.start, end: this.ui.input.selectionEnd ?? this.ui.input.value.length },
+          rect: { x: bounds.x, y: bounds.y, width: bounds.width, height: bounds.height,
+            top: bounds.top, right: bounds.right, bottom: bounds.bottom, left: bounds.left } },
+        bubbles: true, composed: true, cancelable: true,
+      }));
+      if (!proceed) { this.closeSuggestions(); return; }
       // Only what THIS symbol names: typing `#` must not offer a person. The
       // source does its own matching, so a big collection can filter at the
       // query rather than shipping everything here to be sieved.
       const source = this.mentionMap().get(token.prefix);
       const hits = source ? source.search(token.query) : [];
-      if (hits.length === 0) { this.closeSuggestions(); return; }
+      if (hits.length === 0) {
+        this.closeSuggestions();
+        if (source?.emptyText) {
+          const empty = document.createElement('div');
+          empty.className = 'suggestion-empty';
+          empty.setAttribute('part', 'suggestion-empty');
+          empty.setAttribute('role', 'status');
+          empty.textContent = source.emptyText;
+          this.ui.typeahead.replaceChildren(empty);
+          this.ui.typeahead.hidden = false;
+          this.ui.input.setAttribute('aria-expanded', 'true');
+        }
+        return;
+      }
       // Agents before everything else: in a chat the addressable thing is the
       // likelier intent, and a roster is short enough that it never buries the
       // rest.
@@ -1562,6 +2138,8 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       typeahead.replaceChildren(...this.suggestions.map((m, i) => {
         const row = document.createElement('button');
         row.type = 'button';
+        row.id = `agent-chat-suggestion-${i}`;
+        row.tabIndex = -1;
         row.className = 'suggestion';
         row.setAttribute('part', 'suggestion');
         row.setAttribute('role', 'option');
@@ -1585,22 +2163,42 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
           this.cursorAt = i;
           this.acceptSuggestion();
         });
+        // Assistive technology and HTMLElement.click() can invoke semantic
+        // click without mousedown. The first acceptance clears suggestions,
+        // so an ordinary pointer's following click cannot insert twice.
+        row.addEventListener('click', () => {
+          if (this.suggestions[i] !== m) return;
+          this.cursorAt = i;
+          this.acceptSuggestion();
+        });
         return row;
       }));
       typeahead.hidden = false;
       input.setAttribute('aria-expanded', 'true');
+      input.setAttribute('aria-activedescendant', `agent-chat-suggestion-${this.cursorAt}`);
     }
 
     private closeSuggestions() {
-      if (this.suggestions.length === 0) return;
       this.suggestions = [];
       this.cursorAt = -1;
       this.ui.typeahead.hidden = true;
       this.ui.typeahead.replaceChildren();
       this.ui.input.setAttribute('aria-expanded', 'false');
+      this.ui.input.removeAttribute('aria-activedescendant');
     }
 
     private onKeyDown(e: KeyboardEvent) {
+      if (this.composing || e.isComposing || e.keyCode === 229) return;
+      if (e.key === 'Enter') {
+        if (e.shiftKey && this.hasAttribute('multiline')) return;
+        e.preventDefault();
+        if (this.suggestions.length) this.acceptSuggestion();
+        else void this.submit();
+        return;
+      }
+      if (e.key === 'Escape' && !this.ui.typeahead.hidden) {
+        e.preventDefault(); this.closeSuggestions(); return;
+      }
       if (this.suggestions.length === 0) return;
       if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
         e.preventDefault();
@@ -1612,15 +2210,19 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       }
       if (e.key === 'Tab') { e.preventDefault(); this.acceptSuggestion(); return; }
       if (e.key === 'Escape') { e.preventDefault(); this.closeSuggestions(); }
-      // Enter deliberately falls through to the form's submit handler, which
-      // completes instead of sending while this list is open.
+      // Enter is handled above because a textarea's native Enter is a newline,
+      // not an implicit form submit. The send button shares the same guard.
     }
 
     private acceptSuggestion() {
       const chosen = this.suggestions[this.cursorAt];
       const token = this.tokenAtCaret();
-      if (!chosen || !token) { this.closeSuggestions(); return; }
+      if (!chosen || !token || token.prefix !== this.suggestPrefix
+        || !this.mentionMap().get(token.prefix)?.lookup(chosen.handle)) {
+        this.closeSuggestions(); return;
+      }
       const { input } = this.ui;
+      if (!this.requestMentionSelection(token.prefix, chosen)) { this.closeSuggestions(); return; }
       const caret = input.selectionStart ?? input.value.length;
       // The trailing space is what ends the token: without it the next
       // keystroke re-opens the list against a handle that is already complete.
@@ -1630,31 +2232,40 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       input.setSelectionRange(at, at);
       this.closeSuggestions();
       input.focus();
+      this.draftChanged();
+      this.mentionSelected(token.prefix, chosen);
     }
 
     private async submit() {
-      if (this.submission) return;
+      if (this.submission || this.getAttribute('aria-disabled') === 'true'
+        || this.getAttribute('composer-disabled') === 'true'
+        || this.getAttribute('send-disabled') === 'true') return;
       const text = this.ui.input.value.trim();
-      if (!text) return;
+      if (!text && !(this.allowEmptySubmit && this.submissionHandler)) return;
       const { client, sid } = this;
       if (!client || !sid) {
         this.fail(new Error('no session yet — the agent is still starting'));
         return;
       }
       const mode = this.composerMode;
+      const recipient = mode === 'ask' ? this.recipient : undefined;
+      const handler = this.submissionHandler;
       const generation = this.generation;
-      const submission = { mode, text };
+      const submission = { mode, text, ...(recipient === undefined ? {} : { recipient }) };
       this.clearFailure();
       this.submission = submission;
       this.ui.input.value = '';
+      this.draftChanged();
       this.closeSuggestions();
       this.applyComposerMode();
       try {
-        if (mode === 'note') await client.contribute(sid, text);
-        else await client.send(sid, text);
+        if (handler) await handler({ sessionId: sid, ...submission });
+        else if (mode === 'note') await client.contribute(sid, text);
+        else await client.send(sid, text, recipient === undefined ? undefined : { to: recipient });
         if (generation === this.generation) {
           this.dispatchEvent(new CustomEvent('agent-chat:submitted', {
-            detail: { sessionId: sid, mode }, bubbles: true, composed: true,
+            detail: { sessionId: sid, mode, ...(recipient === undefined ? {} : { recipient }) },
+            bubbles: true, composed: true,
           }));
         }
       } catch (e) {
@@ -1662,6 +2273,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         // session the server no longer has) must not eat what was typed.
         if (generation === this.generation) {
           this.ui.input.value = text;
+          this.draftChanged();
           this.fail(e);
         }
       } finally {
@@ -1674,7 +2286,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     private async decide(action: 'approve' | 'deny') {
       const { client, sid } = this;
-      if (!client || !sid || this.approvalAction) return;
+      if (this.getAttribute('aria-disabled') === 'true' || !client || !sid || this.approvalAction) return;
       const ask = client.pending(sid);
       if (client.status(sid) !== 'awaiting' || !ask || ask.verdict) return;
       const generation = this.generation;

@@ -535,7 +535,7 @@ describe('channels', () => {
       assert.match(user.content!, /^the data is attached\n\[file "big\.bin" \(20 bytes\) exceeded the 10 bytes limit/);
       const stored = (await AgentAttachments.findOneAsync({ _id: user.attachments![0].id }))!;
       assert.equal(stored.sessionId, binding.sessionId);
-      assert.equal(Buffer.from(stored.content, 'base64').toString('utf8'), 'a,b\n1,2\n');
+      assert.equal(Buffer.from(stored.content!, 'base64').toString('utf8'), 'a,b\n1,2\n');
     });
 
     it('an attachment-only event is a message now, and `attachments: false` restores v1', async () => {

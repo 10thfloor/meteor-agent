@@ -222,7 +222,7 @@ async function stopRunningDescendants(sessionId: string): Promise<void> {
     // eslint-disable-next-line no-await-in-loop
     await AgentSessions.updateAsync(
       { _id: next, phase: { $in: ACTIVE_PHASES } },
-      { $set: { phase: 'stopped', updatedAt: new Date() } },
+      { $set: { phase: 'stopped', stoppedAt: new Date(), updatedAt: new Date() } },
     );
     // Re-read: the walk continues past un-stopped descendants.
     // eslint-disable-next-line no-await-in-loop
@@ -299,6 +299,18 @@ export async function sendToSession(
   // WHICH MODEL answers (decision 5): explicit `to`, else the leading `@`
   // token, else the primary — resolved here, mechanically, once.
   const addressee = resolveAddressee(text, extras?.to, session);
+  // An explicit selection is a routing promise, not a hint. A stale picker,
+  // removed roster member, or unloaded Agent must never silently wake the
+  // primary instead. Reject before committing a message or charging a turn.
+  if (extras?.to !== undefined && (
+    typeof extras.to !== 'string' || extras.to.trim() === ''
+    || !addressee || !getAgent(addressee.agent)
+  )) {
+    throw new Meteor.Error(
+      'recipient-unavailable',
+      'That agent is no longer available in this conversation. Choose another recipient.',
+    );
+  }
 
   await commitUserMessage({
     sessionId,
@@ -438,10 +450,13 @@ export function registerMethods(): void {
 
     async [NAMES.mSend](
       this: any, agent: string, sessionId: string, text: string, commitKey?: string,
+      options?: { to?: string },
     ) {
       check(agent, String);
       check(sessionId, String);
       check(text, String);
+      const to = options?.to;
+      check(options, Match.Maybe({ to: Match.Maybe(String) }));
       check(commitKey, Match.Maybe(Match.Where(
         (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(value),
       )));
@@ -457,7 +472,7 @@ export function registerMethods(): void {
       // The core carries the rest — see `sendToSession` above (channels spec §5.1):
       // one body, two callers.
       return sendToSession(agent, sessionId, text, this.userId ?? null, {
-        commitKey, source: { kind: 'desktop' },
+        commitKey, to, source: { kind: 'desktop' },
       });
     },
 
@@ -493,7 +508,7 @@ export function registerMethods(): void {
         _id: sessionId,
         erasingAt: { $exists: false },
         phase: { $in: ACTIVE_PHASES },
-      }, { $set: { phase: 'stopped', updatedAt: new Date() } });
+      }, { $set: { phase: 'stopped', stoppedAt: new Date(), updatedAt: new Date() } });
       if (stopped !== 1) return;
 
       // Parent first: prevents it from starting another child between writes.
