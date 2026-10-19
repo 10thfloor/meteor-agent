@@ -55,6 +55,11 @@
 #             on stderr. Idempotent: everything is written under a fresh mktemp
 #             directory that is removed on exit, success or failure. Nothing in
 #             the repo is modified.
+# KEEPING IT  VERIFY_KEEP_BUNDLE=<empty or absent directory> builds there and
+#             leaves the bundle, with its npm install done, for a check that
+#             goes on to boot it:
+#               meteor node scripts/verify-instances.mjs <directory>/bundle
+#             The directory is then the caller's to remove.
 #
 # NOT part of `meteor test-packages`: it needs a full production build, which is
 # minutes, not milliseconds. Operators and CI run it; the test suite does not.
@@ -72,8 +77,16 @@ fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
 command -v meteor >/dev/null 2>&1 || fail "meteor is not on PATH"
 [ -d "$APP_DIR" ] || fail "no app directory at $APP_DIR"
 
-BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-verify-build.XXXXXX")"
-cleanup() { rm -rf "$BUILD_DIR"; }
+if [ -n "${VERIFY_KEEP_BUNDLE:-}" ]; then
+  # Built where the caller says, and left there: see KEEPING IT above.
+  BUILD_DIR="$VERIFY_KEEP_BUNDLE"
+  mkdir -p "$BUILD_DIR"
+  [ -z "$(ls -A "$BUILD_DIR")" ] || fail "VERIFY_KEEP_BUNDLE names a directory that is not empty: $BUILD_DIR"
+  cleanup() { :; }
+else
+  BUILD_DIR="$(mktemp -d "${TMPDIR:-/tmp}/agent-verify-build.XXXXXX")"
+  cleanup() { rm -rf "$BUILD_DIR"; }
+fi
 # EXIT alone does not fire when the shell is signalled, and a killed run must
 # not leave a multi-hundred-megabyte bundle behind.
 trap cleanup EXIT

@@ -10,6 +10,7 @@ import {
   NAMES,
   defineAgentChat,
 } from 'meteor/10thfloor:agent';
+import './durable-threads';
 import {
   CHANNEL_KINDS,
   CHANNEL_SCHEMAS,

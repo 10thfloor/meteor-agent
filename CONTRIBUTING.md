@@ -67,6 +67,16 @@ meteor npm run test-app:once
 A test entry point no CI job executes is coverage that does not exist — the
 control-plane suite ran only on developers' machines until this job landed.
 
+`scripts/verify-instances.mjs` is the one check that boots a production
+bundle: two server processes on one MongoDB (Meteor's own `mongod`, started
+and removed by the script), driven over DDP. It needs a bundle with its
+`npm install` done, which `verify-build.sh` leaves behind when asked:
+
+```bash
+VERIFY_KEEP_BUNDLE=/tmp/verify-bundle ./scripts/verify-build.sh
+(cd app && meteor node ../scripts/verify-instances.mjs /tmp/verify-bundle/bundle)
+```
+
 In one checkout, run the full-app suite and `verify-build.sh` **before**
 `npm test`, or run `meteor npm ci` in between. `meteor test-packages` replaces
 `app/node_modules/@swc/helpers` with links into its temporary test directory
@@ -260,6 +270,8 @@ rules above apply, with this package's own files:
    - run `./scripts/verify-build.sh`. Its durable probe checks that the loader
      takes the copies of Chord and pi-ai that Pi Durable itself imports, and
      runs a whole turn from the bundle;
+   - run `scripts/verify-instances.mjs` on that bundle, and the full-app suite,
+     whose Threads tests drive the package through a real surface;
    - re-read `dist/index.d.ts` and `dist/types.d.ts` against the notes in
      `server/pi.ts`, and update them in the same commit.
 
