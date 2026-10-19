@@ -8,13 +8,21 @@ if (Meteor.isClient) describe('Constellation agent capability navigation', funct
   this.timeout(20_000);
   const $ = (id) => document.getElementById(id);
   const flush = async () => { Tracker.flush(); await new Promise(requestAnimationFrame); };
-  const waitUntil = async (condition) => {
+  const waitUntil = async (condition, message = () => 'Agent capability controls did not become ready.') => {
     const until = Date.now() + 10_000;
     while (!condition()) {
-      if (Date.now() > until) assert.fail('Agent capability controls did not become ready.');
+      if (Date.now() > until) assert.fail(message());
       await new Promise((resolve) => setTimeout(resolve, 25));
     }
   };
+  // The skill dialog hands focus back from its close event, a frame later; that event and a
+  // test timer are separate tasks with no guaranteed order, so wait for the focus to arrive.
+  const focused = () => {
+    const node = document.activeElement;
+    return node ? `${node.tagName.toLowerCase()}${node.id ? `#${node.id}` : ''} "${node.textContent.trim().slice(0, 40)}"` : 'nothing';
+  };
+  const waitForFocus = (matches, target) => waitUntil(() => matches(document.activeElement),
+    () => `Focus did not return to ${target}; ${focused()} has it.`);
   let crew; let skills; let catalog; let primary; let fixtureId; let toolFixtureId; let originalCall; let writes;
   before(async () => {
     await waitUntil(() => Meteor.userId() && $('app-frame')?.dataset.startupState === 'ready');
@@ -97,7 +105,7 @@ if (Meteor.isClient) describe('Constellation agent capability navigation', funct
     assert.equal($('agent-detail-tab-skills').getAttribute('aria-selected'), 'true');
     assert.equal($('crew-name').value, 'Unsaved agent name');
     assert.equal($('crew-edit-state').textContent, 'Unsaved changes');
-    assert.isTrue(document.activeElement.hasAttribute('data-agent-create-skill'));
+    await waitForFocus((node) => node?.hasAttribute('data-agent-create-skill'), 'Create skill');
   });
 
   it('exposes mission file access in the existing Tools settings without saving on view', async () => {
@@ -136,7 +144,7 @@ if (Meteor.isClient) describe('Constellation agent capability navigation', funct
     assert.sameMembers(patch.agents, [primary.agent, specialist.agent]);
     assert.isFalse(patch.enabled, 'Editing must not silently enable a disabled skill.');
     assert.isTrue($('crew-dialog').open);
-    assert.equal(document.activeElement.dataset.skillEdit, fixtureId);
+    await waitForFocus((node) => node?.dataset.skillEdit === fixtureId, 'Edit skill');
   });
 
   it('shows inherited memory without turning it into an explicit new grant', async () => {
