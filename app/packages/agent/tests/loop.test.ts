@@ -4097,10 +4097,15 @@ describe('predicate gates', () => {
 
     const approve = (Meteor.server as any).method_handlers[NAMES.mApprove];
     await approve.call({ userId: 'u1', unblock() {} }, 'gate-remainder', 's-gate-remainder');
+    // The park is durable before the resumed turn winds down: it keeps its
+    // lease through the post-park entitlement check and releases it after.
+    // Wait for the settled park, not just its first write.
     await waitFor(
-      async () => (await AgentSessions
-        .findOneAsync('s-gate-remainder'))?.pending?.toolCallId === 'g3',
-      'the remainder to be re-gated and park again on the third call',
+      async () => {
+        const parked = await AgentSessions.findOneAsync('s-gate-remainder');
+        return parked?.pending?.toolCallId === 'g3' && !parked.lease;
+      },
+      'the remainder to be re-gated, park again on the third call, and release its lease',
     );
 
     assert.deepEqual(ran, ['refund'], 'only the approved call ran');
