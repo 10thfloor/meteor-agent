@@ -23,6 +23,8 @@ agent conversation. pi-ai is the default model Adapter; it is not the harness.
 | Lens | Pure translation between a Channel's wire meaning and harness meaning. | Channel contract |
 | Binding | Routing from one external conversation to one Session. | Channel collections/ingress |
 | Receipt | Durable record of an attempted Channel delivery. | Channel egress |
+| Attachment | Session-scoped file reference with metadata; file contents resolve through a host-selected storage Adapter. | `Agent.attachments` |
+| Attachment Storage Adapter | Server-only byte storage boundary. Constellation uses the mission Sprite; the framework default remains Mongo for other hosts. | `Agent.attachments.configureStorage`; Constellation Sprite attachment Adapter |
 | Release | One verified snapshot of the core and five Channel packages. | `release.json` and the release check |
 | Session Lifecycle | Owner-scoped recursive erasure of Session-owned data. | `Agent#erase` |
 | Agent Identity | Stable continuity for one Agent across display-name, model, Team, and configuration changes. | `Agent.learning`; Agent Identity Module |
@@ -46,6 +48,9 @@ agent conversation. pi-ai is the default model Adapter; it is not the harness.
   pass through pi-ai, and the default pi-ai Adapter stays lazy.
 - Keep Session Lifecycle distinct from Memory and account identity. Erasing a
   conversation preserves user/app Memory and linked Channel Identity.
+- Keep file contents behind the Attachment storage Seam. Constellation's mission
+  filesystem and attachment contents share one Sprite; Mongo stores references.
+  Storage adapters must not provision environments or silently fall back to Mongo.
 - Keep Fact Memory, Experience, Practice, and Constitution logically distinct.
   Facts describe what is known; Experience records what happened; Practice
   encodes how to do the work well; Constitution encodes how the Agent chooses
