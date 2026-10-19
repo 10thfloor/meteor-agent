@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# verify-build.sh — production-build verification for 10thfloor:agent.
+# verify-build.sh — production-build verification for 10thfloor:agent and
+# 10thfloor:durable.
 #
 # WHAT IT PROVES
 #   `meteor test-packages` runs the harness out of the app's dev `node_modules`.
@@ -28,7 +29,18 @@
 #        `builtinModels()` returns a usable model — then repeats the whole
 #        chain for `typebox/value`, the full JSON-Schema checker behind
 #        `validateToolArgs`, and checks a rich schema in both directions — and
-#        once more for `@earendil-works/pi-mcp`, the MCP client library.
+#        once more for `@earendil-works/pi-mcp`, the MCP client library;
+#     6. the same for `10thfloor:durable`: its compiled package and loader
+#        markers, Pi Durable and Chord in the relocated tree, and both browser
+#        bundles carrying its client and Chord's delta module (the client
+#        imports that by file path, which only a real build proves). Its probe
+#        resolves Chord and pi-ai from Pi Durable's side — a copy nested under
+#        it first — and checks that against Node's own lookup from Pi Durable's
+#        entry file: the loader must hand the app the very copies the harness
+#        imports, and where npm keeps two, the bare name is the wrong one.
+#        Then it runs a whole model turn with a tool call on Pi Durable's
+#        memory storage with pi-ai's faux provider, which shows the three
+#        packages load and work together from this layout.
 #
 # WHAT IT DOES NOT NEED
 #   No Mongo, no app boot, no listening port (so it cannot collide with anything
@@ -52,6 +64,7 @@ set -euo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 APP_DIR="$REPO_ROOT/app"
 PKG_NAME='10thfloor:agent'
+DURABLE_NAME='10thfloor:durable'
 
 step() { printf '\n=== %s\n' "$*"; }
 fail() { printf 'FAIL: %s\n' "$*" >&2; exit 1; }
@@ -73,6 +86,12 @@ if ! grep -qE "^[[:space:]]*${PKG_NAME}([[:space:]@#]|$)" "$APP_DIR/.meteor/pack
       this script would verify nothing. Add it:  (cd app && meteor add $PKG_NAME)"
 fi
 echo "app declares $PKG_NAME"
+if ! grep -qE "^[[:space:]]*${DURABLE_NAME}([[:space:]@#]|$)" "$APP_DIR/.meteor/packages"; then
+  fail "$APP_DIR/.meteor/packages does not list $DURABLE_NAME.
+      Without it the bundle carries none of that package and its checks below
+      would verify nothing. Add it:  (cd app && meteor add $DURABLE_NAME)"
+fi
+echo "app declares $DURABLE_NAME"
 echo "build dir: $BUILD_DIR"
 
 step "meteor build --directory --server-only (this is the slow part)"
@@ -97,10 +116,40 @@ for marker in resolvePiAiEntry shimLoad CANDIDATE_DIRS '@earendil-works/pi-ai' t
 done
 echo "loader markers present (resolvePiAiEntry, shimLoad, CANDIDATE_DIRS, pi-ai, pi-mcp)"
 
-for pkg in pi-ai pi-mcp; do
+for pkg in pi-ai pi-mcp pi-durable chord; do
   [ -d "$SERVER_DIR/npm/node_modules/@earendil-works/$pkg" ] \
     || fail "$pkg is not in the bundle at programs/server/npm/node_modules"
   echo "$pkg present at programs/server/npm/node_modules"
+done
+
+BUNDLED_DURABLE="$SERVER_DIR/packages/10thfloor_durable.js"
+[ -f "$BUNDLED_DURABLE" ] || fail "the bundle carries no compiled $DURABLE_NAME ($BUNDLED_DURABLE)"
+echo "compiled package: $(du -h "$BUNDLED_DURABLE" | cut -f1) $BUNDLED_DURABLE"
+
+# The same drift guard for packages/durable/server/loader.ts, which the second
+# probe below is a port of.
+for marker in resolvePackageEntry shimLoad RESOLVED_FROM CANDIDATE_DIRS \
+  '@earendil-works/pi-durable' '@earendil-works/chord'; do
+  grep -qF -- "$marker" "$BUNDLED_DURABLE" \
+    || fail "loader marker '$marker' missing from the bundle — packages/durable/server/loader.ts
+      has changed shape and the durable probe in this script no longer mirrors it."
+done
+echo "durable loader markers present (resolvePackageEntry, shimLoad, RESOLVED_FROM, pi-durable, chord)"
+
+# The browser half. The client reaches Chord's delta module by file path,
+# because the browser bundler follows no exports map either; whether that
+# survives a production build, its minifier, and the legacy target is something
+# only a production build shows. The markers are string literals, which a
+# minifier keeps: the publication's name, and an error message of Chord's.
+for arch in web.browser web.browser.legacy; do
+  CLIENT_JS="$(find "$BUILD_DIR/bundle/programs/$arch" -maxdepth 1 -name '*.js' | head -1)"
+  [ -n "$CLIENT_JS" ] || fail "no client bundle for $arch in the build output"
+  grep -qF -- 'durable.conversation' "$CLIENT_JS" \
+    || fail "the $arch bundle carries no $DURABLE_NAME client"
+  grep -qF -- 'unknown op verb' "$CLIENT_JS" \
+    || fail "the $arch bundle carries no Chord delta module: the client's import of
+      @earendil-works/chord/dist/delta/index.js did not survive the build"
+  echo "$arch bundle carries the durable client and Chord's delta module"
 done
 
 step "npm install inside the bundle (programs/server)"
@@ -372,4 +421,237 @@ PROBE_EOF
 # built for, and the one a `meteor`-managed deploy runs it under.
 ( cd "$SERVER_DIR" && meteor node agent-loader-probe.mjs )
 
-step "PASS — the production bundle carries the agent and its loader chain resolves pi-ai, typebox and pi-mcp"
+step "Durable probe (cwd = programs/server): the loader chain, then a whole turn on Pi Durable"
+cat >"$SERVER_DIR/durable-loader-probe.mjs" <<'DURABLE_PROBE_EOF'
+/*
+ * A port of packages/durable/server/loader.ts, run as a real ESM module against
+ * the built bundle, for the same reason as the probe above. That loader differs
+ * from the agent's in one rule: Chord and pi-ai are resolved from Pi Durable's
+ * side, a copy nested under it first. The rule is checked here against Node's
+ * own algorithm, and then the three packages are made to work together.
+ */
+import path from 'path';
+import fs from 'fs';
+import os from 'os';
+import { createRequire } from 'module';
+import { pathToFileURL } from 'url';
+
+const DURABLE = '@earendil-works/pi-durable';
+const CHORD = '@earendil-works/chord';
+const PI_AI = '@earendil-works/pi-ai';
+const CANDIDATE_DIRS = ['node_modules', path.join('npm', 'node_modules')];
+const RESOLVED_FROM = { [CHORD]: DURABLE, [PI_AI]: DURABLE };
+
+function findNodeModulesBase(pkg, from = process.cwd()) {
+  const dependent = RESOLVED_FROM[pkg];
+  let dir = from;
+  for (let i = 0; i < 8; i += 1) {
+    for (const c of CANDIDATE_DIRS) {
+      const root = path.join(dir, c);
+      if (dependent !== undefined) {
+        const nested = path.join(root, ...dependent.split('/'), 'node_modules');
+        if (fs.existsSync(path.join(nested, ...pkg.split('/')))) return nested;
+      }
+      if (fs.existsSync(path.join(root, ...pkg.split('/')))) return root;
+    }
+    const parent = path.dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return null;
+}
+
+function pickCondition(entry) {
+  if (typeof entry === 'string') return entry;
+  const v = entry?.import ?? entry?.default ?? entry?.require;
+  return typeof v === 'string' ? v : undefined;
+}
+
+function resolveExportKey(map, key) {
+  if (typeof map === 'string') return key === '.' ? map : undefined;
+  if (!map || typeof map !== 'object') return undefined;
+  const hasSubpaths = Object.keys(map).some((k) => k === '.' || k.startsWith('./'));
+  if (!hasSubpaths) return key === '.' ? pickCondition(map) : undefined;
+  if (map[key] !== undefined) return pickCondition(map[key]);
+  for (const [pattern, target] of Object.entries(map)) {
+    const star = pattern.indexOf('*');
+    if (star === -1) continue;
+    const prefix = pattern.slice(0, star);
+    const suffix = pattern.slice(star + 1);
+    if (key.length < prefix.length + suffix.length) continue;
+    if (!key.startsWith(prefix) || !key.endsWith(suffix)) continue;
+    const wildcard = key.slice(prefix.length, key.length - suffix.length);
+    const file = pickCondition(target);
+    if (file) return file.replace('*', wildcard);
+  }
+  return undefined;
+}
+
+function resolvePackageEntry(pkg, subpath) {
+  const base = findNodeModulesBase(pkg);
+  if (!base) throw new Error(`${pkg} not found walking up from ${process.cwd()}`);
+  const pkgDir = path.join(base, ...pkg.split('/'));
+  const pkgJson = JSON.parse(fs.readFileSync(path.join(pkgDir, 'package.json'), 'utf8'));
+  const key = subpath ? `./${subpath.replace(/^\.?\//, '')}` : '.';
+  let rel = resolveExportKey(pkgJson.exports, key);
+  if (!rel && key === '.') rel = pkgJson.main ?? 'index.js';
+  if (!rel) throw new Error(`${pkg} does not export "${key}"`);
+  return path.join(pkgDir, rel);
+}
+
+async function shimLoad(urlHref) {
+  const shimDir = fs.mkdtempSync(path.join(os.tmpdir(), 'durable-loader-'));
+  const shimPath = path.join(shimDir, 'loader.mjs');
+  fs.writeFileSync(shimPath, 'export const load = (u) => import(u);\n');
+  try {
+    const shim = createRequire(shimPath)(shimPath);
+    return await shim.load(urlHref);
+  } finally {
+    try { fs.rmSync(shimDir, { recursive: true, force: true }); } catch { /* temp */ }
+  }
+}
+
+const die = (msg) => { console.error(`FAIL: ${msg}`); process.exit(1); };
+
+const base = findNodeModulesBase(DURABLE);
+if (!base) die('findNodeModulesBase() found no pi-durable in the built bundle');
+if (!base.endsWith(path.join('npm', 'node_modules'))) {
+  die(`resolved a dev-layout node_modules (${base}); this probe is not exercising the production path`);
+}
+console.log(`node_modules base     : ${base}`);
+
+/*
+ * What Node itself does when a file of Pi Durable imports a bare name: look in
+ * `node_modules` of each directory from that file upward. Written out here
+ * without reference to the rule above, so that the two can disagree.
+ */
+function asNodeResolves(pkg, fromFile) {
+  for (let dir = path.dirname(fromFile); ; dir = path.dirname(dir)) {
+    const candidate = path.join(dir, 'node_modules', ...pkg.split('/'));
+    if (fs.existsSync(candidate)) return fs.realpathSync(candidate);
+    if (path.dirname(dir) === dir) return null;
+  }
+}
+
+const durableEntry = resolvePackageEntry(DURABLE);
+for (const pkg of [CHORD, PI_AI]) {
+  const ours = fs.realpathSync(path.join(findNodeModulesBase(pkg), ...pkg.split('/')));
+  const nodes = asNodeResolves(pkg, durableEntry);
+  if (ours !== nodes) die(`${pkg}: the loader takes ${ours}, but Pi Durable itself imports ${nodes}`);
+  const nested = ours.includes(path.join('pi-durable', 'node_modules'));
+  console.log(`${pkg.padEnd(22)}: ${nested ? 'nested under pi-durable' : 'shared copy'}, the one Pi Durable imports`);
+}
+
+const wanted = [
+  [DURABLE, undefined], [DURABLE, 'testing'], [CHORD, 'context'], [CHORD, 'delta'],
+  [PI_AI, undefined], [PI_AI, 'models'], [PI_AI, 'providers/faux'],
+];
+const entries = new Map();
+for (const [pkg, subpath] of wanted) {
+  const entry = resolvePackageEntry(pkg, subpath);
+  if (!fs.existsSync(entry)) die(`${pkg}${subpath ? `/${subpath}` : ''} resolved to a file that does not exist: ${entry}`);
+  entries.set(`${pkg}|${subpath ?? ''}`, entry);
+  console.log(`exports ${`${pkg.split('/')[1]}${subpath ? `/${subpath}` : ''}`.padEnd(22)}: ${path.relative(base, entry)}`);
+}
+
+// Every branch of the loader, for Pi Durable itself. The first that works is the one the package takes.
+const durableUrl = pathToFileURL(durableEntry).href;
+const outcomes = [];
+for (const [label, fn] of [
+  ['1 bare import', () => import(DURABLE)],
+  ['2 URL import', () => import(durableUrl)],
+  ['3 temp shim', () => shimLoad(durableUrl)],
+]) {
+  try { outcomes.push({ label, ok: true, ns: await fn() }); } catch (e) {
+    outcomes.push({ label, ok: false, why: String(e?.code || e?.message || e).slice(0, 140) });
+  }
+}
+for (const o of outcomes) console.log(`pi-durable branch ${o.label.padEnd(14)} ${o.ok ? 'ok' : `fail  (${o.why})`}`);
+const winner = outcomes.find((o) => o.ok);
+if (!winner) die('no loader branch resolved pi-durable in the production bundle');
+const durable = winner.ns;
+if (typeof durable.Harness?.open !== 'function') die('pi-durable exposes no Harness.open');
+for (const name of ['MemoryStorage', 'StorageRejected', 'createRegistry', 'defineExtension', 'defineTool']) {
+  if (typeof durable[name] !== 'function') die(`pi-durable exposes no ${name}`);
+}
+
+// Chord and pi-ai go by path only; the bare name could mean another copy.
+const byPath = async (pkg, subpath) => {
+  const href = pathToFileURL(entries.get(`${pkg}|${subpath ?? ''}`)).href;
+  try { return await import(href); } catch { return shimLoad(href); }
+};
+const testing = await byPath(DURABLE, 'testing');
+if (typeof testing.createStorageConformance !== 'function') die('pi-durable/testing exposes no createStorageConformance');
+const context = (await byPath(CHORD, 'context')).BACKGROUND_CONTEXT;
+if (!context) die('chord/context exposes no BACKGROUND_CONTEXT');
+const { apply, applyImmutable } = await byPath(CHORD, 'delta');
+if (typeof apply !== 'function' || typeof applyImmutable !== 'function') die('chord/delta exposes no apply/applyImmutable');
+const before = { n: 1 };
+if (applyImmutable(before, [['s', ['n'], 2]]).n !== 2 || before.n !== 1) die('applyImmutable does not apply a set, or mutates its input');
+const { Type } = await byPath(PI_AI);
+const { createModels } = await byPath(PI_AI, 'models');
+const faux = await byPath(PI_AI, 'providers/faux');
+if (typeof Type?.Object !== 'function' || typeof createModels !== 'function' || typeof faux.fauxProvider !== 'function') {
+  die('pi-ai exposes no Type/createModels/fauxProvider');
+}
+console.log('namespaces            : pi-durable, pi-durable/testing, chord/context, chord/delta, pi-ai, pi-ai/models, pi-ai/providers/faux');
+
+/*
+ * One whole turn: input, a model request, a tool call, its result, the answer.
+ * Every commit goes through Chord's documents and the request through pi-ai's
+ * catalog, so the three packages have to load and fit together from here.
+ * (Whether they are the same copies is the comparison above; two copies of one
+ * version pass a turn.)
+ */
+const provider = faux.fauxProvider();
+const models = createModels();
+models.setProvider(provider.provider);
+provider.setResponses([
+  faux.fauxAssistantMessage([faux.fauxToolCall('add', { a: 2, b: 3 })], { stopReason: 'toolUse' }),
+  faux.fauxAssistantMessage('It is 5.'),
+]);
+const registry = durable.createRegistry();
+registry.install(durable.defineExtension({
+  name: 'math',
+  tools: [durable.defineTool({
+    name: 'add',
+    description: 'Add two numbers',
+    parameters: Type.Object({ a: Type.Number(), b: Type.Number() }),
+    replay: 'safe',
+    execute: async (args) => ({ content: [{ type: 'text', text: String(args.a + args.b) }] }),
+  })],
+}));
+const textOf = (message) => (typeof message?.content === 'string'
+  ? message.content
+  : (message?.content ?? []).flatMap((part) => (part?.type === 'text' ? [part.text] : [])).join(''));
+
+const turn = (async () => {
+  const harness = await durable.Harness.open(new durable.MemoryStorage(), { models, registry }, context);
+  const root = await harness.root(context, { agent: { model: { provider: 'faux', modelId: 'faux-1' } } });
+  const submission = await root.submit({ type: 'input', content: 'What is 2 + 3?' }, context);
+  const settled = await submission.wait(context);
+  const page = await root.entries({}, 20, undefined, context);
+  await harness.close(context);
+  return { settled, entries: [...page.items].reverse() };
+})();
+const result = await Promise.race([
+  turn,
+  new Promise((resolve) => setTimeout(() => resolve(null), 30_000)),
+]);
+if (result === null) die('the turn did not finish in 30 s');
+if (result.settled.status !== 'done') die(`the submission settled as ${JSON.stringify(result.settled)}`);
+const kinds = result.entries.map((entry) => entry.kind).filter((kind) => kind !== 'pi.system');
+if (JSON.stringify(kinds) !== JSON.stringify(['pi.user', 'pi.assistant', 'pi.tool-result', 'pi.assistant'])) {
+  die(`unexpected transcript: ${JSON.stringify(kinds)}`);
+}
+const toolResult = textOf(result.entries.find((entry) => entry.kind === 'pi.tool-result')?.model?.[0]);
+const answer = textOf(result.entries[result.entries.length - 1].model?.[0]);
+if (toolResult !== '5' || answer !== 'It is 5.') die(`unexpected turn: tool said ${JSON.stringify(toolResult)}, model said ${JSON.stringify(answer)}`);
+console.log(`a whole turn          : ok (tool result "${toolResult}", answer "${answer}")`);
+console.log(`WINNING LOADER BRANCH : ${winner.label.trim()}`);
+process.exit(0);
+DURABLE_PROBE_EOF
+
+( cd "$SERVER_DIR" && meteor node durable-loader-probe.mjs )
+
+step "PASS — the production bundle carries both packages; their loader chains resolve pi-ai, typebox, pi-mcp, pi-durable and chord; a Pi Durable turn runs from it"

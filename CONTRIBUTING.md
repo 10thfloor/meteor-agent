@@ -4,12 +4,17 @@
 
 - `app/packages/agent` — the core package (`10thfloor:agent`).
 - `app/packages/agent-channel-*` — the five optional channel packages.
+- `app/packages/durable` — Pi Durable on Meteor (`10thfloor:durable`):
+  experimental, and independent of the core in both directions.
 - `app/` — the host app: test harness, and the demo chat UI (`meteor run` it).
+  It declares every package of the Release set, so the production bundle
+  check covers all of them.
 - `docs/superpowers/specs/` — historical design records. The source and tests
   are authoritative where a record describes an earlier release.
 - `scripts/verify-build.sh` — production-bundle verification (see README).
-- `release.json` — the six-package Release set, candidate version, and current
-  public documentation tag.
+- `release.json` — the seven-package Release set, candidate version, and
+  current public documentation tag. A package's role is `core`, `channel`, or
+  `runtime` (depends on neither of the others).
 - `CONTEXT.md` — current domain language and Module ownership.
 
 From `app/`, install dependencies with `meteor npm ci` and run the static gates:
@@ -20,9 +25,11 @@ npm run release:check
 npm run types:check
 ```
 
-`types:check` regenerates the declarations shipped by the core and all five
-channel packages and fails if the committed output has drifted, including when
-generation creates a new untracked declaration.
+`types:check` regenerates the declarations shipped by every package of the
+Release set and fails if the committed output has drifted, including when
+generation creates a new untracked declaration. It then compiles
+`app/tests/consumer-types.ts` against those declarations alone, as a vendored
+consumer receives them.
 
 For a stable promotion, update `packageVersion`, `stableTag`, package pins, and
 the documented stable links together in the PR. `release:check` permits that
@@ -59,6 +66,12 @@ meteor npm run test-app:once
 
 A test entry point no CI job executes is coverage that does not exist — the
 control-plane suite ran only on developers' machines until this job landed.
+
+In one checkout, run the full-app suite and `verify-build.sh` **before**
+`npm test`, or run `meteor npm ci` in between. `meteor test-packages` replaces
+`app/node_modules/@swc/helpers` with links into its temporary test directory
+and then removes that directory; the next app boot or build in the same
+checkout cannot find `@swc/helpers/_/…`. CI runs each in its own checkout.
 
 The app's own MCP server (`app/mcp/workspace-server.mjs`) is written against
 the protocol with no server library, so it carries wire-format tests of its own:
@@ -197,6 +210,64 @@ resolution, keep both halves — a named or supplied provider must never route
 through the pi-ai default, and the default must stay lazy. Either regression
 puts an app-level npm peer back on the critical path for every agent, which is
 exactly what the loader seam exists to avoid.
+
+## Pi Durable and Chord (`10thfloor:durable`)
+
+`@earendil-works/pi-durable` and `@earendil-works/chord` are app-level npm
+dependencies of `10thfloor:durable` only, **pinned exactly** (`1.0.0` each).
+Pi Durable is experimental and says its API changes without notice. The three
+rules above apply, with this package's own files:
+
+1. **One file reaches them.** On the server, `packages/durable/server/pi.ts`,
+   through `server/loader.ts`. That loader is a copy of the core's seam, kept
+   apart so the package depends on nothing but the npm modules, with one rule
+   of its own: Chord and pi-ai are resolved **from Pi Durable's side**, a copy
+   npm nested under it first. Where npm keeps two copies, the bare name is the
+   one the harness does *not* import. In the browser, `client/conversation.ts`
+   imports Chord's delta module by file path
+   (`@earendil-works/chord/dist/delta/index.js`), because the client bundler
+   follows no `exports` map either; `client/chord-delta.d.ts` types that one
+   import.
+2. **Nothing is guessed.** The shapes are recorded at the top of
+   `server/pi.ts`. Recorded findings, each read off the installed `dist/*.d.ts`
+   or seen in a run:
+   - the Session recognises `StorageRejected` by identity, so the storage must
+     throw the class of the module instance the harness loaded;
+   - a commit that fails with anything but `StorageRejected` poisons the
+     Session. The host closes that harness and opens the storage again;
+   - `Harness.close()` waits for running tool calls, and a tool that ignores
+     its `abortSignal` never returns. Every close in `server/host.ts` is
+     bounded for that reason;
+   - a user entry (`pi.user`) carries no `data`: there is nowhere in the
+     transcript to put an author;
+   - no hook can refuse a model request (`beforeRequest` may throw; the
+     request goes on);
+   - `configure()` and `create` take extension and tool *objects* and store
+     only their names, so `server/operations.ts` passes `{ name }`;
+   - compaction cuts nothing from a transcript shorter than
+     `settings.compaction.keepRecentTokens`. The tests set it to 1.
+
+   And three of MongoDB's, in `server/host.ts`: `$expr` is not allowed in the
+   predicate of an upsert, so taking a lease is two statements; in an update
+   pipeline a string that begins with `$` is a field path, so names are
+   wrapped in `$literal`; and Meteor's change-stream observer cannot serve a
+   cursor with a limit, so the publication's window is a lower bound.
+3. **A bump is a verification event.** After
+   `meteor npm install --save-exact @earendil-works/pi-durable@<new> @earendil-works/chord@<new>`:
+   - run the package suite. It runs Pi Durable's own storage conformance cases
+     against `MongoStorage`, the real harness on it, and every built-in
+     operation against a model that reports what it was sent;
+   - run `./scripts/verify-build.sh`. Its durable probe checks that the loader
+     takes the copies of Chord and pi-ai that Pi Durable itself imports, and
+     runs a whole turn from the bundle;
+   - re-read `dist/index.d.ts` and `dist/types.d.ts` against the notes in
+     `server/pi.ts`, and update them in the same commit.
+
+`server/mongo-storage.ts`, `server/host.ts`, `server/operations.ts` and
+`server/handover.ts` import nothing at run time: the driver, the harness and
+the clock are passed in. Keep it so. It is what let the cases that need a
+second operating-system process (a `kill -9` in the middle of a tool call, a
+SIGTERM handover) run under plain Node against these very files.
 
 ## Turn-loop invariants
 

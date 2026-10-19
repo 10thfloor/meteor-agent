@@ -58,8 +58,11 @@ if (JSON.stringify(describedDirectories) !== JSON.stringify(declaredDirectories)
 if (manifest.packages.filter((pkg) => pkg.role === 'core').length !== 1) {
   fail('release.json', 'package set must contain exactly one core package');
 }
-if (manifest.packages.some((pkg) => pkg.role !== 'core' && pkg.role !== 'channel')) {
-  fail('release.json', 'every package role must be exactly core or channel');
+// `runtime`: a package the core does not depend on and that does not depend on
+// the core. It ships declarations and runs in the test command like the rest.
+const ROLES = ['core', 'channel', 'runtime'];
+if (manifest.packages.some((pkg) => !ROLES.includes(pkg.role))) {
+  fail('release.json', 'every package role must be exactly core, channel or runtime');
 }
 const core = manifest.packages.find((pkg) => pkg.role === 'core');
 if (core?.name !== '10thfloor:agent' || core?.directory !== 'agent') {
@@ -128,7 +131,7 @@ for (const pkg of manifest.packages) {
   if (!appPackage.includes(testPath)) {
     fail('app/package.json', `test command omits ${pkg.name}`);
   }
-  if (pkg.role === 'channel'
+  if (pkg.role !== 'core'
     && !appPackage.includes(`packages/${pkg.directory}/tsconfig.types.json`)) {
     fail('app/package.json', `declaration generation omits ${pkg.name}`);
   }

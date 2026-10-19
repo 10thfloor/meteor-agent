@@ -826,6 +826,14 @@ architectural decisions live in
 **[docs/superpowers/specs/](docs/superpowers/specs/)**; source and tests are
 authoritative where an older record describes an earlier release.
 
+**Experimental, and separate from everything above:**
+[`10thfloor:durable`](app/packages/durable/README.md) runs Earendil's
+[Pi Durable](https://earendil.com/posts/pi-durable/) harness on Meteor. It
+gives Pi Durable a MongoDB storage, lets any server instance host a storage and
+take over one whose host died, and publishes conversations to the browser from
+any instance. `10thfloor:agent` does not use it, and it is not in the tagged
+release.
+
 ## Requirements
 
 - **Meteor 3.5+** (change streams, async DDP rate limiters, Node 24)
@@ -868,11 +876,12 @@ app/packages/agent-channel-telegram/  Telegram surface  │ one lens, one
 app/packages/agent-channel-whatsapp/  WhatsApp surface  │ transport each
 app/packages/agent-channel-sms/       SMS (Twilio)      │
 app/packages/agent-channel-email/     Email (Postmark)  ┘
+app/packages/durable/                 Pi Durable on Meteor (experimental, independent of the above)
 app/                                  reference/test host; not an app template
 docs/deployment/                      production-host deployment runbooks
 docs/superpowers/specs/               historical architectural decisions
 scripts/verify-build.sh               proves the loader against a real production bundle
-release.json                          the verified core + channel package set
+release.json                          the verified package set
 deploy/galaxy.settings.example.json   host-app Galaxy settings starting point
 ```
 
@@ -885,7 +894,7 @@ The current public source release is
 [`v0.3.0`](https://github.com/10thfloor/meteor-agent/tree/v0.3.0). Until the
 Atmosphere packages are published, vendor the package directories from this
 repository as described above. CI type-checks source and published
-declarations, runs the core and all five channel suites, audits production
+declarations, runs every package's suite, audits production
 dependencies, and verifies a production Meteor bundle.
 
 The default suite uses mock providers. Separate opt-in live smokes cover a real
