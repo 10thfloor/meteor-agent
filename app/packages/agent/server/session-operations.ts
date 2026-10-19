@@ -40,6 +40,52 @@ export class SessionOperationRevokedError extends Error {
   }
 }
 
+/** The work this process has under way on each Session document, by Session
+ * id. Everything this module writes to a Session document — the operation
+ * markers, their renewals, and the transactions that renew them — takes its
+ * turn here, one piece of work per document at a time.
+ *
+ * The reason is MongoDB's. A plain write that meets a document an open
+ * transaction has written is retried inside the server, with a growing pause,
+ * and holds one of the server's write tickets while it waits; MongoDB 7 gives
+ * a server as many write tickets as cores, four on a small one. A burst of
+ * sends to one Session made enough such waits to hold every ticket, so the
+ * transaction that held the document could not get one for its next
+ * statement, and every write on the database stood still until that
+ * transaction's five-second limit. Taking turns here, this process never has
+ * a plain write and a transaction on one Session document in flight together;
+ * what other instances send can still meet a transaction, one write each. */
+const turns = new Map<string, Promise<unknown>>();
+
+function takeTurn(sessionId: string): Promise<() => void> {
+  const previous = turns.get(sessionId) ?? Promise.resolve();
+  let release!: () => void;
+  const mine = new Promise<void>((resolve) => { release = resolve; });
+  const queued = previous.then(() => mine);
+  turns.set(sessionId, queued);
+  return previous.then(() => () => {
+    release();
+    if (turns.get(sessionId) === queued) turns.delete(sessionId);
+  });
+}
+
+/** Run `work` once every earlier piece of this process's work on the same
+ * Session documents has finished. Documents are taken in one order, so two
+ * operations on the same pair of documents cannot each hold what the other
+ * waits for. */
+async function inTurn<T>(sessionIds: readonly string[], work: () => Promise<T>): Promise<T> {
+  const releases: Array<() => void> = [];
+  try {
+    for (const sessionId of [...new Set(sessionIds)].sort()) {
+      // eslint-disable-next-line no-await-in-loop
+      releases.push(await takeTurn(sessionId));
+    }
+    return await work();
+  } finally {
+    for (const release of releases.reverse()) release();
+  }
+}
+
 /** @internal Run Session-owned Mongo writes in one transaction which also
  * renews every lifecycle guard held by the operation. The guard write and the
  * dependent write therefore serialize with erasure's Session fence: whichever
@@ -53,32 +99,34 @@ export async function withSessionOperationTransaction<T>(
   const guards = (operation as GuardedOperation)[OPERATION_GUARDS];
   if (!guards?.length) throw new SessionOperationRevokedError();
 
-  const client = MongoInternals.defaultRemoteCollectionDriver().mongo.client;
-  const mongoSession = client.startSession();
-  let value: T | undefined;
-  try {
-    await (mongoSession as any).withTransaction(async () => {
-      for (const guard of guards) {
-        const now = new Date();
-        // eslint-disable-next-line no-await-in-loop
-        const renewed = await AgentSessions.rawCollection().updateOne(
-          {
-            _id: guard.sessionId,
-            erasingAt: { $exists: false },
-            purgingAt: { $exists: false },
-            operations: { $elemMatch: { id: guard.id, until: { $gt: now } } },
-          },
-          { $set: { 'operations.$.until': new Date(now.getTime() + guard.leaseMs) } },
-          { session: mongoSession },
-        );
-        if (renewed.matchedCount !== 1) throw new SessionOperationRevokedError();
-      }
-      value = await work(mongoSession);
-    }, { timeoutMS: timeoutMs });
-    return value as T;
-  } finally {
-    await mongoSession.endSession();
-  }
+  return inTurn(guards.map((guard) => guard.sessionId), async () => {
+    const client = MongoInternals.defaultRemoteCollectionDriver().mongo.client;
+    const mongoSession = client.startSession();
+    let value: T | undefined;
+    try {
+      await (mongoSession as any).withTransaction(async () => {
+        for (const guard of guards) {
+          const now = new Date();
+          // eslint-disable-next-line no-await-in-loop
+          const renewed = await AgentSessions.rawCollection().updateOne(
+            {
+              _id: guard.sessionId,
+              erasingAt: { $exists: false },
+              purgingAt: { $exists: false },
+              operations: { $elemMatch: { id: guard.id, until: { $gt: now } } },
+            },
+            { $set: { 'operations.$.until': new Date(now.getTime() + guard.leaseMs) } },
+            { session: mongoSession },
+          );
+          if (renewed.matchedCount !== 1) throw new SessionOperationRevokedError();
+        }
+        value = await work(mongoSession);
+      }, { timeoutMS: timeoutMs });
+      return value as T;
+    } finally {
+      await mongoSession.endSession();
+    }
+  });
 }
 
 /** @internal Begin work that could write Session-owned state or disclose it to
@@ -89,17 +137,19 @@ export async function beginSessionOperation(
 ): Promise<SessionOperation | null> {
   const id = Random.secret();
   const now = new Date();
-  // A dead process cannot pull its lease. Prune those remnants on the next
-  // operation so ordinary long-lived Sessions remain bounded.
-  await AgentSessions.rawCollection().updateOne(
-    { _id: sessionId, erasingAt: { $exists: false }, purgingAt: { $exists: false } },
-    { $pull: { operations: { until: { $lte: now } } } },
-  );
   const until = new Date(now.getTime() + leaseMs);
-  const result = await AgentSessions.rawCollection().updateOne(
-    { _id: sessionId, erasingAt: { $exists: false }, purgingAt: { $exists: false } },
-    { $push: { operations: { id, until } } },
-  );
+  const result = await inTurn([sessionId], async () => {
+    // A dead process cannot pull its lease. Prune those remnants on the next
+    // operation so ordinary long-lived Sessions remain bounded.
+    await AgentSessions.rawCollection().updateOne(
+      { _id: sessionId, erasingAt: { $exists: false }, purgingAt: { $exists: false } },
+      { $pull: { operations: { until: { $lte: now } } } },
+    );
+    return AgentSessions.rawCollection().updateOne(
+      { _id: sessionId, erasingAt: { $exists: false }, purgingAt: { $exists: false } },
+      { $push: { operations: { id, until } } },
+    );
+  });
   if (result.modifiedCount !== 1) return null;
 
   let finished = false;
@@ -113,15 +163,17 @@ export async function beginSessionOperation(
   const renew = (): Promise<boolean> => {
     if (finished || revoked.signal.aborted) return Promise.resolve(false);
     if (renewing) return renewing;
-    const heartbeatAt = new Date();
-    const pending = AgentSessions.rawCollection().updateOne(
-      {
-        _id: sessionId,
-        purgingAt: { $exists: false },
-        operations: { $elemMatch: { id, until: { $gt: heartbeatAt } } },
-      },
-      { $set: { 'operations.$.until': new Date(heartbeatAt.getTime() + leaseMs) } },
-    ).then((result) => (result.matchedCount === 1 ? true : lose()))
+    const pending = inTurn([sessionId], () => {
+      const heartbeatAt = new Date();
+      return AgentSessions.rawCollection().updateOne(
+        {
+          _id: sessionId,
+          purgingAt: { $exists: false },
+          operations: { $elemMatch: { id, until: { $gt: heartbeatAt } } },
+        },
+        { $set: { 'operations.$.until': new Date(heartbeatAt.getTime() + leaseMs) } },
+      );
+    }).then((result) => (result.matchedCount === 1 ? true : lose()))
       .catch(() => lose())
       .finally(() => {
         if (renewing === pending) renewing = null;
@@ -146,9 +198,9 @@ export async function beginSessionOperation(
       finished = true;
       clearInterval(heartbeat);
       await renewing;
-      await AgentSessions.rawCollection().updateOne(
+      await inTurn([sessionId], () => AgentSessions.rawCollection().updateOne(
         { _id: sessionId }, { $pull: { operations: { id } } },
-      ).catch(() => { /* an erasure may already have removed the Session */ });
+      )).catch(() => { /* an erasure may already have removed the Session */ });
     },
   };
   return operation;
