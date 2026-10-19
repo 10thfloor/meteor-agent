@@ -415,12 +415,12 @@ describe('applyRateLimits', () => {
     assert.equal(added, 4, 'two rules each for agent.send and agent.contribute');
   });
 
-  it('adds eight rules when both sends and starts are configured', async () => {
+  it('adds ten rules when both sends and starts are configured', async () => {
     // Two per method; `sends` governs send+contribute, and `starts` governs
-    // TWO methods: `agent.start` and
-    // `agent.fork`. A fork creates a session exactly as a start does (and
-    // copies a transcript on top), so it shares the session-creation budget
-    // rather than getting a cheaper knob of its own.
+    // THREE methods: `agent.start`, `agent.fork` and `agent.thread`. A fork or
+    // a thread creates a session exactly as a start does (and copies a
+    // transcript on top), so it shares the session-creation budget rather
+    // than getting a cheaper knob of its own.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
@@ -428,7 +428,7 @@ describe('applyRateLimits', () => {
         starts: { count: HEADROOM, intervalMs: 30000 },
       },
     });
-    assert.equal(added, 8);
+    assert.equal(added, 10);
   });
 
   it('a starts entry registers rules for agent.fork as well as agent.start', async () => {
@@ -450,7 +450,7 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds ten rules when interrupts is configured alongside sends and starts', async () => {
+  it('adds twelve rules when interrupts is configured alongside sends and starts', async () => {
     // `interrupts` gets the identical two-rule treatment, not a cheaper one:
     // it is an unauthenticated-reachable write, so the anonymous-isolation
     // pair rule and the per-user cap on multi-connection multiplication both
@@ -463,7 +463,7 @@ describe('applyRateLimits', () => {
         interrupts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 10);
+    assert.equal(added, 12);
   });
 
   it('registers a rule that actually matches an agent.interrupt invocation', async () => {
@@ -494,11 +494,11 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds fourteen rules when approvals joins sends, starts and interrupts', async () => {
-    // `approvals` is the second entry governing TWO methods: `agent.approve`
-    // and `agent.deny` are the same decision made two ways, and separate knobs
-    // would make `deny` the cheap way to hammer the path `approve` limits.
-    // Two rules per method, so the entry adds four — 10 + 4.
+  it('adds sixteen rules when approvals joins sends, starts and interrupts', async () => {
+    // `approvals` governs TWO methods: `agent.approve` and `agent.deny` are
+    // the same decision made two ways, and separate knobs would make `deny`
+    // the cheap way to hammer the path `approve` limits.
+    // Two rules per method, so the entry adds four — 12 + 4.
     const { applyRateLimits } = await import('../server/rate-limits');
     const added = applyRateLimits({
       rateLimit: {
@@ -508,7 +508,7 @@ describe('applyRateLimits', () => {
         approvals: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 14);
+    assert.equal(added, 16);
   });
 
   it('an approvals entry registers rules for BOTH agent.approve and agent.deny', async () => {
@@ -536,8 +536,8 @@ describe('applyRateLimits', () => {
     );
   });
 
-  it('adds sixteen rules when compacts joins the other four entries', async () => {
-    // `compacts` governs ONE method, so it adds the plain two — 14 + 2. It gets
+  it('adds eighteen rules when compacts joins the other four entries', async () => {
+    // `compacts` governs ONE method, so it adds the plain two — 16 + 2. It gets
     // an entry of its own rather than sharing `sends` because both buy a
     // provider round trip but an operator tunes them apart: a compaction is
     // bookkeeping a UI fires rarely, a send is the product.
@@ -551,7 +551,7 @@ describe('applyRateLimits', () => {
         compacts: { count: HEADROOM, intervalMs: 10000 },
       },
     });
-    assert.equal(added, 16);
+    assert.equal(added, 18);
   });
 
   it('a compacts entry registers rules scoped to agent.compact', async () => {

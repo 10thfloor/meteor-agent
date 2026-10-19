@@ -21,8 +21,18 @@ import { issueAttachmentToken } from './downloads';
 import { beginSessionMutationOperation } from './session-operations';
 import { activate, requestSystemTurn } from './activation';
 import {
-  commitOperationMessage, commitUserMessage, MAX_USER_MESSAGE_BYTES,
+  commitOperationMessage, commitUserMessage, MAX_USER_MESSAGE_BYTES, messageIdFor,
 } from './transcript';
+import { openThread, replyInThread } from './threads';
+
+/** What a send with `replyIn` or `alsoToParent` resolves to. Plain sends keep
+ * resolving to the session id. */
+export interface ThreadSendResult {
+  /** The session the send was addressed to. */
+  sessionId: string;
+  /** `replyIn: 'thread'`: the thread that answers the message. */
+  threadSessionId?: string;
+}
 
 /** Verified channel identity (decision 12); server-side only, never from DDP. */
 export interface ViaIdentity { kind: string; externalUserId: string }
@@ -286,12 +296,36 @@ export async function sendToSession(
     source?: MessageSource;
     /** @internal Stable DDP retry identity; server callers omit it. */
     commitKey?: string;
+    /** `'thread'`: commit the message here without waking this session and
+     *  open a thread on it whose model answers instead. */
+    replyIn?: 'thread';
+    /** Sends to a thread only: also copy the message into the thread's parent
+     *  as context, without waking the parent. */
+    alsoToParent?: boolean;
   },
-): Promise<string> {
+): Promise<string | ThreadSendResult> {
   const config = getAgent(agent);
   if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+  if (extras?.replyIn !== undefined && extras.replyIn !== 'thread') {
+    throw new Meteor.Error('invalid-options', 'replyIn must be "thread".');
+  }
+  if (extras?.replyIn && extras.alsoToParent) {
+    throw new Meteor.Error(
+      'invalid-options', 'A message cannot start a thread and also go to the parent.',
+    );
+  }
   const session = await requireSession(agent, sessionId, userId, extras?.via);
   const roster = session.participants;
+  // Authorize the parent before anything commits: the copy lands there too.
+  let parent: AgentSession | null = null;
+  if (extras?.alsoToParent) {
+    if (!session.thread) {
+      throw new Meteor.Error(
+        'not-a-thread', 'Only messages in a thread can also go to the parent.',
+      );
+    }
+    parent = await requireSession(agent, session.thread.sessionId, userId, extras.via);
+  }
 
   // Resolve the sender from the authenticated source (decision 4).
   const from = humanFrom(session, userId, extras?.via);
@@ -312,24 +346,109 @@ export async function sendToSession(
     );
   }
 
-  await commitUserMessage({
+  const draft = {
+    content: text,
+    ...(extras?.attachments?.length ? { attachments: extras.attachments } : {}),
+    // Attribution on rostered rows only; addressee stamped only when resolved.
+    ...(roster?.length ? { from } : {}),
+    ...(addressee ? { to: addressee.id } : {}),
+    ...(extras?.source ? { source: extras.source } : {}),
+  };
+
+  if (extras?.replyIn === 'thread') {
+    if (Buffer.byteLength(text, 'utf8') > MAX_USER_MESSAGE_BYTES) {
+      throw new Meteor.Error(
+        'message-too-large',
+        `Messages may not exceed ${MAX_USER_MESSAGE_BYTES} UTF-8 bytes.`,
+      );
+    }
+    const threadSessionId = await replyInThread(session, {
+      messageId: messageIdFor(sessionId, extras.commitKey ?? Random.id()),
+      access: { agent, $or: sessionAccessClauses(userId, extras.via) },
+      draft,
+    });
+    // This session stays asleep; the addressed model answers in the thread.
+    activate(threadSessionId);
+    return { sessionId, threadSessionId };
+  }
+
+  const committed = await commitUserMessage({
     sessionId,
     commitKey: extras?.commitKey,
     turnLimit: config.budget?.turns,
-    draft: {
-      content: text,
-      ...(extras?.attachments?.length ? { attachments: extras.attachments } : {}),
-      // Attribution on rostered rows only; addressee stamped only when resolved.
-      ...(roster?.length ? { from } : {}),
-      ...(addressee ? { to: addressee.id } : {}),
-      ...(extras?.source ? { source: extras.source } : {}),
-    },
+    draft,
   });
+
+  if (parent) {
+    await copyToParent(agent, parent, committed.messageId, text, userId, extras ?? {});
+  }
 
   // A compact wake link remains until the Transcript proves the input was
   // answered. Activation re-derives addressee, primary budget, and Memory.
   activate(sessionId);
-  return sessionId;
+  return parent ? { sessionId } : sessionId;
+}
+
+/** "Also send to the topic": copy a thread message into the thread's parent
+ * as a context row (`fromThreadSessionId`). No wake link, no Turn charge, no
+ * Activation. The id derives from the thread row, so a retried send copies
+ * once. Attachments stay with the thread that owns them. */
+async function copyToParent(
+  agent: string,
+  parent: AgentSession,
+  threadMessageId: string,
+  text: string,
+  userId: string | null,
+  extras: { via?: ViaIdentity; source?: MessageSource },
+): Promise<void> {
+  const thread = await AgentMessages.findOneAsync(threadMessageId);
+  if (!thread) throw new Meteor.Error('no-session', 'Session not found');
+  const operation = await beginSessionMutationOperation(parent._id);
+  if (!operation) throw new Meteor.Error('no-session', 'Session not found');
+  try {
+    const seq = await commitOperationMessage(
+      operation,
+      parent._id,
+      `t:${createHash('sha256')
+        .update('10thfloor:agent:thread-copy\0')
+        .update(parent._id)
+        .update('\0')
+        .update(threadMessageId)
+        .digest('hex')}`,
+      { agent, $or: sessionAccessClauses(userId, extras.via) },
+      {},
+      (before) => ({
+        role: 'user',
+        content: text,
+        ...(before.participants?.length
+          ? { from: humanFrom(before, userId, extras.via) }
+          : {}),
+        ...(thread.to !== undefined ? { to: thread.to } : {}),
+        ...(extras.source ? { source: extras.source } : {}),
+        fromThreadSessionId: thread.sessionId,
+        createdAt: new Date(),
+      }),
+    );
+    if (seq === null) throw new Meteor.Error('no-session', 'Session not found');
+  } finally {
+    await operation.close();
+  }
+}
+
+/** Find or open the thread on one message. `userId` scopes the lookup to the
+ * owner or a human roster member (send's rule, not fork's owner-only rule);
+ * `undefined` is an unscoped server call. */
+export async function threadFor(
+  agent: string, sessionId: string, messageId: string, userId?: string | null,
+): Promise<string> {
+  if (!getAgent(agent)) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+  const source = userId === undefined
+    ? await AgentSessions.findOneAsync({
+      _id: sessionId, agent, erasingAt: { $exists: false },
+    })
+    : await requireSession(agent, sessionId, userId);
+  if (!source) throw new Meteor.Error('no-session', 'Session not found');
+  return openThread(source, messageId);
 }
 
 /** Commit a human crew note without scheduling model work. It is deliberately
@@ -450,13 +569,20 @@ export function registerMethods(): void {
 
     async [NAMES.mSend](
       this: any, agent: string, sessionId: string, text: string, commitKey?: string,
-      options?: { to?: string },
+      options?: { to?: string; replyIn?: 'thread'; alsoToParent?: boolean },
     ) {
       check(agent, String);
       check(sessionId, String);
       check(text, String);
+      // Read before `check` (see mStart).
       const to = options?.to;
-      check(options, Match.Maybe({ to: Match.Maybe(String) }));
+      const replyIn = options?.replyIn;
+      const alsoToParent = options?.alsoToParent;
+      check(options, Match.Maybe({
+        to: Match.Maybe(String),
+        replyIn: Match.Maybe(Match.Where((value) => value === 'thread')),
+        alsoToParent: Match.Maybe(Boolean),
+      }));
       check(commitKey, Match.Maybe(Match.Where(
         (value) => typeof value === 'string' && /^[A-Za-z0-9_-]{16,64}$/.test(value),
       )));
@@ -472,8 +598,28 @@ export function registerMethods(): void {
       // The core carries the rest — see `sendToSession` above (channels spec §5.1):
       // one body, two callers.
       return sendToSession(agent, sessionId, text, this.userId ?? null, {
-        commitKey, to, source: { kind: 'desktop' },
+        commitKey,
+        to,
+        source: { kind: 'desktop' },
+        ...(replyIn ? { replyIn } : {}),
+        ...(alsoToParent ? { alsoToParent } : {}),
       });
+    },
+
+    /** Find or open the thread on one message. The owner or any human roster
+     * member may open one — threads are part of the conversation, unlike
+     * `agent.fork`, which branches it for the owner. */
+    async [NAMES.mThread](this: any, agent: string, sessionId: string, messageId: string) {
+      check(agent, String);
+      check(sessionId, String);
+      check(messageId, String);
+      const config = getAgent(agent);
+      if (!config) throw new Meteor.Error('no-agent', `Unknown agent: ${agent}`);
+      // Same guard as `agent.fork`: a thread is a new session.
+      if (config.startable === false) {
+        throw new Meteor.Error('not-startable', 'This agent cannot be started directly');
+      }
+      return threadFor(agent, sessionId, messageId, this.userId ?? null);
     },
 
     /** Human-to-crew context without a model wake. Same authenticated Session

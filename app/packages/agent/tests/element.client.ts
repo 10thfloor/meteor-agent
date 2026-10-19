@@ -1187,6 +1187,73 @@ describe('<agent-chat>', () => {
     }
   });
 
+  it('offers Reply in thread on user and assistant rows when threadable', () => {
+    const rows = [
+      {
+        _id: 'thr-user', sessionId: 's', seq: 1, role: 'user', content: 'question',
+        threadSessionId: 'thread-1', createdAt: new Date(1),
+      },
+      {
+        _id: 'thr-tool-call', sessionId: 's', seq: 2, role: 'assistant', content: '',
+        toolCalls: [{ id: 'c1', name: 'lookup', args: {} }], createdAt: new Date(2),
+      },
+      {
+        _id: 'thr-tool', sessionId: 's', seq: 3, role: 'tool', toolCallId: 'c1',
+        content: '{}', createdAt: new Date(3),
+      },
+      {
+        _id: 'thr-note', sessionId: 's', seq: 4, role: 'note', kind: 'error',
+        error: { error: 'x' }, createdAt: new Date(4),
+      },
+      {
+        _id: 'thr-answer', sessionId: 's', seq: 5, role: 'assistant', content: 'answer',
+        createdAt: new Date(5),
+      },
+      {
+        _id: 'thr-streaming', sessionId: 's', seq: 6, role: 'assistant', content: 'stre',
+        streaming: true,
+      },
+    ];
+    const el = mountTranscript(rows) as ChatElement & { threadable: boolean };
+    assert.lengthOf(partsAll(el, 'thread-button'), 0, 'off unless the host asks');
+
+    el.threadable = true;
+    assert.isTrue(el.hasAttribute('threadable'), 'the property reflects to the attribute');
+    const buttons = () => partsAll(el, 'thread-button');
+    const owners = () => buttons().map((b) => (b.closest('[data-message-id]') as HTMLElement).dataset.messageId);
+    assert.deepEqual(owners(), ['thr-user', 'thr-tool-call', 'thr-answer'],
+      'user and committed assistant rows only — not tool, note or streaming rows');
+    for (const button of buttons()) {
+      assert.equal(button.tagName, 'BUTTON', 'keyboard reachable');
+      assert.equal(button.getAttribute('aria-label'), 'Reply in thread');
+    }
+    assert.include((part(el, 'threaded').dataset.messageId), 'thr-user',
+      'a row answered in a thread carries the threaded token');
+    assert.lengthOf(partsAll(el, 'threaded'), 1);
+
+    const opened: any[] = [];
+    el.addEventListener('agent-chat:open-thread', (event) => {
+      opened.push((event as CustomEvent).detail);
+    });
+    buttons()[2].click();
+    assert.deepEqual(opened, [{ sessionId: el.sessionId, messageId: 'thr-answer', seq: 5 }]);
+
+    // Rows are rebuilt on every paint: the button and its focus survive.
+    buttons()[0].focus();
+    const before = buttons()[0];
+    el.mentionSources = el.mentionSources;
+    assert.notStrictEqual(buttons()[0], before, 'the row really was rebuilt');
+    assert.equal(
+      (el.shadowRoot!.activeElement as HTMLElement | null)?.dataset.messageId, 'thr-user',
+      'keyboard focus stays on the same message\'s button',
+    );
+    buttons()[0].click();
+    assert.deepEqual(opened.at(-1), { sessionId: el.sessionId, messageId: 'thr-user', seq: 1 });
+
+    el.removeAttribute('threadable');
+    assert.lengthOf(buttons(), 0);
+  });
+
   it('preserves a reader\'s viewport and offers New messages until they return', function () {
     const el = mount({ agent: 'itest', 'session-id': 'no-such-scroll-session' });
     const client = el.agentInstance!;

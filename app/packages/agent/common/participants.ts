@@ -220,3 +220,12 @@ export function assistantAnswers(
     ? assistant.answeredThrough >= seq
     : assistant.seq >= seq;
 }
+
+/** A user row that a thread answers, or one copied in from a thread. Both are
+ *  context for the session they sit in, never a request its models owe. */
+export function answeredInThread(
+  message: { role: string; threadSessionId?: string; fromThreadSessionId?: string },
+): boolean {
+  return message.role === 'user'
+    && (message.threadSessionId !== undefined || message.fromThreadSessionId !== undefined);
+}

@@ -19,8 +19,19 @@ import {
   type HookMap, type HookName,
 } from './hooks';
 import {
-  contributeToSession, recordVerdict, sendToSession, startSystemTurn,
+  contributeToSession, recordVerdict, sendToSession, startSystemTurn, threadFor,
+  type ThreadSendResult,
 } from './methods';
+
+/** Options for the server-side `Agent#send`. */
+export interface AgentSendOptions {
+  /** Defaults to null (anonymous owner), never "all sessions". */
+  userId?: string | null;
+  /** Explicit model participant id; fails if unavailable. */
+  to?: string;
+  replyIn?: 'thread';
+  alsoToParent?: boolean;
+}
 import type { SystemTurnResult } from './system-turn';
 import {
   forgetMemory, readSelector, saveMemory, type SaveArgs,
@@ -162,9 +173,23 @@ export class Agent {
   /** Server-side send into an existing session — same core as the DDP method.
    *  `userId` defaults to null (anonymous owner), never "all sessions". */
   send(
-    sessionId: string, text: string, opts?: { userId?: string | null },
-  ): Promise<string> {
-    return sendToSession(this.name, sessionId, text, opts?.userId ?? null);
+    sessionId: string, text: string,
+    opts: AgentSendOptions & ({ replyIn: 'thread' } | { alsoToParent: true }),
+  ): Promise<ThreadSendResult>;
+  send(sessionId: string, text: string, opts?: AgentSendOptions): Promise<string>;
+  /** `to` picks the answering model explicitly. `replyIn: 'thread'` commits
+   *  the message here and opens a thread on it that answers instead;
+   *  `alsoToParent` (thread sessions only) also copies the message into the
+   *  parent as context. Those two resolve to `ThreadSendResult`; plain sends
+   *  resolve to the session id. */
+  send(
+    sessionId: string, text: string, opts?: AgentSendOptions,
+  ): Promise<string | ThreadSendResult> {
+    return sendToSession(this.name, sessionId, text, opts?.userId ?? null, {
+      ...(opts?.to !== undefined ? { to: opts.to } : {}),
+      ...(opts?.replyIn ? { replyIn: opts.replyIn } : {}),
+      ...(opts?.alsoToParent ? { alsoToParent: true } : {}),
+    });
   }
 
   /** Add human conversation context without waking a model. The row remains
@@ -216,11 +241,24 @@ export class Agent {
   }
 
   /** Branch a session at `atSeq` (clamped to batch-safe cut). Returns
-   *  the new session's id; the fork is a new root with zeroed usage. */
+   *  the new session's id; the fork is a new root with zeroed usage.
+   *  With `thread: { messageId }`, finds or opens the thread on that message
+   *  instead (cut forward to the end of its tool batch; `atSeq`/`title` do
+   *  not apply). `userId` scopes either lookup; a thread admits any human
+   *  roster member, a fork the owner or a member. */
   fork(
     sessionId: string,
-    opts?: { atSeq?: number; title?: string; userId?: string | null },
+    opts?: {
+      atSeq?: number; title?: string; userId?: string | null;
+      thread?: { messageId: string };
+    },
   ): Promise<string> {
+    if (opts?.thread) {
+      return threadFor(
+        this.name, sessionId, opts.thread.messageId,
+        'userId' in opts ? opts.userId ?? null : undefined,
+      );
+    }
     return forkSessionById(this.name, sessionId, opts);
   }
 
