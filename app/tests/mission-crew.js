@@ -189,7 +189,8 @@ if (Meteor.isClient) {
       assert.isBelow(box(mission).right, box(roster).left);
       // The heading is left with the count and Reviews, which is what it has room for.
       assert.deepEqual(all(`${CREW} > .section-heading button`).map((button) => button.id), ["open-learning-reviews"]);
-      assert.deepEqual(all(`${CREW} button:not(.crew-card)`).map((button) => button.id), [
+      // The section's own controls: not the agent cards, nor anything a card may hold.
+      assert.deepEqual(all(`${CREW} button`).filter((button) => !button.closest(".crew-card")).map((button) => button.id), [
         "open-learning-reviews", "manage-mission-crew-inspector", "configure-crew",
       ]);
       assert.isTrue(narrow(() => uncut(mission) && uncut(roster)), "neither is cut short in a narrow window");
