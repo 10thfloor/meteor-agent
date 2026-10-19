@@ -1,4 +1,72 @@
 import { assert } from "chai";
+import './constellation-evidence.js';
+import './constellation-lab-federation.js';
+import './constellation-workflows.js';
+import './constellation-plan-navigation.js';
+import './constellation-lab-layout.js';
+import './constellation-composer-plans.js';
+import './constellation-plan-chat-server.js';
+import './constellation-plan-chat-ui.js';
+import './constellation-plan-chat-runs.js';
+import './constellation-plan-foldout-layout.js';
+import './constellation-crew-note-visuals.js';
+import './constellation-decision-workflows.js';
+import './constellation-decisions.js';
+import './constellation-decisions-ui.js';
+import './constellation-decision-layout.js';
+import './constellation-mission-decision-cost.js';
+import './constellation-decision-work-navigation.js';
+import './constellation-decision-work-target.js';
+import './constellation-decision-costs.js';
+import './constellation-chat-message-reveal.js';
+import './constellation-decision-catalog.js';
+import './constellation-agent-capabilities.js';
+import './constellation-agent-capabilities-ui.js';
+import './constellation-agent-config-capabilities.js';
+import './constellation-delegation-chat.js';
+import './constellation-delegation-shell.js';
+import './constellation-agent-work-ui.js';
+import './constellation-agent-work.js';
+import './constellation-runtime-recovery.js';
+import './constellation-desktop-health.js';
+import './constellation-pulse-recovery.js';
+import './constellation-inbound-ttl.js';
+import './constellation-execution.js';
+import './constellation-sprites-provider.js';
+import './constellation-sprites-connections.js';
+import './constellation-execution-ui.js';
+import './constellation-execution-framework.js';
+import './constellation-execution-integration.js';
+import './constellation-execution-shell.js';
+import './constellation-execution-chat.js';
+import './constellation-execution-chat-card.js';
+import './constellation-mission-work-navigation.js';
+import './constellation-mission-work.js';
+import './constellation-code-runs.js';
+import './constellation-mission-files.js';
+import './constellation-mission-recipients.js';
+import './constellation-handoff.js';
+import './constellation-chat-file-upload.js';
+import './constellation-composer-add.js';
+import './constellation-mission-preflight.js';
+import './constellation-mission-file-tools.js';
+import './constellation-mission-file-store.js';
+import './constellation-environment-files.js';
+import './constellation-sprite-attachment-storage.js';
+import './constellation-environment-attachments.js';
+import './constellation-working-file-provider.js';
+import './constellation-workspace-control.js';
+import './constellation-mission-services.js';
+import './constellation-environment-shell.js';
+import './constellation-environments.js';
+import './constellation-environment-races.js';
+// The Mocha driver starts independently of Meteor's async startup callbacks.
+// Let saved-workspace recovery finish before suites create temporary owners.
+if (Meteor.isServer) before(async function () {
+  this.timeout(30_000);
+  const { workspaceRuntimeReady } = await import('../server/main.js');
+  await workspaceRuntimeReady;
+});
 import {
   Agent,
   AgentSessions,
@@ -2601,7 +2669,7 @@ if (Meteor.isClient) {
       workspace.stop(sessionId);
     });
 
-    it("runs a consequential tool without parking when approval gates are disabled", async function () {
+    it("does not park approval-free tools, but still requires a filesystem before saving files", async function () {
       const workspace = new Agent("orchestrator");
       const sessionId = await workspace.start({ title: "Mission approval policy test" });
       const subscription = workspace.subscribe(sessionId);
@@ -2616,9 +2684,9 @@ if (Meteor.isClient) {
       );
       await waitUntil(
         () => workspace.messages(sessionId).fetch().some(
-          (message) => message.role === "tool" && /Published .*\.md/.test(message.content ?? ""),
+          (message) => message.role === "tool" && /Enable the mission filesystem/.test(message.content ?? ""),
         ),
-        "Approval-free Mission did not publish its brief",
+        "Saving a brief without a filesystem did not return its setup hint",
       );
       await waitUntil(
         () => AgentSessions.findOne(sessionId)?.phase === "idle",
@@ -2706,6 +2774,7 @@ if (Meteor.isClient) {
         const agent = created.agent;
         assert.deepEqual(created.experience, {
           record: true,
+          reflect: false,
           recall: true,
           recent: 4,
           scope: "owner",
@@ -2744,6 +2813,8 @@ if (Meteor.isClient) {
           "Automatic Experience policy did not reach Crew and Tool Catalog",
         );
         const experienceAutomatic = crew.findOne(configId);
+        assert.strictEqual(experienceAutomatic.experience.reflect, false,
+          "Automatic admission must not enable background model reflection");
         assert.deepEqual(experienceAutomatic.practice, {
           acquire: false,
           approval: "ask",
@@ -2774,6 +2845,7 @@ if (Meteor.isClient) {
         );
         const practiceAutomatic = crew.findOne(configId);
         assert.strictEqual(practiceAutomatic.experience.approval, "auto");
+        assert.strictEqual(practiceAutomatic.experience.reflect, false);
         assert.deepEqual(practiceAutomatic.practice, {
           acquire: true,
           approval: "auto",

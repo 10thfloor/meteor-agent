@@ -2,6 +2,22 @@ import { Meteor } from 'meteor/meteor';
 import { Tracker } from 'meteor/tracker';
 import { Accounts } from 'meteor/accounts-base';
 import { Mongo } from 'meteor/mongo';
+import { initializeOperations } from './operations';
+import { initializeDecisions } from './operations-decisions';
+import { initializeExecution } from './operations-execution';
+import { initializeExecutionChat } from './execution-chat';
+import { initializeMissionPreflight } from './mission-preflight';
+import { initializeMissionRecipients } from './mission-recipients';
+import { initializeChatFileUpload } from './chat-file-upload';
+import { initializeComposerAdd } from './composer-add';
+import './mission-preflight.css';
+import { initializeMissionWorkNavigation } from './mission-work-navigation';
+import { decisionAgentAccessSummary } from '../imports/constellation/decision-access';
+import { createWorkTranscriptContext } from './agent-work-transcript';
+import { initializeAgentWork } from './agent-work';
+import { initializeAgentCapabilities } from './agent-capabilities';
+import { createDecisionWorkNavigator } from './decision-work-navigation';
+import { initializeMissionDecisionCost } from './mission-decision-cost';
 import {
   Agent,
   AgentMemories,
@@ -29,6 +45,8 @@ if (INITIAL_LINK_TOKEN || INITIAL_VERDICT_TOKEN) {
   window.history.replaceState(window.history.state, '', '/');
 }
 const DEFAULT_MISSION_THRESHOLDS = Object.freeze({ turns: 80, toolCalls: 40, spend: 5 });
+const suspendedCodeSettings = new WeakSet();
+const suspendedCodeCloseEvents = new WeakSet();
 const MISSION_PARTICIPANT_LIMIT = 16;
 const MissionConfigs = new Mongo.Collection('constellation_mission_configs');
 const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
@@ -53,9 +71,16 @@ const $ = (id) => document.getElementById(id);
 
 let currentSessionId = null;
 let currentView = 'missions';
+let decisionControls;
+let executionControls;
+let missionWorkNavigation;
+let agentWorkControls;
+let agentCapabilityControls;
+let workTranscriptContext;
 let memoryFilter = 'all';
 let bootstrap = null;
 let editingMissionSessionId = null;
+const missionEnvironmentChanged = new Tracker.Dependency();
 let editingMissionRevision = null;
 let selectedCrewId = null;
 let crewEditor = null;
@@ -84,6 +109,7 @@ let missionCrewDirectoryReturn = false;
 let missionParticipationHandle = null;
 let missionParticipationSessionId = null;
 let chatComposerMode = 'ask';
+let missionRecipients;
 let selectedPulseId = null;
 let editingPulseRevision = null;
 let selectedSkillId = null;
@@ -111,6 +137,8 @@ const pendingCrewArchives = new Set();
 const pendingSkillStates = new Map();
 const guardedEditors = new Map();
 let childRunComputation = null;
+let childRunSelection = null;
+const childRunStack = [];
 let applicationWired = false;
 let applicationWiringStarted = false;
 let booted = false;
@@ -375,7 +403,10 @@ function registerGuardedEditor({
     event.preventDefault();
     closeGuardedEditor(formId);
   });
-  dialog.addEventListener('close', () => endGuardedEditor(formId));
+  dialog.addEventListener('close', (event) => {
+    if (dialog.open) return;
+    if (!suspendedCodeSettings.has(dialog) && !suspendedCodeCloseEvents.has(event)) endGuardedEditor(formId);
+  });
 }
 
 async function copyText(value, success) {
@@ -532,7 +563,10 @@ async function createMission(title = 'New mission') {
 
 function openSession(sessionId) {
   if (!sessionId) return;
+  if (currentSessionId !== sessionId && $('run-dialog')?.open) $('run-dialog').close();
   currentSessionId = sessionId;
+  missionWorkNavigation?.setMission(sessionId);
+  agentWorkControls?.contextChanged();
   setChatComposerMode('ask', { focus: false });
   subscribeMissionParticipation(sessionId);
   persistResumableMission(sessionId);
@@ -566,18 +600,26 @@ async function sendPrompt(prompt) {
     toast(`Activate this mission before sending work.`, 'error');
     return;
   }
+  setChatComposerMode('ask', { focus: false });
+  if (!missionRecipients?.canSend()) {
+    toast('Choose an available recipient before sending work.', 'error');
+    return;
+  }
+  const missionId = currentSessionId;
+  const recipient = $('mission-chat').recipient;
   activateView('missions');
   const session = AgentSessions.findOne(currentSessionId);
+  missionWorkNavigation?.show('chat');
   maybeAutoTitle(session, prompt);
   try {
-    await workspace.send(currentSessionId, prompt.trim());
+    await workspace.send(missionId, prompt.trim(), { to: recipient });
   } catch (error) {
     toast(messageOf(error), 'error');
   }
 }
 
 function activateView(name) {
-  if (!['missions', 'automations', 'memory', 'capabilities', 'channels'].includes(name)) return;
+  if (!['missions', 'automations', 'memory', 'capabilities', 'channels', 'lab'].includes(name)) return;
   currentView = name;
   $('workspace-shell').dataset.currentView = name;
   const sidebar = $('mission-sidebar');
@@ -593,6 +635,51 @@ function activateView(name) {
     if (active) button.setAttribute('aria-current', 'page');
     else button.removeAttribute('aria-current');
   });
+  missionWorkNavigation?.setVisible(missionScoped);
+}
+
+function navigateToMissionWork(tab, missionId = currentSessionId, options) {
+  if (!missionId) return;
+  if (missionId !== currentSessionId) openSession(missionId);
+  activateView('missions');
+  missionWorkNavigation?.show(tab, options, { focus: true });
+}
+
+// These links navigate to one permission editor without discarding an agent
+// or mission-settings draft. The return affordance belongs to that editor.
+function navigateToCodePermissions() {
+  const previousView = currentView; const previousTab = capabilityTab;
+  const previousMission = currentSessionId;
+  const parentDialogs = [$('mission-dialog'), $('crew-dialog')].filter((dialog) => dialog.open);
+  const editor = crewEditor; const crewId = selectedCrewId;
+  const missionEditorId = editingMissionSessionId; const missionRevision = editingMissionRevision;
+  const opener = document.activeElement;
+  const scrolls = parentDialogs.flatMap((dialog) => [...dialog.querySelectorAll('.crew-form-scroll, .dialog-body, .op-scroll')]
+    .map((element) => ({ element, top: element.scrollTop })));
+  for (const dialog of parentDialogs) {
+    if (dialog.id === 'mission-dialog') suspendedCodeSettings.add(dialog);
+    dialog.close();
+  }
+  activateView('capabilities'); setCapabilityTab('execution');
+  if (!parentDialogs.length) return null;
+  const restore = () => {
+    if (currentSessionId !== previousMission
+      || parentDialogs.some((dialog) => dialog.id === 'crew-dialog' && (crewEditor !== editor || selectedCrewId !== crewId))
+      || parentDialogs.some((dialog) => dialog.id === 'mission-dialog' && editingMissionSessionId !== missionEditorId)) {
+      toast('The settings context changed. Reopen the agent or mission settings.'); return false;
+    }
+    activateView(previousView); if (previousView === 'capabilities') setCapabilityTab(previousTab);
+    if (parentDialogs.some((dialog) => dialog.id === 'mission-dialog')) editingMissionRevision = missionRevision;
+    for (const dialog of parentDialogs) if (!dialog.open) dialog.showModal();
+    requestAnimationFrame(() => {
+      for (const { element, top } of scrolls) if (element.isConnected) element.scrollTop = top;
+      if (opener?.isConnected) opener.focus({ preventScroll: true });
+    });
+    return true;
+  };
+  restore.label = parentDialogs.some((dialog) => dialog.id === 'crew-dialog')
+    ? `Back to ${$('crew-form-title').textContent || 'agent'} settings` : 'Back to mission settings';
+  return restore;
 }
 
 function renderLocalAccountDetails() {
@@ -737,6 +824,9 @@ function renderMissionList(currentMessages = currentMissionMessages()) {
 }
 
 async function archiveMission(sessionId) {
+  const environment = executionControls?.environments?.findOne({ missionId: sessionId });
+  if (environment?.workspaceId && environment.retention === 'delete-on-completion'
+    && !window.confirm(`Archive “${missionConfig(sessionId)?.title || 'this mission'}”? Its remote working files and save points will be deleted, as selected in its environment settings. Chats and downloaded results are kept.`)) return false;
   try {
     const saved = await Meteor.callAsync('constellation.missionArchive', sessionId);
     persistResumableMission(sessionId, saved);
@@ -819,26 +909,22 @@ function updateMissionComposer(primary, config) {
   chat.setAttribute('composer-mode', chatComposerMode);
   chat.setAttribute('placeholder', writable
     ? (chatComposerMode === 'note'
-      ? `Share an update without running ${primary.label}…`
-      : `Give ${primary.label} an outcome, or type @ to address a specialist…`)
+      ? 'Write a crew note…'
+      : 'Write a message…')
     : `Mission ${status}`);
   chat.setAttribute('aria-disabled', String(!writable));
   const apply = () => {
     const input = chat.shadowRoot?.querySelector('.input');
-    const send = chat.shadowRoot?.querySelector('.send');
-    const approve = chat.shadowRoot?.querySelector('.approve');
-    const deny = chat.shadowRoot?.querySelector('.deny');
-    if (!input || !send) return;
-    input.disabled = !writable;
-    send.disabled = !writable;
-    if (approve) approve.disabled = !writable;
-    if (deny) deny.disabled = !writable;
+    if (!input) return;
+    // agent-chat owns disabled/busy/approval state via aria-disabled. A host
+    // paint must not re-enable controls while their request is still pending.
     input.title = writable ? '' : `Mission ${status}`;
   };
   $('compact-mission').disabled = !writable;
-  $('chat-mode-ask').textContent = `Ask ${primary.label}`;
-  $('chat-mode-ask').title = `Send to ${primary.label}`;
-  document.querySelectorAll('[data-prompt]').forEach((button) => { button.disabled = !writable; });
+  missionRecipients?.update({ session: AgentSessions.findOne(currentSessionId), primary, crew: crewDefinitions(),
+    sharedChannels: (missionParticipation()?.surfaces ?? []).filter((surface) => surface.status === 'bound').length,
+    userId: Meteor.userId(), mode: chatComposerMode, writable, status });
+  document.querySelectorAll('[data-prompt]').forEach((button) => { button.disabled = !writable || missionRecipients && !missionRecipients.canSend(); });
   apply();
   queueMicrotask(apply);
 }
@@ -846,28 +932,8 @@ function updateMissionComposer(primary, config) {
 function setChatComposerMode(mode, { focus = true } = {}) {
   if (!['ask', 'note'].includes(mode)) return;
   chatComposerMode = mode;
-  $('chat-mode-control').dataset.mode = mode;
-  for (const candidate of ['ask', 'note']) {
-    const button = $(`chat-mode-${candidate}`);
-    const active = candidate === mode;
-    button.classList.toggle('active', active);
-    button.setAttribute('aria-pressed', String(active));
-  }
-  updateChatModeHint();
   updateMissionComposer(primaryDefinition(), missionConfig());
   if (focus) queueMicrotask(() => $('mission-chat').shadowRoot?.querySelector('.input')?.focus());
-}
-
-function updateChatModeHint() {
-  const connected = (missionParticipation()?.surfaces ?? []).filter(
-    (surface) => surface.status === 'bound',
-  ).length;
-  const audience = connected
-    ? ` · shared to ${connected} channel${connected === 1 ? '' : 's'}`
-    : '';
-  $('chat-mode-hint').textContent = chatComposerMode === 'note'
-    ? `Posts without running agents${audience}`
-    : `Starts an agent turn${audience}`;
 }
 
 function initials(value, fallback = '?') {
@@ -959,7 +1025,6 @@ function renderMissionCollaboration(view = missionParticipation()) {
     .filter((participant) => participant.kind === 'agent')
     .sort((left, right) => (rosterOrder.get(left.agent) ?? 99) - (rosterOrder.get(right.agent) ?? 99));
   const surfaces = view?.surfaces ?? [];
-  updateChatModeHint();
   const stack = $('mission-participant-stack');
   stack.replaceChildren();
   stack.dataset.state = view ? 'ready' : 'loading';
@@ -1050,7 +1115,8 @@ function renderCrew(
   const activeAgent = activeCrewAgent(session, messages, missionState);
   const roster = new Map((session?.participants ?? []).filter((row) => row.kind === 'model').map((row) => [row.agent, row]));
   const list = $('crew-list');
-  const focusedConfigId = document.activeElement?.closest?.('.crew-card')?.dataset.configId ?? null;
+  const focusedAction = document.activeElement?.dataset.crewAction;
+  const focusedAgent = document.activeElement?.closest?.('.crew-card')?.dataset.agent;
   let restoreFocus = null;
   list.textContent = '';
   const definitions = crewDefinitions().filter(
@@ -1066,7 +1132,7 @@ function renderCrew(
     : 'ready';
   updateMissionComposer(primary, config);
   for (const definition of definitions) {
-    const row = document.createElement(definition.configId ? 'button' : 'div');
+    const row = document.createElement('div');
     const active = activeAgent === definition.agent;
     const delegatedWait = !!session?.activeChild
       && !!activeAgent
@@ -1083,20 +1149,13 @@ function renderCrew(
       ? missionState.label
       : (delegatedWait ? 'Waiting' : 'Ready');
     row.className = `crew-card${active ? ' active' : ''}`;
+    row.dataset.agent = definition.agent;
     row.dataset.agentState = agentState;
     row.dataset.accent = definition.className;
     if (definition.configId) {
-      row.type = 'button';
       row.dataset.configId = definition.configId;
       row.dataset.configurable = 'true';
-      row.title = `Configure ${displayName}`;
-      row.setAttribute('aria-label', `Configure ${displayName}. ${detail}. ${stateLabel}.`);
-      row.setAttribute('aria-haspopup', 'dialog');
-      row.setAttribute('aria-controls', 'crew-dialog');
-      row.setAttribute('aria-busy', String(['loading', 'thinking', 'working', 'retrying'].includes(agentState)));
       if (active) row.setAttribute('aria-current', 'true');
-      row.addEventListener('click', () => openCrewSettings(definition.configId));
-      if (focusedConfigId === definition.configId) restoreFocus = row;
     }
     const avatar = document.createElement('span');
     avatar.className = `crew-avatar ${definition.className}`;
@@ -1110,13 +1169,18 @@ function renderCrew(
     name.textContent = displayName;
     const role = document.createElement('span');
     role.textContent = detail;
+    const work = crewWorkButton(definition.agent, displayName);
+    const talk = crewChatButton(definition.agent, displayName, config);
     copy.append(name, role);
     const state = crewStateGlyph(agentState, stateLabel);
-    const disclosure = document.createElement('span');
-    disclosure.className = 'crew-disclosure';
-    disclosure.setAttribute('aria-hidden', 'true');
-    disclosure.textContent = '›';
-    row.append(avatar, copy, state, disclosure);
+    row.append(avatar, copy, talk, work, state);
+    if (definition.configId) {
+      const settings = crewSettingsButton(definition.configId, displayName);
+      row.append(settings);
+      if (focusedAgent === definition.agent && focusedAction === 'settings') restoreFocus = settings;
+    }
+    if (focusedAgent === definition.agent && focusedAction === 'work') restoreFocus = work;
+    if (focusedAgent === definition.agent && focusedAction === 'chat') restoreFocus = talk;
     list.append(row);
   }
   // Agents that took part in this mission but are no longer on its crew —
@@ -1141,6 +1205,7 @@ function renderCrew(
       : (crewConfig.enabled === false ? 'Left · disabled' : 'Left · not on this mission');
     const row = document.createElement('div');
     row.className = 'crew-card';
+    row.dataset.agent = agent;
     row.dataset.agentState = 'left';
     row.dataset.accent = crewConfig?.color ?? 'steel';
     row.setAttribute('aria-label', `${crewConfig?.displayName ?? agent}. ${reason}.`);
@@ -1156,8 +1221,11 @@ function renderCrew(
     name.textContent = crewConfig?.displayName ?? agent;
     const role = document.createElement('span');
     role.textContent = reason;
+    const work = crewWorkButton(agent, crewConfig?.displayName ?? agent);
     copy.append(name, role);
-    row.append(avatar, copy, crewStateGlyph('left', reason));
+    row.append(avatar, copy, work, crewStateGlyph('left', reason));
+    if (crewConfig) row.append(crewSettingsButton(crewConfig._id, crewConfig.displayName));
+    if (focusedAgent === agent) restoreFocus = row.querySelector(`[data-crew-action="${focusedAction}"]`);
     list.append(row);
   }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
@@ -1171,6 +1239,48 @@ function renderCrew(
   $('crew-mode-hint').textContent = Array.isArray(config?.agents)
     ? `${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`
     : 'Follows the workspace roster';
+}
+
+function crewWorkButton(agent, displayName) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'crew-work-button';
+  button.dataset.crewAction = 'work';
+  button.textContent = 'View work';
+  button.setAttribute('aria-label', `View ${displayName}’s work`);
+  button.setAttribute('aria-haspopup', 'dialog');
+  button.setAttribute('aria-controls', 'agent-work-dialog');
+  button.addEventListener('click', () => agentWorkControls?.open({ agent }));
+  return button;
+}
+
+function crewChatButton(agent, displayName, config) {
+  const button = document.createElement('button');
+  button.type = 'button'; button.className = 'crew-chat-button';
+  button.dataset.crewAction = 'chat'; button.textContent = 'Chat';
+  button.setAttribute('aria-label', `Chat with ${displayName}`);
+  button.title = `Message ${displayName} in this mission`;
+  button.disabled = (config?.status ?? 'active') !== 'active';
+  button.addEventListener('click', () => {
+    missionWorkNavigation?.show('chat');
+    setChatComposerMode('ask', { focus: false });
+    missionRecipients?.choose(agent);
+  });
+  return button;
+}
+
+function crewSettingsButton(configId, displayName) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.className = 'crew-settings-button';
+  button.dataset.crewAction = 'settings';
+  button.title = `${displayName} settings`;
+  button.setAttribute('aria-label', `${displayName} settings`);
+  button.setAttribute('aria-haspopup', 'dialog');
+  button.setAttribute('aria-controls', 'crew-dialog');
+  button.innerHTML = '<svg viewBox="0 0 24 24" aria-hidden="true" fill="none" stroke="currentColor" stroke-width="1.5"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2.5" fill="var(--ink-2)"/><circle cx="15" cy="17" r="2.5" fill="var(--ink-2)"/></svg>';
+  button.addEventListener('click', () => openCrewSettings(configId));
+  return button;
 }
 
 // Crew rows are too narrow for the state as words ("APPROVAL NEEDED" clipped
@@ -1454,9 +1564,10 @@ function setLearningPanelState(region, state, text) {
 }
 
 function setAgentDetailTab(tab, { focus = false } = {}) {
-  if (!['profile', 'constitution', 'experience', 'practices', 'frames'].includes(tab)) return;
+  if (!['profile', 'skills', 'tools', 'constitution', 'experience', 'practices', 'frames'].includes(tab)) return;
   if (crewEditor?.isNew && tab !== 'profile') return;
   agentDetailTab = tab;
+  $('agent-learning-stats').hidden = ['skills', 'tools'].includes(tab);
   if (!learningSubscriptionError) clearAgentLearningError();
   document.querySelectorAll('[data-agent-detail-tab]').forEach((button) => {
     const active = button.dataset.agentDetailTab === tab;
@@ -1470,7 +1581,7 @@ function setAgentDetailTab(tab, { focus = false } = {}) {
     panel.hidden = !active;
     panel.classList.toggle('active', active);
   });
-  $('crew-form-actions').hidden = tab !== 'profile' && !crewEditor?.dirty;
+  $('crew-form-actions').hidden = !['profile', 'tools'].includes(tab) && !crewEditor?.dirty;
   $('restore-crew-agent-learning').hidden = tab === 'profile';
 }
 
@@ -1478,6 +1589,7 @@ function renderAgentDetailTabs(config) {
   const draft = !!config?._draft;
   document.querySelectorAll('[data-agent-detail-tab]').forEach((button) => {
     button.disabled = draft && button.dataset.agentDetailTab !== 'profile';
+    button.title = button.disabled ? 'Save this agent first' : '';
   });
   if (draft && agentDetailTab !== 'profile') agentDetailTab = 'profile';
   setAgentDetailTab(agentDetailTab);
@@ -2677,6 +2789,7 @@ function crewExperienceConfig(value) {
   const recent = Number.isSafeInteger(source.recent) ? source.recent : 4;
   return {
     record: source.record !== false,
+    reflect: source.reflect === true,
     recall: source.recall !== false && recent > 0,
     recent,
     scope: ['owner', 'session', 'identity'].includes(source.scope) ? source.scope : 'owner',
@@ -2718,6 +2831,7 @@ function crewConfigPatch(config) {
       framing: !!config.capabilities?.framing,
       memory: !!config.capabilities?.memory,
       publish: !!config.capabilities?.publish,
+      files: config.capabilities?.files !== false,
     },
   };
 }
@@ -2938,6 +3052,7 @@ function populateCrewForm(config) {
   renderCrewModelSelector(config.model);
   $('crew-enabled').checked = config.enabled;
   $('crew-experience-record').checked = experience.record;
+  $('crew-experience-reflect').checked = experience.reflect;
   $('crew-experience-recall').checked = experience.recall;
   $('crew-experience-automatic').checked = experience.approval === 'auto';
   $('crew-experience-scope').value = experience.scope;
@@ -2952,11 +3067,13 @@ function populateCrewForm(config) {
   $('crew-cap-inspect').checked = !!config.capabilities?.inspect;
   $('crew-cap-memory').checked = !!config.capabilities?.memory;
   $('crew-cap-publish').checked = !!config.capabilities?.publish;
+  $('crew-cap-files').checked = config.capabilities?.files !== false;
 }
 
 function updateCrewLearningControls(config) {
   const archived = crewConfigArchived(config);
   const recordsExperience = $('crew-experience-record').checked;
+  $('crew-experience-reflect').disabled = !recordsExperience;
   const recallsExperience = $('crew-experience-recall').checked;
   const experienceScope = $('crew-experience-scope').value;
   const experienceAutomatic = $('crew-experience-automatic');
@@ -3046,7 +3163,7 @@ function renderCrewEditState(config) {
     : (primary ? 'Primary agent · always available' : 'Workspace agent');
   for (const control of document.querySelectorAll(
     '#agent-detail-panel-profile input, #agent-detail-panel-profile select, '
-    + '#agent-detail-panel-profile textarea',
+    + '#agent-detail-panel-profile textarea, .agent-tool-switch input',
   )) control.disabled = archived || control.dataset.availabilityDisabled === 'true';
   $('crew-enabled').disabled = primary || archived;
   const lifecycleAction = $('archive-crew-agent');
@@ -3067,6 +3184,38 @@ function renderCrewEditState(config) {
   submit.textContent = crewEditor?.isNew ? 'Add to workspace' : 'Save changes';
   $('crew-form').classList.toggle('is-archived', archived);
   updateCrewLearningControls(config);
+  updateCrewToolControls(config);
+}
+
+function updateCrewToolControls(config) {
+  const archived = crewConfigArchived(config);
+  const unavailable = archived ? 'Archived' : !config.enabled ? 'Agent inactive' : '';
+  for (const [key, stateId] of [['inspect', 'crew-inspect-state'], ['publish', 'crew-publish-state'], ['files', 'crew-files-state']]) {
+    const allowed = $(`crew-cap-${key}`).checked;
+    const changed = allowed !== (key === 'files' ? crewEditor?.original?.capabilities?.files !== false : !!crewEditor?.original?.capabilities?.[key]);
+    const state = $(stateId);
+    state.textContent = changed ? (allowed ? 'Will allow on save' : 'Will turn off on save') : unavailable || (allowed ? 'Available' : 'Access off');
+    state.dataset.state = changed ? 'pending' : unavailable ? 'unavailable' : allowed ? 'available' : 'off';
+  }
+  const primary = CrewConfigs.findOne({ agent: 'orchestrator', enabled: true, status: { $ne: 'archived' } });
+  const inherited = config.agent !== 'orchestrator' && !!primary?.capabilities?.memory;
+  const memory = $('crew-cap-memory');
+  // Preserve the explicit grant in the hidden control. Inherited access is
+  // not an independent switch, and viewing it must never create a new grant.
+  memory.hidden = inherited;
+  memory.disabled = archived || inherited;
+  const changed = memory.checked !== !!crewEditor?.original?.capabilities?.memory;
+  $('crew-memory-state').textContent = unavailable || (inherited ? `Inherited from ${primary.displayName}`
+    : changed ? (memory.checked ? 'Will allow on save' : 'Will turn off on save')
+      : memory.checked ? 'Available' : 'Access off');
+  $('crew-memory-state').dataset.state = unavailable ? 'unavailable' : inherited ? 'inherited' : changed ? 'pending' : memory.checked ? 'available' : 'off';
+  $('crew-memory-source').hidden = !inherited;
+  $('crew-memory-source').disabled = archived;
+  $('crew-memory-source').textContent = `Manage on ${primary?.displayName ?? 'Atlas'}`;
+  $('crew-memory-hint').textContent = inherited
+    ? 'Inherited in mission chat; not available in delegated work'
+    : 'Save, search, and forget facts in mission chat; not in delegated work';
+  $('crew-form-actions').hidden = !['profile', 'tools'].includes(agentDetailTab) && !crewEditor?.dirty;
 }
 
 function captureCrewEdit() {
@@ -3177,6 +3326,18 @@ function renderCrewSettings() {
   $('crew-form-avatar').className = `crew-form-avatar ${visible.color}`;
   $('crew-form-avatar').textContent = visible.avatar;
   renderCrewEditState({ ...config, ...visible });
+  const decisionSettings = Mongo.getCollection('constellation_decision_settings')?.findOne();
+  const decisionAccess = decisionAgentAccessSummary(decisionSettings?.agentPolicies?.[config.agent]);
+  $('crew-decision-summary').textContent = config._draft ? 'Save this agent to configure decision access.'
+    : `${decisionAccess.text}${decisionSettings?.enabled !== true ? ' · Connection off' : !decisionSettings?.providerConfigured ? ' · Evaluation needs a key' : ''}`;
+  $('crew-decision-summary').dataset.state = decisionAccess.state;
+  $('crew-decision-access').disabled = !!config._draft || crewConfigArchived(config);
+  const executionSettings = executionControls?.settings?.findOne() ?? {};
+  const executionPolicy = executionSettings.agentPolicies?.[config.agent]?.run ?? 'disabled';
+  $('crew-execution-summary').textContent = config._draft ? 'Save this agent to configure code access.'
+    : `Run code: ${{ disabled: 'Off', ask: 'Ask every time', auto: 'Allowed' }[executionPolicy] ?? 'Off'}${!executionSettings.providerConfigured ? ' · Needs a Sprites token' : !executionSettings.enabled ? ' · Connection off' : ''}`;
+  $('crew-execution-access').disabled = !!config._draft || crewConfigArchived(config);
+  agentCapabilityControls?.render(config);
   renderAgentLearning({ ...config, ...visible });
 }
 
@@ -3451,6 +3612,7 @@ function crewFormPatch() {
     flexibility: Number($('crew-flexibility').value),
     experience: {
       record: $('crew-experience-record').checked,
+      reflect: $('crew-experience-reflect').checked,
       recall: $('crew-experience-recall').checked,
       recent: Number($('crew-experience-recent').value),
       scope: $('crew-experience-scope').value,
@@ -3473,6 +3635,7 @@ function crewFormPatch() {
         ?? crewEditor?.config?.capabilities?.framing),
       memory: $('crew-cap-memory').checked,
       publish: $('crew-cap-publish').checked,
+      files: $('crew-cap-files').checked,
     },
   };
 }
@@ -4280,12 +4443,6 @@ function wireCrewSettings() {
       }
     });
   });
-  $('chat-mode-ask').addEventListener('click', (event) => setChatComposerMode(
-    'ask', { focus: event.detail > 0 },
-  ));
-  $('chat-mode-note').addEventListener('click', (event) => setChatComposerMode(
-    'note', { focus: event.detail > 0 },
-  ));
   $('close-crew-dialog').addEventListener('click', () => closeCrewSettings());
   $('cancel-crew-edit').addEventListener('click', () => closeCrewSettings({ discard: true }));
   $('crew-dialog').addEventListener('cancel', (event) => {
@@ -4426,12 +4583,21 @@ function wireCrewSettings() {
   $('crew-model').addEventListener('change', (event) => {
     renderCrewModelSelector(event.currentTarget.value);
   });
+  $('crew-memory-source').addEventListener('click', () => {
+    const primary = CrewConfigs.findOne({ agent: 'orchestrator', status: { $ne: 'archived' } });
+    if (!primary || !selectCrewConfig(primary._id)) return;
+    setAgentDetailTab('tools');
+    $('crew-cap-memory').focus();
+  });
   $('crew-form').addEventListener('keydown', (event) => {
     if (agentDetailTab !== 'profile' && event.key === 'Enter'
       && event.target instanceof HTMLInputElement) event.preventDefault();
   });
-  $('crew-form').addEventListener('input', captureCrewEdit);
-  $('crew-form').addEventListener('change', captureCrewEdit);
+  const captureProfileOrTools = (event) => {
+    if (event.target.closest('#agent-detail-panel-profile, .agent-tool-switch') || event.target.id === 'crew-enabled') captureCrewEdit();
+  };
+  $('crew-form').addEventListener('input', captureProfileOrTools);
+  $('crew-form').addEventListener('change', captureProfileOrTools);
 }
 
 function concise(value, max = 120) {
@@ -4482,8 +4648,18 @@ function setChildRuntimeState(dialog, chat, state) {
   if (label && label.textContent !== state.label) label.textContent = state.label;
 }
 
-function openChildRun(sessionId, agentName) {
+function openChildRun(sessionId, agentName, { nested = false, restoreScroll = null } = {}) {
   const dialog = $('run-dialog');
+  const wasOpen = dialog.open;
+  if (nested && childRunSelection && childRunSelection.sessionId !== sessionId) {
+    const transcript = $('child-chat-mount').querySelector('agent-chat')?.shadowRoot?.querySelector('.messages');
+    childRunStack.push({ ...childRunSelection, scroll: transcript?.scrollTop ?? null });
+  } else if (!dialog.open) {
+    childRunStack.length = 0;
+    dialog._returnFocus = document.activeElement;
+    dialog._returnWorkId = document.activeElement?.dataset?.openWork;
+  }
+  childRunSelection = { sessionId, agentName };
   const mount = $('child-chat-mount');
   childRunComputation?.stop();
   const chat = document.createElement('agent-chat');
@@ -4493,20 +4669,46 @@ function openChildRun(sessionId, agentName) {
   const header = document.createElement('span');
   header.slot = 'header';
   header.className = 'chat-header-label';
-  header.textContent = 'CHILD SESSION';
+  header.textContent = 'RECORDED CONVERSATION';
   chat.append(header);
+  chat.addEventListener('agent-chat:open-run', (event) => {
+    event.stopPropagation();
+    if (event.detail?.sessionId) openChildRun(event.detail.sessionId, event.detail.agent ?? 'researcher', { nested: true });
+  });
   mount.replaceChildren(chat);
-  $('run-dialog-title').textContent = `${crewDefinition(agentName)?.label ?? agentName} run`;
-  dialog.showModal();
+  $('run-dialog-title').textContent = `${crewDefinition(agentName)?.label ?? agentName}’s work`;
+  $('back-agent-work').hidden = childRunStack.length === 0;
+  $('back-agent-work').textContent = childRunStack.length ? `← Back to ${crewDefinition(childRunStack.at(-1).agentName)?.label ?? childRunStack.at(-1).agentName}` : '← Back';
+  if (!dialog.open) dialog.showModal();
+  if (wasOpen) requestAnimationFrame(() => {
+    if (childRunSelection?.sessionId !== sessionId) return;
+    const focus = childRunStack.length ? $('back-agent-work') : $('run-dialog-title');
+    focus.focus({ preventScroll: true });
+  });
+  workTranscriptContext?.show(sessionId);
+  let lastReceiptState = '';
   childRunComputation = Tracker.autorun(() => {
     const session = AgentSessions.findOne(sessionId);
     const messages = chat.agentInstance?.messages(sessionId).fetch() ?? [];
     setChildRuntimeState(dialog, chat, deriveRuntimeState(session, messages));
+    const signature = [session?.phase, session?.updatedAt?.getTime?.(), messages.length,
+      messages.at(-1)?._id, messages.at(-1)?.streaming].join(':');
+    if (signature !== lastReceiptState) { lastReceiptState = signature; workTranscriptContext?.refresh(); }
+    if (restoreScroll !== null && messages.length) {
+      const savedScroll = restoreScroll; restoreScroll = null;
+      requestAnimationFrame(() => {
+        if (childRunSelection?.sessionId !== sessionId) return;
+        const transcript = chat.shadowRoot?.querySelector('.messages');
+        if (transcript) transcript.scrollTop = savedScroll;
+      });
+    }
   });
+  return dialog;
 }
 
 function renderActivity(messages, runtimeState, debugTraces = false) {
   const list = $('activity-feed');
+  const focusedWorkId = document.activeElement?.dataset.openWork;
   list.textContent = '';
   const toolNames = new Map();
   for (const message of messages) {
@@ -4570,7 +4772,8 @@ function renderActivity(messages, runtimeState, debugTraces = false) {
     } else if (debugTraces) {
       body.textContent = concise(raw || 'Transcript event');
     } else if (message.role === 'tool') {
-      body.textContent = message.childSessionId ? 'Delegated run recorded.' : 'Result recorded.';
+      body.textContent = concise(message.displayContent || message.transcriptContent
+        || (message.childSessionId ? 'Delegated run recorded.' : 'Result recorded.'));
     } else if (message.kind === 'approval') {
       body.textContent = 'Decision recorded for one call.';
     } else if (message.toolCalls?.length) {
@@ -4584,12 +4787,16 @@ function renderActivity(messages, runtimeState, debugTraces = false) {
     if (message.childSessionId) {
       const button = document.createElement('button');
       button.type = 'button';
-      button.textContent = 'Open child session →';
       const agentName = toolNames.get(message.toolCallId) ?? 'researcher';
+      button.textContent = `View ${crewDefinition(agentName)?.label ?? agentName}’s work →`;
+      button.dataset.openWork = message.childSessionId;
       button.addEventListener('click', () => openChildRun(message.childSessionId, agentName));
       item.append(button);
     }
     list.append(item);
+  }
+  if (focusedWorkId && !$('run-dialog').open) {
+    list.querySelector(`[data-open-work="${CSS.escape(focusedWorkId)}"]`)?.focus({ preventScroll: true });
   }
 }
 
@@ -4687,21 +4894,26 @@ function renderMissionState() {
   if (pill.className !== pillClass) pill.className = pillClass;
   if (pill.dataset.agentState !== runtimeState.key) pill.dataset.agentState = runtimeState.key;
   if (pill.dataset.runtimePhase !== phase) pill.dataset.runtimePhase = phase;
-  const runtimeAria = `${runtimeState.label}. ${runtimeState.detail}`;
   pill.title = runtimeState.detail;
   const pillLabel = runtimeState.label.toUpperCase();
   if (pill.querySelector('span').textContent !== pillLabel) pill.querySelector('span').textContent = pillLabel;
 
   const runtime = $('mission-runtime-state');
   const runtimeLabel = $('mission-runtime-label');
+  const respondingAgent = activeCrewAgent(session, messages, runtimeState);
+  const respondingName = respondingAgent && (session?.participants?.find((row) => row.kind === 'model' && row.agent === respondingAgent)?.displayName
+    || crewDefinition(respondingAgent)?.label);
+  const runtimeText = respondingName && ['loading', 'thinking', 'working', 'waiting'].includes(runtimeState.key)
+    ? `${respondingName} · ${runtimeState.label}` : runtimeState.label;
   if (runtime) {
     if (runtime.dataset.agentState !== runtimeState.key) runtime.dataset.agentState = runtimeState.key;
     if (runtime.dataset.runtimePhase !== phase) runtime.dataset.runtimePhase = phase;
-    if (runtime.getAttribute('aria-label') !== runtimeAria) runtime.setAttribute('aria-label', runtimeAria);
+    const respondingAria = `${runtimeText}. ${runtimeState.detail}`;
+    if (runtime.getAttribute('aria-label') !== respondingAria) runtime.setAttribute('aria-label', respondingAria);
     runtime.title = runtimeState.detail;
   }
-  if (runtimeLabel && runtimeLabel.textContent !== runtimeState.label) {
-    runtimeLabel.textContent = runtimeState.label;
+  if (runtimeLabel && runtimeLabel.textContent !== runtimeText) {
+    runtimeLabel.textContent = runtimeText;
   }
 
   renderMissionHealth(session, config, runtimeState, phase, busy);
@@ -4710,7 +4922,9 @@ function renderMissionState() {
   renderMissionCollaboration();
   renderActivity(messages, runtimeState, config?.debugTraces === true);
   renderMissionList(messages);
-  if ($('mission-dialog').open) updateMissionConfigBadge(config?.status ?? 'active');
+  if ($('mission-dialog').open) {
+    updateMissionConfigBadge(missionConfig(editingMissionSessionId)?.status ?? 'active');
+  }
 
   if (session && config?.autoTitle !== false && /^(new|untitled) mission$/i.test(title)) {
     const firstUser = messages.find((message) => (
@@ -4846,6 +5060,8 @@ async function openMissionSettings(sessionId = currentSessionId) {
   }
   editingMissionSessionId = sessionId;
   editingMissionRevision = config.revision;
+  missionEnvironmentChanged.changed();
+  renderMissionEnvironmentSetting();
   $('mission-dialog-id').textContent = 'This mission';
   $('mission-config-title').value = config.title ?? 'New mission';
   $('mission-config-objective').value = config.objective ?? '';
@@ -4906,6 +5122,23 @@ function missionFormPatch() {
   };
 }
 
+function renderMissionEnvironmentSetting() {
+  missionEnvironmentChanged.depend();
+  const environment = editingMissionSessionId ? executionControls?.environments?.findOne({ missionId: editingMissionSessionId }) : null;
+  const summary = $('mission-environment-summary');
+  const hint = $('mission-environment-hint');
+  $('mission-environment-settings').disabled = !editingMissionSessionId || !executionControls;
+  summary.textContent = environment?.keepFiles ? (environment?.workspaceId ? 'Enabled · /workspace' : 'Not created yet')
+    : environment?.workspaceId ? 'Off · files retained' : 'Off';
+  hint.textContent = environment?.status === 'needs-attention'
+    ? 'The environment needs attention. Open it to review recovery or removal.'
+    : environment?.workspaceId && environment.retention === 'delete-on-completion'
+      ? 'Completing or archiving this mission deletes its remote files and save points. Download anything you need first.'
+      : environment?.keepFiles || environment?.workspaceId
+        ? 'Manage files in the Files tab. Running code requires separate permission.'
+        : 'Store shared files in a mission Sprite. Sprites usage charges apply.';
+}
+
 function updateMissionStatusHint(status) {
   const copy = status === 'paused'
     ? 'Stops active work and linked Pulses until reactivated.'
@@ -4917,16 +5150,22 @@ function updateMissionStatusHint(status) {
 
 function missionStateChangeNeedsConfirmation(current, nextStatus) {
   if (!current || current.status !== 'active' || nextStatus === 'active') return false;
-  const session = AgentSessions.findOne(currentSessionId);
-  const runtime = deriveRuntimeState(session, currentMissionMessages());
+  const session = AgentSessions.findOne(current._id);
+  const messages = $('mission-chat')?.agentInstance?.messages(current._id).fetch() ?? [];
+  const runtime = deriveRuntimeState(session, messages);
   return ['streaming', 'calling', 'retrying', 'compacting'].includes(session?.phase)
     || runtime.runtimePhase === 'awaiting'
     || runtime.key === 'waiting';
 }
 
 function confirmMissionStateChange(current, nextStatus) {
+  const environment = executionControls?.environments?.findOne({ missionId: current?._id });
+  if (nextStatus === 'completed' && current?.status !== 'completed'
+    && environment?.workspaceId && environment.retention === 'delete-on-completion') {
+    return window.confirm(`Complete “${current.title}”? This stops active work and deletes this mission’s remote working files and save points, as selected in its environment settings. Chats and downloaded results are kept.`);
+  }
   if (!missionStateChangeNeedsConfirmation(current, nextStatus)) return true;
-  const linkedPulses = PulseConfigs.find({ sessionId: currentSessionId, enabled: true }).count();
+  const linkedPulses = PulseConfigs.find({ sessionId: current._id, enabled: true }).count();
   const pulseCopy = `${linkedPulses} linked Pulse${linkedPulses === 1 ? '' : 's'}`;
   const verb = nextStatus === 'completed' ? 'Complete' : 'Pause';
   return window.confirm(
@@ -4942,6 +5181,9 @@ function wireMissionSettings() {
   });
   $('configure-mission').addEventListener('click', (event) => {
     void withControlBusy(event.currentTarget, 'Loading', openMissionSettings);
+  });
+  $('mission-environment-settings').addEventListener('click', () => {
+    if (editingMissionSessionId) executionControls?.openEnvironment(editingMissionSessionId, 'settings');
   });
   $('continuity-toggle').addEventListener('change', async (event) => {
     const toggle = event.currentTarget;
@@ -4964,9 +5206,18 @@ function wireMissionSettings() {
       toggle.disabled = false;
     }
   });
-  $('mission-dialog').addEventListener('close', () => {
+  $('mission-dialog').addEventListener('close', (event) => {
+    if ($('mission-dialog').open) return;
+    if (suspendedCodeSettings.has($('mission-dialog'))) {
+      // Mark this exact close event for the guarded-editor listener too;
+      // a later real close must still discard the editor normally.
+      suspendedCodeCloseEvents.add(event);
+      suspendedCodeSettings.delete($('mission-dialog'));
+      return;
+    }
     editingMissionSessionId = null;
     editingMissionRevision = null;
+    missionEnvironmentChanged.changed();
   });
   $('mission-config-status').addEventListener('change', (event) => {
     updateMissionConfigBadge(event.currentTarget.value);
@@ -5009,7 +5260,7 @@ function wireMissionSettings() {
     });
   });
   $('complete-mission').addEventListener('click', () => {
-    const completed = missionConfig()?.status === 'completed';
+    const completed = missionConfig(editingMissionSessionId)?.status === 'completed';
     const statusSelect = $('mission-config-status');
     if (!completed && !statusSelect.querySelector('option[value="completed"]')) {
       const option = document.createElement('option');
@@ -5185,10 +5436,25 @@ function wireMissionActions() {
     });
   });
   $('close-run-dialog').addEventListener('click', () => $('run-dialog').close());
+  $('back-agent-work').addEventListener('click', () => {
+    const previous = childRunStack.pop();
+    if (previous) openChildRun(previous.sessionId, previous.agentName, { restoreScroll: previous.scroll });
+  });
+  $('view-all-agent-work').addEventListener('click', () => agentWorkControls?.open());
   $('run-dialog').addEventListener('close', () => {
     childRunComputation?.stop();
     childRunComputation = null;
+    childRunSelection = null;
+    childRunStack.length = 0;
+    workTranscriptContext?.stop();
     $('child-chat-mount').replaceChildren();
+    if ($('run-dialog')._returnFocus?.isConnected) {
+      $('run-dialog')._returnFocus.focus({ preventScroll: true });
+    } else if ($('run-dialog')._returnWorkId) {
+      document.querySelector(`[data-open-work="${CSS.escape($('run-dialog')._returnWorkId)}"]`)?.focus({ preventScroll: true });
+    }
+    delete $('run-dialog')._returnFocus;
+    delete $('run-dialog')._returnWorkId;
   });
 }
 
@@ -5616,6 +5882,9 @@ function toolSourceLabel(tool) {
 }
 
 function toolCategoryLabel(tool) {
+  if (tool.category === 'decisions') return 'Jev decisions';
+  if (tool.category === 'execution') return 'Code · Sprites';
+  if (tool.category === 'files') return 'Mission files';
   return normalizedToolSource(tool) === 'framework'
     ? (FRAMEWORK_CATEGORY_LABELS[tool.category] ?? 'System')
     : '';
@@ -5730,8 +5999,8 @@ function toolProvenance(tool) {
   }
   if (source === 'app') {
     return {
-      provider: 'Application code',
-      assignment: 'Crew capability settings',
+      provider: tool.category === 'decisions' ? 'Constellation · Jev' : tool.category === 'execution' ? 'Sprites' : 'Application code',
+      assignment: tool.category === 'decisions' ? 'Decision access' : tool.category === 'execution' ? 'Code access' : 'Crew capability settings',
       why: availability || `Assigned to ${access}`,
     };
   }
@@ -5761,7 +6030,7 @@ function renderToolAgents(tool) {
   const mount = $('tool-detail-agent-list');
   mount.replaceChildren();
   const effectiveAgents = tool.agents ?? [];
-  const configuredAgents = !effectiveAgents.length && normalizedToolSource(tool).endsWith('-mcp')
+  const configuredAgents = !effectiveAgents.length && (normalizedToolSource(tool).endsWith('-mcp') || ['decisions', 'execution'].includes(tool.category))
     ? (tool.assignedAgents ?? []) : effectiveAgents;
   const configuredOnly = !effectiveAgents.length && configuredAgents.length > 0;
   mount.setAttribute('aria-label', configuredOnly ? 'Configured agent assignments' : 'Agents with access');
@@ -5779,7 +6048,9 @@ function renderToolAgents(tool) {
       : summarizedList(assignedSkills, 1);
     const assignmentLabel = assignment === 'inherited' ? 'Inherited'
       : assignment === 'configured' ? 'Configured' : assignment;
-    role.textContent = [config?.role ?? 'Agent', assignmentLabel, configuredOnly ? 'No runtime access' : '', config && !config.enabled ? 'Disabled' : '']
+    const policy = tool.decisionPolicies?.find((entry) => entry.agent === agentId);
+    const decisionPolicy = policy ? decisionAgentAccessSummary(policy).text : '';
+    role.textContent = [config?.role ?? 'Agent', assignmentLabel, decisionPolicy, configuredOnly ? 'No runtime access' : '', config && !config.enabled ? 'Disabled' : '']
       .filter(Boolean).join(' · ');
     if (assignedSkills.length) role.title = assignedSkills.join(', ');
     chip.append(name, role);
@@ -5795,6 +6066,9 @@ function renderToolAgents(tool) {
 
 function toolStatus(tool) {
   const value = String(tool?.status ?? 'available').toLowerCase();
+  if (['decisions', 'execution'].includes(tool?.category) && tool.statusLabel) return {
+    key: value === 'ready' ? 'ready' : value === 'disabled' ? 'disabled' : 'unavailable', label: tool.statusLabel,
+  };
   if (tool?.approval === 'blocked' || value === 'blocked') return { key: 'disabled', label: 'Blocked' };
   if (value === 'disabled') return { key: 'disabled', label: 'Disabled' };
   if (value === 'conflict') return { key: 'unavailable', label: 'Name conflict' };
@@ -5845,11 +6119,18 @@ function renderToolDetail(tool) {
   sourceAction.hidden = false;
   sourceAction.disabled = false;
   sourceAction.dataset.serverId = tool.serverId ?? '';
-  sourceAction.dataset.action = tool.serverId ? 'server' : sourceKey === 'framework' ? 'crew' : 'code';
-  if (tool.serverId) {
-    sourceAction.textContent = 'Configure server access';
-    sourceAction.setAttribute('aria-label', tool.serverName ? `Configure access for ${tool.serverName}` : 'Configure MCP server access');
-  } else if (sourceKey === 'framework') {
+  sourceAction.dataset.agentTab = ['skill', 'skills'].includes(tool.category) ? 'skills' : 'tools';
+  const hasAccessControls = sourceKey === 'framework' || !!tool.serverId
+    || ['inspect_workspace', 'publish_brief'].includes(tool.name) || tool.category === 'files';
+  sourceAction.dataset.action = tool.category === 'decisions' ? `decision-${tool.decisionAction ?? 'access'}`
+    : tool.category === 'execution' ? 'execution-access' : hasAccessControls ? 'crew' : 'code';
+  if (tool.category === 'decisions') {
+    sourceAction.textContent = tool.decisionAction === 'connection' ? 'Configure Jev connection' : 'Manage decision access';
+    sourceAction.setAttribute('aria-label', sourceAction.textContent);
+  } else if (tool.category === 'execution') {
+    sourceAction.textContent = 'Manage code access';
+    sourceAction.setAttribute('aria-label', sourceAction.textContent);
+  } else if (hasAccessControls) {
     sourceAction.textContent = 'Manage crew access';
     sourceAction.setAttribute('aria-label', 'Manage crew access');
   } else {
@@ -5990,7 +6271,10 @@ function renderToolsByAgent(tools) {
     const manage = document.createElement('button');
     manage.type = 'button';
     manage.textContent = 'Manage access';
-    manage.addEventListener('click', () => openCrewSettings(agent._id));
+    manage.addEventListener('click', () => {
+      openCrewSettings(agent._id);
+      if (selectedCrewId === agent._id) setAgentDetailTab('tools');
+    });
     header.append(identity, manage);
     const list = document.createElement('div');
     list.className = 'tool-agent-tool-list';
@@ -6161,7 +6445,7 @@ function renderSkillCatalog(skills) {
 }
 
 function setCapabilityTab(tab) {
-  const nextTab = ['tools', 'skills', 'mcp'].includes(tab) ? tab : 'tools';
+  const nextTab = ['tools', 'skills', 'mcp', 'decisions', 'execution'].includes(tab) ? tab : 'tools';
   if (nextTab !== capabilityTab) $('capability-search').value = '';
   capabilityTab = nextTab;
   document.querySelectorAll('[data-capability-tab]').forEach((button) => {
@@ -6182,7 +6466,8 @@ function setCapabilityTab(tab) {
     summary.hidden = summary.dataset.capabilitySummary !== capabilityTab;
   });
   $('capability-search').placeholder = capabilityTab === 'tools' ? 'Search tools'
-    : capabilityTab === 'skills' ? 'Search skills' : 'Search servers';
+    : capabilityTab === 'skills' ? 'Search skills' : capabilityTab === 'decisions' ? 'Search decisions' : 'Search servers';
+  $('capability-search').closest('label').hidden = capabilityTab === 'execution';
   renderCapabilities();
 }
 
@@ -6233,6 +6518,7 @@ function renderCapabilities() {
   }
   if (capabilityTab === 'skills') renderSkillCatalog(skills);
   if (capabilityTab === 'mcp') renderMcpServers(servers, tools);
+  if (capabilityTab === 'decisions') decisionControls?.render();
   const missionTitle = missionConfig()?.title || AgentSessions.findOne(currentSessionId)?.title || 'current mission';
   $('skill-demo').textContent = `Try skills in “${concise(missionTitle, 28)}”`;
 }
@@ -6259,7 +6545,7 @@ function populateSkillAgents(skill) {
   }
 }
 
-function openSkillDialog(id = null) {
+function openSkillDialog(id = null, { assignAgent } = {}) {
   selectedSkillId = id;
   const skill = id ? SkillConfigs.findOne(id) : null;
   editingSkillRevision = skill?.revision ?? null;
@@ -6273,7 +6559,13 @@ function openSkillDialog(id = null) {
   updateSkillEditorState(false);
   setSkillFormStatus();
   $('delete-skill').hidden = !skill;
-  populateSkillAgents(skill);
+  populateSkillAgents(skill ?? (assignAgent ? { agents: [assignAgent] } : null));
+  const others = skill ? (skill.agents ?? []).filter((agent) => agent !== assignAgent) : [];
+  const hint = $('skill-shared-edit-hint');
+  hint.hidden = !assignAgent;
+  hint.textContent = skill
+    ? `Shared skill · changes apply to ${others.length ? `all ${skill.agents.length} assigned agents` : 'every agent assigned this skill'}.`
+    : `Assigned to ${CrewConfigs.findOne({ agent: assignAgent })?.displayName ?? 'this agent'} when saved.`;
   beginGuardedEditor('skill-form', { cleanLabel: skill ? 'Saved' : 'Not saved' });
   $('skill-dialog').showModal();
   requestAnimationFrame(() => $('skill-name').focus());
@@ -6361,8 +6653,22 @@ function wireSkills() {
     void withControlBusy(event.currentTarget, 'Copying', () => copyText($('tool-detail-schema').textContent, 'Schema copied.'));
   });
   $('open-tool-source').addEventListener('click', (event) => {
+    if (event.currentTarget.dataset.action === 'execution-access') {
+      if (toolAgentFilter !== 'all') executionControls?.openAgentAccess(toolAgentFilter);
+      else { activateView('capabilities'); setCapabilityTab('execution'); }
+      return;
+    }
+    if (event.currentTarget.dataset.action.startsWith('decision-')) {
+      if (event.currentTarget.dataset.action === 'decision-connection') decisionControls?.openConnection();
+      else decisionControls?.openAgentPolicy(toolAgentFilter === 'all' ? undefined : toolAgentFilter);
+      return;
+    }
     if (event.currentTarget.dataset.action === 'crew') {
-      openCrewSettings();
+      const config = toolAgentFilter === 'all' ? null : CrewConfigs.findOne({ agent: toolAgentFilter });
+      openCrewSettings(config?._id);
+      if (config && selectedCrewId !== config._id) return;
+      setCrewDirectoryTab('agents');
+      setAgentDetailTab(event.currentTarget.dataset.agentTab);
       return;
     }
     const serverId = event.currentTarget.dataset.serverId;
@@ -7722,7 +8028,10 @@ async function initializeWorkspace() {
   if (!applicationWired) {
     applicationWiringStarted = true;
     chat.addEventListener('agent-chat:session', (event) => {
+      if (currentSessionId !== event.detail.sessionId && $('run-dialog').open) $('run-dialog').close();
       currentSessionId = event.detail.sessionId;
+      missionWorkNavigation?.setMission(currentSessionId);
+      agentWorkControls?.contextChanged();
       setChatComposerMode('ask', { focus: false });
       subscribeMissionParticipation(currentSessionId);
       void prepareSession(currentSessionId);
@@ -7732,22 +8041,18 @@ async function initializeWorkspace() {
     chat.addEventListener('agent-chat:error', (event) => {
       toast(messageOf(event.detail?.error), 'error');
     });
+    chat.addEventListener('agent-chat:open-run', (event) => {
+      if (event.detail?.sessionId) openChildRun(event.detail.sessionId, event.detail.agent ?? 'researcher');
+    });
     chat.addEventListener('agent-chat:submitted', (event) => {
       if (event.detail?.mode === 'note') setChatComposerMode('ask', { focus: false });
     });
 
     defineAgentChat();
-    chat.mentionSources = {
-      '#': {
-        kind: 'mission-object',
-        list: [
-          { handle: 'launch', label: 'Launch brief', detail: 'Current deliverable' },
-          { handle: 'positioning', label: 'Positioning decision', detail: 'Decision record' },
-          { handle: 'design-partners', label: 'Design partners', detail: 'Target cohort' },
-        ],
-        handle: 'handle', label: 'label', detail: 'detail',
-      },
-    };
+    missionRecipients = initializeMissionRecipients({ chat,
+      onChange: () => updateMissionComposer(primaryDefinition(), missionConfig()),
+      onModeChange: (mode) => setChatComposerMode(mode, { focus: false }),
+    });
 
     wireNavigation();
     wireMissionActions();
@@ -7758,8 +8063,178 @@ async function initializeWorkspace() {
     wireSkills();
     wireMcpServers();
     wireChannels();
+    workTranscriptContext = createWorkTranscriptContext({
+      container: $('run-handoff-context'), dialog: $('run-dialog'),
+      missionId: () => currentSessionId,
+      onDetail: (detail) => {
+        if (childRunSelection?.sessionId === detail.sessionId) $('run-dialog-title').textContent = `${detail.displayName}’s work`;
+      },
+    });
+    agentWorkControls = initializeAgentWork({
+      missionId: () => { sessionChanged.depend(); return currentSessionId; },
+      missionTitle: () => missionConfig()?.title || 'Current mission',
+      crew: () => CrewConfigs.find({}, { sort: { order: 1 } }).fetch(),
+      openChild: (sessionId, agentName) => openChildRun(sessionId, agentName),
+      toast,
+    });
+    decisionControls = initializeDecisions({
+      chat,
+      openWork: createDecisionWorkNavigator({
+        isMission: (sessionId) => !!MissionConfigs.findOne(sessionId),
+        currentMission: () => currentSessionId,
+        rootChat: () => chat,
+        openMission: (id) => navigateToMissionWork('chat', id),
+        showMission: () => navigateToMissionWork('chat'),
+        missionVisible: () => currentView === 'missions' && missionWorkNavigation?.activeTab === 'chat',
+        openChild: openChildRun,
+        toast,
+      }),
+      crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
+      missions: () => MissionConfigs.find({}, { sort: { updatedAt: -1 } }).fetch(),
+      mission: () => { sessionChanged.depend(); return currentSessionId; },
+      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      toast,
+      openCapabilities: () => { activateView('capabilities'); setCapabilityTab('decisions'); },
+    });
+    $('crew-decision-access')?.addEventListener('click', () => {
+      const crew = CrewConfigs.findOne(selectedCrewId);
+      if (crew) decisionControls.openAgentPolicy(crew.agent);
+    });
+    executionControls = initializeExecution({
+      root: $('execution-panel'), runsRoot: $('mission-runs-root'),
+      filesRoot: $('mission-files-root'), servicesRoot: $('mission-services-root'),
+      navigateToMissionWork,
+      crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
+      missionCrew: (id) => {
+        const config = MissionConfigs.findOne(id);
+        const roster = AgentSessions.findOne(id)?.participants;
+        return CrewConfigs.find({ enabled: true, status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch()
+          .filter((agent) => agent.agent === 'orchestrator'
+            || ((!Array.isArray(config?.agents) || config.agents.includes(agent.agent))
+              && (!Array.isArray(roster) || roster.some((row) => row.kind === 'model' && row.agent === agent.agent))));
+      },
+      mission: () => { sessionChanged.depend(); return currentSessionId; },
+      missions: () => MissionConfigs.find({}, { sort: { title: 1 } }).fetch(),
+      missionTitle: (id) => MissionConfigs.findOne(id)?.title || 'Untitled mission',
+      navigateToCode: navigateToCodePermissions,
+      toast,
+    });
+    initializeMissionPreflight({
+      root: $('mission-preflight'),
+      snapshot: () => {
+        sessionChanged.depend();
+        const config = currentSessionId ? MissionConfigs.findOne(currentSessionId) : null;
+        return { missionId: currentSessionId, config,
+          crew: CrewConfigs.find({ enabled: true, status: { $ne: 'archived' } }).fetch()
+            .filter((agent) => agent.agent === 'orchestrator' || !Array.isArray(config?.agents) || config.agents.includes(agent.agent)),
+          environment: executionControls.environments.findOne({ missionId: currentSessionId }),
+          settings: executionControls.settings.findOne(Meteor.userId()), connected: Meteor.status().connected };
+      },
+      enable: (missionId) => Meteor.callAsync('constellation.execution.enableFilesystem', { missionId }),
+      openSettings: async (id, section) => { await openMissionSettings(id); requestAnimationFrame(() => $(section === 'brief' ? 'mission-config-objective' : 'mission-config-approvals')?.focus()); },
+      openCrew: () => openMissionCrew(),
+      openEnvironment: (id) => executionControls.openEnvironment(id, 'settings'),
+      openFiles: (id) => navigateToMissionWork('files', id),
+      openConnection: () => executionControls.openSettings(),
+    });
+    missionWorkNavigation = initializeMissionWorkNavigation({
+      root: $('view-missions'),
+      onChange: (context) => executionControls.setMissionWork(context),
+      onTabChange: (tab) => { $('toggle-inspector').hidden = tab !== 'chat'; },
+    });
+    missionWorkNavigation.setMission(currentSessionId);
+    missionWorkNavigation.setVisible(currentView === 'missions');
+    initializeExecutionChat({ chat, jobs: executionControls.jobs,
+      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      agentName: (agent) => CrewConfigs.findOne({ agent })?.displayName ?? agent,
+      openRun: (jobId, missionId) => executionControls.openRun(jobId, missionId),
+    });
+    $('crew-execution-access')?.addEventListener('click', () => {
+      const crew = CrewConfigs.findOne(selectedCrewId);
+      if (crew) executionControls.openAgentAccess(crew.agent);
+    });
+    initializeMissionDecisionCost({
+      root: document.querySelector('.mission-health'),
+      settings: decisionControls.settings,
+      usage: new Mongo.Collection('constellation_decision_mission_usage'),
+      mission: () => { sessionChanged.depend(); return currentSessionId; },
+    });
+    agentCapabilityControls = initializeAgentCapabilities({
+      skillsMount: $('agent-skills-content'), toolsMount: $('agent-tools-content'),
+      decisionsMount: $('agent-decision-tool-list'),
+      getSkills: () => SkillConfigs.find({}, { sort: { name: 1 } }).fetch(),
+      getTools: () => ToolCatalog.find().fetch(),
+      getServers: () => McpConfigs.find({}, { sort: { name: 1 } }).fetch(),
+      getCrew: () => CrewConfigs.find().fetch(),
+      callMethod: (name, ...args) => Meteor.callAsync(name, ...args),
+      openSkill: (id, options) => {
+        const configId = selectedCrewId;
+        const scroll = $('crew-form').querySelector('.crew-form-scroll').scrollTop;
+        const opener = document.activeElement;
+        openSkillDialog(id, options);
+        $('skill-dialog').addEventListener('close', () => {
+          if (!$('crew-dialog').open || selectedCrewId !== configId || agentDetailTab !== 'skills') return;
+          requestAnimationFrame(() => {
+            $('crew-form').querySelector('.crew-form-scroll').scrollTop = scroll;
+            const replacement = id
+              ? $('agent-skills-content').querySelector(`[data-skill-edit="${CSS.escape(id)}"]`)
+              : $('agent-skills-content').querySelector('[data-agent-create-skill]');
+            (replacement ?? (opener?.isConnected ? opener : $('agent-detail-tab-skills')))?.focus({ preventScroll: true });
+          });
+        }, { once: true });
+      },
+      openMcp: (id) => openMcpDialog(id),
+      openSkillsTab: () => setAgentDetailTab('skills', { focus: true }),
+      configureLearning: () => {
+        setAgentDetailTab('profile');
+        $('experience-learning-settings').scrollIntoView({ block: 'center' });
+        $('crew-experience-record').focus({ preventScroll: true });
+      },
+      onCounts: ({ skills }) => { $('agent-skill-count').textContent = String(skills); },
+      toast,
+    });
+    $('lab-decision-tests')?.addEventListener('click', () => decisionControls.open());
+    const operations = initializeOperations({
+      chat,
+      externalPlanTrigger: true,
+      openDecisions: (options) => decisionControls.open(options),
+      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      missionConfig,
+      defaultModel: () => bootstrap?.model,
+      crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
+      selectedMcp: () => selectedMcpId,
+      missions: () => MissionConfigs.find({ status: 'active' }, { sort: { updatedAt: -1 } }).fetch(),
+      tools: () => ToolCatalog.find().fetch(),
+      toast,
+      openChild: (sessionId, agentName) => openChildRun(sessionId, agentName),
+    });
+    // Install after Plans so both kinds of context keep the selected recipient.
+    const composerSnapshot = () => {
+      sessionChanged.depend();
+      return {
+        missionId: currentSessionId, userId: Meteor.userId(),
+        active: MissionConfigs.findOne(currentSessionId)?.status === 'active',
+        environment: executionControls.environments.findOne({ missionId: currentSessionId }),
+        settings: executionControls.settings.findOne(Meteor.userId()),
+        connected: Meteor.status().connected,
+      };
+    };
+    const chatFiles = initializeChatFileUpload({
+      chat, snapshot: composerSnapshot, externalTrigger: true,
+      upload: (input) => Meteor.callAsync('constellation.execution.uploadChatFile', input),
+      openFiles: (id, filePath) => navigateToMissionWork('files', id, { filePath, location: 'working', savePointId: null }),
+      toast,
+    });
+    initializeComposerAdd({
+      chat, snapshot: composerSnapshot, files: chatFiles,
+      listFiles: (input) => Meteor.callAsync('constellation.execution.environmentFiles', input),
+      enableFilesystem: (id) => executionControls.openEnvironment(id),
+      openPlans: (anchor) => operations.planChat.openBrowse(anchor),
+      toast,
+    });
     wireCommandPalette();
     Tracker.autorun(renderMissionState);
+    Tracker.autorun(renderMissionEnvironmentSetting);
     Tracker.autorun(renderMemory);
     Tracker.autorun(renderCrewSettings);
     Tracker.autorun(renderWorkspacePeople);

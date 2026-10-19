@@ -1,0 +1,36 @@
+.composer-add-button { display: inline-flex; align-items: center; gap: 5px; min-height: 32px; padding: 4px 8px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: var(--muted, #a9b1a5); font: inherit; font-size: 14px; cursor: pointer; }
+.composer-add-button svg { width: 17px; height: 17px; }
+.composer-add-button:hover:not(:disabled), .composer-add-button[aria-expanded="true"] { background: #ffffff09; color: var(--paper, #e9ede6); }
+.composer-add-button:disabled { opacity: .5; cursor: default; }
+.composer-add-popover { position: fixed; inset: auto; margin: 0; padding: 8px; box-sizing: border-box; overflow: auto; border: 1px solid var(--line-strong, #ffffff28); border-radius: 12px; background: #171d19; color: var(--paper, #e9ede6); box-shadow: 0 18px 60px #0008; font-size: 13px; }
+.composer-add-popover [hidden] { display: none !important; }
+.composer-add-popover button { font: inherit; color: inherit; cursor: pointer; }
+.composer-add-popover button:disabled { opacity: .48; cursor: default; }
+.composer-add-heading { display: flex; align-items: center; gap: 8px; padding: 5px 6px 9px; }
+.composer-add-heading strong { flex: 1; font-size: 14px; font-weight: 600; }
+.composer-add-heading button { display: inline-flex; justify-content: center; align-items: center; width: 28px; height: 28px; padding: 5px; background: transparent; border: 0; border-radius: 6px; }
+.composer-add-heading svg { width: 16px; height: 16px; }
+.composer-add-option { display: flex; align-items: center; gap: 12px; width: 100%; padding: 10px; border: 0; border-radius: 8px; background: transparent; text-align: left; }
+.composer-add-option > svg { flex: 0 0 20px; width: 20px; height: 20px; color: var(--muted, #a9b1a5); }
+.composer-add-option span { display: grid; gap: 4px; min-width: 0; }
+.composer-add-option strong { font-size: 14px; font-weight: 550; }
+.composer-add-option small { font-size: 12px; color: #a9b1a5; line-height: 1.4; }
+.composer-add-option:hover:not(:disabled), .composer-add-heading button:hover:not(:disabled), .composer-file-option:hover:not(:disabled) { background: #ffffff08; color: var(--signal-bright, #f0c393); }
+.composer-file-folder { display: flex; align-items: center; gap: 7px; padding: 7px 6px 10px; color: var(--muted, #a9b1a5); font-size: 12px; }
+.composer-file-folder svg { display: block; width: 16px; height: 16px; transform: rotate(90deg); }
+.composer-file-folder span { flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.composer-file-folder button, .composer-file-foot button, .composer-file-status button { flex-shrink: 0; border: 0; border-radius: 5px; background: transparent; padding: 4px; }
+.composer-file-folder button:disabled { opacity: 1; }
+.composer-add-popover input[type="search"] { width: calc(100% - 12px); height: 36px; box-sizing: border-box; margin: 0 6px 8px; padding: 7px 10px; border: 1px solid var(--line, #ffffff20); border-radius: 7px; background: #0003; color: inherit; font: inherit; font-size: 14px; }
+.composer-file-results { min-height: 90px; max-height: 270px; overflow: auto; }
+.composer-file-option { display: flex; align-items: center; gap: 9px; width: 100%; min-height: 38px; padding: 8px; border: 0; border-radius: 6px; background: transparent; text-align: left; }
+.composer-file-option svg { flex-shrink: 0; width: 17px; height: 17px; color: #a9b1a5; }
+.composer-file-option span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+.composer-file-option small { flex-shrink: 0; color: #a9b1a5; font-size: 12px; }
+.composer-file-status { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; padding: 18px 10px; margin: 0; line-height: 1.5; color: #a9b1a5; font-size: 12px; }
+.composer-file-status[role="alert"] { color: var(--signal-bright, #f0c393); }
+.composer-file-foot { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 9px 6px 3px; margin-top: 6px; border-top: 1px solid var(--line, #ffffff15); color: #a9b1a5; font-size: 12px; }
+.composer-file-spinner { width: 12px; height: 12px; flex: 0 0 12px; border: 1.5px solid #e9b87f35; border-top-color: #e9b87f; border-radius: 50%; animation: composer-add-spin .85s linear infinite; }
+.composer-add-button:focus-visible, .composer-add-popover button:focus-visible, .composer-add-popover input:focus-visible { outline: 2px solid var(--signal, #e9b87f); outline-offset: 1px; }
+@keyframes composer-add-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .composer-file-spinner { animation: none; } }

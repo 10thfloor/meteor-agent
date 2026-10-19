@@ -1,0 +1,27 @@
+.chat-upload-button { display: inline-flex; align-items: center; justify-content: center; flex-shrink: 0; width: 34px; height: 34px; padding: 7px; border: 1px solid transparent; border-radius: 8px; background: transparent; color: #bac1b7; cursor: pointer; transition: background .14s, color .14s; }
+.chat-upload-button svg { width: 18px; height: 18px; }
+.chat-upload-button:hover { background: #ffffff08; color: #f0c393; }
+.chat-upload-button:disabled { opacity: .45; cursor: not-allowed; }
+.chat-file-context { min-width: 0; padding: 0 1px 4px; }
+.chat-file-context[hidden], .chat-upload-button[hidden] { display: none; }
+.chat-file-list { display: flex; flex-wrap: wrap; gap: 7px; max-height: 180px; overflow: auto; padding: 2px; }
+.chat-file-chip { display: flex; align-items: center; flex-wrap: wrap; gap: 4px; max-width: min(100%, 440px); padding: 3px 4px; border: 1px solid #ffffff1c; border-radius: 9px; background: #ffffff04; color: var(--paper, #e9ede6); font-size: 12px; }
+.chat-file-chip button { display: inline-flex; align-items: center; gap: 7px; min-width: 0; min-height: 28px; padding: 3px 6px; border: 0; border-radius: 5px; background: transparent; color: inherit; font: inherit; cursor: pointer; }
+.chat-file-chip button:hover:not(:disabled) { background: #ffffff09; color: var(--signal-bright, #f0c393); }
+.chat-file-chip button:disabled { cursor: default; }
+.chat-file-info { flex: 1 1 auto; max-width: 380px; }
+.chat-file-info svg { flex-shrink: 0; width: 15px; height: 15px; color: #a4ad9f; }
+.chat-file-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chat-file-info small { flex-shrink: 0; color: var(--muted, #9da699); font-size: 11px; }
+.chat-file-remove { margin-left: auto; }
+.chat-file-remove svg { width: 14px; height: 14px; }
+.chat-file-status { margin: 6px 2px 0; color: var(--muted, #9da699); font-size: 11px; line-height: 1.5; }
+.chat-file-status[data-error="true"], .chat-file-error { color: var(--signal-bright, #f0c393); }
+.chat-file-error { flex-basis: 100%; padding: 0 6px 3px; max-width: 460px; line-height: 1.5; }
+.chat-file-chip input { flex: 1 1 180px; min-width: 120px; max-width: 320px; height: 30px; padding: 4px 7px; border: 1px solid var(--line, #ffffff20); border-radius: 5px; background: #0003; color: inherit; font: inherit; }
+.chat-file-chip[data-state="error"], .chat-file-chip[data-state="unknown"] { border-color: #e9b87f50; }
+.chat-file-chip[data-state="uploading"] .chat-file-info svg, .chat-file-chip[data-state="queued"] .chat-file-info svg { display: none; }
+.chat-file-chip[data-state="uploading"] .chat-file-info::before, .chat-file-chip[data-state="queued"] .chat-file-info::before { content: ''; flex-shrink: 0; width: 12px; height: 12px; border: 1.5px solid #e9b87f35; border-top-color: #e9b87f; border-radius: 50%; animation: chat-file-spin .85s linear infinite; }
+.chat-upload-button:focus-visible, .chat-file-chip button:focus-visible, .chat-file-chip input:focus-visible { outline: 2px solid #e9b87f; outline-offset: 1px; }
+@keyframes chat-file-spin { to { transform: rotate(360deg); } }
+@media (prefers-reduced-motion: reduce) { .chat-upload-button { transition: none; } .chat-file-info::before { animation: none !important; } }

@@ -48,6 +48,10 @@
             <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M4 5.5h16v10H8l-4 3v-13Z"/><path d="M8 9h8M8 12h5"/></svg>
             <span>Channels</span>
           </button>
+          <button class="rail-button" type="button" data-view="lab" aria-label="Evaluation Lab">
+            <svg viewBox="0 0 24 24" aria-hidden="true"><path d="M9 3h6M10 3v7l-6 9a1 1 0 0 0 1 2h14a1 1 0 0 0 1-2l-6-9V3M8 15h8"/></svg>
+            <span>Lab</span>
+          </button>
         </div>
         <div class="rail-bottom">
           <button class="avatar-button" id="profile-button" type="button" aria-label="Local workspace account" title="Local workspace account" aria-haspopup="dialog" aria-controls="account-dialog">
@@ -98,6 +102,7 @@
               </div>
             </div>
             <div class="mission-actions">
+              <button class="toolbar-button" id="open-mission-plan" type="button" aria-haspopup="dialog" aria-controls="mission-plan-dialog">Plan &amp; runs</button>
               <button class="toolbar-button" id="configure-mission" type="button" title="Configure mission" aria-haspopup="dialog" aria-controls="mission-dialog" data-loading="false" data-loading-label="Loading">
                 <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M3 5h8M15 5h2M3 10h2M9 10h8M3 15h6M13 15h4"/><circle cx="13" cy="5" r="2"/><circle cx="7" cy="10" r="2"/><circle cx="11" cy="15" r="2"/></svg>
                 Mission settings
@@ -124,7 +129,13 @@
             </div>
           </div>
 
-          <div class="mission-workspace">
+          <nav class="mission-work-tabs" role="tablist" aria-label="Mission work">
+            <button id="mission-tab-chat" type="button" role="tab" data-mission-work-tab="chat" aria-selected="true" aria-controls="mission-work-chat">Chat</button>
+            <button id="mission-tab-files" type="button" role="tab" data-mission-work-tab="files" aria-selected="false" aria-controls="mission-work-files" tabindex="-1">Files</button>
+            <button id="mission-tab-runs" type="button" role="tab" data-mission-work-tab="runs" aria-selected="false" aria-controls="mission-work-runs" tabindex="-1">Code runs</button>
+            <button id="mission-tab-services" type="button" role="tab" data-mission-work-tab="services" aria-selected="false" aria-controls="mission-work-services" tabindex="-1">Services</button>
+          </nav>
+          <div class="mission-workspace" id="mission-work-chat" role="tabpanel" data-mission-work-panel="chat" aria-labelledby="mission-tab-chat">
             <section class="conversation-pane">
               <div class="conversation-context">
                 <div class="context-copy">
@@ -146,20 +157,17 @@
                 </div>
               </div>
               <div class="chat-stage">
-                <agent-chat id="mission-chat" agent="orchestrator" placeholder="Give Atlas an outcome, or type @ to address a specialist…">
+                <agent-chat id="mission-chat" agent="orchestrator" composer-layout="panel" multiline placeholder="Write a message…">
                   <span slot="header" class="chat-header-label">LIVE TRANSCRIPT</span>
                 </agent-chat>
-                <div class="chat-mode-control" id="chat-mode-control" data-mode="ask" role="group" aria-label="Message mode">
-                  <button class="active" id="chat-mode-ask" type="button" aria-pressed="true" title="Send to Atlas">Ask Atlas</button>
-                  <button id="chat-mode-note" type="button" aria-pressed="false" title="Post without starting an agent turn">Crew note</button>
-                  <span id="chat-mode-hint">Starts an agent turn</span>
-                </div>
                 <div class="mission-empty" id="mission-empty">
                   <div class="empty-signal" aria-hidden="true">
                     <span class="signal-core"></span><span class="signal-ring one"></span><span class="signal-ring two"></span>
                   </div>
                   <h3>New mission</h3>
-                  <p>Enter an objective or choose a workflow.</p>
+                  <p>Start with a message. Set up only what you need.</p>
+                  <section class="mission-preflight" id="mission-preflight" aria-label="Mission preflight"></section>
+                  <details class="mission-starters"><summary>Try a prompt</summary>
                   <div class="starter-grid">
                     <button class="starter-card" type="button" data-prompt="Build a launch plan for a privacy-first team knowledge product. Research the market, pressure-test the positioning, and prepare a brief for my approval." data-loading="false" data-loading-label="Starting">
                       <span class="starter-icon amber"><svg viewBox="0 0 20 20"><path d="m10 2 2.2 5.8L18 10l-5.8 2.2L10 18l-2.2-5.8L2 10l5.8-2.2L10 2Z"/></svg></span>
@@ -182,6 +190,7 @@
                       <b>↗</b>
                     </button>
                   </div>
+                  </details>
                 </div>
               </div>
             </section>
@@ -227,6 +236,27 @@
                       </div>
                     </div>
                     <p class="health-totals"><span>Tokens</span><b><strong id="usage-tokens">0</strong><span id="usage-token-split"></span></b></p>
+                    <button class="health-cost-tile" data-jev-cost-tile type="button" hidden aria-expanded="false" aria-controls="mission-jev-cost-detail" title="View Jev cost details">
+                      <strong data-jev-cost-value>…</strong><span>Jev cost · est.</span><small data-jev-cost-note hidden></small><i aria-hidden="true">i</i>
+                    </button>
+                    <section id="mission-jev-cost-detail" class="health-cost-detail" data-jev-cost-detail aria-label="Jev cost breakdown" hidden>
+                      <p class="health-cost-message" data-jev-cost-message hidden></p>
+                      <div data-jev-cost-breakdown hidden>
+                        <h3>Estimated Jev cost</h3>
+                        <p class="health-cost-amount"><strong data-jev-cost-amount></strong> <span data-jev-cost-currency>USD</span></p>
+                        <dl class="health-cost-usage">
+                          <div><dt>Evaluations</dt><dd data-jev-evaluations></dd></div>
+                          <div><dt>Input tokens</dt><dd data-jev-input></dd></div>
+                          <div><dt>Output tokens</dt><dd data-jev-output></dd></div>
+                        </dl>
+                        <div class="health-cost-pricing">
+                          <h4>Jev 1.13 · list price</h4>
+                          <dl><div><dt>1M input tokens</dt><dd>$0.042</dd></div><div><dt>Output tokens</dt><dd>Free</dd></div></dl>
+                        </div>
+                        <ul class="health-cost-notices" data-jev-cost-notices hidden></ul>
+                        <p class="health-cost-footnote">Not included in your model-spend limit. Final charges are set by TypeSafe.</p>
+                      </div>
+                    </section>
                   </section>
                   <section class="inspector-section">
                     <div class="section-heading"><span>CHANNELS <b class="section-count" id="mission-surface-count" title="Channel conversations on this Mission" hidden>0</b></span><button type="button" data-view-link="channels">Channel settings</button></div>
@@ -235,14 +265,18 @@
                   </section>
                 </div>
                 <div class="inspector-tab-panel" id="inspector-panel-activity" data-inspector-panel="activity" role="tabpanel" aria-labelledby="inspector-tab-activity" hidden>
+                  <button id="view-all-agent-work" class="agent-work-history-button" type="button" aria-haspopup="dialog" aria-controls="agent-work-dialog">View all agent work <span aria-hidden="true">↗</span></button>
                   <section class="inspector-section">
-                    <div class="section-heading"><span>EXECUTION TRACE</span><span class="trace-live"><i></i> LIVE</span></div>
+                    <div class="section-heading"><span>ACTIVITY</span><button id="open-mission-evidence" type="button" aria-haspopup="dialog" aria-controls="mission-plan-dialog">View evidence</button></div>
                     <div class="activity-feed" id="activity-feed"></div>
                   </section>
                 </div>
               </div>
             </aside>
           </div>
+          <section class="mission-work-panel" id="mission-work-files" role="tabpanel" data-mission-work-panel="files" aria-labelledby="mission-tab-files" hidden><div id="mission-files-root"></div></section>
+          <section class="mission-work-panel" id="mission-work-runs" role="tabpanel" data-mission-work-panel="runs" aria-labelledby="mission-tab-runs" hidden><div id="mission-runs-root"></div></section>
+          <section class="mission-work-panel" id="mission-work-services" role="tabpanel" data-mission-work-panel="services" aria-labelledby="mission-tab-services" hidden><div id="mission-services-root"></div></section>
         </section>
 
         <section class="view-panel page-view" id="view-automations" data-view-panel="automations">
@@ -316,8 +350,14 @@
                 <button class="primary-action" id="add-skill" type="button">+ New skill</button>
               </div>
               <div class="page-header-actions" data-capability-actions="mcp" hidden>
+                <button class="secondary-action" id="open-federation" type="button" aria-haspopup="dialog" aria-controls="federation-dialog">Share access</button>
                 <button class="secondary-action" id="refresh-mcp-servers" type="button" data-loading="false" data-loading-label="Checking">Check all servers</button>
                 <button class="primary-action" id="add-mcp-server" type="button">+ Add server</button>
+              </div>
+              <div class="page-header-actions" data-capability-actions="decisions" hidden>
+                <button class="secondary-action" id="decision-agent-access" type="button" aria-haspopup="dialog">Agent access</button>
+                <button class="secondary-action" id="decision-connection" type="button" aria-haspopup="dialog">Jev connection</button>
+                <button class="primary-action" id="decision-new" type="button" aria-haspopup="dialog">+ New decision</button>
               </div>
             </div>
           </header>
@@ -327,6 +367,8 @@
               <button class="active" id="capability-tab-tools" type="button" role="tab" aria-selected="true" aria-controls="capability-panel-tools" data-capability-tab="tools"><span>Tools</span><b id="tool-tab-count">0</b></button>
               <button id="capability-tab-skills" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-skills" data-capability-tab="skills" tabindex="-1"><span>Skills</span><b id="skill-tab-count">0</b></button>
               <button id="capability-tab-mcp" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-mcp" data-capability-tab="mcp" tabindex="-1"><span>MCP servers</span><b id="mcp-tab-count">0</b></button>
+              <button id="capability-tab-decisions" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-decisions" data-capability-tab="decisions" tabindex="-1"><span>Decisions</span><b id="decision-tab-count">0</b></button>
+              <button id="capability-tab-execution" type="button" role="tab" aria-selected="false" aria-controls="capability-panel-execution" data-capability-tab="execution" tabindex="-1"><span>Code</span></button>
             </div>
             <label class="capability-search-field">
               <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 3.5 3.5"/></svg>
@@ -349,6 +391,11 @@
             <div class="control-stat"><span>Servers</span><strong id="mcp-server-count">0</strong></div>
             <div class="control-stat"><span>Ready</span><strong id="mcp-ready-count">0</strong></div>
             <div class="control-stat"><span>Needs attention</span><strong id="mcp-attention-count">0</strong></div>
+          </div>
+          <div class="control-summary capability-summary" data-capability-summary="decisions" aria-label="Decision status" hidden>
+            <div class="control-stat"><span>Enabled</span><strong id="decision-enabled-count">0</strong></div>
+            <div class="control-stat"><span>Awaiting approval</span><strong id="decision-pending-count">0</strong></div>
+            <div class="control-stat"><span>Jev connection</span><strong id="decision-provider-state">Checking…</strong></div>
           </div>
 
           <div class="capability-panels">
@@ -377,7 +424,7 @@
                     <dl class="detail-metrics"><div><dt>Agent access</dt><dd id="tool-detail-agents">—</dd></div><div><dt>Approval</dt><dd id="tool-detail-approval">—</dd></div></dl>
                     <section class="detail-section tool-availability-section">
                       <div class="detail-section-heading"><strong>Availability</strong><button id="open-tool-source" type="button">Manage access</button></div>
-                      <dl class="tool-provenance"><div><dt>Provided by</dt><dd id="tool-detail-provider">—</dd></div><div><dt>Assigned through</dt><dd id="tool-detail-assignment">—</dd></div><div><dt>Why available</dt><dd id="tool-detail-why">—</dd></div></dl>
+                      <dl class="tool-provenance"><div><dt>Provided by</dt><dd id="tool-detail-provider">—</dd></div><div><dt>Assigned through</dt><dd id="tool-detail-assignment">—</dd></div><div><dt>Requirements</dt><dd id="tool-detail-why">—</dd></div></dl>
                       <div class="tool-agent-list" id="tool-detail-agent-list" aria-label="Agents with access"></div>
                     </section>
                     <section class="detail-section"><div class="detail-section-heading"><strong>Input schema</strong><button id="copy-tool-schema" type="button" data-loading="false" data-loading-label="Copying">Copy</button></div><pre id="tool-detail-schema">{}</pre></section>
@@ -388,10 +435,17 @@
             </section>
 
             <section class="capability-panel" id="capability-panel-skills" role="tabpanel" aria-labelledby="capability-tab-skills" data-capability-panel="skills" hidden>
-              <div class="capability-panel-toolbar"><div><strong>Instruction packs</strong><span>Enabled skills load for assigned agents with Skill access.</span></div><span class="panel-count" id="skill-panel-count">0 skills</span></div>
+              <div class="capability-panel-toolbar"><div><strong>Instruction packs</strong><span>Assign skills here or in an agent’s Skills tab.</span></div><span class="panel-count" id="skill-panel-count">0 skills</span></div>
               <div class="capability-grid" id="capability-grid" aria-live="polite"></div>
             </section>
 
+            <section class="capability-panel decisions-view" id="capability-panel-decisions" role="tabpanel" aria-labelledby="capability-tab-decisions" data-capability-panel="decisions" hidden>
+              <div class="capability-panel-toolbar"><div><strong>Reusable judgments</strong><span>Use decisions to choose an action, check evidence, or score options.</span></div><label class="compact-select"><span>Show</span><select id="decision-scope-filter"><option value="all">All decisions</option><option value="workspace">Workspace</option><option value="mission">Current mission</option><option value="pending">Awaiting approval</option><option value="archived">Removed decisions</option></select></label></div>
+              <div id="decision-page-notice"></div>
+              <div class="decision-layout"><div id="decision-list" class="decision-list" aria-label="Decisions"></div><section id="decision-detail" class="decision-detail" aria-label="Selected decision" tabindex="0"></section></div>
+            </section>
+
+            <section class="capability-panel" id="capability-panel-execution" role="tabpanel" aria-labelledby="capability-tab-execution" data-capability-panel="execution" hidden><div id="execution-panel"></div></section>
             <section class="capability-panel" id="capability-panel-mcp" role="tabpanel" aria-labelledby="capability-tab-mcp" data-capability-panel="mcp" hidden>
               <div class="capability-panel-toolbar"><div><strong>External tool providers</strong><span>Local stdio processes.</span></div><span class="mcp-health-summary" id="mcp-health-summary" data-mcp-state="not-tested"><i aria-hidden="true"></i><span>Not tested</span></span></div>
               <div class="capability-master-detail mcp-server-layout">
@@ -403,7 +457,7 @@
                   <div class="capability-detail-empty" id="mcp-detail-empty"><span class="detail-glyph mcp" aria-hidden="true">M</span><strong>Select a server</strong><span>View tools, access, and diagnostics.</span></div>
                   <div class="mcp-detail-content" id="mcp-detail-content" hidden>
                     <header class="mcp-detail-header"><div><span class="source-badge">WORKSPACE MCP</span><h3 id="mcp-detail-name">Server</h3><code id="mcp-detail-id">server-id</code></div><span class="mcp-status" id="mcp-detail-status" data-mcp-state="not-tested" role="status"><i aria-hidden="true"></i><span>Not tested</span></span></header>
-                    <div class="mcp-detail-actions"><button id="test-mcp-server" type="button" data-loading="false" data-loading-label="Testing">Test &amp; refresh tools</button><button id="edit-mcp-server" type="button">Configure</button></div>
+                    <div class="mcp-detail-actions"><button id="test-mcp-server" type="button" data-loading="false" data-loading-label="Testing">Test &amp; refresh tools</button><button id="edit-mcp-server" type="button">Configure</button><button id="browse-mcp-content" type="button" aria-haspopup="dialog" aria-controls="mcp-content-dialog">Resources &amp; prompts</button></div>
                     <div class="mcp-detail-tabs" role="tablist" aria-label="Server detail">
                       <button class="active" id="mcp-detail-tab-overview" type="button" role="tab" aria-selected="true" aria-controls="mcp-detail-panel-overview" data-mcp-detail-tab="overview">Overview</button><button id="mcp-detail-tab-tools" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-tools" data-mcp-detail-tab="tools" tabindex="-1">Tools <b id="mcp-detail-tool-count">0</b></button><button id="mcp-detail-tab-access" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-access" data-mcp-detail-tab="access" tabindex="-1">Access</button><button id="mcp-detail-tab-diagnostics" type="button" role="tab" aria-selected="false" aria-controls="mcp-detail-panel-diagnostics" data-mcp-detail-tab="diagnostics" tabindex="-1">Diagnostics</button>
                     </div>
@@ -436,6 +490,10 @@
             <div class="channel-list-body" id="channel-list" aria-live="polite"></div>
           </div>
         </section>
+        <section class="view-panel page-view operations-lab" id="view-lab" data-view-panel="lab">
+          <header class="page-header"><div><p class="eyebrow page-scope">Workspace</p><h2>Evaluation Lab</h2></div><div class="page-header-actions"><button class="secondary-action" id="lab-decision-tests" type="button">Test decisions</button><button class="primary-action" id="lab-new-scenario" type="button">+ New scenario</button></div></header>
+          <div id="lab-root"></div>
+        </section>
       </main>
     </div>
   </div>
@@ -448,6 +506,7 @@
       <button type="button" data-command="view:memory"><i>◇</i><span><strong>Memory</strong></span></button>
       <button type="button" data-command="view:capabilities"><i>◈</i><span><strong>Capabilities</strong></span></button>
       <button type="button" data-command="view:channels"><i>∷</i><span><strong>Channels</strong></span></button>
+      <button type="button" data-command="view:lab"><i>✓</i><span><strong>Evaluation Lab</strong></span></button>
     </div>
     <div class="command-group"><span>Actions</span>
       <button type="button" data-command="new"><i>＋</i><span><strong>New mission</strong></span><kbd>⌘ N</kbd></button>
@@ -455,9 +514,9 @@
     </div>
   </dialog>
 
-  <dialog class="run-dialog" id="run-dialog">
+  <dialog class="run-dialog" id="run-dialog" aria-labelledby="run-dialog-title">
     <header>
-      <div><p class="eyebrow">DELEGATED RUN</p><h2 id="run-dialog-title">Specialist trace</h2></div>
+      <div><button id="back-agent-work" class="run-back-button" type="button" hidden>← Back</button><p class="eyebrow">AGENT WORK</p><h2 id="run-dialog-title" tabindex="-1">Agent conversation</h2></div>
       <div class="run-dialog-controls">
         <div class="agent-work-state run-runtime-state" id="run-runtime-state" data-agent-state="loading" data-runtime-phase="idle" role="status" aria-live="polite" aria-atomic="true">
           <span class="work-state-visual" aria-hidden="true"><i></i><i></i><i></i></span>
@@ -466,6 +525,7 @@
         <button id="close-run-dialog" type="button" aria-label="Close">×</button>
       </div>
     </header>
+    <section id="run-handoff-context" class="run-handoff-context" aria-label="Assignment and returned result"></section>
     <div id="child-chat-mount" class="child-chat-mount" data-agent-state="loading" aria-busy="true"></div>
   </dialog>
 
@@ -531,6 +591,13 @@
             <label class="mission-control-option"><input id="mission-config-continuity" name="continuity" type="checkbox"><span><strong>Restore after restart</strong><small>Reopen if this was your last mission</small></span></label>
             <label class="mission-control-option"><input id="mission-config-approvals" name="approvals" type="checkbox"><span><strong>Require approval for mission-controlled actions</strong><small id="mission-config-approvals-hint">Other tool approval policies stay unchanged</small></span></label>
             <label class="mission-control-option"><input id="mission-config-debug-traces" name="debugTraces" type="checkbox"><span><strong>Show debug traces</strong><small>Include raw tool payloads in transcripts</small></span></label>
+          </div>
+        </fieldset>
+        <fieldset class="form-section mission-environment-section">
+          <legend>Mission filesystem</legend>
+          <div class="mission-environment-setting">
+            <div><strong id="mission-environment-summary">Off</strong><p id="mission-environment-hint">Store shared files in a mission Sprite. Sprites usage charges apply.</p></div>
+            <button id="mission-environment-settings" class="secondary-action" type="button" aria-haspopup="dialog">Configure filesystem</button>
           </div>
         </fieldset>
       </div>
@@ -614,6 +681,8 @@
             </div>
             <div class="agent-detail-tabs" role="tablist" aria-label="Agent configuration">
               <button class="active" id="agent-detail-tab-profile" type="button" data-agent-detail-tab="profile" role="tab" aria-selected="true" aria-controls="agent-detail-panel-profile">Profile</button>
+              <button id="agent-detail-tab-skills" type="button" data-agent-detail-tab="skills" role="tab" aria-selected="false" aria-controls="agent-detail-panel-skills" tabindex="-1">Skills <span id="agent-skill-count">0</span></button>
+              <button id="agent-detail-tab-tools" type="button" data-agent-detail-tab="tools" role="tab" aria-selected="false" aria-controls="agent-detail-panel-tools" tabindex="-1">Tools</button>
               <button id="agent-detail-tab-constitution" type="button" data-agent-detail-tab="constitution" role="tab" aria-selected="false" aria-controls="agent-detail-panel-constitution" tabindex="-1">Constitution</button>
               <button id="agent-detail-tab-experience" type="button" data-agent-detail-tab="experience" role="tab" aria-selected="false" aria-controls="agent-detail-panel-experience" tabindex="-1">Experience <span id="agent-experience-count">0</span></button>
               <button id="agent-detail-tab-practices" type="button" data-agent-detail-tab="practices" role="tab" aria-selected="false" aria-controls="agent-detail-panel-practices" tabindex="-1">Practices <span id="agent-practice-count">0</span></button>
@@ -639,14 +708,6 @@
                   <label><span>Spend cap</span><div class="money-input"><span>$</span><input id="crew-spend" type="number" min="0" max="100" step="0.25" required></div></label>
                 </div>
               </fieldset>
-              <fieldset class="form-section">
-                <legend>Capabilities</legend>
-                <div class="capability-checks">
-                  <label><input id="crew-cap-inspect" type="checkbox"><span><strong>Workspace state</strong><small>inspect_workspace</small></span></label>
-                  <label><input id="crew-cap-memory" type="checkbox"><span><strong>Fact memory</strong><small>Personal + shared work</small></span></label>
-                  <label><input id="crew-cap-publish" type="checkbox"><span><strong>Publish brief</strong><small>Approval gated</small></span></label>
-                </div>
-              </fieldset>
               <fieldset class="form-section agent-learning-controls" aria-describedby="crew-learning-next-turn-note">
                 <legend>Learning</legend>
                 <div class="learning-policy-groups">
@@ -655,6 +716,7 @@
                     <div class="capability-checks learning-checks">
                       <label><input id="crew-experience-record" type="checkbox" aria-describedby="crew-experience-record-hint" aria-controls="crew-experience-automatic"><span><strong>Capture new experience</strong><small id="crew-experience-record-hint">Agent can add Experience records</small></span></label>
                       <label><input id="crew-experience-recall" type="checkbox" aria-describedby="crew-experience-recall-hint" aria-controls="crew-experience-recent"><span><strong>Use experience in turns</strong><small id="crew-experience-recall-hint">Recall is frozen for each turn</small></span></label>
+                      <label><input id="crew-experience-reflect" type="checkbox"><span><strong>Reflect after replies</strong><small>Use the agent’s model to look for lessons. Uses extra tokens.</small></span></label>
                     </div>
                     <div class="capability-checks learning-policy-checks">
                       <label id="crew-experience-automatic-control"><input id="crew-experience-automatic" type="checkbox" aria-describedby="crew-experience-automatic-hint"><span><strong>Save without prior approval</strong><small id="crew-experience-automatic-hint">Off: ask in chat before saving</small></span></label>
@@ -681,13 +743,42 @@
               </fieldset>
             </section>
 
+            <section class="agent-detail-panel" id="agent-detail-panel-skills" data-agent-detail-panel="skills" role="tabpanel" aria-labelledby="agent-detail-tab-skills" hidden>
+              <div id="agent-skills-content"></div>
+            </section>
+
+            <section class="agent-detail-panel" id="agent-detail-panel-tools" data-agent-detail-panel="tools" role="tabpanel" aria-labelledby="agent-detail-tab-tools" hidden>
+              <section class="agent-owned-tools" aria-labelledby="agent-owned-tools-title">
+                <header><h3 id="agent-owned-tools-title">Built-in tools</h3><span>Save changes to apply</span></header>
+                <div class="agent-tool-switches">
+                  <label class="agent-tool-switch"><input id="crew-cap-inspect" type="checkbox" aria-describedby="crew-inspect-state"><span><strong>Workspace inspection</strong><small>Read mission and workspace state</small></span><span class="agent-tool-access-state" id="crew-inspect-state">Access off</span></label>
+                  <label class="agent-tool-switch"><input id="crew-cap-publish" type="checkbox" aria-describedby="crew-publish-state"><span><strong>Publish brief</strong><small>Mission approval rules still apply</small></span><span class="agent-tool-access-state" id="crew-publish-state">Access off</span></label>
+                  <label class="agent-tool-switch"><input id="crew-cap-files" type="checkbox" aria-describedby="crew-files-state"><span><strong>Mission files</strong><small>Read attachments and use permitted mission filesystems. Deletion always asks for confirmation.</small></span><span class="agent-tool-access-state" id="crew-files-state">Available</span></label>
+                  <div class="agent-memory-tool">
+                    <label class="agent-tool-switch"><input id="crew-cap-memory" type="checkbox" aria-describedby="crew-memory-hint crew-memory-state"><span><strong>Fact memory</strong><small id="crew-memory-hint">Save, search, and forget facts in mission chat; not in delegated work</small></span><span class="agent-tool-access-state" id="crew-memory-state">Access off</span></label>
+                    <button class="secondary-action" id="crew-memory-source" type="button" hidden>Manage inherited access</button>
+                  </div>
+                </div>
+              </section>
+              <section class="agent-owned-tools agent-decision-tools" aria-labelledby="agent-decision-tools-title">
+                <header><h3 id="agent-decision-tools-title">Jev decisions</h3><button class="secondary-action" id="crew-decision-access" type="button" aria-haspopup="dialog" aria-describedby="crew-decision-summary">Manage decision access</button></header>
+                <p class="op-hint" id="crew-decision-summary" aria-live="polite">Use: Off · Create: Off</p>
+                <div id="agent-decision-tool-list"></div>
+              </section>
+              <div id="agent-tools-content"></div>
+              <section class="agent-owned-tools" aria-labelledby="agent-execution-tools-title">
+                <header><h3 id="agent-execution-tools-title">Run code</h3><button class="secondary-action" id="crew-execution-access" type="button" aria-describedby="crew-execution-summary">View in Capabilities ↗</button></header>
+                <p class="op-hint" id="crew-execution-summary" aria-live="polite">Disabled</p>
+              </section>
+            </section>
+
             <section class="agent-detail-panel" id="agent-detail-panel-constitution" data-agent-detail-panel="constitution" role="tabpanel" aria-labelledby="agent-detail-tab-constitution" hidden>
               <div class="learning-panel-state" id="constitution-loading" role="status"><span>Loading constitution…</span></div>
               <div id="constitution-content" hidden>
                 <header class="learning-panel-header"><div><h3>Current constitution</h3><span id="constitution-version">No version</span></div><span class="learning-status" id="constitution-state">None</span></header>
                 <div class="constitution-current"><p id="constitution-current-body"></p></div>
                 <details class="learning-compose constitution-compose" id="constitution-compose">
-                  <summary class="learning-compose-summary"><span><strong>Revise constitution</strong><small id="constitution-draft-state">Publish a new version while preserving history.</small></span><i aria-hidden="true">+</i></summary>
+                  <summary class="learning-compose-summary"><span><strong>Revise constitution</strong><small id="constitution-draft-state">Publish a new version while preserving history.</small></span><i aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M4 8h8"/><path class="learning-compose-icon-vertical" d="M8 4v8"/></svg></i></summary>
                   <div class="learning-compose-body">
                     <label><span>New version</span><textarea id="constitution-body" maxlength="2000" rows="8"></textarea></label>
                     <label><span>Reason</span><input id="constitution-reason" type="text" maxlength="500" placeholder="Required"></label>
@@ -711,7 +802,7 @@
               <div id="practices-content" hidden>
                 <header class="learning-panel-header"><div><h3>Practices</h3><span id="practices-summary">0 active</span></div><div class="learning-panel-policy"><span class="learning-policy-badge" id="practice-policy-badge">Agent proposals off</span><button type="button" data-learning-configure="practice" aria-label="Configure Practice learning">Configure</button></div></header>
                 <details class="learning-compose practice-compose" id="practice-compose">
-                  <summary class="learning-compose-summary"><span><strong>New practice</strong><small id="practice-draft-state">Add reusable guidance from selected Experience.</small></span><i aria-hidden="true">+</i></summary>
+                  <summary class="learning-compose-summary"><span><strong>New practice</strong><small id="practice-draft-state">Add reusable guidance from selected Experience.</small></span><i aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M4 8h8"/><path class="learning-compose-icon-vertical" d="M8 4v8"/></svg></i></summary>
                   <div class="learning-compose-body">
                     <div class="form-grid two">
                       <label><span>Key</span><input id="practice-key" type="text" maxlength="128" placeholder="e.g. verify-before-publish"></label>
@@ -911,6 +1002,7 @@
             <span class="switch"><input id="skill-enabled" type="checkbox" aria-describedby="skill-enabled-hint" checked><span aria-hidden="true"></span></span>
           </label>
         </div>
+        <p id="skill-shared-edit-hint" class="shared-editor-hint" role="note" hidden></p>
         <label class="form-field form-field-first"><span>Name</span><input id="skill-name" type="text" maxlength="80" autocomplete="off" required></label>
         <label class="form-field"><span>Description</span><textarea id="skill-description" class="compact-textarea" rows="3" maxlength="280" required></textarea></label>
         <label class="form-field"><span>Instructions</span><textarea id="skill-instructions" class="code-editor" rows="14" maxlength="16000" spellcheck="false" required></textarea></label>
