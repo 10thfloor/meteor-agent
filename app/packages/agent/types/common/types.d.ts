@@ -130,6 +130,25 @@ export interface AgentSession {
         sessionId: string;
         seq: number;
     };
+    /** Thread sessions: a fork of `sessionId` opened on one message
+     *  (`messageId`) and cut at `seq`, the end of that message's tool batch.
+     *  A thread is a root like any fork, but it is listed with its parent
+     *  (`agent.threads`), not in `agent.sessions`, and is erased with it.
+     *  `replies` counts user rows and turn-final assistant rows after the cut;
+     *  `repliers` lists the models that answered there. Both move in the same
+     *  transaction as the rows they count. */
+    thread?: {
+        sessionId: string;
+        seq: number;
+        messageId: string;
+        /** The anchor's seq. Its copy in the thread keeps this seq (copies get
+         *  new `_id`s), and it is below `seq` when the anchor opened a tool
+         *  batch. Pass it as `<agent-chat from-seq>` to show just the thread. */
+        anchorSeq: number;
+        replies: number;
+        lastReplyAt?: Date;
+        repliers: string[];
+    };
     /** Subagent hop count. Absent (0) on root; refused past `MAX_SUBAGENT_DEPTH`. */
     depth?: number;
     /** Channel-originated sessions: origin surface and identity assurance level.
@@ -270,6 +289,12 @@ export interface AgentMessage {
     /** Addressee participant id — selects which model answers. Assistant rows
      *  addressing a model are internal deliberation (channel delivery skips them). */
     to?: string;
+    /** User rows sent with "Reply in thread": the thread that answers this row.
+     *  The session it sits in shows it to its model as already answered. */
+    threadSessionId?: string;
+    /** User rows copied into a parent from one of its threads ("Also send to
+     *  the topic"). Context for the parent's model, never a request. */
+    fromThreadSessionId?: string;
     createdAt: Date;
 }
 export type DeltaKind = 'text' | 'thinking' | 'tool_args' | 'tool_output';

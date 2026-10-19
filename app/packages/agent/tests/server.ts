@@ -29,6 +29,7 @@ import './mcp.test';
 import './mcp-catalogs.test';
 import './skills.test';
 import './fork.test';
+import './threads.test';
 import './candidates.test';
 import './watcher.test';
 import './channels.test';

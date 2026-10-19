@@ -76,6 +76,17 @@ export async function ensureIndexes(): Promise<void> {
       name: MESSAGE_RESERVATIONS_NAME,
       keys: { createdAt: 1, _id: 1 },
     },
+    // One thread per message: concurrent opens converge on the first insert.
+    // Also serves `agent.threads` (prefix) and erase's thread cascade.
+    {
+      collection: AgentSessions,
+      name: NAMES.sessions,
+      keys: { 'thread.sessionId': 1, 'thread.messageId': 1 },
+      options: {
+        unique: true,
+        partialFilterExpression: { 'thread.sessionId': { $exists: true } },
+      },
+    },
     // Membership lookups (§4.2): multikey on participants.userId.
     {
       collection: AgentSessions,
@@ -211,6 +222,13 @@ export async function ensureIndexes(): Promise<void> {
           `[10thfloor:agent] could not verify the seven-day admission replay retention index. `
           + 'The existing index and records were left in place; check listIndexes/createIndex/collMod permissions '
           + `and retry startup. Error kind: ${errorKind}`,
+        );
+      } else if (spec.options?.unique && spec.name === NAMES.sessions) {
+        console.warn(
+          `[10thfloor:agent] could not create the UNIQUE ${spec.name} index `
+          + `${JSON.stringify(spec.keys)} — two people opening a thread on the same `
+          + 'message at once may get two threads until this builds. Remove duplicate '
+          + `threads for a message and restart. Error kind: ${errorKind}`,
         );
       } else if (spec.options?.unique) {
         console.warn(

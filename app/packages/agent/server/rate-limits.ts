@@ -10,9 +10,9 @@ interface RateLimitEntry {
 interface AgentPackageSettings {
   rateLimit?: {
     sends?: RateLimitEntry;
-    /** `agent.start` AND `agent.fork` — both create a session, and the fork
-     *  additionally copies a whole transcript. One entry, two methods; see
-     *  `applyRateLimits`. */
+    /** `agent.start`, `agent.fork` and `agent.thread` — all create a session,
+     *  and a fork or thread additionally copies a whole transcript. One
+     *  entry, three methods; see `applyRateLimits`. */
     starts?: RateLimitEntry;
     /** `agent.interrupt` — unauthenticated-reachable write; unlimited, it
      *  becomes a write amplifier or a cancel-faster-than-start loop. */
@@ -85,6 +85,8 @@ export function applyRateLimits(settings: unknown): number {
     // Fork shares the `starts` budget — it creates a session too, and a
     // separate knob would let it bypass the start limit.
     added += addRuleFor(NAMES.mFork, rateLimit.starts, 'starts');
+    // Opening a thread creates a session the same way.
+    added += addRuleFor(NAMES.mThread, rateLimit.starts, 'starts');
   }
   if (rateLimit.interrupts) {
     added += addRuleFor(NAMES.mInterrupt, rateLimit.interrupts, 'interrupts');

@@ -69,7 +69,10 @@ export {
 } from '../common/collections';
 export { mergeView } from '../common/merge';
 // `Agent.provider` / `Agent.compact` are the public doors; internals stay unexported.
-export { Agent, type AgentConfig, type SessionErasure } from './agent';
+export {
+  Agent, type AgentConfig, type AgentSendOptions, type SessionErasure,
+} from './agent';
+export type { ThreadSendResult } from './methods';
 export {
   abandonPendingAgentTurns, type AbandonedAgentTurns,
 } from './session-lifecycle';

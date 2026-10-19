@@ -146,7 +146,9 @@ export async function abandonPendingAgentTurns(
   throw new Error('[10thfloor:agent] pending Agent turns did not quiesce');
 }
 
-/** Graph truth is `parent.sessionId`; `activeChild` is only a live hint. */
+/** Graph truth is `parent.sessionId` plus `thread.sessionId` (a thread goes
+ * with the message it answers; a plain fork does not); `activeChild` is only
+ * a live hint. */
 async function sessionTree(rootId: string): Promise<AgentSession[]> {
   const found = new Map<string, AgentSession>();
   let frontier = [rootId];
@@ -157,6 +159,7 @@ async function sessionTree(rootId: string): Promise<AgentSession[]> {
       $or: [
         { _id: { $in: frontier } },
         { 'parent.sessionId': { $in: frontier } },
+        { 'thread.sessionId': { $in: frontier } },
       ],
     }).fetchAsync();
     const next: string[] = [];
@@ -274,7 +277,8 @@ async function purge(rootId: string, rows: AgentSession[]): Promise<void> {
   );
 
   // Root last: a durable fence remains visible until every dependent store is
-  // gone. Forks survive because lineage is not a parent relationship.
+  // gone. Forks survive because lineage is not a parent relationship; threads
+  // do not, because they are part of the conversation being erased.
   const childIds = ids.filter((id) => id !== rootId);
   if (childIds.length > 0) await AgentSessions.removeAsync({ _id: { $in: childIds } });
   await AgentSessions.removeAsync(rootId);

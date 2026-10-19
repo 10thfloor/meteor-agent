@@ -4,8 +4,8 @@ import { DECIDED_PHASES, type ResolvedMemory } from '../common/types';
 import { memoryBlock, memoryHint } from './memory';
 import type { IdentityConfig, ResolvedExperience, ResolvedPractice } from '../common/learning';
 import {
-  assistantAnswers, modelFrom, modelParticipantId, participantsBlock, resolveAddressee, resolveRelay,
-  unroutedMention,
+  answeredInThread, assistantAnswers, modelFrom, modelParticipantId, participantsBlock,
+  resolveAddressee, resolveRelay, unroutedMention,
 } from '../common/participants';
 import { systemRowId } from './system-turn';
 import type { Provider } from './providers/types';
@@ -406,7 +406,9 @@ export async function runTurn(
         // waits for approval. Finishing that batch must not route the addressed
         // request to the primary on the next iteration. Independent durable
         // Relay/System causes retain their own routing priority.
-        const newestUser = [...history].reverse().find((m) => m.role === 'user' && m.kind !== 'crew-note');
+        const newestUser = [...history].reverse().find(
+          (m) => m.role === 'user' && m.kind !== 'crew-note' && !answeredInThread(m),
+        );
         if (!consumingRelayToken && !consumingSystemToken && newestUser?.to !== undefined
           && !resolveAddressee(newestUser.content, newestUser.to, session)
           && !history.some((m) => m.role === 'assistant' && assistantAnswers(m, newestUser.seq))) return;
@@ -415,7 +417,10 @@ export async function runTurn(
         // colleague-addressed message can enter history without passing the
         // interjection branch, and answering it here would be the wrong model.
         if (session.participants?.length) {
-          const tail = [...history].reverse().find((m) => m.role === 'user');
+          // Thread rows are answered in their thread, never relayed from here.
+          const tail = [...history].reverse().find(
+            (m) => m.role === 'user' && !answeredInThread(m),
+          );
           if (tail) {
             const target = resolveAddressee(tail.content, tail.to, session);
             if (target && target.agent !== selfAgent
@@ -774,7 +779,12 @@ export async function runTurn(
           // A send that landed mid-stream would be stranded unanswered
           // unless we loop to pick it up.
           const interjected = await AgentMessages.findOneAsync({
-            sessionId, role: 'user', seq: { $gt: historyMaxSeq },
+            sessionId,
+            role: 'user',
+            seq: { $gt: historyMaxSeq },
+            // Answered in a thread: nothing here to pick up.
+            threadSessionId: { $exists: false },
+            fromThreadSessionId: { $exists: false },
           });
           if (interjected) {
             // Re-resolve a rostered interjection's addressee (§4.3) — its

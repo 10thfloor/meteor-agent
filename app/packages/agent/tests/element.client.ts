@@ -1187,6 +1187,141 @@ describe('<agent-chat>', () => {
     }
   });
 
+  it('offers Reply in thread on user and assistant rows when threadable', () => {
+    const rows = [
+      {
+        _id: 'thr-user', sessionId: 's', seq: 1, role: 'user', content: 'question',
+        threadSessionId: 'thread-1', createdAt: new Date(1),
+      },
+      {
+        _id: 'thr-tool-call', sessionId: 's', seq: 2, role: 'assistant', content: '',
+        toolCalls: [{ id: 'c1', name: 'lookup', args: {} }], createdAt: new Date(2),
+      },
+      {
+        _id: 'thr-tool', sessionId: 's', seq: 3, role: 'tool', toolCallId: 'c1',
+        content: '{}', createdAt: new Date(3),
+      },
+      {
+        _id: 'thr-note', sessionId: 's', seq: 4, role: 'note', kind: 'error',
+        error: { error: 'x' }, createdAt: new Date(4),
+      },
+      {
+        _id: 'thr-answer', sessionId: 's', seq: 5, role: 'assistant', content: 'answer',
+        createdAt: new Date(5),
+      },
+      {
+        _id: 'thr-streaming', sessionId: 's', seq: 6, role: 'assistant', content: 'stre',
+        streaming: true,
+      },
+    ];
+    const el = mountTranscript(rows) as ChatElement & { threadable: boolean };
+    assert.lengthOf(partsAll(el, 'thread-button'), 0, 'off unless the host asks');
+
+    el.threadable = true;
+    assert.isTrue(el.hasAttribute('threadable'), 'the property reflects to the attribute');
+    const buttons = () => partsAll(el, 'thread-button');
+    const owners = () => buttons().map((b) => (b.closest('[data-message-id]') as HTMLElement).dataset.messageId);
+    assert.deepEqual(owners(), ['thr-user', 'thr-tool-call', 'thr-answer'],
+      'user and committed assistant rows only — not tool, note or streaming rows');
+    for (const button of buttons()) {
+      assert.equal(button.tagName, 'BUTTON', 'keyboard reachable');
+      assert.equal(button.getAttribute('aria-label'), 'Reply in thread');
+    }
+    assert.include((part(el, 'threaded').dataset.messageId), 'thr-user',
+      'a row answered in a thread carries the threaded token');
+    assert.lengthOf(partsAll(el, 'threaded'), 1);
+
+    const opened: any[] = [];
+    el.addEventListener('agent-chat:open-thread', (event) => {
+      opened.push((event as CustomEvent).detail);
+    });
+    buttons()[2].click();
+    assert.deepEqual(opened, [{ sessionId: el.sessionId, messageId: 'thr-answer', seq: 5 }]);
+
+    // Rows are rebuilt on every paint: the button and its focus survive.
+    buttons()[0].focus();
+    const before = buttons()[0];
+    el.mentionSources = el.mentionSources;
+    assert.notStrictEqual(buttons()[0], before, 'the row really was rebuilt');
+    assert.equal(
+      (el.shadowRoot!.activeElement as HTMLElement | null)?.dataset.messageId, 'thr-user',
+      'keyboard focus stays on the same message\'s button',
+    );
+    buttons()[0].click();
+    assert.deepEqual(opened.at(-1), { sessionId: el.sessionId, messageId: 'thr-user', seq: 1 });
+
+    el.removeAttribute('threadable');
+    assert.lengthOf(buttons(), 0);
+  });
+
+  it('shows only the thread when from-seq is set, marking its parent message', () => {
+    const rows = [
+      { _id: 'win-0', sessionId: 's', seq: 0, role: 'user', content: 'topic history', createdAt: new Date(1) },
+      {
+        _id: 'win-1', sessionId: 's', seq: 1, role: 'assistant', content: 'checking',
+        toolCalls: [{ id: 'c1', name: 'lookup', args: {} }], createdAt: new Date(2),
+      },
+      { _id: 'win-2', sessionId: 's', seq: 2, role: 'tool', toolCallId: 'c1', content: '{}', createdAt: new Date(3) },
+      { _id: 'win-3', sessionId: 's', seq: 3, role: 'user', content: 'thread reply', createdAt: new Date(4) },
+      { _id: 'win-4', sessionId: 's', seq: 4, role: 'assistant', content: 'thread ans', streaming: true },
+    ];
+    const el = mountTranscript(rows) as ChatElement & {
+      fromSeq: number | null; threadable: boolean; timelineItems: any[];
+    };
+    const shown = () => partsAll(el, 'message').map((n) => n.dataset.messageId);
+    const roots = () => partsAll(el, 'thread-root').map((n) => n.dataset.messageId);
+    assert.deepEqual(shown(), ['win-0', 'win-1', 'win-2', 'win-3', 'win-4']);
+    assert.deepEqual(roots(), [], 'no root without a window');
+
+    // An app item placed after a hidden row hides with it.
+    const card = document.createElement('div');
+    card.textContent = 'summary card';
+    el.timelineItems = [{ id: 'card', createdAt: new Date(1), afterMessageId: 'win-0', element: card }];
+    const cardShown = () => partsAll(el, 'timeline-item').length === 1;
+    assert.isTrue(cardShown());
+
+    el.fromSeq = 1;
+    assert.equal(el.getAttribute('from-seq'), '1', 'the property reflects to the attribute');
+    assert.deepEqual(shown(), ['win-1', 'win-2', 'win-3', 'win-4'], 'earlier rows are not painted');
+    assert.deepEqual(roots(), ['win-1'], 'the first painted row is the thread root');
+    assert.notInclude(el.shadowRoot!.textContent, 'topic history');
+    assert.isFalse(cardShown(), 'an item placed after a hidden row is hidden too');
+    assert.include(
+      partsAll(el, 'message').find((n) => n.dataset.messageId === 'win-4')!.getAttribute('part'),
+      'streaming', 'in-flight rows in the window still stream',
+    );
+
+    // Other modes keep working inside the window.
+    el.threadable = true;
+    assert.deepEqual(
+      partsAll(el, 'thread-button').map((b) => (b.closest('[data-message-id]') as HTMLElement).dataset.messageId),
+      ['win-1', 'win-3'],
+    );
+
+    el.setAttribute('from-seq', '3');
+    assert.deepEqual(shown(), ['win-3', 'win-4'], 'changing from-seq repaints');
+    assert.deepEqual(roots(), ['win-3']);
+
+    // The session's recorded anchor wins when it is in view.
+    const client = el.agentInstance!;
+    const liveSession = client.session.bind(client);
+    client.session = () => ({ phase: 'idle', thread: { messageId: 'win-4' } });
+    try {
+      el.fromSeq = 3;
+      el.mentionSources = el.mentionSources;
+      assert.deepEqual(roots(), ['win-4']);
+    } finally {
+      client.session = liveSession;
+    }
+
+    el.fromSeq = null;
+    assert.isFalse(el.hasAttribute('from-seq'));
+    assert.deepEqual(shown(), ['win-0', 'win-1', 'win-2', 'win-3', 'win-4']);
+    assert.deepEqual(roots(), []);
+    assert.isTrue(cardShown());
+    el.timelineItems = [];
+  });
+
   it('preserves a reader\'s viewport and offers New messages until they return', function () {
     const el = mount({ agent: 'itest', 'session-id': 'no-such-scroll-session' });
     const client = el.agentInstance!;

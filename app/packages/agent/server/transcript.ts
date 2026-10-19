@@ -8,7 +8,7 @@ import type {
   AgentMessage, AgentSession, AttachmentRef, MessageSource, SessionInc, SessionParticipant,
 } from '../common/types';
 import type { SessionQuery, SessionSet } from '../common/db';
-import { needsAttribution } from '../common/participants';
+import { modelParticipantId, needsAttribution } from '../common/participants';
 import { isDuplicateKey as duplicateKey } from './channels/collections';
 import {
   beginSessionMutationOperation, type SessionOperation,
@@ -30,6 +30,10 @@ export interface UserMessageDraft {
   from?: { participant: string; name: string };
   to?: string;
   source?: MessageSource;
+  /** The thread that answers this row ("Reply in thread"). */
+  threadSessionId?: string;
+  /** The thread this row was copied from ("Also send to the topic"). */
+  fromThreadSessionId?: string;
 }
 
 /** @internal */
@@ -187,6 +191,7 @@ export async function commitLeasedMessage(
       await AgentMessages.rawCollection().insertOne({
         ...message, sessionId, seq: before.nextSeq,
       }, { session: mongoSession });
+      await countThreadReply(mongoSession, before, message);
       committedSeq = before.nextSeq;
     }, TRANSCRIPT_WRITE_MAX_MS);
     return committedSeq;
@@ -236,15 +241,43 @@ export async function commitOperationMessage(
       { returnDocument: 'before', session: mongoSession },
     ) as unknown as AgentSession | null;
     if (!before) return;
+    const row = message(before);
     await AgentMessages.rawCollection().insertOne({
       _id: messageId,
       sessionId,
       seq: before.nextSeq,
-      ...message(before),
+      ...row,
     }, { session: mongoSession });
+    await countThreadReply(mongoSession, before, row);
     committedSeq = before.nextSeq;
   });
   return committedSeq;
+}
+
+/** @internal Count one committed row toward its thread's summary, inside the
+ * transaction that inserts it. User rows and turn-final assistant rows are
+ * replies; tool steps are not. No-op outside thread sessions. */
+export async function countThreadReply(
+  mongoSession: ClientSession,
+  session: Pick<AgentSession, '_id' | 'agent' | 'thread'>,
+  row: Pick<AgentMessage, 'role' | 'createdAt'> & Partial<Pick<AgentMessage, 'toolCalls' | 'from'>>,
+): Promise<void> {
+  if (!session.thread) return;
+  const assistant = row.role === 'assistant';
+  if (row.role !== 'user' && !(assistant && !row.toolCalls?.length)) return;
+  await AgentSessions.rawCollection().updateOne(
+    { _id: session._id, thread: { $exists: true } },
+    {
+      $inc: { 'thread.replies': 1 },
+      $max: { 'thread.lastReplyAt': row.createdAt },
+      ...(assistant ? {
+        $addToSet: {
+          'thread.repliers': row.from?.participant ?? modelParticipantId(session.agent),
+        },
+      } : {}),
+    } as any,
+    { session: mongoSession },
+  );
 }
 
 function sameAttachments(a?: AttachmentRef[], b?: AttachmentRef[]): boolean {
@@ -272,10 +305,13 @@ function sameDraft(a: UserMessageDraft, b: UserMessageDraft): boolean {
     && a.from?.participant === b.from?.participant
     && a.from?.name === b.from?.name
     && (a.from === undefined) === (b.from === undefined)
-    && sameSource(a.source, b.source);
+    && sameSource(a.source, b.source)
+    && a.threadSessionId === b.threadSessionId
+    && a.fromThreadSessionId === b.fromThreadSessionId;
 }
 
-function sameMessage(
+/** @internal Whether a committed row is exactly this draft (replay check). */
+export function sameMessage(
   message: AgentMessage, sessionId: string, draft: UserMessageDraft, seq?: number,
 ): boolean {
   return message.sessionId === sessionId
@@ -287,18 +323,21 @@ function sameMessage(
     && message.from?.participant === draft.from?.participant
     && message.from?.name === draft.from?.name
     && (message.from === undefined) === (draft.from === undefined)
-    && sameSource(message.source, draft.source);
+    && sameSource(message.source, draft.source)
+    && message.threadSessionId === draft.threadSessionId
+    && message.fromThreadSessionId === draft.fromThreadSessionId;
 }
 
-function conflict(): never {
+/** @internal */
+export function conflict(): never {
   throw new Meteor.Error(
     'commit-conflict',
     'This message commit key is already associated with different input.',
   );
 }
 
-
-function messageIdFor(sessionId: string, commitKey: string): string {
+/** @internal Deterministic user-row id for one commit key. */
+export function messageIdFor(sessionId: string, commitKey: string): string {
   return `u:${createHash('sha256')
     .update('10thfloor:agent:user-message\0')
     .update(sessionId)
@@ -419,6 +458,9 @@ async function settleReservation(
       ...reservation.draft,
       createdAt: reservation.createdAt,
     }, { session: mongoSession, ...boundedWrite });
+    await countThreadReply(mongoSession, current, {
+      role: 'user', createdAt: reservation.createdAt,
+    });
     await UserMessageReservations.rawCollection().deleteOne(
       { _id: reservation._id, sessionId: reservation.sessionId },
       { session: mongoSession },
@@ -566,6 +608,13 @@ export interface TranscriptView {
   participants: SessionParticipant[];
 }
 
+/** @internal Appended to a user row a thread answers, in provider requests only. */
+export const THREAD_REPLY_MARKER =
+  '[This message was answered in a thread. It is shown for context; do not reply to it here.]';
+/** @internal Appended to a user row copied in from a thread. */
+export const FROM_THREAD_MARKER =
+  '[This message was posted from a thread and is answered there. It is shown for context; do not reply to it here.]';
+
 export function toProviderMessages(
   msgs: AgentMessage[], view?: TranscriptView,
 ): ProviderMessage[] {
@@ -628,6 +677,13 @@ export function toProviderMessages(
         );
       content = `[${name}]: ${content ?? ''}`;
     }
+    // Thread rows stay in the parent's context but are not requests: the
+    // marker lives in the provider request only, never in stored content.
+    if (m.role === 'user' && m.threadSessionId !== undefined) {
+      content = `${content ?? ''}\n\n${THREAD_REPLY_MARKER}`;
+    } else if (m.role === 'user' && m.fromThreadSessionId !== undefined) {
+      content = `${content ?? ''}\n\n${FROM_THREAD_MARKER}`;
+    }
     const row: ProviderMessage = {
       role: m.role as ProviderMessage['role'],
       content,
@@ -666,6 +722,21 @@ function turnWindows(msgs: AgentMessage[]): TurnWindow[] {
       ),
     };
   });
+}
+
+/** @internal Ids of assistant rows whose tool batch is still open, plus the
+ * tool rows already answered inside that batch. */
+export function openBatchIds(msgs: AgentMessage[]): Set<string> {
+  const ids = new Set<string>();
+  for (const w of turnWindows(msgs)) {
+    const calls = w.assistant.toolCalls ?? [];
+    if (calls.length === 0 || calls.every((c) => w.answered.has(c.id))) continue;
+    ids.add(w.assistant._id);
+    for (const t of msgs) {
+      if (t.role === 'tool' && t.seq > w.assistant.seq && t.seq < w.windowEnd) ids.add(t._id);
+    }
+  }
+  return ids;
 }
 
 /** Walk boundary backward until no tool_use/tool_result pair is split. */

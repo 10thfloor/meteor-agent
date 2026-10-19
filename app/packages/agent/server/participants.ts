@@ -3,7 +3,7 @@ import {
   MAX_PARTICIPANTS, type AgentMessage, type AgentSession, type SessionParticipant,
 } from '../common/types';
 import {
-  assistantAnswers, humanParticipantId, modelParticipantId, resolveAddressee,
+  answeredInThread, assistantAnswers, humanParticipantId, modelParticipantId, resolveAddressee,
   sanitizeDisplayName,
 } from '../common/participants';
 import { ChannelBindings } from './channels/collections';
@@ -147,6 +147,9 @@ export async function unansweredMessageAddressee(
   // particular a leading @name inside one must not be rediscovered as routing
   // when an unrelated System turn or recovery wake arrives later.
   if (user.kind === 'crew-note') return null;
+  // A thread answers this row (or it came from one); the session it sits in
+  // owes nothing for it.
+  if (answeredInThread(user)) return null;
   if (!session.participants?.length) return null;
   const hit = resolveAddressee(user.content, user.to, session);
   // A removed explicit recipient is unavailable, not an invitation for the
@@ -183,7 +186,13 @@ export async function unansweredAddressee(
   session: AgentSession,
 ): Promise<{ id: string; agent: string } | null> {
   const [lastUser] = await AgentMessages.find(
-    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+    {
+      sessionId: session._id,
+      role: 'user',
+      threadSessionId: { $exists: false },
+      fromThreadSessionId: { $exists: false },
+    },
+    { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
   return lastUser ? unansweredMessageAddressee(session, lastUser) : null;
 }

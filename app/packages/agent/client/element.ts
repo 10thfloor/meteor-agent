@@ -45,6 +45,10 @@ export interface AgentChatElement extends HTMLElement {
   draftText: string;
   mentionSources: Record<string, MentionSource>;
   timelineItems: ChatTimelineItem[];
+  /** Show "Reply in thread" on user and assistant rows. */
+  threadable: boolean;
+  /** Paint only rows with `seq >= fromSeq`; `null` paints every row. */
+  fromSeq: number | null;
   setDraft(text: string, options?: ComposerDraftOptions): void;
   focusComposer(): void;
   submitDraft(): Promise<void>;
@@ -255,6 +259,17 @@ const FRAME = `
     outline: 2px solid var(--_accent); outline-offset: 3px;
     box-shadow: 0 0 0 5px color-mix(in srgb, var(--_accent) 14%, transparent);
   }
+  .message.threadable { position: relative; }
+  .thread-button {
+    position: absolute; top: -0.7rem; right: 0.5rem;
+    padding: 0.1rem 0.5rem; border-radius: 999px; font: inherit; font-size: 0.75rem;
+    border: 1px solid color-mix(in srgb, var(--_fg) 18%, var(--_bg));
+    background: var(--_bg); color: var(--_fg); cursor: pointer;
+    opacity: 0; pointer-events: none;
+  }
+  .message.threadable:hover .thread-button,
+  .message.threadable:focus-within .thread-button { opacity: 1; pointer-events: auto; }
+  .thread-button:focus-visible { outline: 2px solid var(--_accent); outline-offset: 2px; }
   .message.user { align-self: flex-end; background: var(--_accent); color: #fff; }
   .message.assistant { align-self: flex-start; background: color-mix(in srgb, var(--_fg) 8%, var(--_bg)); }
   .message.assistant.streaming::after { content: '▍'; animation: agent-chat-blink 1s steps(1) infinite; }
@@ -935,6 +950,38 @@ function renderRow(
   mode: TranscriptMode = 'clean',
   mentions: Map<string, ResolvedSource> = new Map(),
   agentNames: Map<string, string> = new Map(),
+  /** Set when the element is `threadable`: the session the rows belong to. */
+  threadSessionId: string | null = null,
+): HTMLElement | null {
+  const row = renderRowContent(m, names, download, mode, mentions, agentNames);
+  if (row && threadSessionId !== null && !m.streaming
+    && (m.role === 'user' || m.role === 'assistant')) {
+    row.classList.add('threadable');
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'thread-button';
+    button.setAttribute('part', 'thread-button');
+    button.setAttribute('aria-label', 'Reply in thread');
+    button.title = 'Reply in thread';
+    button.dataset.messageId = m._id;
+    button.textContent = 'Reply in thread';
+    button.addEventListener('click', () => {
+      button.dispatchEvent(new CustomEvent('agent-chat:open-thread', {
+        detail: { sessionId: threadSessionId, messageId: m._id, seq: m.seq },
+        bubbles: true, composed: true,
+      }));
+    });
+    row.append(button);
+  }
+  return row;
+}
+
+function renderRowContent(
+  m: ViewMessage, names: Map<string, string>,
+  download: ((attachmentId: string) => void) | undefined,
+  mode: TranscriptMode,
+  mentions: Map<string, ResolvedSource>,
+  agentNames: Map<string, string>,
 ): HTMLElement | null {
   const debug = mode === 'debug';
   if (!debug) {
@@ -955,6 +1002,7 @@ function renderRow(
     m.childSessionId && (m.role === 'tool' || m.kind === 'orphan-child') ? 'delegation' : '',
     m.role === 'note' && m.kind ? m.kind : '',
     m.kind === 'crew-note' ? 'crew-note' : '',
+    m.role === 'user' && m.threadSessionId ? 'threaded' : '',
     !debug && m.role === 'tool' && m.kind === 'handoff' && !m.error ? 'handoff' : '',
     // Application-owned system sources can style their operational receipts
     // without rewriting the durable, model-facing message content.
@@ -1237,7 +1285,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
   class AgentChat extends HTMLElement {
     static get observedAttributes() {
-      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode', 'recipient', 'composer-disabled', 'send-disabled', 'aria-disabled', 'multiline', 'composer-layout', 'submit-label'];
+      return ['agent', 'session-id', 'placeholder', 'verbosity', 'composer-mode', 'recipient', 'composer-disabled', 'send-disabled', 'aria-disabled', 'multiline', 'composer-layout', 'submit-label', 'threadable', 'from-seq'];
     }
 
     private ui!: {
@@ -1420,6 +1468,32 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     /** Whether the composer wakes a model (`ask`) or only records shared
      * human context (`note`). Invalid attribute values fail closed to ask. */
+    /** Show "Reply in thread" on user and assistant rows. A click dispatches
+     *  `agent-chat:open-thread` with `{ sessionId, messageId, seq }`; the host
+     *  opens the thread (for example with `Agent#thread`). */
+    get threadable(): boolean { return this.hasAttribute('threadable'); }
+
+    set threadable(next: boolean) { this.toggleAttribute('threadable', !!next); }
+
+    /** Paint only rows with `seq >= fromSeq` (display only; the model still
+     *  sees every row). The first painted row — the thread's parent message —
+     *  carries the `thread-root` part. For a thread session pass its
+     *  `thread.anchorSeq`. `null` (no attribute) paints every row. */
+    get fromSeq(): number | null {
+      const raw = this.getAttribute('from-seq');
+      if (raw === null || raw.trim() === '') return null;
+      const value = Number(raw);
+      return Number.isFinite(value) ? value : null;
+    }
+
+    set fromSeq(next: number | null) {
+      if (next === null || next === undefined || !Number.isFinite(next)) {
+        this.removeAttribute('from-seq');
+      } else {
+        this.setAttribute('from-seq', String(next));
+      }
+    }
+
     get composerMode(): ComposerMode { return composerMode(this.getAttribute('composer-mode')); }
 
     set composerMode(next: ComposerMode) { this.setAttribute('composer-mode', next); }
@@ -1716,7 +1790,10 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       if (name === 'send-disabled') { this.applyComposerMode(); return; }
       // `verbosity` changes only what is DRAWN. Re-subscribing for it would
       // tear down a live session to change a privacy/display boundary.
-      if (name === 'verbosity') { this.paint(); return; }
+      if (name === 'verbosity' || name === 'threadable' || name === 'from-seq') {
+        this.paint();
+        return;
+      }
       // `agent` or `session-id`: a clean re-subscribe, COALESCED — see
       // `queueReattach`.
       this.queueReattach();
@@ -1853,7 +1930,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       return `${signature}:${this.timeline.map((item) => `${item.id}:${item.afterMessageId ?? ''}`).join(',')}`;
     }
 
-    private timelineNodes(rows: ViewMessage[], render: (row: ViewMessage) => HTMLElement | null): HTMLElement[] {
+    private timelineNodes(
+      rows: ViewMessage[], render: (row: ViewMessage) => HTMLElement | null,
+      /** Rows outside the `from-seq` window; items placed after them stay hidden too. */
+      hidden: Set<string> | null = null,
+    ): HTMLElement[] {
       const at = (value: Date | number | undefined) => {
         const number = value instanceof Date ? value.getTime() : value;
         return typeof number === 'number' && Number.isFinite(number) ? number : Number.POSITIVE_INFINITY;
@@ -1862,6 +1943,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
       const buckets = new Map<number, HTMLElement[]>();
       for (const item of sorted) {
+        if (item.afterMessageId && hidden?.has(item.afterMessageId)) continue;
         const anchor = item.afterMessageId ? rows.findIndex((row) => row._id === item.afterMessageId) : -1;
         const following = rows.findIndex((row) => at(row.createdAt) > at(item.createdAt)
           || (at(row.createdAt) === at(item.createdAt) && row._id > item.id));
@@ -1883,10 +1965,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     private paint() {
       const { client, sid } = this;
-      const rows: ViewMessage[] = client && sid
+      const all: ViewMessage[] = client && sid
         ? (client.messages(sid).fetch() as ViewMessage[])
         : [];
-      const names = toolNames(rows);
+      // `from-seq` is a display window only: earlier rows stay in the model's
+      // context. Tool names still come from every row.
+      const fromSeq = this.fromSeq;
+      const rows = fromSeq === null ? all : all.filter((m) => m.seq >= fromSeq);
+      const hidden = fromSeq === null
+        ? null
+        : new Set(all.filter((m) => m.seq < fromSeq).map((m) => m._id));
+      const names = toolNames(all);
       // The chip's mint-and-navigate: a click-time capability, never a
       // standing URL (participants spec §7.3). `assign` on an
       // attachment-disposition response downloads without navigating away.
@@ -1904,7 +1993,22 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const agentNames = new Map((session?.participants ?? [])
         .filter((p) => p.kind === 'model' && p.agent)
         .map((p) => [p.agent!, p.displayName]));
-      const nodes = this.timelineNodes(rows, (m) => renderRow(m, names, download, mode, mentions, agentNames));
+      // The first shown row is the thread's parent message: the session's
+      // recorded anchor when it is in view, else the first row in the window.
+      const rootId = fromSeq === null
+        ? null
+        : (rows.find((m) => m._id === session?.thread?.messageId) ?? rows[0])?._id ?? null;
+      const nodes = this.timelineNodes(rows, (m) => {
+        const row = renderRow(
+          m, names, download, mode, mentions, agentNames,
+          this.threadable && sid ? sid : null,
+        );
+        if (row && m._id === rootId) {
+          row.classList.add('thread-root');
+          row.setAttribute('part', `${row.getAttribute('part')} thread-root`);
+        }
+        return row;
+      }, hidden);
       if (this.failure) nodes.push(failureRow(this.failure));
       // Subscription hydration starts from an empty collection. Treat the
       // first durable rows as pinned even if layout has not established a
@@ -1912,6 +2016,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const wasPinned = !this.messageTarget
         && (this.renderedTranscriptRows === 0 || this.nearTranscriptBottom());
       const previousScrollTop = this.ui.messages.scrollTop;
+      // Rows are rebuilt each paint; keep keyboard focus on a thread button.
+      const focusedThread = (this.shadowRoot?.activeElement as HTMLElement | null)
+        ?.classList.contains('thread-button')
+        ? (this.shadowRoot!.activeElement as HTMLElement).dataset.messageId
+        : undefined;
       const targetWasFocused = !!this.messageTarget
         && (this.shadowRoot?.activeElement as HTMLElement | null)?.dataset.messageId === this.messageTarget.id;
       const signature = this.signatureFor(rows);
@@ -1925,6 +2034,11 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       for (const node of nodes) {
         if (node === cursor) cursor = cursor.nextSibling;
         else this.ui.messages.insertBefore(node, cursor);
+      }
+      if (focusedThread !== undefined) {
+        const button = [...this.ui.messages.querySelectorAll<HTMLElement>('.thread-button')]
+          .find((candidate) => candidate.dataset.messageId === focusedThread);
+        button?.focus({ preventScroll: true });
       }
       if (this.messageTarget) {
         const target = this.visibleMessageRow(this.messageTarget.id);

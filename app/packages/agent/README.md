@@ -329,9 +329,9 @@ connection) so an anonymous flood only burns its own connection's quota, and
 per-user for authenticated callers so opening more connections does not
 multiply the allowance. `sends` covers both `agent.send` and the non-waking
 `agent.contribute`, so note mode cannot bypass a deployment's transcript-write
-ceiling. Two other entries govern two methods each: `starts` covers
-`agent.start` and `agent.fork` (see **Forking**), both of which create a
-session, and `approvals` covers `agent.approve` and `agent.deny` — the same
+ceiling. Two other entries govern several methods: `starts` covers
+`agent.start`, `agent.fork` (see **Forking**) and `agent.thread` (see
+**Threads**), all of which create a session, and `approvals` covers `agent.approve` and `agent.deny` — the same
 decision made two ways, and the one unauthenticated-reachable method that
 *resumes* a turn. Given separate knobs, `deny` would be the cheap way to hammer
 the path `approve` limits. `memories` covers the three memory methods together (`agent.memorySave`,
@@ -1000,6 +1000,8 @@ framework never re-renders it.
 | `multiline` | Opt-in textarea growth from two to six lines. Set `--agent-chat-input-min-rows: 1` for a compact one-line start (supported range: 1–6). Enter sends; Shift+Enter inserts a newline. IME composition never sends. Without this attribute the composer remains single-line. |
 | `composer-layout` | `panel` groups context above the text and toolbar/actions below it. Default layout remains inline. |
 | `submit-label` | Optional idle label for an app-owned action, such as `Run plan`. Pending labels remain `Sending…`/`Adding note…`. |
+| `threadable` | Adds a "Reply in thread" button to user and assistant rows (not tool, note or in-flight rows), shown on hover or keyboard focus. A click dispatches `agent-chat:open-thread` (bubbles, composed) with `{ sessionId, messageId, seq }`; the host opens the thread, for example with `Agent#thread`. The `threadable` property mirrors the attribute. See **Threads**. |
+| `from-seq` | Paint only rows with `seq >= from-seq` (display only: the model still sees every row, and app timeline items placed after a hidden row are hidden too). The first painted row carries the `thread-root` part. For a thread session pass its `thread.anchorSeq` to show the parent message and its replies. The `fromSeq` property mirrors the attribute; `null` paints every row. |
 | `verbosity` | `clean` is the default: tool calls/results become concise operational receipts, approvals use bounded human-readable argument summaries, embedded JSON-string escapes are decoded, and raw object/array payloads are hidden. `debug` restores exact assistant bytes, tool arguments, tool-result payloads, structured assistant content, and approval records. Legacy `quiet` aliases `clean`; legacy `full` aliases `debug`. It only changes what is drawn, so toggling it re-paints without touching the session. |
 
 In clean mode, assistant prose renders as semantic GFM/CommonMark-style
@@ -1264,6 +1266,9 @@ element you never theme still follows the OS light/dark setting.
 | `message` | Every transcript row; also carries `user` / `assistant` / `note`, plus `operation` on a clean tool receipt, `streaming` on an in-flight row, and the note's `kind` (`::part(note error)`) |
 | `markdown` | Clean assistant content boundary. Descendants expose `markdown-heading`, `markdown-paragraph`, `markdown-list`, `markdown-list-item`, `markdown-strong`, `markdown-emphasis`, `markdown-strikethrough`, `markdown-code`, `markdown-inline-code`, `markdown-code-block`, `markdown-language`, `markdown-blockquote`, `markdown-rule`, `markdown-table`, and `markdown-link`. |
 | `crew-note-header`, `speaker-crew-note`, `crew-note-badge` | Attribution and visible `Crew note` label grouped above a non-waking human contribution. The bubble carries `message user crew-note` for separate theming. Its leading `@agent` chips deliberately never carry `addressed`. |
+| `thread-button` | The "Reply in thread" button on a row of a `threadable` element |
+| `threaded` | On `message user` rows sent with "Reply in thread" (the row's `threadSessionId` is set) |
+| `thread-root` | On the first painted row when `from-seq` is set: the thread's parent message |
 | `new-messages` | The transcript-tail affordance; also carries `pending` while newer rows are waiting below the reader. |
 | `operation`, `operations` | Clean-mode tool/delegation status, without arguments or result payloads |
 | `structured-hidden` | Clean-mode replacement for a whole JSON or JSON-fenced assistant message |
@@ -1495,6 +1500,70 @@ session rather than re-running it. And forking is rate-limited by the
 entry of its own: a fork creates a session exactly as a start does, and copies a
 whole transcript on top of it.
 
+## Threads
+
+A thread is a side conversation on one message. It is a fork of the session
+at that message, so the thread's model sees the conversation up to the message
+plus the thread, and it runs at the same time as the session it came from.
+There is at most one thread per message.
+
+```ts
+// Client: find or open the thread on a user or assistant message.
+const threadId = await Support.thread(sessionId, messageId);
+Support.subscribeThreads(sessionId);     // summaries of this session's threads
+Support.threads(sessionId).fetch();      // reactive, oldest first
+
+// Send a message that is answered in a new thread instead of here.
+const { threadSessionId } = await Support.send(sessionId, 'side question', {
+  replyIn: 'thread',
+});
+
+// In a thread: also post the message to the parent, as context only.
+await Support.send(threadId, 'decision: ship it', { alsoToParent: true });
+
+// Server
+await new Agent('support').fork(sessionId, { thread: { messageId }, userId });
+await new Agent('support').send(sessionId, text, { userId, replyIn: 'thread' });
+```
+
+- **Opening.** `agent.thread(agent, sessionId, messageId)` (client
+  `thread()`, server `fork(…, { thread })`) returns the existing thread or
+  creates it. Concurrent opens get the same thread. The owner or any human on
+  the roster may open one (`agent.fork` stays owner-only); agents with
+  `startable: false` refuse, as for fork. The anchor must be a user or
+  assistant row (`thread-anchor-invalid` otherwise). The copy includes the
+  anchor and, for an assistant row that called tools, the rest of that tool
+  batch; while the batch is still running the open is refused with
+  `thread-anchor-open`.
+- **The session document** carries `thread: { sessionId, seq, messageId,
+  anchorSeq, replies, lastReplyAt?, repliers }` and `forkedFrom`. `seq` is the
+  cut; `anchorSeq` is the anchor's own seq, which its copy in the thread keeps
+  (copies get new `_id`s). Render a thread like a chat thread with
+  `<agent-chat session-id="<thread>" from-seq="<anchorSeq>">`. `replies` counts user
+  rows and final assistant rows after the cut (tool steps are not replies),
+  `repliers` lists the model participant ids that answered, and
+  `lastReplyAt` is the newest reply's time. They are updated in the same
+  transaction as the rows they count. A thread starts with zero usage and
+  budget; add a parent's threads yourself if you show a total.
+- **Reply in thread.** `send(…, { replyIn: 'thread' })` commits the message in
+  this session with `threadSessionId` set, opens the thread on it in the same
+  transaction, and wakes only the thread. The session it was sent to is not
+  woken or charged a turn. Its model later sees the message as context marked
+  as answered in a thread (the note is added to the provider request only,
+  never to the stored row). It resolves to `{ sessionId, threadSessionId }`.
+- **Also send to the parent.** `send(threadId, …, { alsoToParent: true })`
+  answers in the thread as usual and copies the message into the parent as a
+  user row with `fromThreadSessionId`, again without waking the parent. It
+  resolves to `{ sessionId }` (the thread). It is refused (`not-a-thread`)
+  for a session that is not a thread. Plain sends still resolve to the
+  session id.
+- **Listing.** `agent.sessions` leaves threads out (client `sessions()` does
+  too unless the selector names `thread`). `agent.threads(agent, sessionId)`
+  publishes one session's threads to whoever may read that session.
+- **Lifecycle.** Erasing a session erases its threads (plain forks survive).
+  Archiving does not cascade. Otherwise a thread is an ordinary root session:
+  memory, handoff and learning treat it like any conversation.
+
 ## System turns — work that starts without a person
 
 Every other way into a turn is a human action, and a `send` writes a `role:
@@ -1699,7 +1768,7 @@ agent. DDP `rateLimit` entries (`sends`, `compacts`, …) are **opt-in and bucke
 per connection** for anonymous callers (per user for authenticated ones), so
 they cap one caller's rate, not the fleet's aggregate cost. Note the
 startup warning names only the *spend* residual (no `budget`, no `sends`
-limit): on a default deployment, session creation (`agent.start`/`agent.fork`)
+limit): on a default deployment, session creation (`agent.start`/`agent.fork`/`agent.thread`)
 and on-demand compaction (`agent.compact`, a provider round-trip each) are
 also unbounded per caller until you configure their `rateLimit` entries or an
 app-level gateway ceiling — the package cannot see your proxy, so it does not

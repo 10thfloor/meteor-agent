@@ -19,6 +19,8 @@ export declare const NAMES: {
     readonly learningEvents: 'agent_learning_events';
     readonly pubSession: 'agent.session';
     readonly pubSessions: 'agent.sessions';
+    readonly pubThreads: 'agent.threads';
+    readonly mThread: 'agent.thread';
     readonly mStart: 'agent.start';
     readonly mSend: 'agent.send';
     readonly mContribute: 'agent.contribute';
