@@ -37,6 +37,7 @@ import { missionHealthState, missionMeters, missionTotals, tokenTotals } from '.
 import { GENERAL_TOPIC, topicLabel } from '../imports/constellation/topics';
 import { createTopicMemory, renderMissionTree, wireMissionTree } from './mission-tree';
 import { initializeTopicMenu } from './topic-menu';
+import { initializeThreads } from './thread-panel';
 import './mission-tree.css';
 
 const SESSION_KEY = 'constellation.session';
@@ -620,6 +621,7 @@ function openSession(sessionId) {
   if (currentSessionId !== sessionId && $('run-dialog')?.open) $('run-dialog').close();
   const previous = { sessionId: currentSessionId, missionId: currentMissionId };
   setCurrentConversation(sessionId);
+  threadControls?.chatChanged(sessionId);
   missionWorkNavigation?.setMission(currentMissionId);
   // Another topic of the same Mission is opened to talk in it; the Mission-wide tabs stay one click away.
   if (previous.missionId === currentMissionId && previous.sessionId !== sessionId) missionWorkNavigation?.show('chat');
@@ -646,6 +648,11 @@ function openMission(missionId) {
 }
 
 let topicMenu = null;
+let threadControls = null;
+
+function openThread(threadId) {
+  void threadControls?.open(threadId);
+}
 
 function renderTopicChip() {
   if (!topicMenu) {
@@ -734,7 +741,9 @@ async function sendPrompt(prompt) {
   // A Mission is named from its first message in #general, not from a topic.
   if (chatId === currentMissionId) maybeAutoTitle(session, prompt);
   try {
-    await workspace.send(chatId, prompt.trim(), { to: recipient });
+    const replyIn = missionRecipients?.replyIn();
+    const sent = await workspace.send(chatId, prompt.trim(), { to: recipient, ...(replyIn ? { replyIn } : {}) });
+    if (sent?.threadSessionId) openThread(sent.threadSessionId);
   } catch (error) {
     toast(messageOf(error), 'error');
   }
@@ -8376,6 +8385,21 @@ async function initializeWorkspace() {
       onChange: () => updateMissionComposer(primaryDefinition(), missionConfig()),
       onModeChange: (mode) => setChatComposerMode(mode, { focus: false }),
     });
+    threadControls = initializeThreads({
+      workspace, chat, pane: $('inspector-pane'), AgentSessions, timeAgo, toast,
+      currentChat: () => { sessionChanged.depend(); return currentSessionId; },
+      currentMission: () => { sessionChanged.depend(); return currentMissionId; },
+      conversationIds: (missionId) => (missionId
+        ? [missionId, ...MissionTopics.find({ missionId }, { fields: { _id: 1 } }).map((row) => row._id)] : []),
+      topicName: (sessionId) => (sessionId === missionIdFor(sessionId)
+        ? GENERAL_TOPIC : MissionTopics.findOne(sessionId)?.name ?? GENERAL_TOPIC),
+      recipientState: (session) => {
+        const status = missionConfig()?.status ?? 'active';
+        return { session, primary: primaryDefinition(), crew: crewDefinitions(), sharedChannels: 0,
+          userId: Meteor.userId(), writable: status === 'active', status };
+      },
+      openInspector: () => setInspectorOpen(true),
+    });
 
     wireNavigation();
     wireMissionActions();
@@ -8523,6 +8547,8 @@ async function initializeWorkspace() {
       openDecisions: (options) => decisionControls.open(options),
       currentMission: () => { sessionChanged.depend(); return currentMissionId; },
       currentChat: () => { sessionChanged.depend(); return currentSessionId; },
+      replyIn: () => missionRecipients?.replyIn(),
+      openThread: (threadId) => openThread(threadId),
       missionConfig,
       defaultModel: () => bootstrap?.model,
       crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
@@ -8536,7 +8562,7 @@ async function initializeWorkspace() {
     const composerSnapshot = () => {
       sessionChanged.depend();
       return {
-        missionId: currentMissionId, userId: Meteor.userId(),
+        missionId: currentMissionId, chatId: currentSessionId, userId: Meteor.userId(),
         active: MissionConfigs.findOne(currentMissionId)?.status === 'active',
         environment: executionControls.environments.findOne({ missionId: currentMissionId }),
         settings: executionControls.settings.findOne(Meteor.userId()),

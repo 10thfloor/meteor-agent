@@ -297,8 +297,13 @@ export function initializePlanChat(host) {
     const target = mode === 'note' || command ? undefined : recipient;
     if (!handles.length && !command) {
       if (previousHandler) return previousHandler({ sessionId, text, mode, ...(target !== undefined ? { recipient: target } : {}) });
-      return mode === 'note' ? chat.agentInstance.contribute(sessionId, text)
-        : chat.agentInstance.send(sessionId, text, target === undefined ? undefined : { to: target });
+      if (mode === 'note') return chat.agentInstance.contribute(sessionId, text);
+      // "Reply in thread": the message stays here and the answer starts a thread on it, which opens beside the chat.
+      const replyIn = host.replyIn?.();
+      const options = { ...(target !== undefined ? { to: target } : {}), ...(replyIn ? { replyIn } : {}) };
+      const sent = await chat.agentInstance.send(sessionId, text, Object.keys(options).length ? options : undefined);
+      if (sent?.threadSessionId) host.openThread?.(sent.threadSessionId);
+      return sent;
     }
     if (!pendingRequest || pendingRequest.sessionId !== sessionId || pendingRequest.text !== submitted || pendingRequest.mode !== mode || pendingRequest.recipient !== target) {
       pendingRequest = { sessionId, text: submitted, mode, ...(target !== undefined ? { recipient: target } : {}), requestKey: window.crypto.randomUUID(), references: handles.map((handle) => selected.get(handle) ?? plans.find((row) => row.handle === handle)).filter(Boolean).map(reference) };

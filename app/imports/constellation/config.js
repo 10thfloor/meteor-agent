@@ -177,8 +177,10 @@ function runtimeUnansweredUser(messages) {
   // Crew notes are durable human context, not work owed by an agent. Treating
   // the newest note as an unanswered prompt would leave an idle Mission stuck
   // in a false loading state forever.
+  // Likewise a message answered in a thread, or copied here from one: its answer is in the thread.
   const user = [...messages].reverse().find(
-    (message) => message.role === 'user' && message.kind !== 'crew-note',
+    (message) => message.role === 'user' && message.kind !== 'crew-note'
+      && !message.threadSessionId && !message.fromThreadSessionId,
   );
   if (!user) return null;
   return messages.some((message) => message.role === 'assistant' && message.seq > user.seq)
