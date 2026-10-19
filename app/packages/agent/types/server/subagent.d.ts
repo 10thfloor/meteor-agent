@@ -1,4 +1,4 @@
-import { type ResolvedTool, type ToolContext, type ToolResult } from './tools';
+import { type ResolvedTool, type ToolContext, type ToolResult, type SubagentBudget } from './tools';
 import type { RunConfig } from './loop';
 /** Fork-bomb bound: each nesting level multiplies model calls. */
 export declare const MAX_SUBAGENT_DEPTH = 3;
@@ -33,6 +33,9 @@ export interface SubagentDispatch {
     childSessionId?: string;
 }
 type RunTurn = (sessionId: string, config: RunConfig) => Promise<void>;
+/** Persisted per-edge ceilings can only tighten the current Agent definition.
+ * The Turn invokes this again on every approval/resume/recovery entry. */
+export declare function applySubagentBudget(config: RunConfig, budget?: SubagentBudget): RunConfig;
 /** Run a named agent as a child session. Persists (unlike ask) so it can
  *  stream and accept approvals independently. */
 export declare function runSubagent(tool: ResolvedTool, args: unknown, ctx: ToolContext, runTurn: RunTurn, authorize?: () => boolean | Promise<boolean>): Promise<SubagentDispatch>;

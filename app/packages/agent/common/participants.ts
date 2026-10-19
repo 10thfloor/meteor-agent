@@ -82,7 +82,34 @@ export function participantByUserId(
 }
 
 /** Leading `@<name>` addressing parse (decision 5). Token stays in text. */
-const LEADING_MENTION = /^\s*@([\w.-]{1,64})/;
+const LEADING_MENTION = /^\s*@([\w.-]{1,64})(?![\w.-])/;
+const SAFE_MENTION_HANDLE = /^[\w.-]{1,64}$/;
+
+/** Friendly names are aliases, never new identities. Ambiguous names, names
+ * requiring escaping, and aliases that shadow another canonical agent fall
+ * back to the existing handle. Client suggestions and server routing share
+ * this exact rule, including case-insensitive friendly-name matching. */
+export function modelMentionHandles(session: Roster): Array<{
+  participant: SessionParticipant; handle: string;
+}> {
+  const models = modelParticipants(session);
+  return models.map((participant) => {
+    const name = participant.displayName;
+    const folded = name.toLowerCase();
+    const usable = SAFE_MENTION_HANDLE.test(name)
+      && models.filter((p) => p.displayName.toLowerCase() === folded).length === 1
+      && !models.some((p) => p.agent !== participant.agent && p.agent!.toLowerCase() === folded);
+    return { participant, handle: usable ? name : participant.agent! };
+  });
+}
+
+/** Exact canonical names retain priority and backwards compatibility. */
+export function modelParticipantByHandle(session: Roster, handle: string): SessionParticipant | undefined {
+  const models = modelParticipants(session);
+  return models.find((p) => p.agent === handle)
+    ?? modelMentionHandles(session).find((entry) => entry.handle !== entry.participant.agent
+      && entry.handle.toLowerCase() === handle.toLowerCase())?.participant;
+}
 
 /** Resolve addressee: explicit `to` wins, else leading `@`, else null.
  *  Only model participants resolve. */
@@ -97,12 +124,12 @@ export function resolveAddressee(
   }
   const m = LEADING_MENTION.exec(text ?? '');
   if (!m) return null;
-  const exact = models.find((p) => p.agent === m[1]);
+  const exact = modelParticipantByHandle(session, m[1]);
   if (exact) return { id: exact.id, agent: exact.agent! };
   // Retry with trailing punctuation trimmed — same recovery as element.ts.
   const trimmed = m[1].replace(/[.-]+$/, '');
   if (trimmed === m[1] || trimmed === '') return null;
-  const hit = models.find((p) => p.agent === trimmed);
+  const hit = modelParticipantByHandle(session, trimmed);
   return hit ? { id: hit.id, agent: hit.agent! } : null;
 }
 
@@ -125,14 +152,15 @@ export function unroutedMention(
   if (resolveAddressee(text, undefined, session)) return null;
   const models = modelParticipants(session);
   if (models.length === 0) return null;
-  const scan = /@([\w.-]{1,64})/g;
+  const scan = /@([\w.-]{1,64})(?![\w.-])/g;
   let hit: RegExpExecArray | null = scan.exec(text);
   while (hit !== null) {
     // Same punctuation retry as the addressee parse, so "@risk." counts.
     const raw = hit[1];
     const trimmed = raw.replace(/[.-]+$/, '');
-    const found = models.find((p) => p.agent === raw)
-      ?? models.find((p) => p.agent === trimmed);
+    const before = hit.index === 0 ? '' : text[hit.index - 1];
+    const found = before && /[\w@]/.test(before) ? undefined
+      : modelParticipantByHandle(session, raw) ?? modelParticipantByHandle(session, trimmed);
     // Naming yourself is not a missed relay — a model cannot relay to itself.
     if (found && found.agent !== selfAgent) return found.agent!;
     hit = scan.exec(text);
@@ -167,9 +195,11 @@ export function participantsBlock(session: Roster, selfAgent: string): string {
     .join('\n');
   const colleagues = modelParticipants(session).filter((p) => p.agent !== selfAgent);
   const addressing = colleagues.length > 0
-    ? '\nAddress a model colleague by starting your reply with @<their name> '
-      + `(${colleagues.map((p) => `@${p.agent}`).join(', ')}); otherwise your reply `
-      + 'goes to the conversation.'
+    ? '\nTo ask a colleague to take the next turn here, call handoff_to_agent '
+      + 'with their exact agent handle and your message. Call it alone; it ends your turn. '
+      + `Colleagues: ${colleagues.map((p) => `${p.displayName} (@${p.agent}; agent="${p.agent}")`).join(', ')}. `
+      + 'This shares the current conversation, unlike a delegated child task. '
+      + 'Ordinary replies go to the conversation; merely naming a colleague does not ask them to act.'
     : '';
   return `\n\n## Conversation participants\n\nYou are "${selfAgent}". `
     + `Also in this conversation:\n${listing}\n\n`

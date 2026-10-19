@@ -1,5 +1,14 @@
 import { type Watcher } from './watcher';
+export { HANDOFF_TOOL_NAME, HANDOFF_ARGS } from './handoff';
 import { type EgressWorker } from './channels/egress';
+export * from './evidence';
+export * from './observations';
+export * from './workflows';
+export * from './evaluations';
+export * from './federation';
+export * from './execution';
+export { workflowAgentPrimitive, workflowApprovalPrimitive, assertWorkflowSessionExecution } from './workflows-agent';
+export { canonicalDigest } from './learning';
 export * from '../common/types';
 export * from '../common/learning';
 export { NAMES } from '../common/names';
@@ -12,11 +21,11 @@ export { AgentSessions, AgentMessages, AgentDeltas, AgentMemories, } from '../co
 export { mergeView } from '../common/merge';
 export { Agent, type AgentConfig, type SessionErasure } from './agent';
 export { abandonPendingAgentTurns, type AbandonedAgentTurns, } from './session-lifecycle';
-export { validateToolArgs, setToolArgsValidator, defineAgentMethod, fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME, type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool, type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult, type ArgsValidator, type TypeboxValue, type TypeboxCompile, type TypeboxValidator, type Skill, type ToolResult, type Gate, type GateContext, type GatePredicate, tool, methodTool, type TypedInlineTool, type TypedAdoptedTool, } from './tools';
+export { validateToolArgs, setToolArgsValidator, defineAgentMethod, fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME, type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool, type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult, type ArgsValidator, type TypeboxValue, type TypeboxCompile, type TypeboxValidator, type Skill, type ToolResult, toolOutput, type SubagentBudget, type DelegationContext, type DelegationDecision, type DelegationCompletion, type DelegationProjection, type Gate, type GateContext, type GatePredicate, tool, methodTool, type TypedInlineTool, type TypedAdoptedTool, } from './tools';
 export type { FromSchema } from '../common/schema';
 export type { HookName, HookMap, HookPurpose, HookToolCall, BeforeProviderRequestHook, AfterToolResultHook, ProviderRequestHookContext, ToolResultHookContext, } from './hooks';
 export { MAX_SUBAGENT_DEPTH } from './subagent';
-export { discoverMcpTools, disconnectMcpServer, unregisterMcpServer, getMcpServerStatus, stopMcp, type DiscoveryResult, type McpServerState, type McpServerStatus, type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory, } from './mcp/client';
+export { discoverMcpTools, disconnectMcpServer, unregisterMcpServer, getMcpServerStatus, stopMcp, discoverMcpResources, readMcpResource, discoverMcpPrompts, getMcpPrompt, type McpResourceInfo, type McpResourceContent, type McpPromptInfo, type McpPromptContent, type McpPromptMessage, type McpResourcesResult, type McpResourceResult, type McpPromptsResult, type McpPromptResult, type McpCatalogError, type DiscoveryResult, type McpServerState, type McpServerStatus, type McpServerDef, type McpToolInfo, type McpClient, type McpClientFactory, } from './mcp/client';
 export { mcpClientResolvable, mcpSdkResolvable } from './mcp/loader';
 export { mockProvider } from './providers/mock';
 export { createPiAiProvider, piAiProvider, type PiAiModels } from './providers/piai';
@@ -31,7 +40,7 @@ export { startEgress, deliverOnce, type DeliverableBinding, type DeliverOnceOpti
 export { handleInbound, mountChannelRoutes } from './channels/ingress';
 export { issueLinkToken, previewLinkToken, redeemLinkToken, linkIdentity, resolveIdentity, type LinkTokenPreview, issueVerdictToken, previewVerdictToken, redeemVerdictToken, type VerdictTokenPreview, } from './channels/linking';
 export { ChannelBindings, ChannelIdentities, ChannelLinkTokens, ChannelVerdictTokens, DeliveryReceipts, InboundSubmissions, insertOrLose, type ChannelBinding, type ChannelIdentity, type ChannelLinkToken, type ChannelVerdictToken, type DeliveryReceipt, type InboundSubmission, type ReceiptExpectation, } from './channels/collections';
-export { AgentAttachments, DEFAULT_ATTACHMENT_CAPS, sanitizeAttachmentName, prettySize, type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions, } from './attachments';
+export { AgentAttachments, DEFAULT_ATTACHMENT_CAPS, sanitizeAttachmentName, prettySize, configureAttachmentStorage, readAttachmentContent, migrateAttachmentContent, type AgentAttachment, type AttachmentCaps, type CreateAttachmentOptions, type AttachmentStorageAdapter, type AttachmentStorageReference, type AttachmentStorageMetadata, type AttachmentStorageContext, } from './attachments';
 export { humanParticipantId, identityParticipantId, modelParticipantId, participantByIdentity, participantByUserId, resolveAddressee, participantsBlock, sanitizeDisplayName, needsAttribution, } from '../common/participants';
 export { AttachmentDownloadTokens, issueAttachmentToken, DOWNLOAD_ROUTE, type AttachmentDownloadToken, } from './downloads';
 export type { ViaIdentity } from './methods';

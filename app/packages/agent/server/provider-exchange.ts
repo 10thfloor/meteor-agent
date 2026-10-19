@@ -4,6 +4,7 @@ import { runBeforeProviderRequest, type ProviderRequestHookContext } from './hoo
 import { SERVER_ID } from './lease';
 import type { Provider, ProviderChunk, ProviderRequest } from './providers/types';
 import { AGENT_MEMORY_FRAME_CLOSE, AGENT_MEMORY_FRAME_OPEN } from './learning';
+import { evidenceTask, finishEvidenceSpan, startEvidenceSpan } from './evidence';
 
 /** @internal A Provider Exchange is one attempt, not a retry policy. It owns
  * hook ordering and cancellation so every caller presents the same request
@@ -116,6 +117,11 @@ export async function runProviderExchange(
   let failed = false;
   let failure: unknown;
   let interruptPoll: Promise<void> | null = null;
+  const spanId = await evidenceTask(() => startEvidenceSpan({ sessionId: options.sessionId,
+    kind: 'model', name: options.request.model, summary: options.context.purpose === 'compaction'
+      ? 'Summarizing conversation' : 'Preparing reply' }));
+  let requestDigest: string | undefined;
+  let usage: { input: number; output: number; cost?: number } | undefined;
 
   const hasAuthority = async (): Promise<boolean> => !!(await AgentSessions.findOneAsync({
     _id: options.sessionId,
@@ -156,7 +162,10 @@ export async function runProviderExchange(
     pollForInterrupt();
     const initial = interruptPoll;
     if (initial) await initial;
-    if (interrupted || abort.signal.aborted) return { kind: 'interrupted' };
+    if (interrupted || abort.signal.aborted) {
+      await evidenceTask(() => finishEvidenceSpan(spanId, { status: 'stopped', summary: 'Model request stopped' }));
+      return { kind: 'interrupted' };
+    }
     // Hooks never own cancellation. Stamp the harness signal after their
     // replacement request has been accepted.
     const hooked = await runBeforeProviderRequest(options.request, options.context);
@@ -183,8 +192,9 @@ export async function runProviderExchange(
       }
     }
     if (!abort.signal.aborted) {
+      requestDigest = effectiveProviderRequestDigest(request);
       await options.onEffectiveRequest?.(
-        request, effectiveProviderRequestDigest(request),
+        request, requestDigest,
       );
       // Auditing may itself await storage or hooks long enough for the Lease,
       // Session, or lifecycle fence to change. Re-prove authority at the final
@@ -203,7 +213,9 @@ export async function runProviderExchange(
         // A non-cooperative Adapter may yield after its signal was aborted.
         // Do not let that late chunk reach Deltas or any other caller state.
         if (abort.signal.aborted) break;
-        options.onChunk(normalizeChunk(chunk));
+        const normalized = normalizeChunk(chunk);
+        if (normalized.kind === 'done' && normalized.usage) usage = normalized.usage;
+        options.onChunk(normalized);
         if (abort.signal.aborted) break;
       }
     }
@@ -227,6 +239,13 @@ export async function runProviderExchange(
     }
   }
 
+  await evidenceTask(() => finishEvidenceSpan(spanId, {
+    status: interrupted ? 'stopped' : failed ? 'failed' : 'completed',
+    summary: interrupted ? 'Model request stopped' : failed ? 'Model request failed' : 'Model response received',
+    ...(requestDigest ? { requestDigest } : {}), inputCount: options.request.messages.length,
+    ...(usage ? { inputTokens: usage.input, outputTokens: usage.output,
+      ...(usage.cost !== undefined ? { cost: usage.cost } : {}) } : {}),
+  }));
   if (interrupted) return { kind: 'interrupted' };
   if (failed) return { kind: 'failed', error: failure };
   return { kind: 'complete' };

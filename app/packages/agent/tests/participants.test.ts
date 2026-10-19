@@ -487,6 +487,70 @@ describe('participants', () => {
   });
 
   describe('addressing', () => {
+    it('routes an explicit DDP recipient without waking the primary, even with a different leading mention', async function () {
+      this.timeout(30000);
+      const { Meteor } = await import('meteor/meteor');
+      const { NAMES } = await import('../common/names');
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { AgentMessages } = await import('../common/collections');
+      await clean();
+      let primaryCalls = 0;
+      new Agent('pp-explicit-primary', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => { primaryCalls += 1; return { text: 'primary' }; }),
+      });
+      new Agent('pp-explicit-relay', {
+        model: 'mock', instructions: '', tools: [], startable: false,
+        provider: mockProvider(() => ({ text: 'Relay here' })),
+      });
+      await seedRostered('pa-explicit', 'pp-explicit-primary', 'u1', [model('pp-explicit-relay')]);
+      const send = (Meteor.server as any).method_handlers[NAMES.mSend];
+      await send.call(
+        { userId: 'u1' }, 'pp-explicit-primary', 'pa-explicit',
+        '@pp-explicit-primary is background context; Relay, please answer.',
+        'explicit-recipient-send', { to: 'm:pp-explicit-relay' },
+      );
+      await waitFor(async () => !!(await AgentMessages.findOneAsync({
+        sessionId: 'pa-explicit', role: 'assistant',
+      })), 'the explicitly selected reply');
+      const reply = await AgentMessages.findOneAsync({ sessionId: 'pa-explicit', role: 'assistant' });
+      assert.equal(reply?.content, 'Relay here');
+      assert.equal(reply?.from?.participant, 'm:pp-explicit-relay');
+      assert.equal(primaryCalls, 0);
+      const input = await AgentMessages.findOneAsync({ sessionId: 'pa-explicit', role: 'user' });
+      assert.equal(input?.to, 'm:pp-explicit-relay');
+      assert.equal(input?.source?.kind, 'desktop');
+    });
+
+    it('rejects unavailable explicit recipients before committing input or waking the primary', async function () {
+      const { Agent } = await import('../server/agent');
+      const { mockProvider } = await import('../server/providers/mock');
+      const { sendToSession } = await import('../server/methods');
+      const { AgentMessages, AgentSessions } = await import('../common/collections');
+      await clean();
+      let primaryCalls = 0;
+      new Agent('pp-recipient-guard', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => { primaryCalls += 1; return { text: 'primary' }; }),
+      });
+      new Agent('pp-recipient-outside', {
+        model: 'mock', instructions: '', tools: [],
+        provider: mockProvider(() => ({ text: 'outside' })),
+      });
+      await seedRostered('pa-recipient-guard', 'pp-recipient-guard', 'u1', [model('pp-unregistered')]);
+      for (const to of ['m:missing', 'm:pp-recipient-outside', 'm:pp-unregistered', 'h:u1', '']) {
+        await rejectsWith(() => sendToSession(
+          'pp-recipient-guard', 'pa-recipient-guard', '@pp-recipient-guard answer', 'u1', { to },
+        ), 'recipient-unavailable');
+      }
+      assert.equal(await AgentMessages.find({ sessionId: 'pa-recipient-guard' }).countAsync(), 0);
+      const session = await AgentSessions.findOneAsync('pa-recipient-guard');
+      assert.equal(session?.budgetSpent?.turns, 0);
+      assert.equal(session?.phase, 'idle');
+      assert.equal(primaryCalls, 0);
+    });
+
     it('routes @agent to that model\'s config, with the participants block in its prompt', async function () {
       this.timeout(30000);
       const { Agent } = await import('../server/agent');

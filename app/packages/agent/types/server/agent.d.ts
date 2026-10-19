@@ -7,7 +7,7 @@ import { type HookMap, type HookName } from './hooks';
 import type { SystemTurnResult } from './system-turn';
 import { type SaveArgs } from './memory';
 import { type ChannelDef } from './channels/registry';
-import { createAttachment } from './attachments';
+import { createAttachment, configureAttachmentStorage, readAttachmentContent, migrateAttachmentContent } from './attachments';
 import { addParticipant, listParticipants, removeParticipant } from './participants';
 import { type SessionErasure } from './session-lifecycle';
 import { auditLearningState, buildProtectedLearningPrompt, ensureAgentIdentity, freezeMemoryFrame, listExperiences, practiceTransitionAllowed, proposePractice, recordExperience, recordProviderRequestDigest, retractExperience, reviewLearning, reviseConstitution, setIdentityLifecycle, transitionPractice } from './learning';
@@ -90,6 +90,9 @@ export declare class Agent {
     static attachments: {
         create: typeof createAttachment;
         readTool: import("./tools").InlineTool;
+        configureStorage: typeof configureAttachmentStorage;
+        readContent: typeof readAttachmentContent;
+        migrateContent: typeof migrateAttachmentContent;
     };
     /** Session roster — server-only; joins are app-code decisions,
      *  never a DDP cap. 16-participant cap; owner cannot be removed. */

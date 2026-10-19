@@ -14,7 +14,7 @@ export interface DispatchLimits {
 }
 /** parked = awaiting external answer, abandoned = turn gone,
  *  completed = all calls answered (safe to re-enter think loop). */
-export type DispatchOutcome = 'completed' | 'parked' | 'abandoned';
+export type DispatchOutcome = 'completed' | 'parked' | 'abandoned' | 'ended';
 interface TurnAnchor {
     userId: string | null;
     /** The running agent (addressee on addressed turns) — hooks and parks

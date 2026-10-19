@@ -56,6 +56,59 @@ export interface McpCallResult {
     toolResult?: unknown;
     [k: string]: unknown;
 }
+/** Secret-safe, allowlisted views for operator UIs. MCP metadata is supplied
+ * by an untrusted subprocess, so arbitrary `_meta`, annotations, icons, and
+ * document keys never cross this boundary. */
+export interface McpResourceInfo {
+    uri: string;
+    name: string;
+    title?: string;
+    description?: string;
+    mimeType?: string;
+    size?: number;
+}
+export interface McpResourceContent {
+    uri: string;
+    mimeType?: string;
+    text?: string;
+    /** Binary bytes are intentionally not returned through DDP/operator views. */
+    blob?: '[binary content omitted]';
+}
+export interface McpPromptInfo {
+    name: string;
+    title?: string;
+    description?: string;
+    arguments?: Array<{
+        name: string;
+        description?: string;
+        required?: boolean;
+    }>;
+}
+export interface McpPromptContent {
+    type: string;
+    text?: string;
+    mimeType?: string;
+    uri?: string;
+}
+export interface McpPromptMessage {
+    role: 'user' | 'assistant';
+    content: McpPromptContent;
+}
+interface McpResourceListResult {
+    resources?: unknown[];
+    nextCursor?: string;
+}
+interface McpResourceReadResult {
+    contents?: unknown[];
+}
+interface McpPromptListResult {
+    prompts?: unknown[];
+    nextCursor?: string;
+}
+interface McpPromptGetResult {
+    description?: string;
+    messages?: unknown[];
+}
 /** Test seam for the MCP client. Connecting is the factory's job. */
 export interface McpClient {
     listTools(params?: Record<string, unknown>, options?: McpRequestOptions): Promise<{
@@ -65,6 +118,19 @@ export interface McpClient {
         name: string;
         arguments?: Record<string, unknown>;
     }): Promise<McpCallResult>;
+    listResources?(params?: {
+        cursor?: string;
+    }, options?: McpRequestOptions): Promise<McpResourceListResult | undefined>;
+    readResource?(params: {
+        uri: string;
+    }, options?: McpRequestOptions): Promise<McpResourceReadResult | undefined>;
+    listPrompts?(params?: {
+        cursor?: string;
+    }, options?: McpRequestOptions): Promise<McpPromptListResult | undefined>;
+    getPrompt?(params: {
+        name: string;
+        arguments?: Record<string, string>;
+    }, options?: McpRequestOptions): Promise<McpPromptGetResult | undefined>;
     close(): Promise<void>;
 }
 /** Build a CONNECTED client for a server definition. Rejecting is the way to
@@ -93,6 +159,52 @@ export type DiscoveryResult = {
 /** The server's tool catalog, connecting if necessary. Cached with the
  *  connection; a failure is remembered only as a bounded cooldown. */
 export declare function discoverMcpTools(server: string): Promise<DiscoveryResult>;
+export type McpCatalogError = 'mcp-unavailable' | 'mcp-unsupported' | 'not-allowed' | 'invalid-request';
+export type McpResourcesResult = {
+    ok: true;
+    resources: McpResourceInfo[];
+} | {
+    ok: false;
+    error: McpCatalogError;
+    reason: string;
+};
+export type McpResourceResult = {
+    ok: true;
+    contents: McpResourceContent[];
+} | {
+    ok: false;
+    error: McpCatalogError;
+    reason: string;
+};
+export type McpPromptsResult = {
+    ok: true;
+    prompts: McpPromptInfo[];
+} | {
+    ok: false;
+    error: McpCatalogError;
+    reason: string;
+};
+export type McpPromptResult = {
+    ok: true;
+    description?: string;
+    messages: McpPromptMessage[];
+} | {
+    ok: false;
+    error: McpCatalogError;
+    reason: string;
+};
+type McpAuthorize = () => boolean | Promise<boolean>;
+/** Discover every bounded resource page. Catalog metadata is reduced to an
+ * allowlist before it can reach a DDP method or operator UI. */
+export declare function discoverMcpResources(server: string, authorize?: McpAuthorize): Promise<McpResourcesResult>;
+/** Read one resource after authorization. URI validation happens before any
+ * subprocess call, and binary bodies never cross the operator boundary. */
+export declare function readMcpResource(server: string, uri: string, authorize?: McpAuthorize): Promise<McpResourceResult>;
+/** Discover every bounded prompt page with the same allowlist discipline. */
+export declare function discoverMcpPrompts(server: string, authorize?: McpAuthorize): Promise<McpPromptsResult>;
+/** Resolve a server-authored prompt after an authorization recheck. Binary
+ * prompt bodies are represented by metadata only; text is bounded. */
+export declare function getMcpPrompt(server: string, name: string, args: unknown, authorize?: McpAuthorize): Promise<McpPromptResult>;
 /** Close this server's current and in-flight clients while retaining its
  * registration. Returns false only when neither registration nor runtime state
  * exists for `name`. A later discovery reconnects from the stored definition. */
@@ -116,4 +228,5 @@ export declare function stopMcp(): Promise<void>;
 /** Test seam: replace the client factory. null restores the default.
  *  Snapshots and restores server definitions so test registrations don't leak. */
 export declare function _setMcpClientFactory(next: McpClientFactory | null): () => void;
+export {};
 //# sourceMappingURL=client.d.ts.map

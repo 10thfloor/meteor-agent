@@ -26,7 +26,7 @@ import {
   forgetMemory, readSelector, saveMemory, type SaveArgs,
 } from './memory';
 import { registerChannel, type ChannelDef } from './channels/registry';
-import { createAttachment, readTool } from './attachments';
+import { createAttachment, readTool, configureAttachmentStorage, readAttachmentContent, migrateAttachmentContent } from './attachments';
 import {
   addParticipant, listParticipants, removeParticipant,
 } from './participants';
@@ -283,6 +283,9 @@ export class Agent {
   static attachments = {
     create: createAttachment,
     readTool,
+    configureStorage: configureAttachmentStorage,
+    readContent: readAttachmentContent,
+    migrateContent: migrateAttachmentContent,
   };
 
   /** Session roster — server-only; joins are app-code decisions,

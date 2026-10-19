@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from 'crypto';
 import type { ClientSession } from 'mongodb';
 import {
-  AgentAttachments, AgentSessions, ChannelBindings,
+  Agent, AgentAttachments, AgentSessions, ChannelBindings,
   DEFAULT_ATTACHMENT_CAPS, MAX_PARTICIPANTS, channelKnobs, deliverOnce,
   getChannel, headerValue, humanParticipantId, identityParticipantId,
   isLinkGesture, modelParticipantId, prettySize, resolveIdentity, safeEqual,
@@ -842,7 +842,7 @@ export function composeEmailTool(options: ComposeEmailToolOptions): InlineTool {
         const row = await AgentAttachments.findOneAsync({ _id: id, sessionId: ctx.sessionId });
         if (row) {
           files.push({
-            name: row.name, contentType: row.contentType, size: row.size, content: row.content,
+            name: row.name, contentType: row.contentType, size: row.size, content: await Agent.attachments.readContent(row),
           });
         } else missing.push(id);
       }

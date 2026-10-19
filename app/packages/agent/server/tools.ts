@@ -37,6 +37,11 @@ export interface ToolContext {
    *  replaces it for that one tool — see `RUNAS_NOTE` and `runTool`. */
   userId: string | null;
   sessionId: string;
+  /** Cooperative cancellation for dispatched inline tools on Stop, erasure,
+   * or lost worker authority. Pass to I/O or an isolated execution provider;
+   * the framework cannot forcibly terminate arbitrary tool implementations.
+   * Optional for compatibility with direct runTool callers. */
+  signal?: AbortSignal;
   /** Set by loop dispatch; optional for direct `runTool` callers. */
   toolCallId?: string;
   /** Committed assistant Message that contains this Tool call. Set by loop
@@ -101,7 +106,44 @@ export type SubagentTool = {
   args?: unknown;
   name?: string;
   gate?: Gate;
+  /** Exact developer-published AgentConfig version. Mismatch refuses dispatch. */
+  version?: string;
+  /** Per-edge ceilings, always intersected with the child's own limits. */
+  budget?: SubagentBudget;
+  /** Transform only the explicitly delegated prompt; no parent transcript is
+   * implicitly disclosed. Throwing or returning an empty string refuses. */
+  context?: (context: DelegationContext) => string | Promise<string>;
+  beforeDelegate?: (context: DelegationContext) => DelegationDecision | Promise<DelegationDecision>;
+  afterDelegate?: (context: DelegationCompletion) => DelegationProjection | false | Promise<DelegationProjection | false>;
 };
+
+export interface SubagentBudget { toolCalls?: number; spend?: number; maxIterations?: number }
+export interface DelegationContext {
+  prompt: string; userId: string | null; sessionId: string; agent: string;
+  toolCallId?: string;
+}
+export type DelegationDecision = boolean | { prompt?: string; budget?: SubagentBudget };
+export interface DelegationCompletion extends DelegationContext {
+  childSessionId: string; ok: boolean; text?: string;
+  error?: { error: string; reason?: string };
+}
+export interface DelegationProjection { model: string; display?: string; transcript?: string }
+
+/** Dispatch also validates hook-supplied limits before any child is born. */
+export function validateSubagentBudget(budget?: SubagentBudget): void {
+  if (budget === undefined) return;
+  if (!budget || typeof budget !== 'object' || Array.isArray(budget)
+    || Object.keys(budget).some((key) => !['toolCalls', 'spend', 'maxIterations'].includes(key))) {
+    throw new Error('Subagent budget may contain toolCalls, spend, and maxIterations.');
+  }
+  for (const field of ['toolCalls', 'spend', 'maxIterations'] as const) {
+    const value = budget[field];
+    if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value < 0
+      || (field !== 'spend' && !Number.isInteger(value)) || (field === 'maxIterations' && value < 1))) {
+      throw new Error(`Subagent budget.${field} is invalid.`);
+    }
+  }
+}
 
 /** The default subagent argument schema: one string, the child's first user
  *  message. Deliberately minimal — a subagent is given a task in prose, and
@@ -178,6 +220,7 @@ export interface ResolvedTool {
   /** `kind: 'subagent'` only: the REGISTRY NAME of the agent to run. Resolved
    *  to a config at dispatch, never here — see `resolveTools`. */
   subagent?: string;
+  delegation?: Pick<SubagentTool, 'version' | 'budget' | 'context' | 'beforeDelegate' | 'afterDelegate'>;
   /** `kind: 'mcp'` only. `tool` absent means the WHOLE SERVER: a placeholder
    *  that `expandMcpTools` replaces with one entry per discovered tool, and
    *  that never reaches dispatch. */
@@ -196,6 +239,33 @@ export interface ToolResult {
   ok: boolean;
   value?: unknown;
   error?: { error: string; reason?: string };
+  /** Human-safe activity text. Model context continues to use `value`. */
+  display?: string;
+  /** Human-readable persistent history, independent of model context. */
+  transcript?: string;
+  /** Private audit data; dispatch never places this field on a Message. */
+  auditValue?: unknown;
+}
+
+const TOOL_OUTPUT = Symbol('agent-tool-output');
+export interface ProjectedToolOutput {
+  readonly [TOOL_OUTPUT]: true;
+  model: unknown;
+  display: string;
+  transcript: string;
+  raw?: unknown;
+}
+/** Explicit projections keep large nested/tool payloads out of model context
+ * and JSON out of human-facing history. The symbol prevents remote JSON from
+ * impersonating a host-defined projection. */
+export function toolOutput(input: {
+  model: unknown; display: string; transcript?: string; raw?: unknown;
+}): ProjectedToolOutput {
+  if (typeof input.display !== 'string' || !input.display.trim()
+    || (input.transcript !== undefined && typeof input.transcript !== 'string')) {
+    throw new Error('A tool output needs human-readable display text.');
+  }
+  return { [TOOL_OUTPUT]: true, ...input, transcript: input.transcript ?? input.display };
 }
 
 /** The verdict shape. `reason` names the offending FIELD and never echoes its
@@ -830,6 +900,12 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
           + `${JSON.stringify(spec)}`,
         );
       }
+      if (sub.version !== undefined && (typeof sub.version !== 'string'
+        || !sub.version.trim() || sub.version.length > 128)) throw new Error('Subagent version must be 1-128 characters.');
+      for (const hook of ['context', 'beforeDelegate', 'afterDelegate'] as const) {
+        if (sub[hook] !== undefined && typeof sub[hook] !== 'function') throw new Error(`Subagent ${hook} must be a function.`);
+      }
+      validateSubagentBudget(sub.budget);
       // Resolved at dispatch, not here: agent load order is unpredictable.
       return {
         name: sub.name ?? sub.subagent,
@@ -838,6 +914,9 @@ export function resolveTools(specs: ToolSpec[]): ResolvedTool[] {
         gate: normalizeGate(sub.gate, sub.name ?? sub.subagent),
         kind: 'subagent' as const,
         subagent: sub.subagent,
+        ...(sub.version !== undefined || sub.budget || sub.context || sub.beforeDelegate || sub.afterDelegate
+          ? { delegation: { version: sub.version, budget: sub.budget, context: sub.context,
+            beforeDelegate: sub.beforeDelegate, afterDelegate: sub.afterDelegate } } : {}),
       };
     }
     if (hasMethod) {
@@ -1265,8 +1344,9 @@ export async function runTool(
   authorize?: () => boolean | Promise<boolean>,
 ): Promise<ToolResult> {
   const authorized = async (): Promise<boolean> => {
+    if (ctx.signal?.aborted) return false;
     if (!authorize) return true;
-    try { return (await authorize()) === true; } catch { return false; }
+    try { return (await authorize()) === true && !ctx.signal?.aborted; } catch { return false; }
   };
   const denied = (): ToolResult => ({
     ok: false,
@@ -1352,6 +1432,11 @@ export async function runTool(
       }
       return tool.run!(args, toolCtx);
     });
+    if (value && typeof value === 'object' && value[TOOL_OUTPUT] === true) {
+      const projected = value as ProjectedToolOutput;
+      return { ok: true, value: projected.model, display: projected.display,
+        transcript: projected.transcript, auditValue: projected.raw ?? projected.model };
+    }
     return { ok: true, value };
   } catch (e: any) {
     if (e instanceof Meteor.Error) {
