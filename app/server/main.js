@@ -58,6 +58,10 @@ import { telegram } from 'meteor/10thfloor:agent-channel-telegram';
 import { whatsapp } from 'meteor/10thfloor:agent-channel-whatsapp';
 import { sms } from 'meteor/10thfloor:agent-channel-sms';
 import { email } from 'meteor/10thfloor:agent-channel-email';
+import {
+  conversationRoot, installMissionTopics, missionConversationIds, missionRoot,
+} from './mission-topics';
+import { MISSION_ROOT_SELECTOR } from '../imports/constellation/topics';
 import './constellation-durable';
 import {
   CHANNEL_KINDS,
@@ -1215,11 +1219,13 @@ async function syncCrewSession(userId, sessionId, preparedConfigs) {
 }
 
 async function workspaceMissionSessions(userId) {
+  // Missions only: topics and threads take the Mission's roster from #general (see mission-topics.js).
   return AgentSessions.find(
     {
       userId,
       agent: 'orchestrator',
       erasingAt: { $exists: false },
+      ...MISSION_ROOT_SELECTOR,
     },
     { fields: { _id: 1, title: 1, phase: 1, activeChild: 1 }, sort: { updatedAt: -1 } },
   ).fetchAsync();
@@ -3066,9 +3072,11 @@ function missionBudget(value, fallback = DEFAULT_MISSION_BUDGET) {
 }
 
 async function ensureMissionConfig(userId, sessionOrId) {
-  const session = typeof sessionOrId === 'string'
+  let session = typeof sessionOrId === 'string'
     ? await AgentSessions.findOneAsync({ _id: sessionOrId, userId, agent: 'orchestrator' })
     : sessionOrId;
+  // Topics and threads have no settings of their own; they use their Mission's.
+  if (session?.missionTopic || session?.thread) session = await rootMissionSession(session._id);
   if (!session || session.userId !== userId || session.agent !== 'orchestrator') {
     throw new Meteor.Error('no-session', 'Mission not found.');
   }
@@ -3173,11 +3181,14 @@ function missionInput(current, patch) {
   };
 }
 
+/** The Mission a session belongs to (#general's session), through subagents, topics and threads. */
 async function rootMissionSession(sessionId) {
-  let session = await AgentSessions.findOneAsync(sessionId);
-  for (let depth = 0; session?.parent?.sessionId && depth < 8; depth += 1) {
-    session = await AgentSessions.findOneAsync(session.parent.sessionId);
-  }
+  return missionRoot(AgentSessions, sessionId);
+}
+
+/** The topic or thread whose work this is: the top of its own subagent tree. */
+async function conversationRootSession(sessionId) {
+  const session = await conversationRoot(AgentSessions, sessionId);
   return session?.agent === 'orchestrator' ? session : null;
 }
 
@@ -3323,9 +3334,12 @@ export async function requireActiveMissionExecution(sessionId, agent, { reflecti
   await assertWorkflowSessionExecution(sessionId, { reflection });
   const root = await rootMissionSession(sessionId);
   if (!root) return;
-  // A delayed specialist continuation must not outrun a stop on its parent
-  // mission. Rechecked at provider entry as well as at approval dispatch.
-  if (sessionId !== root._id && ['stopped', 'error'].includes(root.phase) && !reflection) {
+  // A delayed specialist continuation must not outrun a stop on the topic or
+  // thread it works for. Rechecked at provider entry as well as at approval
+  // dispatch. Another topic stopping is not this conversation's stop.
+  const conversation = await conversationRootSession(sessionId);
+  if (conversation && sessionId !== conversation._id
+    && ['stopped', 'error'].includes(conversation.phase) && !reflection) {
     throw new Meteor.Error('mission-stopped', 'The mission is stopped. Send a message in its chat to continue.');
   }
   if (!reflection) await constellationDecisions?.assertContinuationExecution(sessionId, agent);
@@ -3417,7 +3431,8 @@ export function withResponseStyle(request, context) {
 
 Agent.hook('beforeProviderRequest', withResponseStyle);
 
-async function stopMissionExecution(userId, session) {
+/** Stop one topic or thread and the subagent work under it. */
+async function stopConversationExecution(userId, session) {
   let current = await AgentSessions.findOneAsync({
     _id: session._id, userId, erasingAt: { $exists: false },
   });
@@ -3433,6 +3448,13 @@ async function stopMissionExecution(userId, session) {
     current = nextId
       ? await AgentSessions.findOneAsync({ _id: nextId, userId })
       : null;
+  }
+}
+
+/** Stop every topic and thread of a Mission, then its continuations and code runs. */
+async function stopMissionExecution(userId, session) {
+  for (const id of await missionConversationIds(AgentSessions, userId, session._id)) {
+    await stopConversationExecution(userId, { _id: id });
   }
   await constellationDecisions?.stopMissionContinuations(userId, session._id);
   await constellationExecution?.stopMissionExecutions(userId, session._id);
@@ -4681,7 +4703,7 @@ constellationDecisions = installConstellationDecisions({
       throw new Meteor.Error('not-authorized', 'Sign in as the workspace owner to manage decisions.');
     }
   },
-  rootMissionSession, missionAllowsAgent, requireActiveMissionExecution,
+  rootMissionSession, conversationRootSession, missionAllowsAgent, requireActiveMissionExecution,
   startDecisionContinuation: startSystemTurn,
   encryptSecret: (userId, value) => encryptChannelSecret(userId, 'typesafe', 'apiKey', value),
   decryptSecret: (userId, box) => decryptChannelSecret(userId, 'typesafe', 'apiKey', box),
@@ -4700,6 +4722,10 @@ constellationExecution = installConstellationExecution({
   decryptSecret: (userId, box) => decryptChannelSecret(userId, 'sprites', 'token', box),
   canStoreSecret: () => !!configKeyBytes,
   onPolicyChange: (userId) => syncCodeToolCatalog(userId),
+});
+installMissionTopics({
+  AgentSessions, orchestrator, claimWorkspace, ensureMissionConfig,
+  stopConversation: stopConversationExecution,
 });
 // Resolve the authoritative workspace before registering a Crew. Eager default
 // definitions can race recovery after a restart and claim a different Identity
@@ -4805,7 +4831,7 @@ Meteor.methods({
     const crew = await ensureCrewConfigs(this.userId);
     const modelCatalog = await modelCatalogView(this.userId);
     const sessions = await AgentSessions.find(
-      { userId: this.userId, agent: 'orchestrator', parent: { $exists: false } },
+      { userId: this.userId, agent: 'orchestrator', parent: { $exists: false }, ...MISSION_ROOT_SELECTOR },
       { sort: { updatedAt: -1 }, limit: 100 },
     ).fetchAsync();
     for (const session of sessions) await ensureMissionConfig(this.userId, session);
@@ -4836,11 +4862,13 @@ Meteor.methods({
     await claimWorkspace(this.userId);
     const userId = this.userId;
     return withWorkspaceConfigMutation(userId, async () => {
-    const session = await AgentSessions.findOneAsync({ _id: sessionId, agent: 'orchestrator', userId: this.userId });
-    if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
+    const opened = await AgentSessions.findOneAsync({ _id: sessionId, agent: 'orchestrator', userId: this.userId });
+    // Opening a topic or thread prepares its Mission; its roster follows #general's.
+    const session = opened?.missionTopic || opened?.thread ? await rootMissionSession(sessionId) : opened;
+    if (!session || session.userId !== this.userId) throw new Meteor.Error('no-session', 'Mission not found.');
     await ensureMissionConfig(this.userId, session);
-    await ensurePulseConfigs(this.userId, sessionId);
-    return reconcileConfiguredMissionCrew(this.userId, sessionId);
+    await ensurePulseConfigs(this.userId, session._id);
+    return reconcileConfiguredMissionCrew(this.userId, session._id);
     });
   },
 
@@ -4872,7 +4900,9 @@ Meteor.methods({
       // This runs before the MissionConfig CAS. A fast Reactivate click can
       // wait for ordinary cleanup, but it can never make the Mission active
       // while the stopped Turn still owns a Lease or live-child marker.
-      await waitForMissionQuiescence(this.userId, sessionId);
+      for (const id of await missionConversationIds(AgentSessions, this.userId, sessionId)) {
+        await waitForMissionQuiescence(this.userId, id);
+      }
     }
     const changed = await MissionConfigs.updateAsync(
       { _id: sessionId, userId: this.userId, revision: expectedRevision },
@@ -4887,10 +4917,12 @@ Meteor.methods({
     else if (reactivating) {
       // A paused approval is a durable question, not discarded work. Restore
       // that exact gate when the Mission is reactivated so it never becomes a
-      // hidden `pending` marker on an idle session.
+      // hidden `pending` marker on an idle session. Every topic and thread of
+      // the Mission was stopped with it and comes back with it.
+      const conversationIds = await missionConversationIds(AgentSessions, this.userId, sessionId);
       await AgentSessions.updateAsync(
         {
-          _id: sessionId,
+          _id: { $in: conversationIds },
           userId: this.userId,
           agent: 'orchestrator',
           phase: 'stopped',
@@ -4900,10 +4932,11 @@ Meteor.methods({
           'pending.verdict': { $exists: false },
         },
         { $set: { phase: 'awaiting', updatedAt: new Date() } },
+        { multi: true },
       );
       await AgentSessions.updateAsync(
         {
-          _id: sessionId,
+          _id: { $in: conversationIds },
           userId: this.userId,
           agent: 'orchestrator',
           phase: 'stopped',
@@ -4911,6 +4944,7 @@ Meteor.methods({
           lease: { $exists: false },
         },
         { $set: { phase: 'idle', updatedAt: new Date() } },
+        { multi: true },
       );
     }
     if (current.status === 'completed' && next.status !== 'completed') {
@@ -5958,12 +5992,13 @@ Meteor.methods({
     await claimWorkspace(this.userId);
     const clean = title.replace(/[\u0000-\u001f\u007f]/g, '').trim().slice(0, 96);
     if (!clean) throw new Meteor.Error('invalid-title', 'Mission title cannot be empty.');
+    // Topics are renamed with constellation.topicRename; this names the Mission.
     const session = await AgentSessions.findOneAsync({
-      _id: sessionId, agent: 'orchestrator', userId: this.userId,
+      _id: sessionId, agent: 'orchestrator', userId: this.userId, ...MISSION_ROOT_SELECTOR,
     });
     if (!session) throw new Meteor.Error('no-session', 'Mission not found.');
     const changed = await AgentSessions.updateAsync(
-      { _id: sessionId, agent: 'orchestrator', userId: this.userId },
+      { _id: sessionId, agent: 'orchestrator', userId: this.userId, ...MISSION_ROOT_SELECTOR },
       { $set: { title: clean, updatedAt: new Date() } },
     );
     if (changed !== 1) throw new Meteor.Error('no-session', 'Mission not found.');

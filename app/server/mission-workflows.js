@@ -10,6 +10,8 @@ import { PLAN_HANDLE_PATTERN, planHandleBase, planReferenceHandles, parsePlanRun
 import { workflowDecisionPrimitive } from './decision-workflows';
 import { workflowDecisionState } from './decision-workflows';
 import { decisionJson } from '../imports/constellation/decisions';
+import { isMissionRoot, MISSION_ROOT_SELECTOR } from '../imports/constellation/topics';
+import { missionRoot } from './mission-topics';
 
 export const MissionWorkflows = new Mongo.Collection('constellation_workflows');
 export const MissionWorkflowRuns = AgentWorkflowRuns;
@@ -70,9 +72,19 @@ export function installMissionWorkflows({
     await owner(userId);
     if (typeof missionId !== 'string' || !missionId || missionId.length > 120) error('invalid-workflow', 'Choose a mission.');
     const root = await AgentSessions.findOneAsync({ _id: missionId, userId, agent: 'orchestrator',
-      'parent.sessionId': { $exists: false }, erasingAt: { $exists: false } });
+      'parent.sessionId': { $exists: false }, erasingAt: { $exists: false }, ...MISSION_ROOT_SELECTOR });
     if (!root) error('no-session', 'Mission not found.');
     return ensureMissionConfig(userId, root);
+  };
+  // A chat is #general, a topic or a thread. Plans belong to its Mission.
+  const chatMission = async (userId, chatId) => {
+    await owner(userId);
+    if (typeof chatId !== 'string' || !chatId || chatId.length > 120) error('invalid-workflow', 'Choose a mission.');
+    const chat = await AgentSessions.findOneAsync({ _id: chatId, userId, agent: 'orchestrator',
+      'parent.sessionId': { $exists: false }, erasingAt: { $exists: false } });
+    const root = chat && (isMissionRoot(chat) ? chat : await missionRoot(AgentSessions, chatId));
+    if (!root || root.userId !== userId) error('no-session', 'Mission not found.');
+    return mission(userId, root._id);
   };
   const engine = new WorkflowEngine({
     namespace,
@@ -216,13 +228,13 @@ export function installMissionWorkflows({
     if (!row) error('workflow-conflict', 'This plan changed. Add its current reference before running it.');
     return engine.start({ userId, missionId, definition: row.definition, requestKey });
   };
-  const resolveReferences = async (userId, originChatId, message, selected = [], command) => {
+  const resolveReferences = async (userId, currentMissionId, message, selected = [], command) => {
     if (!Array.isArray(selected) || selected.length > 8) error('invalid-plan-reference', 'Choose up to eight plans.');
     const handles = planReferenceHandles(message);
     if (handles.length > 8) error('invalid-plan-reference', 'Choose up to eight plans.');
-    const plans = await accessiblePlans(userId, originChatId);
+    const plans = await accessiblePlans(userId, currentMissionId);
     if (command?.currentMission) {
-      const own = plans.find((plan) => plan.missionId === originChatId);
+      const own = plans.find((plan) => plan.missionId === currentMissionId);
       if (!own) error('workflow-not-saved', 'Save a plan for this mission first.');
       handles.push(own.handle);
     }
@@ -259,7 +271,7 @@ export function installMissionWorkflows({
     return Meteor.server.method_handlers[method].call({ userId: record.userId, connection: null }, ...args);
   };
   const finishChatRequest = async (record) => {
-    await mission(record.userId, record.originChatId);
+    await chatMission(record.userId, record.originChatId);
     let outcome;
     if (record.kind === 'run') {
       const plan = record.plans[0];
@@ -358,7 +370,10 @@ export function installMissionWorkflows({
     async 'constellation.workflowChatSend'(input) {
       if (!input || typeof input !== 'object') error('invalid-plan-reference', 'A chat message is required.');
       const { missionId, text: message, requestKey, references = [], mode = 'agent' } = input;
+      // The message goes to `chatId` (a topic or thread of the Mission); without one, to #general.
+      const chatId = input.chatId ?? missionId;
       await mission(this.userId, missionId);
+      if ((await chatMission(this.userId, chatId))._id !== missionId) error('no-session', 'Mission not found.');
       if (typeof message !== 'string' || !message.trim() || message.length > 32_000
         || !['agent', 'note'].includes(mode) || typeof requestKey !== 'string' || !/^[A-Za-z0-9_-]{16,100}$/.test(requestKey)) {
         error('invalid-plan-reference', 'Use a message and a new send key.');
@@ -368,7 +383,8 @@ export function installMissionWorkflows({
       if (recipient !== undefined && (typeof recipient !== 'string' || !recipient || recipient.length > 160 || /[\x00-\x1f\x7f]/.test(recipient))) {
         error('invalid-plan-reference', 'Choose a valid chat recipient.');
       }
-      const id = workflowFingerprint([this.userId, missionId, requestKey]);
+      // #general keeps its existing request ids; another chat is part of the id.
+      const id = workflowFingerprint(chatId === missionId ? [this.userId, missionId, requestKey] : [this.userId, missionId, chatId, requestKey]);
       // Preserve legacy hashes when no recipient was selected. Routing is part
       // of a message's retry identity, never an override for plan step agents.
       const inputHash = workflowFingerprint({ message, references, mode, ...(recipient !== undefined ? { recipient } : {}) });
@@ -384,7 +400,7 @@ export function installMissionWorkflows({
       } else {
         const plans = await resolveReferences(this.userId, missionId, message, references, command);
         const kind = command ? 'run' : mode === 'note' ? 'note' : 'message';
-        record = { _id: id, userId: this.userId, originChatId: missionId, text: message,
+        record = { _id: id, userId: this.userId, originChatId: chatId, text: message,
           ...(recipient !== undefined ? { recipient } : {}), inputHash, kind, plans, createdAt: new Date() };
         try { await MissionPlanChatRequests.insertAsync(record); }
         catch (failure) {
