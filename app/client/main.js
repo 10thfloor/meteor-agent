@@ -37,6 +37,7 @@ import { missionHealthState, missionMeters, tokenTotals } from '../imports/const
 
 const SESSION_KEY = 'constellation.session';
 const IDENTITY_KEY = 'constellation.local-identity';
+const INSPECTOR_KEY = 'constellation.inspector';
 const INITIAL_LINK_TOKEN = window.location.pathname
   .match(/^\/link\/([A-Za-z0-9_-]{8,128})$/)?.[1] ?? null;
 const INITIAL_VERDICT_TOKEN = window.location.pathname
@@ -5325,6 +5326,29 @@ function wireNavigation() {
   });
 }
 
+function inspectorOpen() {
+  return !document.querySelector('.mission-workspace')?.classList.contains('inspector-hidden');
+}
+
+// One place sets the inspector's state: both buttons, the shortcut and the command menu go through here.
+// A hidden inspector is inert, so Tab never lands on controls nobody can see.
+function setInspectorOpen(open, { persist = true } = {}) {
+  const workspaceEl = document.querySelector('.mission-workspace');
+  const pane = $('inspector-pane');
+  const toggle = $('toggle-inspector');
+  if (!workspaceEl || !pane) return;
+  if (!open && pane.contains(document.activeElement) && !toggle.hidden) toggle.focus();
+  workspaceEl.classList.toggle('inspector-hidden', !open);
+  pane.inert = !open;
+  const label = open ? 'Hide inspector' : 'Show inspector';
+  toggle.classList.toggle('active', open);
+  toggle.setAttribute('aria-expanded', String(open));
+  toggle.setAttribute('aria-label', label);
+  toggle.title = `${label} (⌥⌘B)`;
+  if (!persist) return;
+  try { localStorage.setItem(INSPECTOR_KEY, open ? 'open' : 'closed'); } catch { /* the choice just won't be remembered */ }
+}
+
 function wireMissionActions() {
   const moreActions = $('mission-more-actions');
   const moreTrigger = $('mission-more-trigger');
@@ -5403,10 +5427,14 @@ function wireMissionActions() {
       } catch (error) { toast(messageOf(error), 'error'); }
     });
   });
-  $('toggle-inspector').addEventListener('click', (event) => {
-    const workspaceEl = document.querySelector('.mission-workspace');
-    workspaceEl.classList.toggle('inspector-hidden');
-    event.currentTarget.classList.toggle('active', !workspaceEl.classList.contains('inspector-hidden'));
+  let savedInspector = null;
+  try { savedInspector = localStorage.getItem(INSPECTOR_KEY); } catch { savedInspector = null; }
+  setInspectorOpen(savedInspector !== 'closed', { persist: false });
+  $('toggle-inspector').addEventListener('click', () => setInspectorOpen(!inspectorOpen()));
+  $('collapse-inspector').addEventListener('click', () => setInspectorOpen(false));
+  $('inspector-pane').addEventListener('keydown', (event) => {
+    // On a narrow window the inspector is a drawer over the chat; Escape puts it away.
+    if (event.key === 'Escape' && matchMedia('(max-width: 1060px)').matches) setInspectorOpen(false);
   });
   document.querySelectorAll('[data-inspector-tab]').forEach((button) => {
     const activate = (target, focus = false) => {
@@ -7557,6 +7585,12 @@ function executeCommand(command) {
   if (command.startsWith('view:')) activateView(command.slice(5));
   if (command === 'new') void newMission();
   if (command === 'reviews') openLearningReviews();
+  if (command === 'inspector') {
+    if (currentView !== 'missions') {
+      activateView('missions');
+      setInspectorOpen(true);
+    } else setInspectorOpen(!inspectorOpen());
+  }
 }
 
 function wireCommandPalette() {
@@ -7586,6 +7620,11 @@ function wireCommandPalette() {
     const meta = event.metaKey || event.ctrlKey;
     if (meta && event.key.toLowerCase() === 'k') { event.preventDefault(); open(); }
     if (meta && event.key.toLowerCase() === 'n') { event.preventDefault(); void newMission(); }
+    // Option changes event.key on macOS, so the physical key is matched.
+    if (meta && event.altKey && event.code === 'KeyB' && currentView === 'missions' && !$('toggle-inspector').hidden) {
+      event.preventDefault();
+      setInspectorOpen(!inspectorOpen());
+    }
     if (meta && event.key.toLowerCase() === 'f' && currentView === 'memory') {
       event.preventDefault();
       $('memory-search').focus();

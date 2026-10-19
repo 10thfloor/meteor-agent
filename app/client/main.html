@@ -123,8 +123,8 @@
                   </button>
                 </div>
               </details>
-              <button class="toolbar-button icon-only active" id="toggle-inspector" type="button" aria-label="Toggle inspector" title="Toggle inspector">
-                <svg viewBox="0 0 20 20" aria-hidden="true"><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M12.5 3v14"/></svg>
+              <button class="toolbar-button icon-only active" id="toggle-inspector" type="button" aria-controls="inspector-pane" aria-expanded="true" aria-label="Hide inspector" title="Hide inspector (⌥⌘B)">
+                <svg viewBox="0 0 20 20" aria-hidden="true"><path class="inspector-toggle-fill" d="M12.5 3h3a2 2 0 0 1 2 2v10a2 2 0 0 1-2 2h-3Z"/><rect x="2.5" y="3" width="15" height="14" rx="2"/><path d="M12.5 3v14"/></svg>
               </button>
             </div>
           </div>
@@ -195,10 +195,15 @@
               </div>
             </section>
 
-            <aside class="inspector-pane" id="inspector-pane">
-              <div class="inspector-tabs" role="tablist" aria-label="Mission inspector">
-                <button class="active" id="inspector-tab-crew" type="button" data-inspector-tab="crew" role="tab" aria-selected="true" aria-controls="inspector-panel-crew">Crew</button>
-                <button id="inspector-tab-activity" type="button" data-inspector-tab="activity" role="tab" aria-selected="false" aria-controls="inspector-panel-activity" tabindex="-1">Activity</button>
+            <aside class="inspector-pane" id="inspector-pane" aria-label="Mission inspector">
+              <div class="inspector-header">
+                <div class="inspector-tabs" role="tablist" aria-label="Mission inspector">
+                  <button class="active" id="inspector-tab-crew" type="button" data-inspector-tab="crew" role="tab" aria-selected="true" aria-controls="inspector-panel-crew">Crew</button>
+                  <button id="inspector-tab-activity" type="button" data-inspector-tab="activity" role="tab" aria-selected="false" aria-controls="inspector-panel-activity" tabindex="-1">Activity</button>
+                </div>
+                <button class="inspector-collapse" id="collapse-inspector" type="button" aria-controls="inspector-pane" aria-label="Hide inspector" title="Hide inspector (⌥⌘B)">
+                  <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m5.5 6 4 4-4 4M10.5 6l4 4-4 4"/></svg>
+                </button>
               </div>
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
@@ -510,6 +515,7 @@
     </div>
     <div class="command-group"><span>Actions</span>
       <button type="button" data-command="new"><i>＋</i><span><strong>New mission</strong></span><kbd>⌘ N</kbd></button>
+      <button type="button" data-command="inspector"><i>▯</i><span><strong>Show or hide inspector</strong></span><kbd>⌥ ⌘ B</kbd></button>
       <button type="button" data-command="reviews"><i>✓</i><span><strong>Learning reviews</strong><small id="command-reviews-count">0 items need attention</small></span></button>
     </div>
   </dialog>
