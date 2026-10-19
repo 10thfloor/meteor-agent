@@ -126,7 +126,7 @@ export async function createInitialTranscript(
 export interface LeasedMessageMutation {
   inc?: SessionInc;
   set?: SessionSet;
-  unset?: { pending?: 1; pendingRelay?: 1; pendingSystem?: 1 };
+  unset?: { pending?: 1; pendingRelay?: 1; pendingSystem?: 1; activeChild?: 1 };
   unlessStopped?: boolean;
   pendingRelayToken?: string;
   pendingSystemToken?: string;

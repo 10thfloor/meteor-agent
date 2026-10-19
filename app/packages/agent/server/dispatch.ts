@@ -494,6 +494,7 @@ export async function dispatchCalls(
     });
 
     // Atomic seq + budget $inc — a subagent costs one toolCall to the parent.
+    // A subagent's live marker ends in the same transaction as its tool row.
     const row = toolResultContent(result, limits.maxResultChars);
     const toolSeq = await commitLeasedMessage(sessionId, {
       _id: Random.id(), role: 'tool',
@@ -507,7 +508,10 @@ export async function dispatchCalls(
       // Attachments that survived the hook chain.
       ...(resultRefs.length > 0 ? { attachments: resultRefs } : {}),
       createdAt: new Date(),
-    }, { inc: refusedByCanUse ? {} : { 'budgetSpent.toolCalls': 1 } });
+    }, {
+      inc: refusedByCanUse ? {} : { 'budgetSpent.toolCalls': 1 },
+      ...(tool?.kind === 'subagent' ? { unset: { activeChild: 1 } } : {}),
+    });
     // Null seq = turn gone; abandon to avoid stranding a tool_use.
     if (toolSeq === null) return abandon();
   }
@@ -687,6 +691,7 @@ export async function resumeParkedTurn(
     }, {
       inc: (pending.verdict === 'denied' || refusedByCanUse)
         ? {} : { 'budgetSpent.toolCalls': 1 },
+      ...(tool?.kind === 'subagent' ? { unset: { activeChild: 1 } } : {}),
     });
     if (seq === null) return abandon();
   }

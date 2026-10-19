@@ -118,7 +118,7 @@ export interface AgentSession {
         };
     };
     /** Live handle to an in-flight subagent child — a hint, not a contract
-     *  (can go stale on lease steal). Cleared when dispatch returns. */
+     *  (can go stale on lease steal). Cleared with the call's tool row. */
     activeChild?: {
         sessionId: string;
         toolCallId: string;

@@ -408,7 +408,11 @@ export async function runSubagent(
     return { result: failure('subagent-failed', 'The calling session is no longer writable.') };
   }
 
-  try { // outer: the finally at the end clears activeChild on every exit
+  // A returned dispatch leaves activeChild in place: the dispatcher clears it in
+  // the transaction that commits this call's tool row, so the child is never
+  // without both handles (the watcher would re-link it as an orphan). Only a
+  // throw, which commits no row, clears it here.
+  try { // outer: clears activeChild if this throws
   try {
     await runTurn(childSessionId, childRunConfig);
   } catch {
@@ -422,8 +426,9 @@ export async function runSubagent(
 
   return completeDelegation(tool, context,
     dispatchFromOutcome(await readTurnOutcome(childSessionId), name, childSessionId));
-  } finally {
+  } catch (error) {
     // Clear live-child marker so it doesn't shadow the next call's.
     await guardedUpdate(ctx.sessionId, SERVER_ID, { $unset: { activeChild: 1 } });
+    throw error;
   }
 }

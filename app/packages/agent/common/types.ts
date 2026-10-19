@@ -135,7 +135,7 @@ export interface AgentSession {
     budget?: { toolCalls?: number; spend?: number; maxIterations?: number };
   };
   /** Live handle to an in-flight subagent child — a hint, not a contract
-   *  (can go stale on lease steal). Cleared when dispatch returns. */
+   *  (can go stale on lease steal). Cleared with the call's tool row. */
   activeChild?: { sessionId: string; toolCallId: string };
   /** Forked sessions: source session and inclusive cut-point seq. A fork is a
    *  new ROOT conversation (not a child), so it copies neither `parent` nor
