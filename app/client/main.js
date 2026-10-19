@@ -17,6 +17,7 @@ import {
   deriveRuntimeState,
   nextScheduledAt,
 } from '../imports/constellation/config';
+import { missionHealthState, missionMeters, tokenTotals } from '../imports/constellation/mission-health';
 
 const SESSION_KEY = 'constellation.session';
 const IDENTITY_KEY = 'constellation.local-identity';
@@ -899,7 +900,10 @@ function createSurfaceRow(surface, compact = false, participantNames = new Map()
   icon.className = `surface-kind-icon ${surface.kind}`;
   icon.dataset.kind = surface.kind;
   icon.setAttribute('aria-hidden', 'true');
-  icon.textContent = surfaceLabel(surface.kind).slice(0, 1).toUpperCase();
+  // The glyph the Channels page uses for this kind, so Slack and SMS are not
+  // both "S" here.
+  icon.textContent = CHANNEL_ICONS[surface.kind]?.[0]
+    ?? surfaceLabel(surface.kind).slice(0, 1).toUpperCase();
   const copy = document.createElement('span');
   copy.className = 'surface-list-copy';
   const name = document.createElement('strong');
@@ -909,8 +913,9 @@ function createSurfaceRow(surface, compact = false, participantNames = new Map()
   const participantName = surface.participantKey
     ? participantNames.get(surface.participantKey)
     : '';
+  const lastActive = surface.lastActivityAt ? timeAgo(surface.lastActivityAt) : '';
   detail.textContent = surface.detail || [participantName, audience,
-    surface.lastActivityAt ? `active ${timeAgo(surface.lastActivityAt)}` : '']
+    lastActive && (lastActive === 'now' ? 'active now' : `active ${lastActive} ago`)]
     .filter(Boolean).join(' · ');
   copy.append(name, detail);
   const status = document.createElement('span');
@@ -1015,14 +1020,15 @@ function renderMissionCollaboration(view = missionParticipation()) {
     name.textContent = person.displayName;
     const detail = document.createElement('span');
     const channels = (person.surfaceKinds ?? []).map(surfaceLabel);
+    // One line under the name, as an agent has: the owner's says so, and
+    // anyone else's says how they reach the Mission. Everyone here who is
+    // not the owner is a participant, so no row needs a badge to say it.
     detail.textContent = person.role === 'owner'
       ? 'Owner · Desktop'
       : (channels.length ? channels.join(' · ') : connectionLabel(person.connection));
     copy.append(name, detail);
-    const role = document.createElement('span');
-    role.className = 'mission-person-role';
-    role.textContent = person.role === 'owner' ? 'Owner' : 'Participant';
-    row.append(avatar, copy, role);
+    row.dataset.role = person.role === 'owner' ? 'owner' : 'participant';
+    row.append(avatar, copy);
     peopleList.append(row);
   }
   $('mission-crew-people-empty').hidden = people.length > 0;
@@ -1030,6 +1036,8 @@ function renderMissionCollaboration(view = missionParticipation()) {
   renderSurfaceList(
     'mission-surface-list', 'mission-surface-empty', surfaces, true, participants,
   );
+  $('mission-surface-count').textContent = String(surfaces.length);
+  $('mission-surface-count').hidden = surfaces.length === 0;
   if ($('mission-crew-dialog')?.open) renderMissionCrewDialog();
 }
 
@@ -1156,11 +1164,13 @@ function renderCrew(
   $('crew-count').textContent = String(definitions.length);
   // Say which crew this is. 'inherit' follows the workspace roster; 'custom'
   // is this mission's own subset — the distinction the two levels turn on.
+  // A mission that chose its own keeps the list in its settings. (The mode by
+  // name is a field of the participation view, not of these.)
   const specialistsOnRoster = specialistDefinitions().length;
   const specialistsHere = definitions.length - 1;
-  $('crew-mode-hint').textContent = (config?.agentMode ?? 'inherit') === 'inherit'
-    ? '· follows the workspace roster'
-    : `· ${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`;
+  $('crew-mode-hint').textContent = Array.isArray(config?.agents)
+    ? `${specialistsHere} of ${specialistsOnRoster} specialists, chosen for this mission`
+    : 'Follows the workspace roster';
 }
 
 // Crew rows are too narrow for the state as words ("APPROVAL NEEDED" clipped
@@ -2595,6 +2605,8 @@ function renderReviews() {
     'aria-label',
     `Open learning reviews, ${attentionCopy}`,
   );
+  // The button wears its count only while something waits for review.
+  $('open-learning-reviews').dataset.pending = String(pendingCount > 0);
   $('command-reviews-count').textContent = attentionCopy;
   $('reviews-directory-summary').textContent = attentionCopy;
   $('reviews-needs-count').textContent = String(pendingCount);
@@ -4581,6 +4593,47 @@ function renderActivity(messages, runtimeState, debugTraces = false) {
   }
 }
 
+/** The Mission health panel: one meter for each alert, and the Mission's state in a word (see mission-health.js). */
+function renderMissionHealth(session, config, runtimeState, phase, busy) {
+  const usage = session?.usage ?? { input: 0, output: 0, cost: 0 };
+  const meters = missionMeters(usage, session?.budgetSpent, config?.budget ?? DEFAULT_MISSION_THRESHOLDS);
+  for (const meter of meters) {
+    const row = document.querySelector(`.health-meter[data-meter="${meter.key}"]`);
+    if (!row) continue;
+    const used = row.querySelector('[data-used]');
+    const alert = row.querySelector('[data-alert]');
+    const bar = row.querySelector('[role="meter"]');
+    if (row.dataset.level !== meter.level) row.dataset.level = meter.level;
+    if (used.textContent !== meter.usedText) used.textContent = meter.usedText;
+    if (alert.textContent !== meter.alertText) alert.textContent = meter.alertText;
+    row.style.setProperty('--meter-fill', String(meter.fill));
+    // Where the alert comes from, for whoever wonders what the second number is.
+    row.title = `${meter.label}: ${meter.usedText} of ${meter.alertText}. Alert levels are set in Mission settings.`;
+    // A meter needs a range: an alert set to nothing is reached by the first of anything.
+    const most = meter.alert > 0 ? meter.alert : Math.max(meter.used, 1);
+    bar.setAttribute('aria-valuemax', String(most));
+    bar.setAttribute('aria-valuenow', String(Math.min(meter.used, most)));
+    bar.setAttribute('aria-valuetext', `${meter.usedText} of ${meter.alertText}`);
+  }
+  const tokens = tokenTotals(usage);
+  $('usage-tokens').textContent = tokens.total;
+  $('usage-token-split').textContent = tokens.split;
+
+  const state = missionHealthState({
+    status: config?.status,
+    archived: missionArchived(session),
+    runtime: runtimeState.key,
+    phase,
+    busy,
+    meters,
+  });
+  const label = $('health-label');
+  if (label.dataset.state !== state.key) label.dataset.state = state.key;
+  if (label.textContent !== state.label) label.textContent = state.label;
+  // The label is short; which alert, and by how much, is said in full where it costs no room.
+  if (label.title !== state.detail) label.title = state.detail;
+}
+
 function renderMissionState() {
   sessionChanged.depend();
   const chat = $('mission-chat');
@@ -4651,29 +4704,7 @@ function renderMissionState() {
     runtimeLabel.textContent = runtimeState.label;
   }
 
-  const usage = session?.usage ?? { input: 0, output: 0, cost: 0 };
-  const tokens = usage.input + usage.output;
-  const spent = session?.budgetSpent ?? { turns: 0, toolCalls: 0 };
-  const thresholds = config?.budget ?? DEFAULT_MISSION_THRESHOLDS;
-  $('usage-tokens').textContent = tokens > 999 ? `${(tokens / 1000).toFixed(1)}k` : String(tokens);
-  $('usage-tools').textContent = String(spent.toolCalls ?? 0);
-  $('usage-cost').textContent = `$${Number(usage.cost ?? 0).toFixed(2)}`;
-  const ratio = (value, limit) => (limit > 0 ? value / limit : (value > 0 ? 1 : 0));
-  const budgetPct = Math.min(100, Math.max(
-    ratio(spent.turns ?? 0, thresholds.turns),
-    ratio(spent.toolCalls ?? 0, thresholds.toolCalls),
-    ratio(Number(usage.cost ?? 0), thresholds.spend),
-  ) * 100);
-  $('budget-fill').style.width = `${budgetPct}%`;
-  $('budget-copy').textContent = `${spent.turns ?? 0} / ${thresholds.turns} turns · ${spent.toolCalls ?? 0} / ${thresholds.toolCalls} tools · $${Number(usage.cost ?? 0).toFixed(2)} / $${Number(thresholds.spend).toFixed(2)}`;
-  $('health-label').textContent = config?.status === 'completed' ? (missionArchived(session) ? 'Archived' : 'Completed')
-    : (config?.status === 'paused' ? 'Paused'
-      : (runtimeState.key === 'error' ? 'Needs attention'
-        : (budgetPct >= 100 ? 'Threshold reached'
-          : (budgetPct >= 80 ? 'Approaching threshold'
-            : (phase === 'awaiting' ? 'Awaiting you'
-              : (runtimeState.key === 'stopped' ? 'Stopped'
-                : (busy ? 'Active' : 'Nominal')))))));
+  renderMissionHealth(session, config, runtimeState, phase, busy);
 
   renderCrew(session, messages, runtimeState, config);
   renderMissionCollaboration();

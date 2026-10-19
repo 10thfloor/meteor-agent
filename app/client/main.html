@@ -194,32 +194,44 @@
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
                   <section class="inspector-section">
-                    <div class="section-heading"><span>CREW</span><span class="section-heading-actions"><span class="mini-count" id="mission-crew-count">0</span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention">Reviews <b id="mission-reviews-count">0</b></button><button id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Mission crew</button></span></div>
+                    <div class="section-heading"><span>CREW <b class="section-count" id="mission-crew-count" title="People and agents on this Mission">0</b></span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention" data-pending="false">Reviews <b id="mission-reviews-count">0</b></button></div>
                     <div class="crew-subsection">
                       <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
                       <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
                       <p class="compact-empty" id="mission-crew-people-empty">No people added</p>
                     </div>
                     <div class="crew-subsection">
-                      <div class="crew-subsection-heading"><span>Agents <small class="crew-mode-hint" id="crew-mode-hint"></small></span><span id="crew-count">0</span></div>
+                      <div class="crew-subsection-heading"><span>Agents</span><span id="crew-count">0</span></div>
                       <div class="crew-list" id="crew-list" role="group" aria-label="Agents in this mission"></div>
                     </div>
-                    <button class="workspace-crew-link" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Workspace roster</button>
+                    <p class="crew-mode-hint" id="crew-mode-hint"></p>
+                    <div class="crew-actions">
+                      <button class="crew-action" id="manage-mission-crew-inspector" type="button" aria-haspopup="dialog" aria-controls="mission-crew-dialog" data-loading="false" data-loading-label="Loading">Mission crew</button>
+                      <button class="crew-action" id="configure-crew" type="button" aria-haspopup="dialog" aria-controls="crew-dialog">Workspace roster</button>
+                    </div>
                   </section>
                   <section class="inspector-section mission-health">
-                    <div class="section-heading"><span>MISSION HEALTH</span><span id="health-label">Nominal</span></div>
-                    <div class="health-grid">
-                      <div><strong id="usage-tokens">0</strong><span>tokens</span></div>
-                      <div><strong id="usage-tools">0</strong><span>tool calls</span></div>
-                      <div><strong id="usage-cost">$0.00</strong><span>model cost</span></div>
+                    <div class="section-heading"><span>MISSION HEALTH</span><span class="health-state" id="health-label" data-state="nominal">Nominal</span></div>
+                    <div class="health-meters" id="health-meters">
+                      <div class="health-meter" data-meter="turns" data-level="ok">
+                        <div class="health-meter-line"><span id="health-turns-label">Turns</span><b><strong data-used>0</strong> / <span data-alert>80</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-turns-label" aria-valuemin="0" aria-valuemax="80" aria-valuenow="0"><i></i></div>
+                      </div>
+                      <div class="health-meter" data-meter="toolCalls" data-level="ok">
+                        <div class="health-meter-line"><span id="health-tools-label">Tool calls</span><b><strong data-used>0</strong> / <span data-alert>40</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-tools-label" aria-valuemin="0" aria-valuemax="40" aria-valuenow="0"><i></i></div>
+                      </div>
+                      <div class="health-meter" data-meter="spend" data-level="ok">
+                        <div class="health-meter-line"><span id="health-spend-label">Model spend</span><b><strong data-used>$0.00</strong> / <span data-alert>$5.00</span></b></div>
+                        <div class="health-meter-bar" role="meter" aria-labelledby="health-spend-label" aria-valuemin="0" aria-valuemax="5" aria-valuenow="0"><i></i></div>
+                      </div>
                     </div>
-                    <div class="budget-bar"><span id="budget-fill"></span></div>
-                    <p id="budget-copy">0 / 40 tool calls</p>
+                    <p class="health-totals"><span>Tokens</span><b><strong id="usage-tokens">0</strong><span id="usage-token-split"></span></b></p>
                   </section>
                   <section class="inspector-section">
-                    <div class="section-heading"><span>CHANNELS</span><button type="button" data-view-link="channels">Channel settings</button></div>
+                    <div class="section-heading"><span>CHANNELS <b class="section-count" id="mission-surface-count" title="Channel conversations on this Mission" hidden>0</b></span><button type="button" data-view-link="channels">Channel settings</button></div>
                     <div class="surface-list compact" id="mission-surface-list" role="list" aria-label="Channel conversations on this Mission"></div>
-                    <p class="compact-empty" id="mission-surface-empty">None yet — channel missions land here.</p>
+                    <p class="compact-empty" id="mission-surface-empty">Desktop only. Conversations from other Channels are listed here.</p>
                   </section>
                 </div>
                 <div class="inspector-tab-panel" id="inspector-panel-activity" data-inspector-panel="activity" role="tabpanel" aria-labelledby="inspector-tab-activity" hidden>

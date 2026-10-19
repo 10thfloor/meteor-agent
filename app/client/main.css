@@ -157,7 +157,6 @@ kbd { font: inherit; }
 .continuity-card { min-height: 58px; display: grid; grid-template-columns: 30px 1fr auto; align-items: center; gap: 8px; background: #111412; border: 1px solid var(--line); border-radius: 9px; padding: 8px; }
 .continuity-switch { min-height: 18px; }
 .continuity-switch input:disabled + span { opacity: .45; cursor: not-allowed; }
-.crew-mode-hint { margin-left: 4px; font-size: 9px; font-weight: 400; letter-spacing: 0; text-transform: none; color: #6d736e; }
 .continuity-orbit { width: 26px; height: 26px; border: 1px solid rgba(118,169,233,.2); border-radius: 50%; position: relative; }
 .continuity-orbit::after { content: ""; position: absolute; width: 6px; height: 6px; background: var(--blue); border-radius: 50%; left: 9px; top: 9px; box-shadow: 0 0 9px rgba(118,169,233,.4); }
 .continuity-orbit span { position: absolute; width: 3px; height: 3px; border-radius: 50%; background: #607692; }
@@ -322,13 +321,19 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .inspector-section { padding: 17px 15px; border-bottom: 1px solid var(--line); }
 .section-heading { margin-bottom: 12px; display: flex; align-items: center; justify-content: space-between; gap: 10px; color: #656b66; font-size: 7px; font-weight: 730; letter-spacing: .13em; }
 .section-heading > span:first-child { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+/* A heading is as tall as the button some headings hold, so every section's title stands the same distance under its rule. */
+.inspector-section > .section-heading { min-height: 22px; }
 .section-heading button { flex: none; min-height: 22px; display: inline-flex; align-items: center; padding: 0 7px; border: 1px solid var(--line); border-radius: 999px; background: transparent; color: #8f948f; font-size: 8px; font-weight: 650; letter-spacing: .03em; white-space: nowrap; cursor: pointer; transition: color .16s ease, background .16s ease, border-color .16s ease; }
 .section-heading button:hover { color: #d1d5ce; border-color: var(--line-strong); background: rgba(255,255,255,.035); }
 .section-heading button:focus-visible { outline: 1px solid rgba(240,163,90,.68); outline-offset: 2px; color: #e2e5df; }
-.mini-count { min-width: 17px; height: 17px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 5px; color: #8d928d; }
-.section-heading-actions { flex: none; display:flex; align-items:center; gap:4px; }
-.section-heading-actions #open-learning-reviews { min-height:24px; display:inline-flex; align-items:center; gap:5px; padding:0 6px; border:1px solid var(--line); }
-.section-heading-actions #open-learning-reviews b { min-width:17px; height:17px; display:grid; place-items:center; border-radius:5px; background:rgba(240,163,90,.08); color:var(--signal-bright); font-size:10px; font-weight:680; }
+/* How many, said beside a heading rather than boxed like a control. */
+.section-count { margin-left: 2px; color: var(--muted-2); font-weight: 600; letter-spacing: 0; font-variant-numeric: tabular-nums; }
+/* Reviews wears its count only while something waits for review, and lit: a nought said nothing, in the colour of
+   an alert. */
+#open-learning-reviews { gap: 5px; }
+#open-learning-reviews b { min-width: 16px; height: 16px; display: none; place-items: center; padding: 0 4px; border-radius: 5px; background: rgba(240,163,90,.12); color: var(--signal-bright); font-size: 10px; font-weight: 680; font-variant-numeric: tabular-nums; }
+#open-learning-reviews[data-pending="true"] { padding-right: 4px; border-color: rgba(240,163,90,.3); color: #d1d5ce; }
+#open-learning-reviews[data-pending="true"] b { display: grid; }
 .crew-list { display: flex; flex-direction: column; gap: 3px; }
 .crew-card {
   --crew-accent: #9aa19b;
@@ -336,7 +341,7 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
   position: relative;
   isolation: isolate;
   width: 100%;
-  min-height: 40px;
+  min-height: 42px;
   display: grid;
   grid-template-columns: 28px minmax(0,1fr) auto 9px;
   align-items: center;
@@ -387,14 +392,16 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
   border-radius: 8px;
   display: grid;
   place-items: center;
-  font-size: 8px;
-  font-weight: 760;
+  font-size: 11px;
+  font-weight: 720;
   position: relative;
   transition: transform .16s ease, border-color .16s ease, box-shadow .16s ease;
 }
 .crew-card:hover .crew-avatar,.crew-card:focus-visible .crew-avatar { transform: translateY(-1px) scale(1.035); border-color: color-mix(in srgb,var(--crew-accent) 34%,transparent); box-shadow: 0 6px 14px color-mix(in srgb,var(--crew-accent) 11%,transparent); }
 .crew-avatar.atlas { color: #f3b475; background: #38271b; }.crew-avatar.researcher { color: #8ab5ea; background: #1d2a37; }.crew-avatar.operator { color: #92d4aa; background: #1e3025; }.crew-avatar.critic { color: #e78a80; background: #36211f; }
 .crew-avatar i { position: absolute; right: -2px; bottom: -2px; width: 7px; height: 7px; background: #1b1e1c; border: 2px solid #1b1e1c; border-radius: 50%; }.crew-card.active .crew-avatar i { background: var(--green); }
+/* An agent with nothing to report shows no dot: unlit, it was a notch cut out of the avatar's corner. */
+.crew-card[data-agent-state="ready"]:not(.active) .crew-avatar i,.crew-card[data-agent-state="left"] .crew-avatar i { display: none; }
 .crew-card[data-agent-state="thinking"] .crew-avatar i { background:var(--signal-bright); animation:state-breathe 1.15s ease-in-out infinite; }
 .crew-card[data-agent-state="loading"] .crew-avatar i { background:var(--blue); animation:state-breathe 1.15s ease-in-out infinite; }
 .crew-card[data-agent-state="working"] .crew-avatar i { background:var(--green); animation:state-breathe .85s ease-in-out infinite; }
@@ -408,10 +415,12 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 .crew-card[data-agent-state="left"] .crew-avatar { filter: saturate(.35); }
 .crew-card[data-agent-state="error"] .crew-avatar i,.crew-card[data-agent-state="stopped"] .crew-avatar i { background:var(--red); animation:none; }
 .crew-copy { min-width: 0; }
-.crew-card .crew-copy strong { display: block; color: #cfd3cc; font-size: 10px; font-weight: 620; transition: color .16s ease; }
-.crew-card .crew-copy span { display: block; margin-top: 3px; color: #858b85; font-size: 9px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; transition: color .16s ease; }
+/* An agent's name and role are the size of a person's, two lists down the same panel. These two rules are more
+   specific than the readability pass further down, and held the agents at 10 and 9 pixels. */
+.crew-card .crew-copy strong { display: block; color: #d3d7d0; font-size: 13px; font-weight: 610; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; transition: color .16s ease; }
+.crew-card .crew-copy span { display: block; margin-top: 2px; color: var(--muted); font-size: 12px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; transition: color .16s ease; }
 .crew-card:hover .crew-copy strong,.crew-card:focus-visible .crew-copy strong { color: #f0f2ed; }
-.crew-card:hover .crew-copy span,.crew-card:focus-visible .crew-copy span { color: #8b918b; }
+.crew-card:hover .crew-copy span,.crew-card:focus-visible .crew-copy span { color: #b4bab2; }
 .crew-state {
   flex: none;
   width: 20px;
@@ -420,13 +429,16 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
   place-items: center;
   border: 1px solid transparent;
   border-radius: 999px;
-  color: #6f766f;
+  /* Ready is the state of most agents most of the time: its glyph recedes, so that any other state stands out. */
+  color: #5b615c;
   transition: color .16s ease, border-color .16s ease, background .16s ease;
 }
 .crew-state svg { width: 13px; height: 13px; stroke-width: 1.8; }
 .crew-state[data-agent-state="thinking"] svg { stroke-width: 3; }
 .crew-card:hover .crew-state,.crew-card:focus-visible .crew-state { border-color: var(--line); background: rgba(255,255,255,.025); color: #8c928c; }
 .crew-card.active .crew-state,.crew-card:not([data-agent-state="ready"]) .crew-state { border-color: color-mix(in srgb,var(--crew-state-color) 22%,transparent); background: color-mix(in srgb,var(--crew-state-color) 8%,transparent); color: var(--crew-state-color); }
+/* An agent who has left is part of the record, not of what is happening now: dimmed, and not boxed like a state. */
+.crew-card[data-agent-state="left"],.crew-card[data-agent-state="left"] .crew-state { border-color: transparent; background: transparent; }
 @media (prefers-reduced-motion: no-preference) {
   .crew-state[data-agent-state="working"] svg,.crew-state[data-agent-state="loading"] svg { animation: crew-state-spin 1.1s linear infinite; }
   .crew-state[data-agent-state="thinking"] svg { animation: crew-state-pulse 1.4s ease-in-out infinite; }
@@ -437,10 +449,28 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: max(20px, calc((10
 @keyframes crew-state-beckon { 50% { box-shadow: 0 0 0 4px color-mix(in srgb,var(--crew-state-color) 18%,transparent); } }
 .crew-disclosure { display: grid; place-items: center; color: color-mix(in srgb,var(--crew-accent) 70%,#777d77); font-size: 14px; font-weight: 350; line-height: 1; opacity: 0; transform: translateX(-4px); transition: opacity .16s ease, transform .16s ease; }
 .crew-card:hover .crew-disclosure,.crew-card:focus-visible .crew-disclosure { opacity: 1; transform: translateX(0); }
-.mission-health .section-heading > span:last-child { color: var(--green); letter-spacing: .04em; text-transform: none; }
-.health-grid { display: grid; grid-template-columns: repeat(3,1fr); gap: 6px; }
-.health-grid div { min-width: 0; background: #111412; border: 1px solid var(--line); border-radius: 7px; padding: 9px 8px; }.health-grid strong, .health-grid span { display: block; }.health-grid strong { font-size: 11px; font-weight: 620; letter-spacing: -.03em; }.health-grid span { margin-top: 3px; color: #636964; font-size: 6px; text-transform: uppercase; letter-spacing: .08em; }
-.budget-bar { height: 3px; margin-top: 12px; border-radius: 3px; background: #282c29; overflow: hidden; }.budget-bar span { display: block; width: 0; height: 100%; background: linear-gradient(90deg,var(--green),var(--signal)); transition: width .3s; }.mission-health > p { margin: 6px 0 0; color: #626863; font-size: 7px; }
+/* Mission health: the Mission's state, and one meter for each alert, coloured by how near its own alert is. */
+.health-state { --health-color: var(--green); flex: none; display: inline-flex; align-items: center; gap: 6px; color: var(--health-color); font-weight: 650; letter-spacing: .02em; text-transform: none; white-space: nowrap; }
+.health-state::before { content: ""; width: 6px; height: 6px; flex: none; border-radius: 50%; background: currentColor; }
+.health-state[data-state="active"]::before { animation: state-breathe .95s ease-in-out infinite; }
+.health-state[data-state="awaiting"],.health-state[data-state="near"] { --health-color: var(--signal-bright); }
+.health-state[data-state="awaiting"]::before { animation: state-breathe 1.7s ease-in-out infinite; }
+.health-state[data-state="reached"],.health-state[data-state="attention"],.health-state[data-state="stopped"] { --health-color: var(--red); }
+.health-state[data-state="paused"],.health-state[data-state="completed"],.health-state[data-state="archived"] { --health-color: var(--muted-2); }
+.health-meters { display: grid; gap: 12px; }
+.health-meter { --meter-color: var(--green); min-width: 0; }
+.health-meter[data-level="near"] { --meter-color: var(--signal); }
+.health-meter[data-level="reached"] { --meter-color: var(--red); }
+.health-meter-line { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--muted); font-size: 12px; line-height: 1.35; }
+.health-meter-line > span { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.health-meter-line > b,.health-totals > b { flex: none; color: var(--muted-2); font-weight: 450; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.health-meter-line strong,.health-totals strong { color: #dfe2da; font-weight: 620; }
+.health-meter:not([data-level="ok"]) .health-meter-line strong { color: var(--meter-color); }
+.health-meter-bar { height: 4px; margin-top: 7px; border-radius: 4px; background: #262a27; overflow: hidden; }
+.health-meter-bar i { display: block; width: calc(var(--meter-fill, 0) * 100%); height: 100%; border-radius: inherit; background: var(--meter-color); transition: width .3s ease, background-color .3s ease; }
+.mission-health > .health-totals { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; margin: 14px 0 0; padding-top: 12px; border-top: 1px solid var(--line); }
+.health-totals #usage-token-split:not(:empty)::before { content: " · "; }
+@media (prefers-reduced-motion: reduce) { .health-state::before { animation: none; } .health-meter-bar i { transition: none; } }
 .surface-row { display: flex; align-items: center; }.surface-icon { width: 24px; height: 24px; margin-right: -4px; display: inline-grid; place-items: center; border-radius: 7px; border: 2px solid var(--ink-2); font-size: 7px; font-style: normal; font-weight: 760; }.surface-icon.web { color: #d9dcd5; background: #333735; }.surface-icon.slack { color: #f3c36b; background: #3b2d1f; }.surface-icon.telegram { color: #8fc5f1; background: #193044; }.surface-icon.mail { color: #e99188; background: #3b2220; }.surface-icon.sms { color: #9cd9b0; background: #1d3426; }.surface-icon.whatsapp { color: #89d4a0; background: #1d3426; }
 .surface-more { width: 24px; height: 24px; display: grid; place-items: center; border: 1px solid var(--line); border-radius: 7px; background: #202321; color: #777c77; font-size: 6px; }.surface-note { margin: 10px 0 0; color: #666c67; font-size: 7px; line-height: 1.5; }
 .trace-live { display: flex; align-items: center; gap: 4px; color: var(--green); }.trace-live i { width: 4px; height: 4px; background: var(--green); border-radius: 50%; }
@@ -531,7 +561,7 @@ dialog { color:var(--paper); }
 .toast-region { position:fixed; inset:auto 16px 16px auto; z-index:1300; width:auto; height:auto; margin:0; padding:0; border:0; overflow:visible; display:flex; flex-direction:column; gap:7px; background:transparent; color:inherit; pointer-events:none; }.toast-region:popover-open { display:flex; }.toast { min-width:220px; max-width:360px; display:grid; grid-template-columns:8px 1fr; gap:9px; align-items:center; border:1px solid var(--line-strong); border-radius:9px; background:#202320; box-shadow:0 16px 40px rgba(0,0,0,.35); padding:11px; color:#c9cdc6; font-size:8px; animation:toast-in .22s ease both; }.toast i { width:7px; height:7px; border-radius:50%; background:var(--green); }.toast.error i { background:var(--red); }.toast.out { animation:toast-out .22s ease both; }
 
 /* Readability */
-.rc-badge,.mission-breadcrumb,.live-pill,.chat-header-label,.crew-state,.health-grid span,.activity-item time,.command-group > span,.command-group kbd,.channel-row.header { font-size:10px; }
+.rc-badge,.mission-breadcrumb,.live-pill,.chat-header-label,.crew-state,.activity-item time,.command-group > span,.command-group kbd,.channel-row.header { font-size:10px; }
 .rail-button span,.eyebrow,.mission-row-copy span,.mission-row time,.toolbar-button,.context-copy span,.context-metrics,.starter-card small,.section-heading,.section-heading button,.crew-copy span,.mission-health > p,.activity-item p,.activity-item button,.green-label,.feature-kicker,.primary-action,.secondary-action,.primary-action b,.automation-meta span,.automation-last,.automation-last button,.memory-compose label,.memory-compose button,.segmented button,.capability-filter button,.memory-toolbar > input,.memory-row-copy div,.cap-type,.capability-grid p,.capability-grid article > b,.capability-stack span,.channel-center strong,.channel-node,.channel-health,.channel-row,.command-input-wrap kbd { font-size:11px; }
 .command-trigger span,.sidebar-search input,.mission-row-copy strong,.continuity-card strong,.continuity-card span,.starter-card strong,.crew-copy strong,.inspector-tabs button,.activity-item strong,.automation-card > p,.memory-scope-stat,.memory-compose input[type="text"],.memory-row-copy p,.memory-empty,.channel-row b,.command-group strong,.toast { font-size:12px; }
 .window-status,.context-copy strong,.page-section-title,.page-section-title > button,.automation-hero p,.capability-feature p { font-size:13px; }
@@ -1063,33 +1093,38 @@ button.participant-avatar.more:focus-visible { z-index:2; outline:2px solid var(
 .chat-mode-control button:disabled { opacity:.42; cursor:not-allowed; }
 .mission-empty { bottom:104px; }
 
-#inspector-panel-crew > .inspector-section:first-child { padding:14px 12px; }
-#inspector-panel-crew > .inspector-section:first-child > .section-heading { margin-bottom:9px; }
-.crew-subsection + .crew-subsection { margin-top:10px; padding-top:10px; border-top:1px solid var(--line); }
-.crew-subsection-heading { min-height:18px; display:flex; align-items:center; justify-content:space-between; margin-bottom:3px; color:#7d837d; font-size:9px; font-weight:650; }
-.crew-subsection-heading > span:last-child { min-width:18px; color:#646a65; font-size:8px; text-align:right; }
+/* The Crew section keeps the other sections' edge: its headings, its avatars and its buttons stand on one line down
+   the panel. A row has room of its own around it, for its hover; the lists are pulled out by that much. */
+#inspector-panel-crew .mission-people-list,#inspector-panel-crew .crew-list { margin-inline:-7px; }
+.crew-subsection + .crew-subsection { margin-top:12px; padding-top:12px; border-top:1px solid var(--line); }
+.crew-subsection-heading { min-height:18px; display:flex; align-items:center; justify-content:space-between; margin-bottom:4px; color:var(--muted); font-size:11px; font-weight:650; }
+.crew-subsection-heading > span:last-child { min-width:18px; color:var(--muted-2); font-size:11px; font-variant-numeric:tabular-nums; text-align:right; }
 .mission-people-list { display:flex; flex-direction:column; gap:3px; }
-.mission-person-row { width:100%; min-height:38px; display:grid; grid-template-columns:27px minmax(0,1fr) auto; align-items:center; gap:7px; padding:4px 6px; border:1px solid transparent; border-radius:8px; background:transparent; color:inherit; text-align:left; }
+.mission-person-row { width:100%; min-height:42px; display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:7px; padding:4px 6px; border:1px solid transparent; border-radius:8px; background:transparent; color:inherit; text-align:left; }
 button.mission-person-row { cursor:pointer; }
 button.mission-person-row:hover { border-color:var(--line); background:#191c1a; }
 button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,90,.5); box-shadow:0 0 0 3px rgba(240,163,90,.07); }
-.mission-person-row .person-avatar { width:27px; height:27px; border:1px solid var(--line); border-radius:8px; font-size:9px; }
+/* A person's avatar is an agent's size and shape. (These rows carry `participant-avatar`, whose own border is the
+   dark ring of the header's overlapping stack, and made this one look smaller than an agent's.) */
+.mission-person-row .participant-avatar { width:27px; height:27px; border:1px solid var(--line); border-radius:8px; box-shadow:none; font-size:11px; }
 .mission-person-copy { min-width:0; }
 .mission-person-copy strong,.mission-person-copy span { display:block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .mission-person-copy strong { color:#d3d7d0; font-size:10px; font-weight:610; }
 .mission-person-copy span { margin-top:2px; color:#7d847d; font-size:9px; }
-.mission-person-role { min-height:20px; display:inline-flex; align-items:center; padding:0 6px; border:1px solid var(--line); border-radius:999px; color:#969d96; font-size:9px; font-weight:680; text-transform:uppercase; letter-spacing:.05em; }
 .compact-empty { margin:6px 0 0; color:#6d736e; font-size:9px; line-height:1.45; }
-.workspace-crew-link { width:100%; min-height:29px; margin-top:10px; border:1px solid var(--line); border-radius:7px; background:transparent; color:#878e87; font-size:9px; cursor:pointer; }
-.workspace-crew-link:hover { border-color:var(--line-strong); background:#191c1a; color:#cdd1cb; }
-.workspace-crew-link:focus-visible { outline:2px solid var(--signal-bright); outline-offset:2px; }
+/* Under the list: which crew this is, in a line with room to say so, and the two things there are to change about
+   one, who is on this Mission and who is in the workspace. */
+.crew-mode-hint { margin:12px 0 0; color:var(--muted); font-size:12px; line-height:1.4; }
+.crew-actions { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:6px; margin-top:8px; }
+.crew-action { min-width:0; min-height:32px; padding:0 8px; overflow:hidden; border:1px solid var(--line); border-radius:7px; background:transparent; color:var(--muted); font-size:12px; white-space:nowrap; text-overflow:ellipsis; cursor:pointer; transition:color .16s ease, background .16s ease, border-color .16s ease; }
+.crew-action:hover { border-color:var(--line-strong); background:#191c1a; color:#cdd1cb; }
+.crew-action:focus-visible { outline:2px solid var(--signal-bright); outline-offset:2px; }
+.crew-action:disabled { opacity:.42; cursor:not-allowed; }
+.crew-action:disabled:hover { border-color:var(--line); background:transparent; color:var(--muted); }
 
 .surface-list { display:flex; flex-direction:column; gap:6px; }
-.surface-list.compact { gap:5px; }
 .surface-list-item { min-width:0; min-height:42px; display:grid; grid-template-columns:28px minmax(0,1fr) auto; align-items:center; gap:9px; padding:6px 8px; border:1px solid var(--line); border-radius:8px; background:#111412; }
-.surface-list.compact .surface-list-item { min-height:38px; grid-template-columns:25px minmax(0,1fr) auto; padding:5px 7px; }
 .surface-kind-icon { width:28px; height:28px; display:grid; place-items:center; border-radius:8px; background:#262b28; color:#c1c7c0; font-size:8px; font-weight:740; text-transform:uppercase; }
-.surface-list.compact .surface-kind-icon { width:25px; height:25px; border-radius:7px; }
 .surface-kind-icon[data-kind="slack"],.surface-kind-icon.slack { background:#3b2d1f; color:#f3c36b; }
 .surface-kind-icon[data-kind="telegram"],.surface-kind-icon.telegram { background:#193044; color:#8fc5f1; }
 .surface-kind-icon[data-kind="email"],.surface-kind-icon.email { background:#3b2220; color:#e99188; }
@@ -1101,6 +1136,15 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
 .surface-status { color:#959c95; font-size:9px; text-transform:capitalize; }
 .surface-status[data-status="closing"],.surface-status[data-state="closing"] { color:var(--signal-bright); }
 .surface-status[data-status="bound"],.surface-status[data-state="bound"] { color:#91c8a5; }
+/* In the Mission inspector, channel rows match the Crew rows: no box, icon on the section's left edge, same type sizes.
+   The status sits on the name's line so the detail line below can use the full width. */
+.surface-list.compact { gap:3px; margin-inline:-7px; }
+.surface-list.compact .surface-list-item { grid-template-rows:auto auto; align-content:center; align-items:baseline; gap:2px 7px; padding:4px 6px; border-color:transparent; background:transparent; }
+.surface-list.compact .surface-kind-icon { grid-row:1 / span 2; align-self:center; width:27px; height:27px; font-size:11px; font-weight:720; }
+.surface-list.compact .surface-list-copy { display:contents; }
+.surface-list.compact .surface-list-copy strong { grid-column:2; grid-row:1; color:#d3d7d0; font-size:13px; }
+.surface-list.compact .surface-list-copy small { grid-column:2 / span 2; grid-row:2; margin-top:0; }
+.surface-list.compact .surface-status { grid-column:3; grid-row:1; font-size:11px; font-weight:600; white-space:nowrap; }
 
 .crew-dialog > header { position:relative; }
 .crew-dialog-actions { display:flex; align-items:center; gap:8px; }
@@ -1538,7 +1582,7 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
 .command-palette small { color:var(--muted); font-size:11px; }
 .toast { font-size:12px; }
 .rail-button span,.account-label { font-size:11px; }
-.toolbar-button,.manage-crew-button,.workspace-crew-link,.section-heading button { font-size:12px; }
+.toolbar-button,.manage-crew-button,.section-heading button { font-size:12px; }
 .starter-card strong,.crew-copy strong,.mission-person-copy strong { font-size:13px; }
 .starter-card small,.mission-row-copy span,.continuity-card span,.context-copy span,.crew-copy span,.mission-person-copy span,.compact-empty,.mission-health > p,.surface-list-copy span,.surface-list-copy small { color:var(--muted); font-size:12px; }
 .primary-action:disabled,
