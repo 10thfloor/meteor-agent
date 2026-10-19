@@ -99,7 +99,9 @@ export function initializeThreads(host) {
   }
 
   const threadDoc = (id = openThreadId) => (id ? host.AgentSessions.findOne(id) : null);
+  // Where the thread starts: the message it was opened on (recorded on the thread; else found in the topic).
   const parentSeqOf = (row) => {
+    if (Number.isInteger(row.thread.anchorSeq)) return row.thread.anchorSeq;
     const parent = chat.agentInstance?.messages(row.thread.sessionId).fetch()
       .find((message) => message._id === row.thread.messageId);
     return parent?.seq ?? row.thread.seq;
