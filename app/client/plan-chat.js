@@ -43,6 +43,8 @@ export function initializePlanChat(host) {
   const browse = picker.querySelector('.chat-plan-browse'), previewBody = picker.querySelector('.chat-plan-preview');
   const message = (error) => error?.reason || error?.message || 'Could not load plans. Try again.';
   const current = () => host.currentMission();
+  // The open chat: #general (the Mission's own id) or one of its topics. Plans belong to the Mission.
+  const currentChat = () => host.currentChat?.() ?? current();
   const reference = (plan) => ({ handle: plan.handle, missionId: plan.missionId, revision: plan.revision });
   const missionLabel = (plan) => plan.missionId === current() ? 'This mission' : plan.missionTitle;
   const matching = (query = '') => plans.filter((plan) => `${plan.name} ${plan.handle} ${plan.missionTitle}`.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase()));
@@ -195,8 +197,9 @@ export function initializePlanChat(host) {
   async function runPreview() {
     if (!preview || disabled() || preview.loading || preview.error || preview.stale || !preview.definition?.steps?.length || preview.plan.status !== 'active') return;
     const state = preview, plan = state.plan, sessionId = current();
-    if (!launchRequest || launchRequest.missionId !== sessionId || launchRequest.references[0].handle !== plan.handle || launchRequest.references[0].revision !== plan.revision) {
-      launchRequest = { missionId: sessionId, text: `Run #${plan.handle}`, mode: 'agent', requestKey: window.crypto.randomUUID(), references: [reference(plan)] };
+    const chatId = currentChat();
+    if (!launchRequest || launchRequest.missionId !== sessionId || launchRequest.chatId !== chatId || launchRequest.references[0].handle !== plan.handle || launchRequest.references[0].revision !== plan.revision) {
+      launchRequest = { missionId: sessionId, chatId, text: `Run #${plan.handle}`, mode: 'agent', requestKey: window.crypto.randomUUID(), references: [reference(plan)] };
     }
     const pending = launchRequest;
     launching = true; state.launchError = ''; updateAddState(); renderPreview();
@@ -302,15 +305,15 @@ export function initializePlanChat(host) {
     }
     const pending = pendingRequest;
     try {
-      const result = await Meteor.callAsync('constellation.workflowChatSend', { missionId: sessionId, text: submitted, mode: mode === 'note' ? 'note' : 'agent', ...(pending.recipient !== undefined ? { recipient: pending.recipient } : {}), requestKey: pending.requestKey, references: pending.references });
-      if (pendingRequest === pending && current() === sessionId && !disposed) {
+      const result = await Meteor.callAsync('constellation.workflowChatSend', { missionId: current(), chatId: sessionId, text: submitted, mode: mode === 'note' ? 'note' : 'agent', ...(pending.recipient !== undefined ? { recipient: pending.recipient } : {}), requestKey: pending.requestKey, references: pending.references });
+      if (pendingRequest === pending && currentChat() === sessionId && !disposed) {
         pendingRequest = null;
         attachmentSnapshot.forEach((plan) => { if (selected.get(plan.handle)?.revision === plan.revision) selected.delete(plan.handle); }); renderAttachments();
         if (result?.kind === 'run') host.toast('Plan started with its assigned agents.');
       }
       return result;
     } catch (error) {
-      if (pendingRequest === pending && current() === sessionId && ['workflow-conflict', 'workflow-reference-stale'].includes(error?.error)) { pendingRequest = null; void refresh(); }
+      if (pendingRequest === pending && currentChat() === sessionId && ['workflow-conflict', 'workflow-reference-stale'].includes(error?.error)) { pendingRequest = null; void refresh(); }
       throw error;
     }
   };

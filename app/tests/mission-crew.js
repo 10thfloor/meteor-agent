@@ -5,8 +5,8 @@ import { Mongo } from "meteor/mongo";
 if (Meteor.isClient) {
   // The Crew section of the Mission inspector, as the app draws it for the
   // Mission it opens with: the people and the agents on the Mission, set alike
-  // in two lists; what waits for review; and under the lists, which crew this
-  // is and the two controls that change one.
+  // in two lists; and under the lists, which crew this is and the two controls
+  // that change one. What waits for review is the Mission's Reviews tab.
   describe("Mission crew: the panel", function () {
     this.timeout(60_000);
 
@@ -83,12 +83,12 @@ if (Meteor.isClient) {
 
     it("stands on the edges the other sections keep", function () {
       const left = box(heading()).left;
-      const right = box($("open-learning-reviews")).right;
+      const right = box(one(".crew-actions")).right;
       for (const selector of [
         ".crew-subsection-heading", "#mission-crew-people .participant-avatar", "#crew-list .crew-avatar",
         "#crew-mode-hint", ".crew-actions", ".mission-health .section-heading", ".health-meter",
       ]) assert.closeTo(box(one(selector)).left, left, 0.5, `left of ${selector}`);
-      for (const selector of ["#mission-crew-people-count", "#crew-count", ".crew-actions", ".health-meter"]) {
+      for (const selector of ["#mission-crew-people-count", "#crew-count", ".health-meter"]) {
         assert.closeTo(box(one(selector)).right, right, 0.5, `right of ${selector}`);
       }
       // A title stands the same distance under its section's rule, with a button beside it or without.
@@ -113,39 +113,45 @@ if (Meteor.isClient) {
       assert.isTrue(narrow(() => uncut(heading())), "in a narrow window");
     });
 
-    it("shows a count on Reviews only while something waits for review", async function () {
-      const reviews = $("open-learning-reviews");
-      const count = $("mission-reviews-count");
+    it("counts what waits for review on this Mission's Reviews tab, not in the Crew heading", async function () {
+      const tab = $("mission-tab-reviews");
+      const count = $("mission-tab-reviews-count");
+      const missionId = one(".mission-row.current")?.dataset.sessionId;
+      assert.ok(missionId, "the open Mission");
+      assert.isNull($("open-learning-reviews"), "the Crew heading has no Reviews button");
       // Nothing has been learned in a workspace this new.
-      await until(() => reviews.getAttribute("aria-label").includes("0 items need attention"), "the reviews to be counted");
-      assert.strictEqual(reviews.dataset.pending, "false");
+      await until(() => tab.getAttribute("aria-label") === "Reviews", "the reviews to be counted");
+      assert.isTrue(count.hidden);
       assert.strictEqual(drawn(count).display, "none");
-      const quiet = { width: box(reviews).width, border: drawn(reviews).borderTopColor };
-      // The button eases into its lit colours; the test wants where it ends up.
-      reviews.style.transition = "none";
 
-      // What the server would publish for a practice an agent has proposed, put where the page reads it.
+      // What the server would publish for practices agents have proposed, put where the page reads it: one learned
+      // on this Mission, one learned somewhere this page can't place, which the server says is no Mission of yours.
       const practices = Mongo.getCollection("agent_practices");
-      const proposed = practices._collection.insert({
+      const here = practices._collection.insert({
         status: "candidate", key: "say-what-changed", agentId: "constellation-agent-orchestrator",
-        createdAt: new Date(), updatedAt: new Date(),
+        source: { kind: "turn", sessionId: missionId, triggerSeq: 1 }, createdAt: new Date(), updatedAt: new Date(),
+      });
+      const elsewhere = practices._collection.insert({
+        status: "candidate", key: "elsewhere", agentId: "constellation-agent-orchestrator",
+        source: { kind: "turn", sessionId: "not-a-session-here", triggerSeq: 1 }, createdAt: new Date(), updatedAt: new Date(),
       });
       try {
-        await until(() => reviews.dataset.pending === "true", "Reviews to say something waits");
-        assert.strictEqual(count.textContent, "1");
-        assert.include(reviews.getAttribute("aria-label"), "1 item needs attention");
+        await until(() => !count.hidden, "the tab to say something waits");
+        await new Promise((resolve) => setTimeout(resolve, 600));
+        assert.strictEqual(count.textContent, "1", "only this Mission's practice");
+        assert.include(tab.getAttribute("aria-label"), "1 needs attention");
         assert.notStrictEqual(drawn(count).display, "none");
-        assert.notStrictEqual(drawn(count).color, drawn(reviews).color, "the count is lit");
-        assert.notStrictEqual(drawn(reviews).borderTopColor, quiet.border);
-        assert.isAbove(box(reviews).width, quiet.width);
-        assert.isTrue(narrow(() => uncut(heading())), "the heading keeps its room in a narrow window");
+        assert.notStrictEqual(drawn(count).color, drawn(tab).color, "the count is lit");
+        assert.strictEqual($("crew-reviews-count").textContent, "2", "the workspace list keeps both");
+        const rows = all("#mission-reviews-list .review-row");
+        assert.strictEqual(rows.length, 1);
+        assert.include(rows[0].textContent, "say-what-changed");
       } finally {
-        practices._collection.remove(proposed);
-        reviews.style.transition = "";
+        practices._collection.remove(here);
+        practices._collection.remove(elsewhere);
       }
-      await until(() => reviews.dataset.pending === "false", "Reviews to go quiet again");
+      await until(() => count.hidden, "the tab to go quiet again");
       assert.strictEqual(drawn(count).display, "none");
-      assert.closeTo(box(reviews).width, quiet.width, 0.5);
     });
 
     it("shows a state dot only on an agent with something to report", function () {
@@ -190,11 +196,11 @@ if (Meteor.isClient) {
       assert.closeTo(box(mission).top, box(roster).top, 0.5);
       assert.closeTo(box(mission).width, box(roster).width, 0.5);
       assert.isBelow(box(mission).right, box(roster).left);
-      // The heading is left with the count and Reviews, which is what it has room for.
-      assert.deepEqual(all(`${CREW} > .section-heading button`).map((button) => button.id), ["open-learning-reviews"]);
+      // The heading is left with its count.
+      assert.deepEqual(all(`${CREW} > .section-heading button`).map((button) => button.id), []);
       // The section's own controls: not the agent cards, nor anything a card may hold.
       assert.deepEqual(all(`${CREW} button`).filter((button) => !button.closest(".crew-card")).map((button) => button.id), [
-        "open-learning-reviews", "manage-mission-crew-inspector", "configure-crew",
+        "manage-mission-crew-inspector", "configure-crew",
       ]);
       assert.isTrue(narrow(() => uncut(mission) && uncut(roster)), "neither is cut short in a narrow window");
       // A control that cannot be used now looks it. (Mission crew waits for a turn to finish.)

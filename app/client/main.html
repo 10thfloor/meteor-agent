@@ -75,13 +75,16 @@
         </div>
         <label class="sidebar-search">
           <svg viewBox="0 0 20 20" aria-hidden="true"><circle cx="8.5" cy="8.5" r="5.5"/><path d="m13 13 3.5 3.5"/></svg>
-          <input id="mission-search" type="search" placeholder="Search missions" autocomplete="off">
+          <input id="mission-search" type="search" placeholder="Search missions and topics" autocomplete="off">
           <kbd>/</kbd>
         </label>
         <div class="sidebar-section-label">
           <span>Missions</span><span id="mission-count">0</span>
         </div>
-        <div class="mission-list" id="mission-list" aria-label="Missions"></div>
+        <div class="mission-list" id="mission-list">
+          <div class="mission-tree" id="mission-tree"></div>
+          <div id="mission-shelf"></div>
+        </div>
         <div class="sidebar-foot">
           <div class="continuity-card">
             <div class="continuity-orbit" aria-hidden="true"><span></span><span></span><span></span></div>
@@ -98,6 +101,13 @@
               <div class="mission-breadcrumb"><span>MISSIONS</span><b>/</b><span id="mission-slug">NEW MISSION</span></div>
               <div class="mission-title-row">
                 <h2 id="mission-title">New mission</h2>
+                <details class="topic-menu" id="topic-menu">
+                  <summary class="topic-chip" id="topic-chip" role="button" tabindex="0" aria-haspopup="menu" aria-controls="topic-menu-list" aria-expanded="false" title="Topic actions">
+                    <span class="topic-hash" aria-hidden="true">#</span><span id="topic-chip-name">general</span>
+                    <svg viewBox="0 0 20 20" aria-hidden="true"><path d="m6 8 4 4 4-4"/></svg>
+                  </summary>
+                  <div class="topic-menu-list mission-more-menu" id="topic-menu-list" role="menu" aria-label="Topic actions"></div>
+                </details>
                 <span class="live-pill loading" id="phase-pill" data-agent-state="loading" data-runtime-phase="idle"><i></i><span>LOADING</span></span>
               </div>
             </div>
@@ -134,6 +144,7 @@
             <button id="mission-tab-files" type="button" role="tab" data-mission-work-tab="files" aria-selected="false" aria-controls="mission-work-files" tabindex="-1">Files</button>
             <button id="mission-tab-runs" type="button" role="tab" data-mission-work-tab="runs" aria-selected="false" aria-controls="mission-work-runs" tabindex="-1">Code runs</button>
             <button id="mission-tab-services" type="button" role="tab" data-mission-work-tab="services" aria-selected="false" aria-controls="mission-work-services" tabindex="-1">Services</button>
+            <button id="mission-tab-reviews" type="button" role="tab" data-mission-work-tab="reviews" aria-selected="false" aria-controls="mission-work-reviews" tabindex="-1">Reviews <b class="mission-tab-count" id="mission-tab-reviews-count" hidden>0</b></button>
           </nav>
           <div class="mission-workspace" id="mission-work-chat" role="tabpanel" data-mission-work-panel="chat" aria-labelledby="mission-tab-chat">
             <section class="conversation-pane">
@@ -208,7 +219,7 @@
               <div class="inspector-scroll">
                 <div class="inspector-tab-panel active" id="inspector-panel-crew" data-inspector-panel="crew" role="tabpanel" aria-labelledby="inspector-tab-crew">
                   <section class="inspector-section">
-                    <div class="section-heading"><span>CREW <b class="section-count" id="mission-crew-count" title="People and agents on this Mission">0</b></span><button id="open-learning-reviews" type="button" aria-haspopup="dialog" aria-controls="crew-dialog" aria-label="Open learning reviews, 0 items need attention" data-pending="false">Reviews <b id="mission-reviews-count">0</b></button></div>
+                    <div class="section-heading"><span>CREW <b class="section-count" id="mission-crew-count" title="People and agents on this Mission">0</b></span></div>
                     <div class="crew-subsection">
                       <div class="crew-subsection-heading"><span>People</span><span id="mission-crew-people-count">0</span></div>
                       <div class="mission-people-list" id="mission-crew-people" role="list" aria-label="People in this mission"></div>
@@ -282,6 +293,25 @@
           <section class="mission-work-panel" id="mission-work-files" role="tabpanel" data-mission-work-panel="files" aria-labelledby="mission-tab-files" hidden><div id="mission-files-root"></div></section>
           <section class="mission-work-panel" id="mission-work-runs" role="tabpanel" data-mission-work-panel="runs" aria-labelledby="mission-tab-runs" hidden><div id="mission-runs-root"></div></section>
           <section class="mission-work-panel" id="mission-work-services" role="tabpanel" data-mission-work-panel="services" aria-labelledby="mission-tab-services" hidden><div id="mission-services-root"></div></section>
+          <section class="mission-work-panel" id="mission-work-reviews" role="tabpanel" data-mission-work-panel="reviews" aria-labelledby="mission-tab-reviews" hidden>
+            <div class="mission-reviews">
+              <header class="mission-reviews-header">
+                <div><h3>Reviews</h3><p id="mission-reviews-summary">What the crew learned on this Mission, and what waits for you.</p></div>
+                <button class="toolbar-button" id="mission-reviews-all" type="button" aria-haspopup="dialog">All reviews</button>
+              </header>
+              <div class="learning-panel-state" id="mission-reviews-loading" role="status"><span>Loading reviews…</span></div>
+              <div id="mission-reviews-content" hidden>
+                <section class="reviews-section" aria-labelledby="mission-reviews-needs-title">
+                  <header><h4 id="mission-reviews-needs-title">Needs attention</h4><span id="mission-reviews-needs-count">0</span></header>
+                  <div class="reviews-list" id="mission-reviews-list" role="list" aria-live="polite"></div>
+                </section>
+                <section class="reviews-section reviews-recent-section" aria-labelledby="mission-reviews-recent-title">
+                  <header><h4 id="mission-reviews-recent-title">Recent learning</h4><span id="mission-reviews-recent-count">0</span></header>
+                  <div class="reviews-list" id="mission-reviews-recent-list" role="list"></div>
+                </section>
+              </div>
+            </div>
+          </section>
         </section>
 
         <section class="view-panel page-view" id="view-automations" data-view-panel="automations">
@@ -515,9 +545,11 @@
     </div>
     <div class="command-group"><span>Actions</span>
       <button type="button" data-command="new"><i>＋</i><span><strong>New mission</strong></span><kbd>⌘ N</kbd></button>
+      <button type="button" data-command="topic-new"><i>#</i><span><strong>Add topic</strong><small>To the open Mission</small></span></button>
       <button type="button" data-command="inspector"><i>▯</i><span><strong>Show or hide inspector</strong></span><kbd>⌥ ⌘ B</kbd></button>
       <button type="button" data-command="reviews"><i>✓</i><span><strong>Learning reviews</strong><small id="command-reviews-count">0 items need attention</small></span></button>
     </div>
+    <div class="command-group" id="command-topics" hidden><span>Topics</span></div>
   </dialog>
 
   <dialog class="run-dialog" id="run-dialog" aria-labelledby="run-dialog-title">

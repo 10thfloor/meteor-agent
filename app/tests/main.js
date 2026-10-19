@@ -1482,8 +1482,12 @@ if (Meteor.isClient) {
         "Recent learning",
       );
       assert.strictEqual(
-        document.getElementById("open-learning-reviews")?.getAttribute("aria-controls"),
-        "crew-dialog",
+        document.getElementById("mission-tab-reviews")?.getAttribute("aria-controls"),
+        "mission-work-reviews",
+      );
+      assert.strictEqual(
+        document.getElementById("mission-reviews-all")?.getAttribute("aria-haspopup"),
+        "dialog",
       );
       assert.strictEqual(
         document.querySelector('[data-command="reviews"]')?.textContent.includes("Learning reviews"),

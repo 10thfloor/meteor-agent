@@ -353,12 +353,16 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: var(--mission-chat
 .section-heading button:focus-visible { outline: 1px solid rgba(240,163,90,.68); outline-offset: 2px; color: #e2e5df; }
 /* How many, said beside a heading rather than boxed like a control. */
 .section-count { margin-left: 2px; color: var(--muted-2); font-weight: 600; letter-spacing: 0; font-variant-numeric: tabular-nums; }
-/* Reviews wears its count only while something waits for review, and lit: a nought said nothing, in the colour of
-   an alert. */
-#open-learning-reviews { gap: 5px; }
-#open-learning-reviews b { min-width: 16px; height: 16px; display: none; place-items: center; padding: 0 4px; border-radius: 5px; background: rgba(240,163,90,.12); color: var(--signal-bright); font-size: 10px; font-weight: 680; font-variant-numeric: tabular-nums; }
-#open-learning-reviews[data-pending="true"] { padding-right: 4px; border-color: rgba(240,163,90,.3); color: #d1d5ce; }
-#open-learning-reviews[data-pending="true"] b { display: grid; }
+/* The Mission's Reviews tab wears its count only while something waits for review, and lit: a nought said nothing,
+   in the colour of an alert. */
+.mission-tab-count { min-width: 18px; height: 18px; margin-left: 5px; display: inline-grid; place-items: center; padding: 0 5px; border-radius: 9px; background: rgba(240,163,90,.16); color: var(--signal-bright); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; vertical-align: 1px; }
+.mission-tab-count[hidden] { display: none; }
+.mission-reviews { max-width: 880px; margin: 0 auto; padding: 22px 28px 40px; display: flex; flex-direction: column; gap: 18px; }
+.mission-reviews-header { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; }
+.mission-reviews-header h3 { margin: 0; font-size: 16px; font-weight: 640; letter-spacing: -.02em; }
+.mission-reviews-header p { margin: 5px 0 0; color: var(--muted); font-size: 13px; }
+#mission-reviews-content { display: flex; flex-direction: column; }
+#mission-reviews-content[hidden] { display: none; }
 .crew-list { display: flex; flex-direction: column; gap: 3px; }
 .crew-card {
   --crew-accent: #9aa19b;
