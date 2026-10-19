@@ -121,6 +121,8 @@ if (Meteor.isClient) {
       assert.strictEqual(reviews.dataset.pending, "false");
       assert.strictEqual(drawn(count).display, "none");
       const quiet = { width: box(reviews).width, border: drawn(reviews).borderTopColor };
+      // The button eases into its lit colours; the test wants where it ends up.
+      reviews.style.transition = "none";
 
       // What the server would publish for a practice an agent has proposed, put where the page reads it.
       const practices = Mongo.getCollection("agent_practices");
@@ -139,6 +141,7 @@ if (Meteor.isClient) {
         assert.isTrue(narrow(() => uncut(heading())), "the heading keeps its room in a narrow window");
       } finally {
         practices._collection.remove(proposed);
+        reviews.style.transition = "";
       }
       await until(() => reviews.dataset.pending === "false", "Reviews to go quiet again");
       assert.strictEqual(drawn(count).display, "none");
