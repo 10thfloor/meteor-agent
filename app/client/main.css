@@ -15,7 +15,7 @@
   --blue: #76a9e9;
   --red: #e0786d;
   --violet: #ae91dc;
-  --rail-width: 74px;
+  --rail-width: 78px;
   --sidebar-width: 270px;
   --inspector-width: 312px;
   font-family: Inter, ui-sans-serif, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -71,14 +71,20 @@ kbd { font: inherit; }
 .workspace-shell { height: calc(100vh - 46px); display: grid; grid-template-columns: var(--rail-width) var(--sidebar-width) minmax(0, 1fr); }
 .workspace-shell:not([data-current-view="missions"]) { grid-template-columns:var(--rail-width) 0 minmax(0,1fr); }
 .workspace-shell:not([data-current-view="missions"]) .mission-sidebar { visibility:hidden; opacity:0; border-right:0; pointer-events:none; }
-.primary-rail { border-right: 1px solid var(--line); background: #0d0f0e; padding: 18px 9px 13px; display: flex; flex-direction: column; justify-content: space-between; }
-.rail-top { display: flex; flex-direction: column; gap: 8px; }
-.rail-button { width: 56px; min-height: 54px; padding: 7px 3px 5px; border: 0; border-radius: 10px; background: transparent; color: #666c67; cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px; position: relative; transition: .18s ease; }
-.rail-button:hover { background: rgba(255,255,255,.035); color: #b4b8b2; }
-.rail-button.active { color: var(--paper); background: rgba(255,255,255,.055); }
-.rail-button.active::before { content: ""; position: absolute; left: -9px; width: 2px; height: 24px; border-radius: 0 2px 2px 0; background: var(--signal); box-shadow: 0 0 14px rgba(240,163,90,.4); }
-.rail-button svg { width: 18px; height: 18px; }
-.rail-button span { font-size: 8px; font-weight: 590; }
+.primary-rail { border-right: 1px solid var(--line); background: #0d0f0e; padding: 16px 4px 13px; display: flex; flex-direction: column; justify-content: space-between; }
+.rail-top { display: flex; flex-direction: column; gap: 6px; }
+/* Navigation rail: the selected item is marked by a pill behind its icon and a stronger label, so the label never has to fit inside a box. */
+.rail-button { width: 100%; min-height: 56px; padding: 4px 0; border: 0; border-radius: 10px; background: transparent; color: var(--muted); cursor: pointer; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px; position: relative; transition: color .15s ease; }
+.rail-button svg { width: 48px; height: 30px; padding: 6px 15px; border-radius: 15px; transition: background-color .15s ease, color .15s ease, box-shadow .15s ease; }
+.rail-button span { max-width: 100%; font-size: 8px; font-weight: 590; letter-spacing: -.01em; white-space: nowrap; }
+.rail-button:hover { color: var(--paper); }
+.rail-button:hover svg { background: rgba(255,255,255,.06); }
+.rail-button:active svg { background: rgba(255,255,255,.09); }
+.rail-button.active { color: var(--paper); }
+.rail-button.active svg { background: rgba(240,163,90,.17); color: var(--signal-bright); }
+.rail-button.active span { font-weight: 680; }
+.rail-button:focus-visible { outline: 0; }
+.rail-button:focus-visible svg { box-shadow: 0 0 0 2px var(--signal); }
 .avatar-button {
   width: 56px; min-height: 54px; margin: 0 auto; padding: 6px 3px 5px; border: 0; border-radius: 10px;
   display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 5px;
@@ -321,7 +327,16 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: var(--mission-chat
 
 .inspector-pane { width: var(--inspector-width); flex: none; border-left: 1px solid var(--line); background: var(--ink-2); display: flex; flex-direction: column; overflow: hidden; transition: width .2s ease, opacity .15s ease; }
 .mission-workspace.inspector-hidden .inspector-pane { width: 0; opacity: 0; border-left: 0; }
-.inspector-tabs { height: 40px; display: grid; grid-template-columns: repeat(2,1fr); border-bottom: 1px solid var(--line); padding: 0 12px; }
+/* The contents keep their width while the pane slides, so nothing reflows mid-animation. */
+.inspector-header,.inspector-scroll { min-width: var(--inspector-width); }
+.inspector-header { height: 40px; flex: none; display: flex; align-items: center; gap: 4px; border-bottom: 1px solid var(--line); padding: 0 6px 0 12px; }
+.inspector-tabs { flex: 1; align-self: stretch; display: grid; grid-template-columns: repeat(2,1fr); }
+.inspector-collapse { width: 28px; height: 28px; flex: none; border: 0; border-radius: 7px; background: transparent; color: var(--muted-2); display: grid; place-items: center; cursor: pointer; transition: background-color .15s ease, color .15s ease; }
+.inspector-collapse svg { width: 14px; height: 14px; }
+.inspector-collapse:hover { background: rgba(255,255,255,.06); color: var(--paper); }
+.inspector-collapse:focus-visible { outline: 0; color: var(--paper); box-shadow: 0 0 0 2px var(--signal); }
+#toggle-inspector .inspector-toggle-fill { stroke: none; fill: currentColor; opacity: 0; transition: opacity .15s ease; }
+#toggle-inspector[aria-expanded="true"] .inspector-toggle-fill { opacity: .35; }
 .inspector-tabs button { border: 0; border-bottom: 1px solid transparent; background: transparent; color: #686e69; font-size: 8px; cursor: pointer; }
 .inspector-tabs button:hover { color: #aeb3ad; }
 .inspector-tabs button:focus-visible { outline: 0; color: #e0e3dc; box-shadow: inset 0 -2px var(--signal); }
@@ -1576,9 +1591,8 @@ button.mission-person-row:focus-visible { outline:0; border-color:rgba(240,163,9
   .capability-master-panel { border-right:0; border-bottom:1px solid var(--line); }
 }
 @media (max-width: 900px) {
-  :root { --rail-width: 66px; --sidebar-width: 210px; }
+  :root { --rail-width: 76px; --sidebar-width: 210px; }
   .window-bar { padding-left:70px; grid-template-columns:1fr 280px 1fr; }
-  .rail-button { width:48px; }
   .mission-actions > .toolbar-button:not(.icon-only),.mission-more-actions > summary.toolbar-button { width:29px; overflow:hidden; padding:0; font-size:0; }
   .mission-actions > .toolbar-button[data-loading="true"]::before { left:50%; margin-left:-6px; }
   .mission-actions > .toolbar-button[data-loading="true"]::after { display:none; }

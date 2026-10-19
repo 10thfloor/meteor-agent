@@ -18,8 +18,11 @@
 .workspace-shell[data-threads-open] #mission-sidebar { visibility: hidden; }
 
 /* While the layer is open, the view underneath is not the one in front. */
-.workspace-shell[data-threads-open] .rail-button[data-view].active { color: #666c67; background: transparent; }
-.workspace-shell[data-threads-open] .rail-button[data-view].active::before { content: none; }
+.workspace-shell[data-threads-open] .rail-button[data-view].active { color: var(--muted); }
+.workspace-shell[data-threads-open] .rail-button[data-view].active svg { background: transparent; color: inherit; }
+.workspace-shell[data-threads-open] .rail-button[data-view].active span { font-weight: 590; }
+.workspace-shell[data-threads-open] .rail-button[data-view].active:hover { color: var(--paper); }
+.workspace-shell[data-threads-open] .rail-button[data-view].active:hover svg { background: rgba(255,255,255,.06); }
 .rail-button[aria-pressed] { margin-top: 2px; }
 
 .threads-sidebar {
