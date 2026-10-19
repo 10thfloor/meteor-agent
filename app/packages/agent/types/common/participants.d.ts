@@ -75,5 +75,12 @@ export declare function assistantAnswers(assistant: {
     seq: number;
     answeredThrough?: number;
 }, seq: number): boolean;
+/** A user row that a thread answers, or one copied in from a thread. Both are
+ *  context for the session they sit in, never a request its models owe. */
+export declare function answeredInThread(message: {
+    role: string;
+    threadSessionId?: string;
+    fromThreadSessionId?: string;
+}): boolean;
 export {};
 //# sourceMappingURL=participants.d.ts.map

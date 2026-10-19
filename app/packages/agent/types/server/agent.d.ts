@@ -4,6 +4,16 @@ import type { Provider } from './providers/types';
 import { type AdoptedTool, type AgentMethodOptions } from './tools';
 import { type McpServerDef } from './mcp/client';
 import { type HookMap, type HookName } from './hooks';
+import { type ThreadSendResult } from './methods';
+/** Options for the server-side `Agent#send`. */
+export interface AgentSendOptions {
+    /** Defaults to null (anonymous owner), never "all sessions". */
+    userId?: string | null;
+    /** Explicit model participant id; fails if unavailable. */
+    to?: string;
+    replyIn?: 'thread';
+    alsoToParent?: boolean;
+}
 import type { SystemTurnResult } from './system-turn';
 import { type SaveArgs } from './memory';
 import { type ChannelDef } from './channels/registry';
@@ -31,9 +41,12 @@ export declare class Agent {
     }): Promise<string>;
     /** Server-side send into an existing session — same core as the DDP method.
      *  `userId` defaults to null (anonymous owner), never "all sessions". */
-    send(sessionId: string, text: string, opts?: {
-        userId?: string | null;
-    }): Promise<string>;
+    send(sessionId: string, text: string, opts: AgentSendOptions & ({
+        replyIn: 'thread';
+    } | {
+        alsoToParent: true;
+    })): Promise<ThreadSendResult>;
+    send(sessionId: string, text: string, opts?: AgentSendOptions): Promise<string>;
     /** Add human conversation context without waking a model. The row remains
      * visible to a later turn, but does not consume the Turn budget or resolve
      * a leading @mention. Server callers may stamp another trusted surface;
@@ -63,11 +76,18 @@ export declare class Agent {
         expectedToolCallId?: string;
     }): Promise<void>;
     /** Branch a session at `atSeq` (clamped to batch-safe cut). Returns
-     *  the new session's id; the fork is a new root with zeroed usage. */
+     *  the new session's id; the fork is a new root with zeroed usage.
+     *  With `thread: { messageId }`, finds or opens the thread on that message
+     *  instead (cut forward to the end of its tool batch; `atSeq`/`title` do
+     *  not apply). `userId` scopes either lookup; a thread admits any human
+     *  roster member, a fork the owner or a member. */
     fork(sessionId: string, opts?: {
         atSeq?: number;
         title?: string;
         userId?: string | null;
+        thread?: {
+            messageId: string;
+        };
     }): Promise<string>;
     /** Manual compaction — skips the threshold, runs the same path as auto.
      *  Returns true if compacted, false if nothing worth compacting. */

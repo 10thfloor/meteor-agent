@@ -1,5 +1,13 @@
 import { type AgentSession, type AttachmentRef, type MessageSource } from '../common/types';
 import { type SystemTurnResult } from './system-turn';
+/** What a send with `replyIn` or `alsoToParent` resolves to. Plain sends keep
+ * resolving to the session id. */
+export interface ThreadSendResult {
+    /** The session the send was addressed to. */
+    sessionId: string;
+    /** `replyIn: 'thread'`: the thread that answers the message. */
+    threadSessionId?: string;
+}
 /** Verified channel identity (decision 12); server-side only, never from DDP. */
 export interface ViaIdentity {
     kind: string;
@@ -24,7 +32,17 @@ extras?: {
     /** Trusted ingress attribution. DDP/channel callers stamp this themselves;
      *  no public method argument accepts it. */
     source?: MessageSource;
-}): Promise<string>;
+    /** `'thread'`: commit the message here without waking this session and
+     *  open a thread on it whose model answers instead. */
+    replyIn?: 'thread';
+    /** Sends to a thread only: also copy the message into the thread's parent
+     *  as context, without waking the parent. */
+    alsoToParent?: boolean;
+}): Promise<string | ThreadSendResult>;
+/** Find or open the thread on one message. `userId` scopes the lookup to the
+ * owner or a human roster member (send's rule, not fork's owner-only rule);
+ * `undefined` is an unscoped server call. */
+export declare function threadFor(agent: string, sessionId: string, messageId: string, userId?: string | null): Promise<string>;
 /** Commit a human crew note without scheduling model work. It is deliberately
  * a `user` row (so a later turn sees it as conversation context) with
  * `kind:'crew-note'` (so recovery/routing never treats it as unanswered).

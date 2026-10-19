@@ -6,6 +6,19 @@ export interface SendOptions {
     /** Explicit model participant ID. When supplied, it takes precedence over
      * a leading @mention and fails if that participant is unavailable. */
     to?: string;
+    /** `'thread'`: commit the message in this session without waking it, and
+     * open a thread on it where the addressed model answers. */
+    replyIn?: 'thread';
+    /** Sends to a thread session only: also copy the message into the thread's
+     * parent as context, without waking the parent. */
+    alsoToParent?: boolean;
+}
+/** What a send with `replyIn` or `alsoToParent` resolves to. */
+export interface ThreadSendResult {
+    /** The session the send was addressed to. */
+    sessionId: string;
+    /** `replyIn: 'thread'`: the thread that answers the message. */
+    threadSessionId?: string;
 }
 /** Client-side handle on one agent. Uses minimongo's synchronous API
  *  (the async-only rule is server-side). */
@@ -34,10 +47,26 @@ export declare class Agent {
     /** Requires a separate Meteor.subscribe(NAMES.pubSessions, name).
      *  Archived sessions are left out unless asked for. */
     subscribeSessions(includeArchived?: boolean): Meteor.SubscriptionHandle;
+    /** Thread sessions are left out unless the selector names `thread`; read
+     *  them with `threads(sessionId)`. */
     sessions(selector?: SessionQuery): Mongo.Cursor<import(".").AgentSession, import(".").AgentSession>;
+    /** The threads opened on one session's messages (summary fields: title,
+     *  phase, thread stats, roster, usage). Pair with `threads(sessionId)`. */
+    subscribeThreads(sessionId: string): Meteor.SubscriptionHandle;
+    /** Reactive cursor over one session's threads, oldest first. Each doc's
+     *  `thread.messageId` is the row it was opened on. */
+    threads(sessionId: string): Mongo.Cursor<import(".").AgentSession, import(".").AgentSession>;
+    /** Find or open the thread on one message (user or assistant row) and
+     *  resolve to its session id. Any human in the conversation may open one. */
+    thread(sessionId: string, messageId: string): Promise<string>;
     start(opts?: {
         title?: string;
     }): Promise<string>;
+    send(sessionId: string, text: string, options: SendOptions & ({
+        replyIn: 'thread';
+    } | {
+        alsoToParent: true;
+    })): Promise<ThreadSendResult>;
     send(sessionId: string, text: string, options?: SendOptions): Promise<string>;
     /** Commit human-to-crew context without waking an agent. The stable retry
      * key makes Meteor's transparent reconnect retry exactly-once. */
