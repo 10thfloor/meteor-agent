@@ -36,6 +36,8 @@ export type SessionQuery = Fields<AgentSession> & {
 } & {
     [k: `forkedFrom.${string}`]: unknown;
 } & {
+    [k: `thread.${string}`]: unknown;
+} & {
     [k: `usage.${string}`]: unknown;
 } & {
     [k: `budgetSpent.${string}`]: unknown;

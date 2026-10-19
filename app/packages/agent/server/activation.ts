@@ -111,8 +111,15 @@ async function inputState(session: AgentSession): Promise<InputState> {
     return { owed, answered };
   }
 
+  // Rows a thread answers are context here, never owed work.
   const [lastUser] = await AgentMessages.find(
-    { sessionId: session._id, role: 'user' }, { sort: { seq: -1 }, limit: 1 },
+    {
+      sessionId: session._id,
+      role: 'user',
+      threadSessionId: { $exists: false },
+      fromThreadSessionId: { $exists: false },
+    },
+    { sort: { seq: -1 }, limit: 1 },
   ).fetchAsync();
   if (!lastUser) return { owed: null, answered: [] };
   if (!session.participants?.length && lastUser.to !== undefined) return { owed: null, answered: [] };

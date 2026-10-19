@@ -25,6 +25,8 @@ export const NAMES = {
   learningEvents: 'agent_learning_events',
   pubSession: 'agent.session',
   pubSessions: 'agent.sessions',
+  pubThreads: 'agent.threads',
+  mThread: 'agent.thread',
   mStart: 'agent.start',
   mSend: 'agent.send',
   mContribute: 'agent.contribute',

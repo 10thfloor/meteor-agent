@@ -39,6 +39,7 @@ export type SessionQuery =
   & { [k: `parent.${string}`]:unknown }
   & { [k: `activeChild.${string}`]:unknown }
   & { [k: `forkedFrom.${string}`]:unknown }
+  & { [k: `thread.${string}`]:unknown }
   & { [k: `usage.${string}`]:unknown }
   & { [k: `budgetSpent.${string}`]:unknown }
   & { [k: `channel.${string}`]:unknown }

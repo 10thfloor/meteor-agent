@@ -19,7 +19,8 @@ export { hostLearningSource, assertLearningReviewTarget, assertPracticeTransitio
 export { resolveMemory } from './registry';
 export { AgentSessions, AgentMessages, AgentDeltas, AgentMemories, } from '../common/collections';
 export { mergeView } from '../common/merge';
-export { Agent, type AgentConfig, type SessionErasure } from './agent';
+export { Agent, type AgentConfig, type AgentSendOptions, type SessionErasure, } from './agent';
+export type { ThreadSendResult } from './methods';
 export { abandonPendingAgentTurns, type AbandonedAgentTurns, } from './session-lifecycle';
 export { validateToolArgs, setToolArgsValidator, defineAgentMethod, fullValidationAvailable, SUBAGENT_ARGS, SKILL_TOOL_NAME, type ToolSpec, type InlineTool, type AdoptedTool, type SubagentTool, type McpTool, type ToolContext, type AgentMethodOptions, type ValidationResult, type ArgsValidator, type TypeboxValue, type TypeboxCompile, type TypeboxValidator, type Skill, type ToolResult, toolOutput, type SubagentBudget, type DelegationContext, type DelegationDecision, type DelegationCompletion, type DelegationProjection, type Gate, type GateContext, type GatePredicate, tool, methodTool, type TypedInlineTool, type TypedAdoptedTool, } from './tools';
 export type { FromSchema } from '../common/schema';

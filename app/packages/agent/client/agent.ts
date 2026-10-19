@@ -12,6 +12,20 @@ export interface SendOptions {
   /** Explicit model participant ID. When supplied, it takes precedence over
    * a leading @mention and fails if that participant is unavailable. */
   to?: string;
+  /** `'thread'`: commit the message in this session without waking it, and
+   * open a thread on it where the addressed model answers. */
+  replyIn?: 'thread';
+  /** Sends to a thread session only: also copy the message into the thread's
+   * parent as context, without waking the parent. */
+  alsoToParent?: boolean;
+}
+
+/** What a send with `replyIn` or `alsoToParent` resolves to. */
+export interface ThreadSendResult {
+  /** The session the send was addressed to. */
+  sessionId: string;
+  /** `replyIn: 'thread'`: the thread that answers the message. */
+  threadSessionId?: string;
 }
 
 /** Client-side handle on one agent. Uses minimongo's synchronous API
@@ -100,18 +114,50 @@ export class Agent {
     return Meteor.subscribe(NAMES.pubSessions, this.name, includeArchived);
   }
 
+  /** Thread sessions are left out unless the selector names `thread`; read
+   *  them with `threads(sessionId)`. */
   sessions(selector: SessionQuery = {}) {
     return AgentSessions.find(
-      { ...selector, agent: this.name },
+      { thread: { $exists: false }, ...selector, agent: this.name },
       { sort: { updatedAt: -1 } },
     );
+  }
+
+  /** The threads opened on one session's messages (summary fields: title,
+   *  phase, thread stats, roster, usage). Pair with `threads(sessionId)`. */
+  subscribeThreads(sessionId: string) {
+    return Meteor.subscribe(NAMES.pubThreads, this.name, sessionId);
+  }
+
+  /** Reactive cursor over one session's threads, oldest first. Each doc's
+   *  `thread.messageId` is the row it was opened on. */
+  threads(sessionId: string) {
+    return AgentSessions.find(
+      { 'thread.sessionId': sessionId, agent: this.name },
+      { sort: { createdAt: 1 } },
+    );
+  }
+
+  /** Find or open the thread on one message (user or assistant row) and
+   *  resolve to its session id. Any human in the conversation may open one. */
+  thread(sessionId: string, messageId: string): Promise<string> {
+    return Meteor.callAsync(NAMES.mThread, this.name, sessionId, messageId);
   }
 
   start(opts?: { title?: string }): Promise<string> {
     return Meteor.callAsync(NAMES.mStart, this.name, opts);
   }
 
-  send(sessionId: string, text: string, options?: SendOptions): Promise<string> {
+  send(
+    sessionId: string, text: string,
+    options: SendOptions & ({ replyIn: 'thread' } | { alsoToParent: true }),
+  ): Promise<ThreadSendResult>;
+  send(sessionId: string, text: string, options?: SendOptions): Promise<string>;
+  /** Plain sends resolve to the session id; `replyIn` / `alsoToParent` sends
+   *  resolve to `ThreadSendResult`. */
+  send(
+    sessionId: string, text: string, options?: SendOptions,
+  ): Promise<string | ThreadSendResult> {
     // Stable across Meteor's transparent method retry: the server's private
     // Transcript Commit Module uses this only as an idempotency identity.
     return Meteor.callAsync(NAMES.mSend, this.name, sessionId, text, Random.id(), options);

@@ -3,7 +3,9 @@ import type {
   ExperienceAudience, ExperienceScope, IdentityConfig, ResolvedExperience, ResolvedPractice,
 } from '../common/learning';
 import { AgentMemories, AgentMessages } from '../common/collections';
-import { modelParticipantId, resolveAddressee } from '../common/participants';
+import {
+  answeredInThread, modelParticipantId, resolveAddressee,
+} from '../common/participants';
 import { promptDisplay } from '../common/channel-contract';
 import { memoryBlockSnapshot, memoryHintSnapshot } from './memory';
 import {
@@ -50,6 +52,8 @@ function triggerForAgent(
   // Crew notes promise "no model work" (participants.ts applies the same
   // rule); one landing mid-park must not become the next trigger.
   if (message.kind === 'crew-note') return false;
+  // Answered in (or copied from) a thread: context, not a trigger.
+  if (answeredInThread(message)) return false;
   if (!session.participants?.length) return message.to === undefined && session.agent === agentName;
   const addressee = resolveAddressee(message.content, message.to, session);
   if (message.to !== undefined && !addressee) return false;
