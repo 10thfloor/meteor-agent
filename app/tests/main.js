@@ -1,5 +1,6 @@
 import { assert } from "chai";
 import './constellation-evidence.js';
+import './constellation-topics.js';
 import './constellation-lab-federation.js';
 import './constellation-workflows.js';
 import './constellation-plan-navigation.js';

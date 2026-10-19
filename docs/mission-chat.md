@@ -24,6 +24,13 @@ shows the addressed agent.
 Plan context follows the selected recipient. Explicit **Run plan** actions use
 the agents saved on the plan’s steps, not the chat recipient.
 
+Each of a Mission's topics has its own chat and its own remembered recipient. The
+same menu also chooses where the answer goes: **Reply in this topic**, or **Reply
+in thread**, which keeps your message in the topic and answers it in a thread
+beside the chat (`Agent.send(sessionId, text, { to, replyIn: 'thread' })`). A
+thread's composer has its own menu, without that choice. See
+[Topics and threads](topics-and-threads.md).
+
 ## Uploads in chat
 
 The composer’s **Add** menu groups **Upload files**, **Choose mission file**, and
