@@ -117,7 +117,12 @@ export async function forkSession(
       }
       cut = threadCut;
       thread = {
-        sessionId: source._id, seq: cut, messageId: anchor._id, replies: 0, repliers: [],
+        sessionId: source._id,
+        seq: cut,
+        messageId: anchor._id,
+        anchorSeq: anchor.seq,
+        replies: 0,
+        repliers: [],
       };
       title = opts.title ?? threadTitle(anchor);
     } else {

@@ -141,6 +141,10 @@ export interface AgentSession {
         sessionId: string;
         seq: number;
         messageId: string;
+        /** The anchor's seq. Its copy in the thread keeps this seq (copies get
+         *  new `_id`s), and it is below `seq` when the anchor opened a tool
+         *  batch. Pass it as `<agent-chat from-seq>` to show just the thread. */
+        anchorSeq: number;
         replies: number;
         lastReplyAt?: Date;
         repliers: string[];

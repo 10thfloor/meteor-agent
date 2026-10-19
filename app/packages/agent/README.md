@@ -1001,6 +1001,7 @@ framework never re-renders it.
 | `composer-layout` | `panel` groups context above the text and toolbar/actions below it. Default layout remains inline. |
 | `submit-label` | Optional idle label for an app-owned action, such as `Run plan`. Pending labels remain `Sending…`/`Adding note…`. |
 | `threadable` | Adds a "Reply in thread" button to user and assistant rows (not tool, note or in-flight rows), shown on hover or keyboard focus. A click dispatches `agent-chat:open-thread` (bubbles, composed) with `{ sessionId, messageId, seq }`; the host opens the thread, for example with `Agent#thread`. The `threadable` property mirrors the attribute. See **Threads**. |
+| `from-seq` | Paint only rows with `seq >= from-seq` (display only: the model still sees every row, and app timeline items placed after a hidden row are hidden too). The first painted row carries the `thread-root` part. For a thread session pass its `thread.anchorSeq` to show the parent message and its replies. The `fromSeq` property mirrors the attribute; `null` paints every row. |
 | `verbosity` | `clean` is the default: tool calls/results become concise operational receipts, approvals use bounded human-readable argument summaries, embedded JSON-string escapes are decoded, and raw object/array payloads are hidden. `debug` restores exact assistant bytes, tool arguments, tool-result payloads, structured assistant content, and approval records. Legacy `quiet` aliases `clean`; legacy `full` aliases `debug`. It only changes what is drawn, so toggling it re-paints without touching the session. |
 
 In clean mode, assistant prose renders as semantic GFM/CommonMark-style
@@ -1267,6 +1268,7 @@ element you never theme still follows the OS light/dark setting.
 | `crew-note-header`, `speaker-crew-note`, `crew-note-badge` | Attribution and visible `Crew note` label grouped above a non-waking human contribution. The bubble carries `message user crew-note` for separate theming. Its leading `@agent` chips deliberately never carry `addressed`. |
 | `thread-button` | The "Reply in thread" button on a row of a `threadable` element |
 | `threaded` | On `message user` rows sent with "Reply in thread" (the row's `threadSessionId` is set) |
+| `thread-root` | On the first painted row when `from-seq` is set: the thread's parent message |
 | `new-messages` | The transcript-tail affordance; also carries `pending` while newer rows are waiting below the reader. |
 | `operation`, `operations` | Clean-mode tool/delegation status, without arguments or result payloads |
 | `structured-hidden` | Clean-mode replacement for a whole JSON or JSON-fenced assistant message |
@@ -1534,7 +1536,10 @@ await new Agent('support').send(sessionId, text, { userId, replyIn: 'thread' });
   batch; while the batch is still running the open is refused with
   `thread-anchor-open`.
 - **The session document** carries `thread: { sessionId, seq, messageId,
-  replies, lastReplyAt?, repliers }` and `forkedFrom`. `replies` counts user
+  anchorSeq, replies, lastReplyAt?, repliers }` and `forkedFrom`. `seq` is the
+  cut; `anchorSeq` is the anchor's own seq, which its copy in the thread keeps
+  (copies get new `_id`s). Render a thread like a chat thread with
+  `<agent-chat session-id="<thread>" from-seq="<anchorSeq>">`. `replies` counts user
   rows and final assistant rows after the cut (tool steps are not replies),
   `repliers` lists the model participant ids that answered, and
   `lastReplyAt` is the newest reply's time. They are updated in the same

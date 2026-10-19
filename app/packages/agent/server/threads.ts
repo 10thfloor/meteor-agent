@@ -124,7 +124,7 @@ export async function replyInThread(
       const thread: AgentSession = {
         ...forkDocument(before, threadId, seq, threadTitle(row), createdAt),
         thread: {
-          sessionId: source._id, seq, messageId: row._id, replies: 0, repliers: [],
+          sessionId: source._id, seq, messageId: row._id, anchorSeq: seq, replies: 0, repliers: [],
         },
         // The send's Turn is charged where it runs.
         budgetSpent: { turns: 1, toolCalls: 0 },
