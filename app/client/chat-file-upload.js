@@ -222,8 +222,9 @@ export function initializeChatFileUpload(host) {
   add.addEventListener('click', openPicker); picker.addEventListener('change', picked);
   const submit = async (submission) => {
     const state = host.snapshot(); syncAccount(state);
-    const selected = [...entries(submission.sessionId)];
-    if (selected.length && (state.missionId !== submission.sessionId || sending)) throw errorWithReason('Return to this mission before sending its files.');
+    // Files belong to the Mission; the message goes to the open chat (#general or a topic).
+    const selected = [...entries(state.missionId)];
+    if (selected.length && ((state.chatId ?? state.missionId) !== submission.sessionId || sending)) throw errorWithReason('Return to this mission before sending its files.');
     const block = sendBlock(state, selected);
     if (block) throw errorWithReason(block);
     if (selected.length && submission.mode !== 'note' && parsePlanRunCommand(submission.text)) throw errorWithReason('Remove the files from this message to run a plan. Send them in a separate message to share them as context.');
@@ -234,7 +235,7 @@ export function initializeChatFileUpload(host) {
       const result = previousHandler ? await previousHandler(forwarded)
         : submission.mode === 'note' ? await chat.agentInstance.contribute(submission.sessionId, text)
           : await chat.agentInstance.send(submission.sessionId, text, submission.recipient ? { to: submission.recipient } : undefined);
-      if (!disposed && state.userId === account) buckets.set(submission.sessionId, entries(submission.sessionId).filter((entry) => !selected.includes(entry)));
+      if (!disposed && state.userId === account) buckets.set(state.missionId, entries(state.missionId).filter((entry) => !selected.includes(entry)));
       return result;
     } finally { sending = false; notify(); }
   };

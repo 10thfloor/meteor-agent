@@ -260,22 +260,32 @@ agent-chat[data-agent-state="working"]::part(phase) { color:var(--green); }
 agent-chat[data-agent-state="error"]::part(phase),agent-chat[data-agent-state="stopped"]::part(phase) { color:var(--red); }
 agent-chat[data-agent-state="loading"]::part(phase),agent-chat[data-agent-state="thinking"]::part(phase),agent-chat[data-agent-state="working"]::part(phase) { animation:state-breathe .95s ease-in-out infinite; }
 agent-chat[data-agent-state="waiting"]::part(phase),agent-chat[data-agent-state="retrying"]::part(phase) { animation:state-breathe 1.7s ease-in-out infinite; }
-agent-chat::part(messages) { padding: 16px var(--mission-chat-gutter); gap: 15px; scrollbar-width: thin; scrollbar-color: #313532 transparent; }
-agent-chat[aria-busy="true"]::part(messages) { background:linear-gradient(180deg,color-mix(in srgb,var(--signal) 2.5%,transparent),transparent 120px); }
-agent-chat::part(message) { font-size: 11px; line-height: 1.62; padding: 11px 14px; box-shadow: 0 1px 0 rgba(255,255,255,.02); }
-agent-chat::part(message user),agent-chat::part(message assistant),agent-chat::part(message tool),agent-chat::part(message handoff) { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; align-self: stretch; }
-agent-chat::part(message user) { color: #e5e6df; background: #24251f; border: 1px solid #424235; font-weight: 400; border-bottom-right-radius: 4px; }
-agent-chat::part(message user crew-note) { background:#1b2832; color:#d6e2ed; border:1px solid #405c70; box-shadow:none; font-weight:400; }
-agent-chat::part(message assistant) { background: #1b1e1c; border: 1px solid var(--line); color: #d9dcd5; border-bottom-left-radius: 4px; }
-agent-chat::part(speaker) { color: var(--signal-bright); font-size: 7px; letter-spacing: .08em; text-transform: uppercase; margin-bottom: 5px; }
-agent-chat::part(speaker-user) { color: #c4bea8; font-weight: 650; opacity: 1; }
-agent-chat::part(crew-note-header) { gap:6px 12px; margin-bottom:8px; }
-agent-chat::part(speaker-crew-note) { color:#b9cedf; margin:0; opacity:1; }
-agent-chat::part(crew-note-badge) { padding:3px 7px; border-color:#526e84; border-radius:5px; background:#91b9da12; color:#c5def2; font-size:11px; font-weight:600; line-height:1.25; letter-spacing:.01em; text-transform:none; }
-agent-chat::part(message tool) { margin-left: 0; padding: 8px 14px; border-radius: 8px; background: #121513; border: 1px dashed rgba(238,241,232,.1); color: #8c928c; font-size: 8px; }
-agent-chat::part(tool-name) { color: #c1b19f; }
-agent-chat::part(message note) { color: #777d77; font-size: 7px; letter-spacing: .03em; border: 0; background: transparent; box-shadow: none; }
-agent-chat::part(message note approval) { padding:5px 9px; border:1px solid rgba(240,163,90,.14); border-radius:999px; background:rgba(240,163,90,.045); color:#b8a48f; font-weight:620; }
+/* Transcript: one flat list. Rows carry no box or tint; who spoke is the name
+   line, in one colour for people and agents alike. Metadata (recipient, channel,
+   crew note) is quiet text on that line. Operational receipts and notes are
+   small muted lines. A faint wash on hover shows the row a control belongs to. */
+agent-chat::part(messages) { padding: 14px var(--mission-chat-gutter) 18px; gap: 2px; scrollbar-width: thin; scrollbar-color: #313532 transparent; }
+agent-chat[aria-busy="true"]::part(messages) { background: none; }
+agent-chat::part(message) { font-size: 11px; line-height: 1.6; padding: 8px 12px; border: 0; border-radius: 8px; background: transparent; box-shadow: none; color: #d9dcd5; }
+agent-chat::part(message user),agent-chat::part(message assistant),agent-chat::part(message tool),agent-chat::part(message operation),agent-chat::part(message handoff),agent-chat::part(message note) { box-sizing: border-box; width: 100%; max-width: 100%; min-width: 0; align-self: stretch; }
+agent-chat::part(message user):hover,agent-chat::part(message assistant):hover { background: rgba(255,255,255,.025); }
+agent-chat::part(message user),agent-chat::part(message assistant) { margin-top: 6px; }
+agent-chat::part(message user crew-note) { color: #c3c8c1; }
+agent-chat::part(speaker) { display: block; margin-bottom: 2px; color: #eef1ea; font-weight: 640; letter-spacing: 0; text-transform: none; opacity: 1; }
+agent-chat::part(source),agent-chat::part(recipient) { color: #80877f; font-weight: 400; }
+/* Desktop is where everyone here is typing; only another surface is worth naming. */
+agent-chat::part(source source-desktop) { display: none; }
+agent-chat::part(crew-note-header) { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
+agent-chat::part(speaker-crew-note) { margin: 0; }
+agent-chat::part(crew-note-badge) { padding: 0; border: 0; background: none; color: #80877f; font-weight: 400; letter-spacing: 0; text-transform: none; }
+agent-chat::part(message tool),agent-chat::part(message operation) { padding: 2px 12px; color: #80877f; font-size: 8px; }
+agent-chat::part(tool-name) { color: #a3a9a2; }
+agent-chat::part(delegation-link) { margin-left: 8px; padding: 0; border: 0; background: none; color: #c9cdc6; font: inherit; text-decoration: underline; text-decoration-color: rgba(201,205,198,.35); text-underline-offset: 3px; cursor: pointer; }
+agent-chat::part(delegation-link):hover { color: var(--signal-bright); text-decoration-color: currentColor; background: none; }
+agent-chat::part(message note) { padding: 2px 12px; color: #80877f; font-size: 7px; letter-spacing: 0; }
+agent-chat::part(message note approval) { color: #a3a9a2; }
+/* The mission header already shows whether the crew is working. */
+#mission-chat::part(header) { display: none; }
 agent-chat::part(mention) { border-radius: 5px; background: rgba(255,255,255,.06); }
 agent-chat::part(mention addressed) { background: rgba(240,163,90,.12); }
 agent-chat::part(attachment) { border-color: rgba(240,163,90,.3); background: rgba(240,163,90,.08); color: #ffd2a5; }
@@ -353,12 +363,18 @@ agent-chat::part(typeahead) { bottom: calc(100% - 6px); left: var(--mission-chat
 .section-heading button:focus-visible { outline: 1px solid rgba(240,163,90,.68); outline-offset: 2px; color: #e2e5df; }
 /* How many, said beside a heading rather than boxed like a control. */
 .section-count { margin-left: 2px; color: var(--muted-2); font-weight: 600; letter-spacing: 0; font-variant-numeric: tabular-nums; }
-/* Reviews wears its count only while something waits for review, and lit: a nought said nothing, in the colour of
-   an alert. */
-#open-learning-reviews { gap: 5px; }
-#open-learning-reviews b { min-width: 16px; height: 16px; display: none; place-items: center; padding: 0 4px; border-radius: 5px; background: rgba(240,163,90,.12); color: var(--signal-bright); font-size: 10px; font-weight: 680; font-variant-numeric: tabular-nums; }
-#open-learning-reviews[data-pending="true"] { padding-right: 4px; border-color: rgba(240,163,90,.3); color: #d1d5ce; }
-#open-learning-reviews[data-pending="true"] b { display: grid; }
+/* The Mission's Reviews tab wears its count only while something waits for review, and lit: a nought said nothing,
+   in the colour of an alert. */
+.mission-tab-count { min-width: 18px; height: 18px; margin-left: 5px; display: inline-grid; place-items: center; padding: 0 5px; border-radius: 9px; background: rgba(240,163,90,.16); color: var(--signal-bright); font-size: 11px; font-weight: 700; font-variant-numeric: tabular-nums; vertical-align: 1px; }
+.mission-tab-count[hidden] { display: none; }
+/* Laid out like the Services tab: a full-width header bar over full-width content. */
+.mission-reviews { height: 100%; min-height: 0; overflow: auto; display: flex; flex-direction: column; }
+.mission-reviews-header { display: flex; align-items: center; justify-content: space-between; gap: 18px; padding: 22px 26px; border-bottom: 1px solid var(--line); }
+.mission-reviews-header h3 { margin: 0 0 4px; font-size: 1.05rem; }
+.mission-reviews-header p { margin: 0; color: var(--muted); font-size: .85rem; }
+.mission-reviews > .learning-panel-state { margin: 12px 26px; }
+#mission-reviews-content { display: flex; flex-direction: column; padding: 18px 26px 26px; }
+#mission-reviews-content[hidden] { display: none; }
 .crew-list { display: flex; flex-direction: column; gap: 3px; }
 .crew-card {
   --crew-accent: #9aa19b;
@@ -650,7 +666,7 @@ dialog { color:var(--paper); }
 .rail-button span,.eyebrow,.mission-row-copy span,.mission-row time,.toolbar-button,.context-copy span,.context-metrics,.starter-card small,.section-heading,.section-heading button,.crew-copy span,.mission-health > p,.activity-item p,.activity-item button,.green-label,.feature-kicker,.primary-action,.secondary-action,.primary-action b,.automation-meta span,.automation-last,.automation-last button,.memory-compose label,.memory-compose button,.segmented button,.capability-filter button,.memory-toolbar > input,.memory-row-copy div,.cap-type,.capability-grid p,.capability-grid article > b,.capability-stack span,.channel-center strong,.channel-node,.channel-health,.channel-row,.command-input-wrap kbd { font-size:11px; }
 .command-trigger span,.sidebar-search input,.mission-row-copy strong,.continuity-card strong,.continuity-card span,.starter-card strong,.crew-copy strong,.inspector-tabs button,.activity-item strong,.automation-card > p,.memory-scope-stat,.memory-compose input[type="text"],.memory-row-copy p,.memory-empty,.channel-row b,.command-group strong,.toast { font-size:12px; }
 .window-status,.context-copy strong,.page-section-title,.page-section-title > button,.automation-hero p,.capability-feature p { font-size:13px; }
-agent-chat::part(message) { font-size:14px; } agent-chat::part(input) { font-size:13px; } agent-chat::part(message tool),agent-chat::part(approval),agent-chat::part(button approve),agent-chat::part(button deny),agent-chat::part(button send),agent-chat::part(button stop) { font-size:12px; } agent-chat::part(phase),agent-chat::part(speaker),agent-chat::part(message note),.chat-header-label { font-size:11px; }
+agent-chat::part(message) { font-size:14px; } agent-chat::part(input) { font-size:13px; } agent-chat::part(message tool),agent-chat::part(approval),agent-chat::part(button approve),agent-chat::part(button deny),agent-chat::part(button send),agent-chat::part(button stop) { font-size:12px; } agent-chat::part(phase),agent-chat::part(message note),.chat-header-label { font-size:11px; } agent-chat::part(speaker) { font-size:13px; } agent-chat::part(source),agent-chat::part(recipient),agent-chat::part(crew-note-badge) { font-size:12px; }
 
 /* Resource controls */
 .page-header-actions { display:flex; align-items:center; gap:8px; }

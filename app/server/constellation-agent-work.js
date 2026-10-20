@@ -1,12 +1,14 @@
 import { Meteor } from 'meteor/meteor';
 import { DDPRateLimiter } from 'meteor/ddp-rate-limiter';
 import { AgentSessions, AgentMessages, AgentWorkflowRuns } from 'meteor/10thfloor:agent';
+import { missionConversationIds } from './mission-topics';
+import { isMissionRoot } from '../imports/constellation/topics';
 
 const STATUSES = new Set(['working', 'waiting', 'completed', 'failed', 'stopped']);
 const ACTIVE = new Set(['streaming', 'calling', 'compacting', 'retrying']);
 const LABELS = { working: 'Working', waiting: 'Needs approval', completed: 'Completed', failed: 'Failed', stopped: 'Stopped' };
 const SESSION_FIELDS = { _id: 1, userId: 1, agent: 1, phase: 1, title: 1, parent: 1,
-  participants: 1, createdAt: 1, updatedAt: 1, activeChild: 1 };
+  participants: 1, createdAt: 1, updatedAt: 1, activeChild: 1, missionTopic: 1, thread: 1 };
 const fail = (code, reason) => { throw new Meteor.Error(code, reason); };
 const request = (input) => {
   if (!input || typeof input !== 'object' || Array.isArray(input)) fail('invalid-agent-work', 'Choose a mission and agent assignment.');
@@ -73,14 +75,16 @@ export function createConstellationAgentWorkService({ requireUser, CrewConfigs,
     const root = await Sessions.findOneAsync({ _id: missionId, userId, agent: 'orchestrator',
       'parent.sessionId': { $exists: false }, erasingAt: { $exists: false }, purgingAt: { $exists: false } }, { fields: SESSION_FIELDS });
     if (!root) fail('no-session', 'Mission not found.');
-    return root;
+    if (!isMissionRoot(root)) fail('no-session', 'Mission not found.');
+    // Work is delegated from #general, from any topic and from any thread.
+    return { ...root, conversationIds: await missionConversationIds(Sessions, userId, root._id) };
   };
 
   // Traversal is based on saved parent edges, not recent chat messages or the
   // current roster. Owner checks at EVERY edge exclude mixed-owner ancestry.
   // Mongo detects cycles; cursor pages are stable even when new work arrives.
   const workPipeline = (root) => [
-    { $match: { _id: root._id, userId: root.userId, erasingAt: { $exists: false }, purgingAt: { $exists: false } } },
+    { $match: { _id: { $in: root.conversationIds ?? [root._id] }, userId: root.userId, erasingAt: { $exists: false }, purgingAt: { $exists: false } } },
     { $graphLookup: { from: Sessions.rawCollection().collectionName, startWith: '$_id', connectFromField: '_id', connectToField: 'parent.sessionId',
       as: 'work', restrictSearchWithMatch: { userId: root.userId, erasingAt: { $exists: false }, purgingAt: { $exists: false } } } },
     { $unwind: '$work' }, { $replaceRoot: { newRoot: '$work' } },
@@ -220,13 +224,14 @@ export function createConstellationAgentWorkService({ requireUser, CrewConfigs,
       if (!child?.parent?.sessionId) fail('no-session', 'Agent work not found.');
       let current = child;
       const visited = new Set([child._id]);
-      while (current.parent?.sessionId && current.parent.sessionId !== root._id) {
+      const conversations = new Set(root.conversationIds);
+      while (current.parent?.sessionId && !conversations.has(current.parent.sessionId)) {
         if (visited.has(current.parent.sessionId) || visited.size > 100) fail('no-session', 'Agent work not found.');
         current = await Sessions.findOneAsync({ _id: current.parent.sessionId, userId, erasingAt: { $exists: false }, purgingAt: { $exists: false } }, { fields: SESSION_FIELDS });
         if (!current) fail('no-session', 'Agent work not found.');
         visited.add(current._id);
       }
-      if (current.parent?.sessionId !== root._id) fail('no-session', 'Agent work not found.');
+      if (!conversations.has(current.parent?.sessionId)) fail('no-session', 'Agent work not found.');
       const rows = await decorate(root, [child], await crewFor(userId), true);
       await mission(userId, root._id);
       if (!rows[0] || !await Sessions.findOneAsync({ _id: child._id, userId, erasingAt: { $exists: false }, purgingAt: { $exists: false } }, { fields: { _id: 1 } })) fail('no-session', 'Agent work not found.');

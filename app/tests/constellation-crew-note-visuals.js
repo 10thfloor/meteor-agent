@@ -44,31 +44,30 @@ if (Meteor.isClient) describe('Constellation crew note visuals', function () {
     return [...chat.shadowRoot.querySelectorAll('.message.user')];
   };
 
-  it('keeps crew notes distinct from the muted regular chat surface', async () => {
+  // The transcript is one flat list: rows have no box or tint, and a crew note is told apart by its label and its
+  // quieter text, not by a coloured card.
+  it('keeps crew notes distinct from regular messages on the flat transcript', async () => {
     const [note, ask] = await render([
       { kind: 'crew-note', content: 'The release is ready for review.' },
       { content: 'Please review the release.' },
     ]);
     const noteStyle = getComputedStyle(note);
     const askStyle = getComputedStyle(ask);
-    assert.strictEqual(noteStyle.backgroundImage, 'none');
-    assert.strictEqual(noteStyle.backgroundColor, 'rgb(27, 40, 50)');
-    assert.strictEqual(noteStyle.color, 'rgb(214, 226, 237)');
-    assert.strictEqual(noteStyle.borderTopStyle, 'solid');
-    assert.strictEqual(noteStyle.borderTopColor, 'rgb(64, 92, 112)');
-    assert.strictEqual(askStyle.backgroundImage, 'none', 'full-width messages do not use a bright gradient');
-    assert.strictEqual(askStyle.backgroundColor, 'rgb(36, 37, 31)');
-    assert.strictEqual(askStyle.color, 'rgb(229, 230, 223)');
-    assert.strictEqual(askStyle.borderTopStyle, 'solid');
-    assert.strictEqual(askStyle.borderTopColor, 'rgb(66, 66, 53)');
-    assert.strictEqual(askStyle.fontWeight, '400', 'message content uses normal reading weight');
-    assert.notEqual(noteStyle.backgroundColor, askStyle.backgroundColor);
-    assert.notEqual(noteStyle.color, askStyle.color);
+    for (const [style, label] of [[noteStyle, 'note'], [askStyle, 'message']]) {
+      assert.strictEqual(style.backgroundImage, 'none', label);
+      assert.strictEqual(style.backgroundColor, 'rgba(0, 0, 0, 0)', `${label} has no tint`);
+      assert.strictEqual(style.borderTopStyle, 'none', `${label} has no box`);
+      assert.strictEqual(style.fontWeight, '400', `${label} content uses normal reading weight`);
+    }
+    assert.strictEqual(noteStyle.color, 'rgb(195, 200, 193)');
+    assert.strictEqual(askStyle.color, 'rgb(217, 220, 213)');
+    assert.notEqual(noteStyle.color, askStyle.color, 'a note reads quieter than a message');
+    assert.ok(part(note, 'crew-note-badge'), 'a note is labelled');
     assert.isNull(part(ask, 'crew-note-header'));
     assert.isNull(part(ask, 'crew-note-badge'));
   });
 
-  it('keeps user message text and attribution readable on the muted surface', async () => {
+  it('keeps user message text and attribution readable on the chat background', async () => {
     const [ask] = await render([{
       content: 'Please review the release.',
       from: { participant: 'h:me', name: 'You' }, source: { kind: 'desktop' },
@@ -82,7 +81,9 @@ if (Meteor.isClient) describe('Constellation crew note visuals', function () {
       });
       return linear[0] * 0.2126 + linear[1] * 0.7152 + linear[2] * 0.0722;
     };
-    const surface = luminance(getComputedStyle(ask).backgroundColor);
+    // Rows are transparent; the text sits on what is behind the chat.
+    const row = getComputedStyle(ask).backgroundColor;
+    const surface = luminance(row === 'rgba(0, 0, 0, 0)' ? getComputedStyle(mount).backgroundColor : row);
     const attribution = part(ask, 'speaker-user');
     assert.equal(attribution.textContent, 'You · Desktop');
     for (const [element, label] of [[ask, 'Message body'], [attribution, 'User attribution']]) {

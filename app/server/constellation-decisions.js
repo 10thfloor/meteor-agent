@@ -136,6 +136,10 @@ export function createConstellationDecisionService(host, { adapter = requestType
     if (!session || session.userId !== context.userId || session.agent !== 'orchestrator' || session.erasingAt) fail('decision-mission-unavailable', 'This mission is no longer available.');
     return session;
   };
+  // Stop belongs to a conversation: the topic or thread whose work this is. Another topic stopping is not this one's
+  // stop; stopping the Mission stops every topic, so each one's own root says so.
+  const stopRoot = async (sessionId, fallback) => (
+    host.conversationRootSession && sessionId ? (await host.conversationRootSession(sessionId)) ?? fallback : fallback);
   const getSettings = async (userId) => {
     await owner(userId);
     let settings = await DecisionSettings.findOneAsync(userId);
@@ -295,8 +299,9 @@ export function createConstellationDecisionService(host, { adapter = requestType
         continuation.reason = 'Approved. The original agent conversation is no longer available; continue from the mission chat.';
         return continuation;
       }
-      if ([root?.phase, session.phase].some((phase) => ['stopped', 'error'].includes(phase))
-        || [root?.stoppedAt, session.stoppedAt].some((at) => at instanceof Date && at >= continuation.requestedAt)) {
+      const conversation = await stopRoot(context.sessionId, root);
+      if ([conversation?.phase, session.phase].some((phase) => ['stopped', 'error'].includes(phase))
+        || [conversation?.stoppedAt, session.stoppedAt].some((at) => at instanceof Date && at >= continuation.requestedAt)) {
         continuation.reason = 'Approved. Work remains stopped; send a message in the mission chat when you want to continue.';
         return continuation;
       }
@@ -461,7 +466,7 @@ export function createConstellationDecisionService(host, { adapter = requestType
       const ancestors = await DecisionNodes.find({ userId: target.userId, 'continuation.sessionId': parent._id,
         'continuation.status': { $in: ['preparing', 'queued', 'resumed', 'waiting', 'uncertain', 'stopped'] } }).fetchAsync();
       for (const node of ancestors) {
-        const root = await rootMission({ userId: node.userId, sessionId: parent._id });
+        const root = await stopRoot(parent._id, await rootMission({ userId: node.userId, sessionId: parent._id }));
         const cutoffs = [parent.stoppedAt, root?.stoppedAt].filter((at) => at instanceof Date && at >= node.continuation.requestedAt);
         if (!cutoffs.length) continue;
         const cutoff = new Date(Math.max(...cutoffs.map((at) => at.getTime())));
@@ -495,7 +500,7 @@ export function createConstellationDecisionService(host, { adapter = requestType
     for (const node of nodes) {
       const creator = await continuationSession(node);
       if (!creator) continue;
-      const root = await rootMission({ userId: node.userId, sessionId });
+      const root = await stopRoot(sessionId, await rootMission({ userId: node.userId, sessionId }));
       if (![creator.stoppedAt, root?.stoppedAt].some((at) => at instanceof Date && at >= node.continuation.requestedAt)) continue;
       const oldCause = await isContinuationCause(node);
       await stopContinuationSession(node);
@@ -519,7 +524,7 @@ export function createConstellationDecisionService(host, { adapter = requestType
       const trace = trigger && await AgentTraces.findOneAsync({ sessionId: creatorSessionId, agent: continuation.agent, kind: 'turn', triggerSeq: trigger.seq }, { sort: { startedAt: -1 } });
       const getSession = (id) => host.getSession ? host.getSession(id) : AgentSessions.findOneAsync(id);
       const creator = await getSession(creatorSessionId);
-      const root = continuation.missionId ? await getSession(continuation.missionId) : creator;
+      const root = await stopRoot(creatorSessionId, continuation.missionId ? await getSession(continuation.missionId) : creator);
       const cancelled = [observedStopAt, creator?.stoppedAt, root?.stoppedAt]
         .some((at) => at instanceof Date && at >= continuation.requestedAt);
       // Stop can win before the queued System row exists. Session lifecycle is

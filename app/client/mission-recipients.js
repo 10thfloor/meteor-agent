@@ -6,6 +6,12 @@ const svg = (body) => `<svg viewBox="0 0 20 20" fill="none" stroke="currentColor
 const chevron = svg('<path d="m6 8 4 4 4-4"/>');
 const people = svg('<circle cx="7" cy="6" r="2.5"/><path d="M2.5 16v-2a4.5 4.5 0 0 1 9 0v2M13 4a2.5 2.5 0 0 1 0 5M14 11a4 4 0 0 1 3.5 4v1"/>');
 const check = svg('<path d="m5 10 3 3 7-7"/>');
+const inChat = svg('<path d="M3.5 4.5h13v9h-8l-4 3v-12Z"/>');
+const inThread = svg('<path d="M3.5 4h9v6h-5l-4 3V4Z"/><path d="M15.5 8.5h1v7l-3-2h-4.5v-1.5"/>');
+const REPLY_MODES = Object.freeze({
+  'reply:chat': { name: 'Reply in this topic', detail: 'The answer stays in the chat', icon: inChat },
+  'reply:thread': { name: 'Reply in thread', detail: 'The answer starts a thread under your message', icon: inThread },
+});
 
 /** One explicit destination/action in the shared mission chat. */
 export function initializeMissionRecipients({ chat, storage = window.localStorage, onChange = () => {}, onModeChange = () => {} }) {
@@ -27,12 +33,20 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
   const choices = document.createElement('div'); choices.className = 'mission-recipient-choices'; choices.setAttribute('role', 'group'); choices.setAttribute('aria-label', 'Agents');
   const divider = document.createElement('div'); divider.className = 'mission-recipient-divider'; divider.setAttribute('role', 'separator');
   const note = menuOption('note', 'Crew note', 'No agent reply');
-  menu.append(menuHint, choices, divider, note); document.body.append(menu);
+  // Where an agent's answer goes: in the chat, or in a thread opened on the message. Not offered inside a thread.
+  const replyDivider = document.createElement('div'); replyDivider.className = 'mission-recipient-divider'; replyDivider.setAttribute('role', 'separator');
+  const replies = document.createElement('div'); replies.className = 'mission-recipient-choices mission-recipient-replies';
+  replies.setAttribute('role', 'group'); replies.setAttribute('aria-label', 'Where the answer goes');
+  replies.append(...Object.entries(REPLY_MODES).map(([value, mode]) => menuOption(value, mode.name, mode.detail)));
+  menu.append(menuHint, choices, divider, note, replyDivider, replies); document.body.append(menu);
   const notice = document.createElement('p');
   notice.className = 'mission-recipient-notice'; notice.slot = 'composer-context';
   notice.setAttribute('role', 'status'); notice.hidden = true;
   chat.append(control, notice);
   let state = null, key = null, choice = null, leading = '', disposed = false;
+  let replyMode = 'reply:chat';
+  const replyKey = () => (key ? key.replace('constellation.recipient:', 'constellation.reply-in:') : null);
+  const repliesOffered = () => state?.replyModes !== false && !!state?.session?._id;
   let typeahead = '', typeaheadAt = 0;
   const remembered = new Map();
   const busy = () => chat.shadowRoot?.querySelector('.composer')?.getAttribute('aria-busy') === 'true';
@@ -53,7 +67,9 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     item.dataset.recipientChoice = value; item.dataset.recipientName = name;
     item.setAttribute('role', 'menuitemradio'); item.setAttribute('aria-checked', 'false');
     const icon = document.createElement('span'); icon.className = 'mission-recipient-avatar'; icon.setAttribute('aria-hidden', 'true');
-    if (value === 'note') icon.innerHTML = people; else icon.textContent = Array.from(name)[0] || '?';
+    if (value === 'note') icon.innerHTML = people;
+    else if (REPLY_MODES[value]) icon.innerHTML = REPLY_MODES[value].icon;
+    else icon.textContent = Array.from(name)[0] || '?';
     const copy = document.createElement('span'); copy.className = 'mission-recipient-option-copy';
     const title = document.createElement('span'); title.textContent = name; copy.append(title);
     if (role) { const detail = document.createElement('small'); detail.textContent = role; copy.append(detail); }
@@ -88,13 +104,20 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     if (!state || disposed) return;
     const isNote = state.mode === 'note', row = selected(), missing = !!choice && !row;
     const name = row?.displayName || choice?.label || state.primary?.label || 'agent';
+    const threaded = !isNote && repliesOffered() && replyMode === 'reply:thread';
     label.textContent = isNote ? 'Crew note' : `Ask ${name}`;
     if (isNote) avatar.innerHTML = people; else avatar.textContent = Array.from(name)[0] || '?';
-    noteHint.hidden = !isNote;
-    button.setAttribute('aria-label', `${label.textContent} — choose an agent or post a crew note`);
-    menuHint.textContent = state.sharedChannels > 0
-      ? 'Replies stay in this mission’s shared chat and connected channels'
-      : 'Replies stay in this mission’s shared chat';
+    noteHint.hidden = !isNote && !threaded;
+    noteHint.textContent = isNote ? 'No agent reply' : 'Reply in thread';
+    control.dataset.replyIn = threaded ? 'thread' : 'chat';
+    replies.hidden = isNote || !repliesOffered();
+    replyDivider.hidden = replies.hidden;
+    button.setAttribute('aria-label', `${label.textContent}${threaded ? ', reply in thread' : ''} — choose an agent, where the answer goes, or post a crew note`);
+    menuHint.textContent = threaded
+      ? 'The answer starts a thread under your message'
+      : state.sharedChannels > 0
+        ? 'Replies stay in this mission’s shared chat and connected channels'
+        : 'Replies stay in this mission’s shared chat';
     const options = models().map((participant) => {
       const definition = state.crew?.find((entry) => entry.agent === participant.agent);
       return { id: participant.id, label: participant.displayName || participant.agent,
@@ -113,7 +136,8 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
       choices.dataset.options = signature;
     }
     menu.querySelectorAll('[data-recipient-choice]').forEach((item) => item.setAttribute('aria-checked', String(
-      item.dataset.recipientChoice === 'note' ? isNote : !isNote && item.dataset.recipientChoice === choice?.id,
+      REPLY_MODES[item.dataset.recipientChoice] ? item.dataset.recipientChoice === replyMode
+        : item.dataset.recipientChoice === 'note' ? isNote : !isNote && item.dataset.recipientChoice === choice?.id,
     )));
     chat.recipient = isNote ? undefined : choice?.id;
     chat.composerMode = isNote ? 'note' : 'ask';
@@ -141,6 +165,15 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     if (focus) chat.focusComposer?.();
     return true;
   }
+  function chooseReply(mode, { focus = true } = {}) {
+    if (unavailable() || !REPLY_MODES[mode] || !repliesOffered()) return false;
+    replyMode = mode;
+    const storageKey = replyKey();
+    try { if (storageKey) storage.setItem(storageKey, mode); } catch { /* In-memory preference still works. */ }
+    paint(); close();
+    if (focus) chat.focusComposer?.();
+    return true;
+  }
   function chooseNote({ focus = true } = {}) {
     if (unavailable()) return false;
     const changedMode = state.mode !== 'note'; state = { ...state, mode: 'note' };
@@ -160,6 +193,9 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
           if (typeof saved?.id === 'string' && typeof saved?.label === 'string') choice = saved;
         } catch { /* A corrupt preference never prevents opening a mission. */ }
       }
+      let savedReply = null;
+      try { savedReply = replyKey() ? storage.getItem(replyKey()) : null; } catch { savedReply = null; }
+      replyMode = REPLY_MODES[savedReply] ? savedReply : 'reply:chat';
     }
     if (!choice) {
       const primary = models().find((row) => row.agent === next.session?.agent);
@@ -203,7 +239,9 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
   const pick = (event) => {
     const item = event.target.closest('[data-recipient-choice]');
     if (!item || item.disabled) return;
-    if (item.dataset.recipientChoice === 'note') chooseNote(); else choose(item.dataset.recipientChoice);
+    if (item.dataset.recipientChoice === 'note') chooseNote();
+    else if (REPLY_MODES[item.dataset.recipientChoice]) chooseReply(item.dataset.recipientChoice);
+    else choose(item.dataset.recipientChoice);
   };
   const menuKey = (event) => {
     if (event.key === 'Escape') { event.preventDefault(); event.stopPropagation(); close(true); return; }
@@ -227,8 +265,10 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
   window.addEventListener('resize', position); window.addEventListener('scroll', position, true);
   const observer = new MutationObserver(syncAvailability);
   if (chat.shadowRoot) observer.observe(chat.shadowRoot, { subtree: true, attributes: true, attributeFilter: ['aria-busy'] });
-  return { update, choose, chooseNote, open, close, control, button, menu, notice,
+  return { update, choose, chooseNote, chooseReply, open, close, control, button, menu, notice,
     canSend: () => !!state?.writable && !!selected() && !busy(),
+    /** 'thread' when the next agent message should be answered in a thread on it. */
+    replyIn: () => (state?.mode !== 'note' && repliesOffered() && replyMode === 'reply:thread' ? 'thread' : undefined),
     dispose() {
       disposed = true; observer.disconnect(); close(); menu.remove(); control.remove(); notice.remove();
       chat.recipient = undefined; chat.removeAttribute('composer-disabled');

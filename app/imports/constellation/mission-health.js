@@ -54,6 +54,23 @@ export function missionMeters(usage, spent, thresholds) {
   });
 }
 
+/**
+ * What a Mission has used across all its conversations: #general, every topic and every thread. Each is its own
+ * session with its own counters; the Mission's alerts are about the sum.
+ */
+export function missionTotals(sessions) {
+  const usage = { input: 0, output: 0, cost: 0 };
+  const spent = { turns: 0, toolCalls: 0 };
+  for (const session of sessions ?? []) {
+    usage.input += Number(session?.usage?.input ?? 0);
+    usage.output += Number(session?.usage?.output ?? 0);
+    usage.cost += Number(session?.usage?.cost ?? 0);
+    spent.turns += Number(session?.budgetSpent?.turns ?? 0);
+    spent.toolCalls += Number(session?.budgetSpent?.toolCalls ?? 0);
+  }
+  return { usage, spent };
+}
+
 /** Tokens have no alert: a total, and where it went once there is any. */
 export function tokenTotals(usage) {
   const input = Number(usage?.input ?? 0);

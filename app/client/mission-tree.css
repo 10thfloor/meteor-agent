@@ -1,0 +1,73 @@
+/* The Mission list as a tree of Missions and their #topics (mission-tree.js), and the #topic chip in the header. */
+
+.mission-tree { display: flex; flex-direction: column; gap: 2px; }
+.mission-group + .mission-group { margin-top: 6px; }
+
+.mission-group-row {
+  min-height: 34px; display: grid; grid-template-columns: 16px 6px minmax(0, 1fr) auto; align-items: center; gap: 7px;
+  padding: 0 8px 0 4px; border-radius: 8px; color: #c9cdc5; cursor: pointer; outline: 0;
+}
+.mission-group-row:hover { background: rgba(255,255,255,.028); }
+.mission-group-row:focus-visible, .topic-row:focus-visible, .topic-add-row:focus-visible { box-shadow: inset 0 0 0 2px var(--signal); }
+.mission-group-title { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 610; letter-spacing: -.01em; }
+.mission-group-row.current-mission .mission-group-title { color: var(--paper); }
+.mission-group-row.unread .mission-group-title { color: var(--paper); font-weight: 720; }
+.mission-group-row > i, .topic-row > i { width: 6px; height: 6px; border-radius: 50%; background: transparent; }
+.mission-group-row > i.active, .topic-row > i.active { background: var(--green); box-shadow: 0 0 8px rgba(121,210,155,.32); animation: state-breathe .95s ease-in-out infinite; }
+.mission-group-row > i.awaiting, .topic-row > i.awaiting { background: var(--signal); box-shadow: 0 0 8px rgba(240,163,90,.32); animation: state-breathe 1.7s ease-in-out infinite; }
+.mission-group-row[data-agent-state="error"] > i, .topic-row[data-agent-state="error"] > i { background: var(--red); }
+.mission-group-row[data-agent-state="paused"] > i { background: var(--signal); opacity: .6; }
+.mission-group-row[data-agent-state="completed"] > i { background: var(--blue); opacity: .7; }
+
+.tree-fold { width: 16px; height: 22px; padding: 0; border: 0; border-radius: 5px; background: transparent; color: var(--muted-2); cursor: pointer; display: grid; place-items: center; }
+.tree-fold::before { content: ''; width: 5px; height: 5px; border-right: 1.5px solid currentColor; border-bottom: 1.5px solid currentColor; transform: rotate(-45deg); transition: transform .15s ease; }
+.mission-group-row[aria-expanded="true"] .tree-fold::before { transform: rotate(45deg) translate(-1px, -1px); }
+.tree-fold:hover { color: var(--paper); background: rgba(255,255,255,.06); }
+
+.tree-end { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.tree-end time { color: var(--muted-2); font-size: 11px; font-variant-numeric: tabular-nums; }
+.tree-badge { min-width: 18px; height: 18px; padding: 0 5px; border-radius: 9px; display: grid; place-items: center; background: rgba(240,163,90,.18); color: var(--signal-bright); font-size: 11px; font-weight: 700; }
+.tree-unread-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--paper); }
+
+.mission-topics { display: flex; flex-direction: column; gap: 1px; padding: 2px 0 2px 16px; }
+.mission-tree .topic-row {
+  min-height: 30px; margin: 0; padding: 0 8px 0 9px; border: 0; border-radius: 7px; display: grid; grid-template-columns: 6px minmax(0, 1fr) auto;
+  align-items: center; gap: 8px; color: var(--muted); cursor: pointer; outline: 0; box-shadow: none;
+}
+.mission-tree .topic-row + .topic-row { margin-top: 0; }
+.mission-tree .topic-row:hover { background: rgba(255,255,255,.035); color: #d3d6cf; }
+.mission-tree .topic-row.current { background: rgba(240,163,90,.13); color: var(--paper); border: 0; box-shadow: none; }
+.mission-tree .topic-row.unread { color: var(--paper); }
+.mission-tree .topic-row.unread .topic-name { font-weight: 720; }
+.topic-name { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; font-size: 13px; font-weight: 520; }
+.topic-hash { margin-right: 3px; color: var(--muted-2); font-weight: 500; }
+.topic-row.current .topic-hash, .topic-row.unread .topic-hash { color: var(--muted); }
+
+.topic-add-row { min-height: 28px; padding: 0 8px 0 23px; border-radius: 7px; display: flex; align-items: center; gap: 7px; color: var(--muted-2); font-size: 12px; cursor: pointer; outline: 0; }
+.topic-add-row:hover { background: rgba(255,255,255,.035); color: var(--paper); }
+.topic-add-plus { width: 14px; text-align: center; font-size: 14px; line-height: 1; }
+
+.topic-add-form { margin: 2px 0 4px 6px; display: flex; flex-direction: column; gap: 4px; }
+.topic-add-field { height: 30px; padding: 0 8px; border: 1px solid rgba(240,163,90,.4); border-radius: 7px; background: #111412; display: flex; align-items: center; gap: 2px; }
+.topic-add-field input { min-width: 0; flex: 1; border: 0; outline: 0; background: transparent; color: var(--paper); font-size: 13px; }
+.topic-add-field input::placeholder { color: #5f6560; }
+.topic-add-hint { padding-left: 2px; color: var(--muted-2); font-size: 11px; }
+.topic-add-form.invalid .topic-add-field, .topic-rename-form.invalid .topic-add-field { border-color: rgba(224,120,109,.6); }
+.topic-add-form.invalid .topic-add-hint, .topic-rename-form.invalid .topic-add-hint { color: var(--red); }
+
+#mission-shelf:empty { display: none; }
+
+/* The #topic chip beside the Mission title. */
+.topic-menu { position: relative; }
+.topic-chip {
+  height: 24px; padding: 0 6px 0 8px; border: 1px solid var(--line); border-radius: 7px; background: rgba(255,255,255,.03);
+  display: flex; align-items: center; gap: 1px; color: #d6d9d2; font-size: 13px; font-weight: 600; cursor: pointer; list-style: none; user-select: none;
+}
+.topic-chip::-webkit-details-marker { display: none; }
+.topic-chip svg { width: 12px; height: 12px; margin-left: 3px; color: var(--muted-2); }
+.topic-chip:hover, .topic-menu[open] > .topic-chip { border-color: var(--line-strong); background: #202321; color: var(--paper); }
+.topic-chip:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+.topic-menu .topic-menu-list { left: 0; right: auto; top: 30px; width: 230px; }
+.topic-menu-heading { margin: 8px 8px 4px; color: var(--muted-2); font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; }
+.topic-rename-form { padding: 6px; display: flex; flex-direction: column; gap: 6px; }
+.topic-rename-form label { display: flex; flex-direction: column; gap: 6px; color: var(--muted); font-size: 12px; }

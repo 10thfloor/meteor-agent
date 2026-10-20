@@ -2,6 +2,8 @@ import { createHash, createHmac, randomBytes, timingSafeEqual } from 'node:crypt
 import { Agent, AgentSessions, AgentAttachments } from 'meteor/10thfloor:agent';
 import { executionObject, executionText } from '../imports/constellation/execution';
 import { createLegacyMissionFileReader } from './mission-file-store';
+import { missionConversationIds } from './mission-topics';
+import { conversationHop, isMissionRoot } from '../imports/constellation/topics';
 
 const cursorKey = randomBytes(32);
 const MAX_MISSION_SESSIONS = 2048;
@@ -66,23 +68,27 @@ export function createMissionWorkService(host, { owner, rootMission, jobs, publi
   const sessionLoader = () => {
     const cache = new Map();
     return (id) => {
-      if (!cache.has(id)) cache.set(id, sessions.findOneAsync(id, { fields: { userId: 1, parent: 1, erasingAt: 1, erasedAt: 1, ephemeral: 1, title: 1, agent: 1 } }));
+      if (!cache.has(id)) cache.set(id, sessions.findOneAsync(id, { fields: { userId: 1, parent: 1, erasingAt: 1, erasedAt: 1, ephemeral: 1, title: 1, agent: 1, missionTopic: 1, thread: 1 } }));
       return cache.get(id);
     };
   };
   const inMission = async (userId, sessionId, missionId, load = sessionLoader()) => {
     const visited = new Set();
-    for (let depth = 0; sessionId && depth <= 8; depth += 1) {
+    for (let depth = 0; sessionId && depth <= 12; depth += 1) {
       if (visited.has(sessionId)) return false; visited.add(sessionId);
       const session = await load(sessionId);
       if (!liveSession(session, userId)) return false;
-      if (sessionId === missionId) return !session.parent?.sessionId && session.agent === 'orchestrator';
-      sessionId = session.parent?.sessionId;
+      if (sessionId === missionId) return isMissionRoot(session);
+      // Past the top of a conversation: a thread belongs to its topic, a topic to its Mission.
+      sessionId = session.parent?.sessionId ?? conversationHop(session);
     }
     return false;
   };
   const missionSessions = async (userId, missionId) => {
-    const root = await exactMission(userId, missionId); const rows = new Map([[root._id, root]]); let frontier = [root._id];
+    const root = await exactMission(userId, missionId); const rows = new Map([[root._id, root]]);
+    // Every topic and thread is a conversation of the Mission, and so is the work under it.
+    let frontier = await missionConversationIds(sessions, userId, root._id);
+    for (const id of frontier) if (!rows.has(id)) rows.set(id, { _id: id, agent: 'orchestrator' });
     for (let depth = 0; frontier.length && depth < 8; depth += 1) {
       const children = await sessions.find({ userId, 'parent.sessionId': { $in: frontier }, erasingAt: { $exists: false }, erasedAt: { $exists: false }, ephemeral: { $ne: true } },
         { fields: { _id: 1, agent: 1 }, limit: MAX_MISSION_SESSIONS - rows.size + 1 }).fetchAsync();

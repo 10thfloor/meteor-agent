@@ -1,6 +1,7 @@
 import { createHash } from 'node:crypto';
 import { Meteor } from 'meteor/meteor';
 import { attachmentStoragePath } from './sprite-attachment-path';
+import { conversationHop } from '../imports/constellation/topics';
 
 const MAX_BYTES = 10_000_000;
 const validId = (value) => typeof value === 'string' && value.length > 0 && value.length <= 160 && !/[\x00-\x1f\x7f]/.test(value);
@@ -41,8 +42,13 @@ export function createSpriteAttachmentStorage(host) {
       if (!available(session) || session._id !== id || session.userId !== root.userId) unavailable();
       lineage.push(id);
       if (!session.parent?.sessionId) {
-        if (id !== root._id) unavailable();
-        break;
+        if (id === root._id) break;
+        // A thread belongs to its topic and a topic to its Mission; both share the Mission's files.
+        const next = conversationHop(session);
+        if (!next) unavailable();
+        id = next;
+        if (depth === 8) unavailable();
+        continue;
       }
       id = session.parent.sessionId;
       if (depth === 8) unavailable();

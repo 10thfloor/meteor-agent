@@ -112,7 +112,10 @@ if (Meteor.isClient) describe('Mission chat recipients', function () {
     chat.setDraft('Keep this unfinished thought.');
     controls.button.focus(); key(controls.button, 'ArrowDown');
     assert.strictEqual(document.activeElement, option('m:orchestrator'));
-    key(document.activeElement, 'End'); assert.strictEqual(document.activeElement, option('note'));
+    // Agents, then Crew note, then where the answer goes.
+    key(document.activeElement, 'End'); assert.strictEqual(document.activeElement, option('reply:thread'));
+    key(document.activeElement, 'ArrowUp'); assert.strictEqual(document.activeElement, option('reply:chat'));
+    key(document.activeElement, 'ArrowUp'); assert.strictEqual(document.activeElement, option('note'));
     key(document.activeElement, 'ArrowUp'); assert.strictEqual(document.activeElement, option('m:researcher'));
     key(document.activeElement, 'Home'); assert.strictEqual(document.activeElement, option('m:orchestrator'));
     key(document.activeElement, 'r'); assert.strictEqual(document.activeElement, option('m:operator'));

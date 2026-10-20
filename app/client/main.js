@@ -33,7 +33,12 @@ import {
   deriveRuntimeState,
   nextScheduledAt,
 } from '../imports/constellation/config';
-import { missionHealthState, missionMeters, tokenTotals } from '../imports/constellation/mission-health';
+import { missionHealthState, missionMeters, missionTotals, tokenTotals } from '../imports/constellation/mission-health';
+import { GENERAL_TOPIC, topicLabel } from '../imports/constellation/topics';
+import { createTopicMemory, renderMissionTree, wireMissionTree } from './mission-tree';
+import { initializeTopicMenu } from './topic-menu';
+import { initializeThreads } from './thread-panel';
+import './mission-tree.css';
 
 const SESSION_KEY = 'constellation.session';
 const IDENTITY_KEY = 'constellation.local-identity';
@@ -54,6 +59,7 @@ const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
 const ModelCatalog = new Mongo.Collection('constellation_model_catalog');
 const WorkspaceMembers = new Mongo.Collection('constellation_workspace_members');
 const MissionParticipation = new Mongo.Collection('constellation_mission_participation');
+const MissionTopics = new Mongo.Collection('constellation_mission_topics');
 const PulseConfigs = new Mongo.Collection('constellation_pulses');
 const SkillConfigs = new Mongo.Collection('constellation_skills');
 const ChannelConfigs = new Mongo.Collection('constellation_channel_configs');
@@ -70,7 +76,11 @@ const memoryViewChanged = new Tracker.Dependency();
 const learningViewChanged = new Tracker.Dependency();
 const $ = (id) => document.getElementById(id);
 
+// The open conversation (#general, a topic or a thread) and the Mission it belongs to. #general's id is the
+// Mission's id, so the two are equal there.
 let currentSessionId = null;
+let currentMissionId = null;
+let topicMemory = createTopicMemory(null);
 let currentView = 'missions';
 let decisionControls;
 let executionControls;
@@ -435,12 +445,53 @@ function titleFromPrompt(prompt) {
   return words ? words.charAt(0).toUpperCase() + words.slice(1) : 'New mission';
 }
 
-function missionConfig(sessionId = currentSessionId) {
-  return sessionId ? MissionConfigs.findOne(sessionId) : null;
+function missionConfig(missionId = currentMissionId) {
+  return missionId ? MissionConfigs.findOne(missionId) : null;
 }
 
-function missionParticipation(sessionId = currentSessionId) {
-  return sessionId ? MissionParticipation.findOne(sessionId) : null;
+function missionParticipation(missionId = currentMissionId) {
+  return missionId ? MissionParticipation.findOne(missionId) : null;
+}
+
+/** The Mission a conversation belongs to: a thread's topic's Mission, a topic's Mission, or #general itself. */
+function missionIdFor(sessionId) {
+  let id = sessionId;
+  for (let hop = 0; id && hop < 4; hop += 1) {
+    const session = AgentSessions.findOne(id, { fields: { missionTopic: 1, thread: 1 } });
+    const next = MissionTopics.findOne(id, { fields: { missionId: 1 } })?.missionId
+      ?? session?.missionTopic?.missionId ?? session?.thread?.sessionId;
+    if (!next) break;
+    id = next;
+  }
+  return id ?? null;
+}
+
+/** A Mission's topics other than #general, oldest first. */
+function missionTopics(missionId, { archived = false } = {}) {
+  return MissionTopics.find(
+    { missionId, archivedAt: { $exists: archived } }, { sort: { createdAt: 1 } },
+  ).fetch();
+}
+
+/** The open conversation's topic name: 'general' for the Mission's own session. */
+function currentTopicName() {
+  if (!currentSessionId || currentSessionId === currentMissionId) return GENERAL_TOPIC;
+  return MissionTopics.findOne(currentSessionId)?.name ?? GENERAL_TOPIC;
+}
+
+/** The sessions whose usage counts toward a Mission: #general, its topics and their threads. */
+function missionConversationSessions(missionId) {
+  if (!missionId) return [];
+  const owners = [missionId, ...MissionTopics.find({ missionId }, { fields: { _id: 1 } }).map((row) => row._id)];
+  return AgentSessions.find({ $or: [{ _id: { $in: owners } }, { 'thread.sessionId': { $in: owners } }] }).fetch();
+}
+
+function setCurrentConversation(sessionId) {
+  currentSessionId = sessionId ?? null;
+  currentMissionId = sessionId ? missionIdFor(sessionId) : null;
+  if (currentMissionId && currentSessionId && !AgentSessions.findOne(currentSessionId)?.thread) {
+    topicMemory.setLastTopic(currentMissionId, currentSessionId);
+  }
 }
 
 // Archived is shelved, not a lifecycle state: the package's `archived` stamp
@@ -451,12 +502,15 @@ function missionArchived(session) {
   return Boolean(session?.archived);
 }
 
+// Topics and threads are sessions too, but they are listed under their Mission, not as Missions.
+const isMissionSession = (session) => !session.missionTopic && !session.thread && !MissionTopics.findOne(session._id);
+
 function listedMissions() {
-  return workspace.sessions({ archived: { $exists: false } }).fetch();
+  return workspace.sessions({ archived: { $exists: false } }).fetch().filter(isMissionSession);
 }
 
 function archivedMissions() {
-  return workspace.sessions({ archived: { $exists: true } }).fetch()
+  return workspace.sessions({ archived: { $exists: true } }).fetch().filter(isMissionSession)
     .sort((left, right) => (right.archived?.getTime?.() ?? 0) - (left.archived?.getTime?.() ?? 0));
 }
 
@@ -486,7 +540,7 @@ function missionLifecycleState(runtimeState, config, session = null) {
   return runtimeState;
 }
 
-function persistResumableMission(sessionId, config = missionConfig(sessionId)) {
+function persistResumableMission(sessionId, config = missionConfig(missionIdFor(sessionId))) {
   if (!sessionId) return;
   if (config?.continuity !== false && config?.status !== 'completed') {
     localStorage.setItem(SESSION_KEY, sessionId);
@@ -565,12 +619,16 @@ async function createMission(title = 'New mission') {
 function openSession(sessionId) {
   if (!sessionId) return;
   if (currentSessionId !== sessionId && $('run-dialog')?.open) $('run-dialog').close();
-  currentSessionId = sessionId;
-  missionWorkNavigation?.setMission(sessionId);
+  const previous = { sessionId: currentSessionId, missionId: currentMissionId };
+  setCurrentConversation(sessionId);
+  threadControls?.chatChanged(sessionId);
+  missionWorkNavigation?.setMission(currentMissionId);
+  // Another topic of the same Mission is opened to talk in it; the Mission-wide tabs stay one click away.
+  if (previous.missionId === currentMissionId && previous.sessionId !== sessionId) missionWorkNavigation?.show('chat');
   agentWorkControls?.contextChanged();
   setChatComposerMode('ask', { focus: false });
-  subscribeMissionParticipation(sessionId);
-  persistResumableMission(sessionId);
+  subscribeMissionParticipation(currentMissionId);
+  persistResumableMission(sessionId, missionConfig());
   const chat = $('mission-chat');
   chat.setAttribute('agent', 'orchestrator');
   chat.setAttribute('session-id', sessionId);
@@ -580,6 +638,75 @@ function openSession(sessionId) {
     .then(() => sessionChanged.changed())
     .catch((error) => toast(`Could not refresh this Mission crew: ${messageOf(error)}`, 'error'));
   activateView('missions');
+}
+
+/** Open a Mission where you left it: the topic last open there, or #general. */
+function openMission(missionId) {
+  const last = topicMemory.lastTopic(missionId);
+  const usable = last && (last === missionId || MissionTopics.findOne({ _id: last, missionId, archivedAt: { $exists: false } }));
+  openSession(usable ? last : missionId);
+}
+
+let topicMenu = null;
+let threadControls = null;
+
+function openThread(threadId) {
+  void threadControls?.open(threadId);
+}
+
+function renderTopicChip() {
+  if (!topicMenu) {
+    topicMenu = initializeTopicMenu({
+      details: $('topic-menu'), summary: $('topic-chip'), name: $('topic-chip-name'), list: $('topic-menu-list'),
+      state: () => ({
+        missionId: currentMissionId,
+        sessionId: currentSessionId,
+        name: currentTopicName(),
+        taken: missionTopics(currentMissionId).filter((row) => row._id !== currentSessionId).map((row) => row.name),
+        archived: missionTopics(currentMissionId, { archived: true }),
+      }),
+      actions: {
+        toast,
+        rename: async (topicId, name) => {
+          const saved = await Meteor.callAsync('constellation.topicRename', topicId, name);
+          toast(`Renamed to ${topicLabel(saved)}.`);
+        },
+        archive: async (topicId) => {
+          const missionId = currentMissionId;
+          await Meteor.callAsync('constellation.topicArchive', topicId);
+          if (currentSessionId === topicId) openSession(missionId);
+          toast('Topic archived. Restore it from the topic menu in #general or any topic.');
+        },
+        unarchive: async (topicId) => {
+          const name = await Meteor.callAsync('constellation.topicUnarchive', topicId);
+          openSession(topicId);
+          toast(`${topicLabel(name)} is back.`);
+        },
+        add: (missionId) => startAddTopic(missionId),
+      },
+    });
+  }
+  topicMenu.render();
+}
+
+/** Open the inline name field under a Mission in the list. */
+function startAddTopic(missionId) {
+  if (!missionId) return;
+  activateView('missions');
+  $('mission-search').value = '';
+  topicMemory.setFolded(missionId, false);
+  renderMissionList();
+  requestAnimationFrame(() => {
+    $('mission-tree').querySelector(`.topic-add-row[data-mission-id="${CSS.escape(missionId)}"]`)?.click();
+  });
+}
+
+async function createTopic(missionId, name) {
+  const topic = await Meteor.callAsync('constellation.topicCreate', missionId, name);
+  topicMemory.setFolded(missionId, false);
+  openSession(topic._id);
+  toast(`${topicLabel(topic.name)} added.`);
+  return topic;
 }
 
 async function newMission(control = $('new-mission')) {
@@ -606,14 +733,17 @@ async function sendPrompt(prompt) {
     toast('Choose an available recipient before sending work.', 'error');
     return;
   }
-  const missionId = currentSessionId;
+  const chatId = currentSessionId;
   const recipient = $('mission-chat').recipient;
   activateView('missions');
   const session = AgentSessions.findOne(currentSessionId);
   missionWorkNavigation?.show('chat');
-  maybeAutoTitle(session, prompt);
+  // A Mission is named from its first message in #general, not from a topic.
+  if (chatId === currentMissionId) maybeAutoTitle(session, prompt);
   try {
-    await workspace.send(missionId, prompt.trim(), { to: recipient });
+    const replyIn = missionRecipients?.replyIn();
+    const sent = await workspace.send(chatId, prompt.trim(), { to: recipient, ...(replyIn ? { replyIn } : {}) });
+    if (sent?.threadSessionId) openThread(sent.threadSessionId);
   } catch (error) {
     toast(messageOf(error), 'error');
   }
@@ -639,9 +769,9 @@ function activateView(name) {
   missionWorkNavigation?.setVisible(missionScoped);
 }
 
-function navigateToMissionWork(tab, missionId = currentSessionId, options) {
+function navigateToMissionWork(tab, missionId = currentMissionId, options) {
   if (!missionId) return;
-  if (missionId !== currentSessionId) openSession(missionId);
+  if (missionId !== currentMissionId) openMission(missionId);
   activateView('missions');
   missionWorkNavigation?.show(tab, options, { focus: true });
 }
@@ -754,10 +884,68 @@ function missionRowButton(session, currentMessages) {
 }
 
 let archivedMissionsOpen = false;
+let missionTreeWired = false;
 
-function renderMissionList(currentMessages = currentMissionMessages()) {
+const lastSeqOf = (session) => Math.max(0, Number(session?.nextSeq ?? 1) - 1);
+const waitingIn = (session) => (session?.phase === 'awaiting' || session?.pending?.toolCallId ? 1 : 0);
+// Of a Mission's conversations, the one that most needs a glance speaks for it in the list.
+const STATE_WEIGHT = { waiting: 6, working: 5, thinking: 5, loading: 4, retrying: 4, error: 3 };
+
+function missionTreeModel(currentMessages, query) {
+  const topicQuery = query.replace(/^#/, '');
+  const missions = [];
+  for (const session of listedMissions()) {
+    const config = missionConfig(session._id);
+    const missionText = `${session.title ?? ''} ${config?.objective ?? ''} ${config?.status ?? 'active'} ${session.channel?.origin ?? 'desktop'}`.toLowerCase();
+    const missionMatches = !query || missionText.includes(query);
+    const conversations = [
+      { id: session._id, name: GENERAL_TOPIC, session },
+      ...missionTopics(session._id).map((row) => ({ id: row._id, name: row.name, session: AgentSessions.findOne(row._id) })),
+    ];
+    const topics = conversations
+      .filter((topic) => missionMatches || topic.name.includes(topicQuery))
+      .map((topic) => {
+        const current = topic.id === currentSessionId;
+        const seq = lastSeqOf(topic.session);
+        if (current && topic.session) topicMemory.markRead(topic.id, seq);
+        return {
+          id: topic.id,
+          name: topic.name,
+          current,
+          state: missionLifecycleState(
+            deriveRuntimeState(topic.session, current ? currentMessages : []), config, session,
+          ),
+          waiting: waitingIn(topic.session),
+          unread: !current && Boolean(topic.session) && topicMemory.unread(topic.id, seq),
+        };
+      });
+    if (query && !topics.length) continue;
+    const loudest = topics.reduce((best, topic) => (
+      (STATE_WEIGHT[topic.state.key] ?? 0) > (STATE_WEIGHT[best.state.key] ?? 0) ? topic : best), topics[0]);
+    const updated = Math.max(...conversations.map((topic) => topic.session?.updatedAt?.getTime?.() ?? 0));
+    missions.push({
+      id: session._id,
+      title: session.title || 'New mission',
+      time: timeAgo(updated ? new Date(updated) : session.updatedAt),
+      state: loudest?.state ?? missionLifecycleState(deriveRuntimeState(session, []), config, session),
+      waiting: topics.reduce((sum, topic) => sum + topic.waiting, 0),
+      unread: topics.some((topic) => topic.unread),
+      folded: topicMemory.folded(session._id),
+      current: session._id === currentMissionId,
+      topics,
+    });
+  }
+  return missions;
+}
+
+function renderMissionList(messages) {
+  // Also an input listener, which passes an event.
+  const currentMessages = Array.isArray(messages) ? messages : currentMissionMessages();
   const list = $('mission-list');
-  const focusedSessionId = document.activeElement?.closest?.('.mission-row')?.dataset.sessionId ?? null;
+  const tree = $('mission-tree');
+  const shelfSlot = $('mission-shelf');
+  const focusedSessionId = shelfSlot.contains(document.activeElement)
+    ? document.activeElement?.closest?.('.mission-row')?.dataset.sessionId ?? null : null;
   let restoreFocus = null;
   const query = $('mission-search').value.trim().toLowerCase();
   const matches = (session) => {
@@ -766,22 +954,33 @@ function renderMissionList(currentMessages = currentMissionMessages()) {
     const text = `${session.title ?? ''} ${config?.objective ?? ''} ${config?.status ?? 'active'} ${session.channel?.origin ?? 'desktop'}`.toLowerCase();
     return text.includes(query);
   };
-  const sessions = listedMissions().filter(matches);
+  const missions = missionTreeModel(currentMessages, query);
   const archived = archivedMissions().filter(matches);
-  $('mission-count').textContent = String(sessions.length);
-  list.textContent = '';
+  $('mission-count').textContent = String(listedMissions().length);
+  if (!missionTreeWired) {
+    missionTreeWired = true;
+    wireMissionTree(tree, {
+      toggle: (missionId, fold) => { topicMemory.setFolded(missionId, fold); renderMissionList(); },
+      open: (sessionId) => openSession(sessionId),
+      active: () => currentView === 'missions' && !document.querySelector('dialog[open]'),
+      formClosed: () => renderMissionList(),
+    });
+  }
+  renderMissionTree(tree, { query, missions }, {
+    open: (sessionId) => openSession(sessionId),
+    openMission: (missionId) => { topicMemory.setFolded(missionId, false); openMission(missionId); },
+    toggle: (missionId, fold) => { topicMemory.setFolded(missionId, fold); renderMissionList(); },
+    createTopic: (missionId, name) => createTopic(missionId, name),
+    takenNames: (missionId) => missionTopics(missionId).map((row) => row.name),
+  });
+  shelfSlot.textContent = '';
+  list.querySelector(':scope > .memory-empty')?.remove();
 
-  if (sessions.length === 0 && !(query && archived.length > 0)) {
+  if (missions.length === 0 && !(query && archived.length > 0)) {
     const empty = document.createElement('div');
     empty.className = 'memory-empty';
-    empty.textContent = query ? 'No matching missions.' : 'No missions.';
-    list.append(empty);
-  }
-
-  for (const session of sessions) {
-    const button = missionRowButton(session, currentMessages);
-    list.append(button);
-    if (session._id === focusedSessionId) restoreFocus = button;
+    empty.textContent = query ? 'No matching missions or topics.' : 'No missions.';
+    list.prepend(empty);
   }
 
   // Shelved Missions stay one click away: collapsed by default, opened by the
@@ -819,7 +1018,7 @@ function renderMissionList(currentMessages = currentMissionMessages()) {
       shelf.append(item);
       if (session._id === focusedSessionId) restoreFocus = button;
     }
-    list.append(shelf);
+    shelfSlot.append(shelf);
   }
   if (restoreFocus) requestAnimationFrame(() => restoreFocus.focus({ preventScroll: true }));
 }
@@ -831,7 +1030,7 @@ async function archiveMission(sessionId) {
   try {
     const saved = await Meteor.callAsync('constellation.missionArchive', sessionId);
     persistResumableMission(sessionId, saved);
-    if (sessionId === currentSessionId) {
+    if (sessionId === currentMissionId) {
       // The archived Mission leaves the list, so land on the most recent one
       // still on it, or start fresh exactly as launch does with no missions.
       const next = listedMissions().find((session) => session._id !== sessionId);
@@ -2713,13 +2912,6 @@ function renderReviews() {
     + automaticPracticeReviews.length + automaticExperienceReviews.length;
   const attentionCopy = `${pendingCount} ${pendingCount === 1 ? 'item needs' : 'items need'} attention`;
   $('crew-reviews-count').textContent = String(pendingCount);
-  $('mission-reviews-count').textContent = String(pendingCount);
-  $('open-learning-reviews').setAttribute(
-    'aria-label',
-    `Open learning reviews, ${attentionCopy}`,
-  );
-  // The button wears its count only while something waits for review.
-  $('open-learning-reviews').dataset.pending = String(pendingCount > 0);
   $('command-reviews-count').textContent = attentionCopy;
   $('reviews-directory-summary').textContent = attentionCopy;
   $('reviews-needs-count').textContent = String(pendingCount);
@@ -2777,12 +2969,77 @@ function renderReviews() {
       };
     }),
   ]
-    .sort((left, right) => new Date(learningAt(right.row)) - new Date(learningAt(left.row)))
-    .slice(0, 24);
-  $('reviews-recent-count').textContent = String(recent.length);
+    .sort((left, right) => new Date(learningAt(right.row)) - new Date(learningAt(left.row)));
+  $('reviews-recent-count').textContent = String(Math.min(recent.length, 24));
   if (!recent.length) appendLearningEmpty(recentList, 'No learning history yet.');
-  for (const item of recent) appendReviewRow(recentList, item, { recent: true });
+  for (const item of recent.slice(0, 24)) appendReviewRow(recentList, item, { recent: true });
   restoreReviewFocus();
+  // The Mission's Reviews tab shows the same rows, narrowed to that Mission.
+  latestReviewItems = { actionable, recent };
+  reviewItemsChanged.changed();
+}
+
+let latestReviewItems = null;
+const reviewItemsChanged = new Tracker.Dependency();
+// Learning is recorded against the session where it happened. #general's and topics' Missions are known here;
+// a specialist's own session is not published, so its Mission is asked of the server once and remembered.
+const sessionMissionCache = new Map();
+const sessionMissionPending = new Set();
+const reviewSessionId = (item) => item.row?.source?.sessionId ?? item.row?.sessionId ?? null;
+
+function reviewMissionFor(sessionId) {
+  if (!sessionId) return null;
+  if (sessionMissionCache.has(sessionId)) return sessionMissionCache.get(sessionId);
+  if (AgentSessions.findOne(sessionId)) return missionIdFor(sessionId);
+  return undefined;
+}
+
+function resolveReviewMissions(items) {
+  const unknown = [...new Set(items.map(reviewSessionId).filter((id) => (
+    id && reviewMissionFor(id) === undefined && !sessionMissionPending.has(id))))].slice(0, 400);
+  if (!unknown.length) return;
+  unknown.forEach((id) => sessionMissionPending.add(id));
+  Meteor.callAsync('constellation.sessionMissions', unknown)
+    .then((map) => { for (const [id, missionId] of Object.entries(map)) sessionMissionCache.set(id, missionId); })
+    .catch(() => { for (const id of unknown) sessionMissionCache.set(id, null); })
+    .finally(() => { unknown.forEach((id) => sessionMissionPending.delete(id)); reviewItemsChanged.changed(); });
+}
+
+function renderMissionReviews() {
+  reviewItemsChanged.depend();
+  sessionChanged.depend();
+  const loading = $('mission-reviews-loading');
+  const content = $('mission-reviews-content');
+  if (!latestReviewItems || !currentMissionId) {
+    loading.hidden = false;
+    content.hidden = true;
+    return;
+  }
+  const all = [...latestReviewItems.actionable, ...latestReviewItems.recent];
+  resolveReviewMissions(all);
+  const here = (item) => reviewMissionFor(reviewSessionId(item)) === currentMissionId;
+  const pending = latestReviewItems.actionable.filter(here);
+  const recent = latestReviewItems.recent.filter(here).slice(0, 24);
+  const count = $('mission-tab-reviews-count');
+  count.textContent = String(pending.length);
+  count.hidden = pending.length === 0;
+  $('mission-tab-reviews').setAttribute('aria-label', pending.length
+    ? `Reviews, ${pending.length} ${pending.length === 1 ? 'needs' : 'need'} attention` : 'Reviews');
+  $('mission-reviews-summary').textContent = pending.length
+    ? `${pending.length} ${pending.length === 1 ? 'item needs' : 'items need'} attention on this Mission.`
+    : 'What the crew learned on this Mission, and what waits for you.';
+  $('mission-reviews-needs-count').textContent = String(pending.length);
+  $('mission-reviews-recent-count').textContent = String(recent.length);
+  const needsList = $('mission-reviews-list');
+  const recentList = $('mission-reviews-recent-list');
+  needsList.replaceChildren();
+  recentList.replaceChildren();
+  if (!pending.length) appendLearningEmpty(needsList, 'Nothing on this Mission needs attention.');
+  for (const item of pending) appendReviewRow(needsList, item);
+  if (!recent.length) appendLearningEmpty(recentList, 'No learning from this Mission yet.');
+  for (const item of recent) appendReviewRow(recentList, item, { recent: true });
+  loading.hidden = true;
+  content.hidden = false;
 }
 
 function crewExperienceConfig(value) {
@@ -3732,7 +3989,7 @@ function missionCrewSnapshot(view = missionParticipation()) {
         && row.agent !== 'orchestrator' && availableAgents.has(row.agent))
       .map((row) => row.agent),
   );
-  const config = missionConfig(view?.missionId ?? currentSessionId);
+  const config = missionConfig(view?.missionId ?? currentMissionId);
   const agentMode = view?.agentMode
     ?? (Array.isArray(config?.agents) ? 'custom' : 'inherit');
   if (agentMode === 'inherit') {
@@ -3807,7 +4064,7 @@ function missionCrewSelectionTotal(snapshot = missionCrewDraft ?? missionCrewSna
     : 2;
 }
 
-function missionCrewIsBusy(sessionId = currentSessionId) {
+function missionCrewIsBusy(sessionId = currentMissionId) {
   const session = sessionId ? AgentSessions.findOne(sessionId) : null;
   return ['streaming', 'calling', 'retrying', 'compacting'].includes(session?.phase);
 }
@@ -3964,7 +4221,7 @@ function renderMissionCrewDialog() {
 }
 
 async function openMissionCrew(control = null) {
-  const sessionId = currentSessionId;
+  const sessionId = currentMissionId;
   if (!sessionId) return;
   if (missionCrewIsBusy(sessionId)) {
     toast('Crew editing is available when the current turn finishes.', 'error');
@@ -3974,17 +4231,17 @@ async function openMissionCrew(control = null) {
   const show = async () => {
     subscribeMissionParticipation(sessionId);
     await prepareSession(sessionId);
-    if (currentSessionId !== sessionId) return;
+    if (currentMissionId !== sessionId) return;
     const view = await waitForReactiveValue(
       () => {
         sessionChanged.depend();
-        return currentSessionId !== sessionId
+        return currentMissionId !== sessionId
           ? { aborted: true }
           : missionParticipation(sessionId);
       },
       'Mission crew', 8_000,
     );
-    if (currentSessionId !== sessionId || view.aborted) return;
+    if (currentMissionId !== sessionId || view.aborted) return;
     const snapshot = missionCrewSnapshot(view);
     missionCrewDraft = {
       sessionId,
@@ -4064,7 +4321,6 @@ function wireCrewSettings() {
       });
     });
   });
-  $('open-learning-reviews').addEventListener('click', openLearningReviews);
   $('agent-learning-error-action').addEventListener('click', async (event) => {
     const action = agentLearningErrorAction;
     if (!action) return;
@@ -4451,7 +4707,7 @@ function wireCrewSettings() {
     closeCrewSettings();
   });
   const addCrewAgent = () => {
-    if (!currentSessionId || !discardCrewChanges('Discard these changes and add a new agent?')) return;
+    if (!currentMissionId || !discardCrewChanges('Discard these changes and add a new agent?')) return;
     const draft = newCrewDraft();
     resetCrewEditor(draft, true);
     selectedCrewId = draft._id;
@@ -4462,7 +4718,7 @@ function wireCrewSettings() {
   $('crew-new-agent').addEventListener('click', addCrewAgent);
   $('crew-form').addEventListener('submit', async (event) => {
     event.preventDefault();
-    if (!currentSessionId || !selectedCrewId || !crewEditor) return;
+    if (!currentMissionId || !selectedCrewId || !crewEditor) return;
     const submit = event.submitter ?? event.currentTarget.querySelector('[type="submit"]');
     clearFormError(event.currentTarget);
     await withControlBusy(submit, 'Saving', async () => {
@@ -4470,10 +4726,10 @@ function wireCrewSettings() {
         const patch = crewFormPatch();
         const wasNew = crewEditor.isNew;
         const savedId = wasNew
-          ? await Meteor.callAsync('constellation.crewCreate', currentSessionId, patch)
+          ? await Meteor.callAsync('constellation.crewCreate', currentMissionId, patch)
           : selectedCrewId;
         if (!wasNew) {
-          await Meteor.callAsync('constellation.crewSave', currentSessionId, selectedCrewId, patch);
+          await Meteor.callAsync('constellation.crewSave', currentMissionId, selectedCrewId, patch);
         }
         crewEditor = null;
         selectedCrewId = savedId;
@@ -4519,7 +4775,7 @@ function wireCrewSettings() {
       await restoreCrewAgent(config, event.currentTarget);
       return;
     }
-    if (!currentSessionId) return;
+    if (!currentMissionId) return;
     if (crewEditor?.dirty) {
       if (!discardCrewChanges('Discard unsaved changes and continue to archive this agent?')) return;
       crewEditor = null;
@@ -4541,7 +4797,7 @@ function wireCrewSettings() {
   $('close-crew-archive').addEventListener('click', closeCrewArchive);
   $('cancel-crew-archive').addEventListener('click', closeCrewArchive);
   $('confirm-crew-archive').addEventListener('click', async (event) => {
-    if (!currentSessionId || !pendingCrewArchiveImpact) return;
+    if (!currentMissionId || !pendingCrewArchiveImpact) return;
     const impact = pendingCrewArchiveImpact;
     const primary = crewConfigs().find((candidate) => candidate.agent === 'orchestrator');
     await withControlBusy(event.currentTarget, 'Archiving', async () => {
@@ -4552,7 +4808,7 @@ function wireCrewSettings() {
       sessionChanged.changed();
       try {
         await Meteor.callAsync(
-          'constellation.crewArchive', currentSessionId, impact.configId, impact.agent,
+          'constellation.crewArchive', currentMissionId, impact.configId, impact.agent,
           impact.configRevision, impact.digest,
         );
         pendingCrewArchives.delete(impact.configId);
@@ -4803,8 +5059,10 @@ function renderActivity(messages, runtimeState, debugTraces = false) {
 
 /** The Mission health panel: one meter for each alert, and the Mission's state in a word (see mission-health.js). */
 function renderMissionHealth(session, config, runtimeState, phase, busy) {
-  const usage = session?.usage ?? { input: 0, output: 0, cost: 0 };
-  const meters = missionMeters(usage, session?.budgetSpent, config?.budget ?? DEFAULT_MISSION_THRESHOLDS);
+  // The Mission's alerts count every topic and thread, not only the one that is open.
+  const conversations = missionConversationSessions(currentMissionId);
+  const { usage, spent } = missionTotals(conversations.length ? conversations : [session]);
+  const meters = missionMeters(usage, spent, config?.budget ?? DEFAULT_MISSION_THRESHOLDS);
   for (const meter of meters) {
     const row = document.querySelector(`.health-meter[data-meter="${meter.key}"]`);
     if (!row) continue;
@@ -4829,7 +5087,7 @@ function renderMissionHealth(session, config, runtimeState, phase, busy) {
 
   const state = missionHealthState({
     status: config?.status,
-    archived: missionArchived(session),
+    archived: missionArchived(AgentSessions.findOne(currentMissionId) ?? session),
     runtime: runtimeState.key,
     phase,
     busy,
@@ -4851,9 +5109,11 @@ function renderMissionState() {
     ? chat.agentInstance.messages(currentSessionId).fetch()
     : [];
 
-  const title = config?.title || session?.title || 'New mission';
+  const missionSession = currentMissionId ? AgentSessions.findOne(currentMissionId) : null;
+  const title = config?.title || missionSession?.title || 'New mission';
   $('mission-title').textContent = title;
   $('mission-slug').textContent = title.toUpperCase().slice(0, 34);
+  renderTopicChip();
   $('configure-mission').disabled = !config;
   const continuityOn = config?.continuity !== false;
   const completed = config?.status === 'completed';
@@ -4927,7 +5187,7 @@ function renderMissionState() {
     updateMissionConfigBadge(missionConfig(editingMissionSessionId)?.status ?? 'active');
   }
 
-  if (session && config?.autoTitle !== false && /^(new|untitled) mission$/i.test(title)) {
+  if (session && currentSessionId === currentMissionId && config?.autoTitle !== false && /^(new|untitled) mission$/i.test(title)) {
     const firstUser = messages.find((message) => (
       message.role === 'user' && message.kind !== 'crew-note' && message.content?.trim()
     ));
@@ -5042,7 +5302,7 @@ function updateMissionConfigBadge(status = missionConfig()?.status ?? 'active') 
   badge.querySelector('span').textContent = state.label;
 }
 
-async function openMissionSettings(sessionId = currentSessionId) {
+async function openMissionSettings(sessionId = currentMissionId) {
   if (!sessionId) return;
   let config = missionConfig(sessionId);
   if (!config) {
@@ -5188,7 +5448,7 @@ function wireMissionSettings() {
   });
   $('continuity-toggle').addEventListener('change', async (event) => {
     const toggle = event.currentTarget;
-    const sessionId = currentSessionId;
+    const sessionId = currentMissionId;
     const enabled = toggle.checked;
     if (!sessionId) return;
     // The reactive render re-syncs this control from config; the flag keeps
@@ -5391,9 +5651,11 @@ function wireMissionActions() {
     if (!currentSessionId) return;
     await withControlBusy(event.currentTarget, 'Forking', async () => {
       try {
-        const session = AgentSessions.findOne(currentSessionId);
+        // The open topic's conversation becomes a new Mission with this Mission's settings.
+        const session = AgentSessions.findOne(currentMissionId);
         const source = missionConfig();
-        const branchTitle = `${session?.title ?? 'Mission'} · branch`.slice(0, 96);
+        const topic = currentTopicName();
+        const branchTitle = `${session?.title ?? 'Mission'}${topic === GENERAL_TOPIC ? '' : ` ${topicLabel(topic)}`} · branch`.slice(0, 96);
         const forked = await workspace.fork(currentSessionId, { title: branchTitle });
         await prepareSession(forked);
         if (source) {
@@ -5717,7 +5979,7 @@ function populatePulseTargets(pulse) {
     sessionSelect.append(option);
   }
   agentSelect.value = pulse?.agent ?? 'orchestrator';
-  sessionSelect.value = pulse?.sessionId ?? currentSessionId ?? sessions[0]?._id ?? '';
+  sessionSelect.value = pulse?.sessionId ?? currentMissionId ?? sessions[0]?._id ?? '';
 }
 
 function setPulseScheduleFields(kind) {
@@ -6547,7 +6809,7 @@ function renderCapabilities() {
   if (capabilityTab === 'skills') renderSkillCatalog(skills);
   if (capabilityTab === 'mcp') renderMcpServers(servers, tools);
   if (capabilityTab === 'decisions') decisionControls?.render();
-  const missionTitle = missionConfig()?.title || AgentSessions.findOne(currentSessionId)?.title || 'current mission';
+  const missionTitle = missionConfig()?.title || AgentSessions.findOne(currentMissionId)?.title || 'current mission';
   $('skill-demo').textContent = `Try skills in “${concise(missionTitle, 28)}”`;
 }
 
@@ -7585,6 +7847,8 @@ function executeCommand(command) {
   if (command.startsWith('view:')) activateView(command.slice(5));
   if (command === 'new') void newMission();
   if (command === 'reviews') openLearningReviews();
+  if (command === 'topic-new') startAddTopic(currentMissionId);
+  if (command.startsWith('topic:')) openSession(command.slice(6));
   if (command === 'inspector') {
     if (currentView !== 'missions') {
       activateView('missions');
@@ -7596,8 +7860,35 @@ function executeCommand(command) {
 function wireCommandPalette() {
   const dialog = $('command-palette');
   const input = $('command-input');
+  // Every listed Mission's conversations, so "#pricing" jumps straight there.
+  const renderTopicCommands = () => {
+    const group = $('command-topics');
+    group.querySelectorAll('[data-command]').forEach((button) => button.remove());
+    const rows = listedMissions().flatMap((mission) => [
+      { id: mission._id, name: GENERAL_TOPIC, mission: mission.title || 'New mission' },
+      ...missionTopics(mission._id).map((topic) => ({ id: topic._id, name: topic.name, mission: mission.title || 'New mission' })),
+    ]).filter((row) => row.id !== currentSessionId).slice(0, 60);
+    group.hidden = rows.length === 0;
+    for (const row of rows) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.dataset.command = `topic:${row.id}`;
+      const icon = document.createElement('i');
+      icon.textContent = '#';
+      const copy = document.createElement('span');
+      const strong = document.createElement('strong');
+      strong.textContent = topicLabel(row.name);
+      const small = document.createElement('small');
+      small.textContent = row.mission;
+      copy.append(strong, small);
+      button.append(icon, copy);
+      button.addEventListener('click', () => executeCommand(button.dataset.command));
+      group.append(button);
+    }
+  };
   const open = () => {
     input.value = '';
+    renderTopicCommands();
     dialog.querySelectorAll('[data-command]').forEach((button) => { button.hidden = false; });
     dialog.showModal();
     requestAnimationFrame(() => input.focus());
@@ -8021,6 +8312,7 @@ async function initializeWorkspace() {
     // Archived Missions ride along so the list's Archived section can show them.
     { label: 'missions', handle: workspace.subscribeSessions(true) },
     { label: 'mission settings', handle: Meteor.subscribe('constellation.missions') },
+    { label: 'topics', handle: Meteor.subscribe('constellation.missionTopics') },
     { label: 'memory', handle: Meteor.subscribe(NAMES.pubMemories) },
     { label: 'crew', handle: Meteor.subscribe('constellation.crew') },
     { label: 'agent learning', handle: learningSubscription },
@@ -8042,7 +8334,7 @@ async function initializeWorkspace() {
     const savedTitle = AgentSessions.findOne(initialSession)?.title || 'your previous mission';
     try {
       await prepareSession(initialSession);
-      const config = missionConfig(initialSession);
+      const config = missionConfig(missionIdFor(initialSession));
       if (!config || config.continuity === false || config.status === 'completed') {
         throw new Error('Mission is not resumable.');
       }
@@ -8060,7 +8352,8 @@ async function initializeWorkspace() {
     initialSession = preferred?._id ?? await createMission();
     if (preferred) await prepareSession(initialSession);
   }
-  currentSessionId = initialSession;
+  topicMemory = createTopicMemory(Meteor.userId());
+  setCurrentConversation(initialSession);
 
   const chat = $('mission-chat');
   chat.setAttribute('session-id', initialSession);
@@ -8068,13 +8361,13 @@ async function initializeWorkspace() {
     applicationWiringStarted = true;
     chat.addEventListener('agent-chat:session', (event) => {
       if (currentSessionId !== event.detail.sessionId && $('run-dialog').open) $('run-dialog').close();
-      currentSessionId = event.detail.sessionId;
-      missionWorkNavigation?.setMission(currentSessionId);
+      setCurrentConversation(event.detail.sessionId);
+      missionWorkNavigation?.setMission(currentMissionId);
       agentWorkControls?.contextChanged();
       setChatComposerMode('ask', { focus: false });
-      subscribeMissionParticipation(currentSessionId);
+      subscribeMissionParticipation(currentMissionId);
       void prepareSession(currentSessionId);
-      persistResumableMission(currentSessionId);
+      persistResumableMission(currentSessionId, missionConfig());
       sessionChanged.changed();
     });
     chat.addEventListener('agent-chat:error', (event) => {
@@ -8092,6 +8385,21 @@ async function initializeWorkspace() {
       onChange: () => updateMissionComposer(primaryDefinition(), missionConfig()),
       onModeChange: (mode) => setChatComposerMode(mode, { focus: false }),
     });
+    threadControls = initializeThreads({
+      workspace, chat, pane: $('inspector-pane'), AgentSessions, timeAgo, toast,
+      currentChat: () => { sessionChanged.depend(); return currentSessionId; },
+      currentMission: () => { sessionChanged.depend(); return currentMissionId; },
+      conversationIds: (missionId) => (missionId
+        ? [missionId, ...MissionTopics.find({ missionId }, { fields: { _id: 1 } }).map((row) => row._id)] : []),
+      topicName: (sessionId) => (sessionId === missionIdFor(sessionId)
+        ? GENERAL_TOPIC : MissionTopics.findOne(sessionId)?.name ?? GENERAL_TOPIC),
+      recipientState: (session) => {
+        const status = missionConfig()?.status ?? 'active';
+        return { session, primary: primaryDefinition(), crew: crewDefinitions(), sharedChannels: 0,
+          userId: Meteor.userId(), writable: status === 'active', status };
+      },
+      openInspector: () => setInspectorOpen(true),
+    });
 
     wireNavigation();
     wireMissionActions();
@@ -8104,13 +8412,13 @@ async function initializeWorkspace() {
     wireChannels();
     workTranscriptContext = createWorkTranscriptContext({
       container: $('run-handoff-context'), dialog: $('run-dialog'),
-      missionId: () => currentSessionId,
+      missionId: () => currentMissionId,
       onDetail: (detail) => {
         if (childRunSelection?.sessionId === detail.sessionId) $('run-dialog-title').textContent = `${detail.displayName}’s work`;
       },
     });
     agentWorkControls = initializeAgentWork({
-      missionId: () => { sessionChanged.depend(); return currentSessionId; },
+      missionId: () => { sessionChanged.depend(); return currentMissionId; },
       missionTitle: () => missionConfig()?.title || 'Current mission',
       crew: () => CrewConfigs.find({}, { sort: { order: 1 } }).fetch(),
       openChild: (sessionId, agentName) => openChildRun(sessionId, agentName),
@@ -8120,7 +8428,7 @@ async function initializeWorkspace() {
       chat,
       openWork: createDecisionWorkNavigator({
         isMission: (sessionId) => !!MissionConfigs.findOne(sessionId),
-        currentMission: () => currentSessionId,
+        currentMission: () => currentMissionId,
         rootChat: () => chat,
         openMission: (id) => navigateToMissionWork('chat', id),
         showMission: () => navigateToMissionWork('chat'),
@@ -8130,8 +8438,8 @@ async function initializeWorkspace() {
       }),
       crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
       missions: () => MissionConfigs.find({}, { sort: { updatedAt: -1 } }).fetch(),
-      mission: () => { sessionChanged.depend(); return currentSessionId; },
-      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      mission: () => { sessionChanged.depend(); return currentMissionId; },
+      currentMission: () => { sessionChanged.depend(); return currentMissionId; },
       toast,
       openCapabilities: () => { activateView('capabilities'); setCapabilityTab('decisions'); },
     });
@@ -8152,7 +8460,7 @@ async function initializeWorkspace() {
             || ((!Array.isArray(config?.agents) || config.agents.includes(agent.agent))
               && (!Array.isArray(roster) || roster.some((row) => row.kind === 'model' && row.agent === agent.agent))));
       },
-      mission: () => { sessionChanged.depend(); return currentSessionId; },
+      mission: () => { sessionChanged.depend(); return currentMissionId; },
       missions: () => MissionConfigs.find({}, { sort: { title: 1 } }).fetch(),
       missionTitle: (id) => MissionConfigs.findOne(id)?.title || 'Untitled mission',
       navigateToCode: navigateToCodePermissions,
@@ -8162,11 +8470,11 @@ async function initializeWorkspace() {
       root: $('mission-preflight'),
       snapshot: () => {
         sessionChanged.depend();
-        const config = currentSessionId ? MissionConfigs.findOne(currentSessionId) : null;
-        return { missionId: currentSessionId, config,
+        const config = currentMissionId ? MissionConfigs.findOne(currentMissionId) : null;
+        return { missionId: currentMissionId, config,
           crew: CrewConfigs.find({ enabled: true, status: { $ne: 'archived' } }).fetch()
             .filter((agent) => agent.agent === 'orchestrator' || !Array.isArray(config?.agents) || config.agents.includes(agent.agent)),
-          environment: executionControls.environments.findOne({ missionId: currentSessionId }),
+          environment: executionControls.environments.findOne({ missionId: currentMissionId }),
           settings: executionControls.settings.findOne(Meteor.userId()), connected: Meteor.status().connected };
       },
       enable: (missionId) => Meteor.callAsync('constellation.execution.enableFilesystem', { missionId }),
@@ -8181,10 +8489,10 @@ async function initializeWorkspace() {
       onChange: (context) => executionControls.setMissionWork(context),
       onTabChange: (tab) => { $('toggle-inspector').hidden = tab !== 'chat'; },
     });
-    missionWorkNavigation.setMission(currentSessionId);
+    missionWorkNavigation.setMission(currentMissionId);
     missionWorkNavigation.setVisible(currentView === 'missions');
     initializeExecutionChat({ chat, jobs: executionControls.jobs,
-      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      currentMission: () => { sessionChanged.depend(); return currentMissionId; },
       agentName: (agent) => CrewConfigs.findOne({ agent })?.displayName ?? agent,
       openRun: (jobId, missionId) => executionControls.openRun(jobId, missionId),
     });
@@ -8196,7 +8504,7 @@ async function initializeWorkspace() {
       root: document.querySelector('.mission-health'),
       settings: decisionControls.settings,
       usage: new Mongo.Collection('constellation_decision_mission_usage'),
-      mission: () => { sessionChanged.depend(); return currentSessionId; },
+      mission: () => { sessionChanged.depend(); return currentMissionId; },
     });
     agentCapabilityControls = initializeAgentCapabilities({
       skillsMount: $('agent-skills-content'), toolsMount: $('agent-tools-content'),
@@ -8237,7 +8545,10 @@ async function initializeWorkspace() {
       chat,
       externalPlanTrigger: true,
       openDecisions: (options) => decisionControls.open(options),
-      currentMission: () => { sessionChanged.depend(); return currentSessionId; },
+      currentMission: () => { sessionChanged.depend(); return currentMissionId; },
+      currentChat: () => { sessionChanged.depend(); return currentSessionId; },
+      replyIn: () => missionRecipients?.replyIn(),
+      openThread: (threadId) => openThread(threadId),
       missionConfig,
       defaultModel: () => bootstrap?.model,
       crew: () => CrewConfigs.find({ status: { $ne: 'archived' } }, { sort: { order: 1 } }).fetch(),
@@ -8251,9 +8562,9 @@ async function initializeWorkspace() {
     const composerSnapshot = () => {
       sessionChanged.depend();
       return {
-        missionId: currentSessionId, userId: Meteor.userId(),
-        active: MissionConfigs.findOne(currentSessionId)?.status === 'active',
-        environment: executionControls.environments.findOne({ missionId: currentSessionId }),
+        missionId: currentMissionId, chatId: currentSessionId, userId: Meteor.userId(),
+        active: MissionConfigs.findOne(currentMissionId)?.status === 'active',
+        environment: executionControls.environments.findOne({ missionId: currentMissionId }),
         settings: executionControls.settings.findOne(Meteor.userId()),
         connected: Meteor.status().connected,
       };
@@ -8278,6 +8589,8 @@ async function initializeWorkspace() {
     Tracker.autorun(renderCrewSettings);
     Tracker.autorun(renderWorkspacePeople);
     Tracker.autorun(renderReviews);
+    Tracker.autorun(renderMissionReviews);
+    $('mission-reviews-all').addEventListener('click', openLearningReviews);
     Tracker.autorun(renderPulses);
     Tracker.autorun(renderCapabilities);
     Tracker.autorun(renderChannels);

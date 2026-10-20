@@ -1,0 +1,35 @@
+/* Threads (thread-panel.js): the summary under a message, and the thread in the right-hand pane. */
+
+.thread-summary {
+  margin: -2px 0 10px 40px; min-height: 30px; padding: 4px 10px 4px 6px; border: 1px solid transparent; border-radius: 8px;
+  display: inline-flex; align-items: center; gap: 8px; background: transparent; color: var(--muted); font-size: 12px; cursor: pointer;
+}
+.thread-summary:hover, .thread-summary[aria-expanded="true"] { border-color: var(--line); background: rgba(255,255,255,.035); color: var(--paper); }
+.thread-summary:focus-visible { outline: 2px solid var(--signal); outline-offset: 1px; }
+.thread-summary-faces { display: flex; }
+.thread-summary-face {
+  width: 20px; height: 20px; margin-left: -4px; border: 2px solid var(--ink); border-radius: 6px; display: grid; place-items: center;
+  background: #2a2e2b; color: #e3e5df; font-size: 10px; font-weight: 700;
+}
+.thread-summary-face:first-child { margin-left: 0; }
+.thread-summary-count { color: var(--blue); font-weight: 650; }
+.thread-summary[data-state="working"] .thread-summary-meta { color: var(--green); }
+.thread-summary[data-state="waiting"] .thread-summary-meta { color: var(--signal-bright); }
+
+/* The right-hand pane holds either the inspector or one thread. A thread wants more room than the inspector. */
+.inspector-pane.thread-open { --inspector-width: 440px; }
+.inspector-pane.thread-open > .inspector-header, .inspector-pane.thread-open > .inspector-scroll { display: none; }
+.thread-panel { min-height: 0; flex: 1; display: flex; flex-direction: column; min-width: var(--inspector-width); }
+.thread-panel[hidden] { display: none; }
+.thread-panel-header { height: 40px; flex: none; display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 0 6px 0 14px; border-bottom: 1px solid var(--line); }
+.thread-panel-heading { min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.thread-panel-heading h3 { margin: 0; color: var(--paper); font-size: 13px; font-weight: 650; }
+.thread-panel-topic { min-width: 0; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--muted); font-size: 12px; }
+.thread-panel-close { width: 28px; height: 28px; border: 0; border-radius: 7px; display: grid; place-items: center; background: transparent; color: var(--muted-2); cursor: pointer; }
+.thread-panel-close svg { width: 14px; height: 14px; }
+.thread-panel-close:hover { background: rgba(255,255,255,.06); color: var(--paper); }
+.thread-panel-close:focus-visible { outline: 0; box-shadow: 0 0 0 2px var(--signal); }
+.thread-chat { min-height: 0; flex: 1; }
+.thread-chat::part(message thread-root) { border-bottom: 1px solid var(--line); padding-bottom: 14px; margin-bottom: 6px; }
+.thread-also { display: flex; align-items: center; gap: 7px; padding: 2px 2px 6px; color: var(--muted); font-size: 12px; cursor: pointer; }
+.thread-also input { accent-color: var(--signal); }

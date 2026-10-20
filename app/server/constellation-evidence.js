@@ -1,5 +1,6 @@
 import { Meteor } from 'meteor/meteor';
 import { check, Match } from 'meteor/check';
+import { conversationHop } from '../imports/constellation/topics';
 import {
   Agent, AgentSessions, AgentMemories, AgentTraces, AgentObservations,
   listSessionEvidence, listSessionObservations, readObservationSources,
@@ -85,8 +86,9 @@ export function installConstellationEvidence({ requireUser, MissionConfigs, Crew
       check(includeDebug, Boolean);
       const session = await ownedSession(this.userId, sessionId);
       let root = session;
-      for (let depth = 0; root.parent?.sessionId && depth < 8; depth += 1) {
-        root = await ownedSession(this.userId, root.parent.sessionId);
+      for (let depth = 0; (root.parent?.sessionId || conversationHop(root)) && depth < 12; depth += 1) {
+        // Up through subagents, then from a thread to its topic and a topic to its Mission.
+        root = await ownedSession(this.userId, root.parent?.sessionId ?? conversationHop(root));
       }
       const mission = await MissionConfigs.findOneAsync({ _id: root._id, userId: this.userId });
       const result = await listSessionEvidence(sessionId, { includeDebug: includeDebug && mission?.debugTraces === true });
