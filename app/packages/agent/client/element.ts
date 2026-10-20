@@ -75,6 +75,9 @@ export interface Mentionable {
   detail?: string;
   /** Non-@ references can open an app-owned detail view without sending. */
   actionable?: boolean;
+  /** Any CSS colour. Set as `--mention-color` on the chip and the typeahead
+   *  row; model participants take theirs from `agentColors`. */
+  color?: string;
 }
 
 /** A field name or a function derived from the record. */
@@ -96,6 +99,7 @@ interface MentionShape {
   /** Defaults to the handle. */
   label?: Field<string>;
   detail?: Field<string>;
+  color?: Field<string>;
   /** How many the typeahead offers at once. Default 8. */
   limit?: number;
   /** Ceiling on records pulled from a collection in one read. Default 1000 —
@@ -173,6 +177,7 @@ function normalizeSource(src: MentionSource): ResolvedSource {
         handle: String(fieldOf<string>(r, cfg.handle) ?? ''),
         label: fieldOf<string>(r, cfg.label),
         detail: fieldOf<string>(r, cfg.detail),
+        color: fieldOf<string>(r, cfg.color),
         kind: cfg.kind,
         actionable: cfg.actionable,
       }))
@@ -383,6 +388,11 @@ const FRAME = `
      carries. Absent on 1:1 rows, so nothing changes for the classic pair. */
   .speaker { display: block; font-size: 0.72rem; opacity: 0.65; font-weight: 600; }
   .source, .recipient { font-weight: 500; }
+  /* An agent's name wherever the transcript prints one; coloured when the
+     host gives that agent a colour through \`agentColors\`. */
+  .agent-name[data-colored] { color: var(--agent-color); }
+  /* The default user bubble is accent-filled; a coloured name would fight it. */
+  .message.user .agent-name[data-colored] { color: inherit; }
   .crew-note-header {
     display: flex; align-items: center; flex-wrap: wrap; gap: 0.4rem 0.65rem;
     margin-bottom: 0.5rem; white-space: normal;
@@ -433,6 +443,13 @@ const FRAME = `
      white instead of off the page. */
   .message.user .mention { background: color-mix(in srgb, #fff 22%, transparent); }
   .message.user .mention.addressed { background: color-mix(in srgb, #fff 38%, transparent); }
+  .mention[data-colored] {
+    color: var(--mention-color);
+    background: color-mix(in srgb, var(--mention-color) 15%, transparent);
+  }
+  .mention.addressed[data-colored] { background: color-mix(in srgb, var(--mention-color) 26%, transparent); }
+  /* The default user bubble is accent-filled; a coloured name would fight it. */
+  .message.user .mention[data-colored] { color: inherit; }
 
   .typeahead {
     position: absolute; left: 1rem; right: 1rem; bottom: calc(100% - 0.25rem);
@@ -451,6 +468,7 @@ const FRAME = `
     background: color-mix(in srgb, var(--_accent) 18%, transparent);
   }
   .suggestion-handle { font-weight: 600; }
+  .suggestion-handle[data-colored] { color: var(--mention-color); }
   .suggestion-detail { font-size: 0.8rem; opacity: 0.65; margin-left: auto; }
   .suggestion-empty { padding: 0.6rem 0.75rem; font-size: 0.85rem; opacity: 0.75; }
 
@@ -942,6 +960,29 @@ function summarizeToolArgs(args: unknown): string {
   return parts.join(' · ');
 }
 
+/** Agent id → CSS colour, keeping only non-empty string values. */
+function colorMap(next: unknown): Map<string, string> {
+  const entries = next && typeof next === 'object' ? Object.entries(next as Record<string, unknown>) : [];
+  return new Map(entries.filter(
+    (entry): entry is [string, string] => typeof entry[1] === 'string' && entry[1] !== '',
+  ));
+}
+
+/** An agent's name as its own span, carrying the colour the host gave that
+ *  agent (if any) as `--agent-color`. */
+function agentLabel(name: string, agent: string | undefined, agentColors: Map<string, string>): HTMLElement {
+  const label = document.createElement('span');
+  label.className = 'agent-name';
+  label.setAttribute('part', 'agent-name');
+  label.textContent = name;
+  const color = agent ? agentColors.get(agent) : undefined;
+  if (color) {
+    label.style.setProperty('--agent-color', color);
+    label.dataset.colored = '';
+  }
+  return label;
+}
+
 /** One transcript row. Clean mode replaces machine records with bounded
  * operational receipts; debug mode preserves the exact historical renderer. */
 function renderRow(
@@ -952,8 +993,9 @@ function renderRow(
   agentNames: Map<string, string> = new Map(),
   /** Set when the element is `threadable`: the session the rows belong to. */
   threadSessionId: string | null = null,
+  agentColors: Map<string, string> = new Map(),
 ): HTMLElement | null {
-  const row = renderRowContent(m, names, download, mode, mentions, agentNames);
+  const row = renderRowContent(m, names, download, mode, mentions, agentNames, agentColors);
   if (row && threadSessionId !== null && !m.streaming
     && (m.role === 'user' || m.role === 'assistant')) {
     row.classList.add('threadable');
@@ -982,6 +1024,7 @@ function renderRowContent(
   mode: TranscriptMode,
   mentions: Map<string, ResolvedSource>,
   agentNames: Map<string, string>,
+  agentColors: Map<string, string>,
 ): HTMLElement | null {
   const debug = mode === 'debug';
   if (!debug) {
@@ -1022,7 +1065,7 @@ function renderRowContent(
     link.type = 'button';
     link.className = 'delegation-link';
     link.setAttribute('part', 'delegation-link');
-    link.textContent = `View ${childName}’s work`;
+    link.append('View ', agentLabel(childName, childAgent, agentColors), '’s work');
     link.addEventListener('click', () => {
       link.dispatchEvent(new CustomEvent('agent-chat:open-run', {
         detail: { sessionId: m.childSessionId, ...(childAgent ? { agent: childAgent } : {}) },
@@ -1033,8 +1076,9 @@ function renderRowContent(
   };
 
   if (m.role === 'note') {
-    row.textContent = m.kind === 'orphan-child' && m.childSessionId
-      ? `${childName}’s work recovered` : noteText(m, names);
+    if (m.kind === 'orphan-child' && m.childSessionId) {
+      row.append(agentLabel(childName, childAgent, agentColors), '’s work recovered');
+    } else row.textContent = noteText(m, names);
     if (m.kind === 'orphan-child') appendWorkLink();
     return row;
   }
@@ -1043,17 +1087,18 @@ function renderRowContent(
     const tool = (rawTool && agentNames.get(rawTool)) || humanizeIdentifier(rawTool);
     if (!debug) {
       if (m.kind === 'handoff' && !m.error) {
-        const source = (m.from?.participant?.startsWith('m:')
-          ? agentNames.get(m.from.participant.slice(2)) : undefined) || m.from?.name || 'Agent';
-        const target = m.to?.startsWith('m:')
-          ? agentNames.get(m.to.slice(2)) || humanizeIdentifier(m.to.slice(2)) : 'Agent';
+        const sourceAgent = m.from?.participant?.startsWith('m:') ? m.from.participant.slice(2) : undefined;
+        const targetAgent = m.to?.startsWith('m:') ? m.to.slice(2) : undefined;
+        const source = (sourceAgent ? agentNames.get(sourceAgent) : undefined) || m.from?.name || 'Agent';
+        const target = targetAgent ? agentNames.get(targetAgent) || humanizeIdentifier(targetAgent) : 'Agent';
         const header = document.createElement('div');
         header.className = 'handoff-header';
         header.setAttribute('part', 'handoff-header');
         const route = document.createElement('span');
         route.className = 'handoff-route';
         route.setAttribute('part', 'handoff-route');
-        route.textContent = `${source} → ${target}`;
+        route.append(agentLabel(source, sourceAgent, agentColors), ' → ',
+          agentLabel(target, targetAgent, agentColors));
         const status = document.createElement('span');
         status.className = 'handoff-status';
         status.setAttribute('part', 'handoff-status');
@@ -1073,9 +1118,9 @@ function renderRowContent(
       const projected = m.transcriptContent ?? m.displayContent;
       const status = document.createElement('span');
       if (m.childSessionId) status.className = 'delegation-status';
-      status.textContent = projected && !isStructuredAssistantStream(projected, false)
-        ? projected
-        : m.childSessionId ? `${childName}’s work ${outcome}` : `${tool} ${outcome}`;
+      if (projected && !isStructuredAssistantStream(projected, false)) status.textContent = projected;
+      else if (m.childSessionId) status.append(agentLabel(childName, childAgent, agentColors), `’s work ${outcome}`);
+      else status.textContent = `${tool} ${outcome}`;
       row.append(status);
       appendWorkLink();
       return row;
@@ -1105,8 +1150,10 @@ function renderRowContent(
     const speaker = document.createElement('span');
     speaker.className = 'speaker';
     speaker.setAttribute('part', `speaker speaker-${m.role}${noteHeader ? ' speaker-crew-note' : ''}`);
-    speaker.textContent = m.from?.participant?.startsWith('m:')
-      ? agentNames.get(m.from.participant.slice(2)) || m.from.name : m.from?.name || '';
+    const speakerAgent = m.from?.participant?.startsWith('m:') ? m.from.participant.slice(2) : undefined;
+    const speakerName = speakerAgent ? agentNames.get(speakerAgent) || m.from!.name : m.from?.name || '';
+    if (speakerAgent && speakerName) speaker.append(agentLabel(speakerName, speakerAgent, agentColors));
+    else speaker.textContent = speakerName;
     if (m.source) {
       const source = document.createElement('span');
       source.className = 'source';
@@ -1121,7 +1168,8 @@ function renderRowContent(
       const recipient = document.createElement('span');
       recipient.className = 'recipient';
       recipient.setAttribute('part', 'recipient recipient-user');
-      recipient.textContent = `${speaker.hasChildNodes() ? ' · ' : ''}To ${agentNames.get(agent) || humanizeIdentifier(agent, 'Agent')}`;
+      recipient.append(`${speaker.hasChildNodes() ? ' · ' : ''}To `,
+        agentLabel(agentNames.get(agent) || humanizeIdentifier(agent, 'Agent'), agent, agentColors));
       speaker.append(recipient);
     }
     (noteHeader ?? row).append(speaker);
@@ -1176,7 +1224,9 @@ function renderRowContent(
       const operation = document.createElement('span');
       operation.className = 'operation-status';
       operation.setAttribute('part', 'operation');
-      operation.textContent = `${agentNames.get(call.name) || humanizeIdentifier(call.name)} requested`;
+      const calledAgent = agentNames.get(call.name);
+      if (calledAgent) operation.append(agentLabel(calledAgent, call.name, agentColors), ' requested');
+      else operation.textContent = `${humanizeIdentifier(call.name)} requested`;
       operations.append(operation);
     }
     row.append(operations);
@@ -1250,6 +1300,10 @@ function renderText(
       chip.className = `mention ${flags}`;
       chip.setAttribute('part', `mention ${flags}`);
       chip.textContent = `${prefix}${found.label ?? handle}`;
+      if (found.color) {
+        chip.style.setProperty('--mention-color', found.color);
+        chip.dataset.colored = '';
+      }
       chip.title = addressed
         ? `Addressed to ${found.label ?? handle} — schedules their turn`
         : (found.detail ?? '');
@@ -1316,6 +1370,8 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
      *  list of objects, and a JSON attribute would make every roster change a
      *  re-parse of a string the host already had in hand. */
     private sources: Record<string, MentionSource> = {};
+    /** Agent id → CSS colour, from the host (`agentColors`). */
+    private agentColorMap: Map<string, string> = new Map();
     /** Hosts may intercept a write, but never bypass composer busy/error state. */
     submissionHandler: ComposerSubmissionHandler | null = null;
     /** Attachment-only writes require an application handler to interpret them. */
@@ -1362,6 +1418,13 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
 
     constructor() {
       super();
+      // A host that sets agentColors before the element is defined leaves an own
+      // property that hides the setter; take its value over and remove it.
+      if (Object.prototype.hasOwnProperty.call(this, 'agentColors')) {
+        const early = (this as unknown as { agentColors: Record<string, string> }).agentColors;
+        delete (this as unknown as { agentColors?: unknown }).agentColors;
+        this.agentColorMap = colorMap(early);
+      }
       const root = this.attachShadow({ mode: 'open' });
       root.innerHTML = FRAME;
       const q = <T extends Element>(sel: string) => root.querySelector(sel) as unknown as T;
@@ -1602,6 +1665,17 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       else this.closeSuggestions();
     }
 
+    /** Agent id → any CSS colour. Every agent name the transcript prints (the
+     *  speaker line, "To …", handoffs, delegated work, `@` chips and the
+     *  typeahead) carries its agent's colour as `--agent-color` (names) or
+     *  `--mention-color` (chips), and the default sheet uses it. */
+    get agentColors(): Record<string, string> { return Object.fromEntries(this.agentColorMap); }
+
+    set agentColors(next: Record<string, string>) {
+      this.agentColorMap = colorMap(next);
+      this.paint();
+    }
+
     /** A local navigation action: never fetch, switch verbosity, or write. */
     revealMessage(messageId: string): boolean {
       if (typeof messageId !== 'string' || !messageId || !this.live) return false;
@@ -1732,6 +1806,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const roster: Mentionable[] = entries.map(({ participant: p, handle }) => ({
         handle, label: p.displayName, kind: 'agent',
         ...(handle !== p.displayName ? { detail: `Use @${handle}` } : {}),
+        ...(this.agentColorMap.has(p.agent!) ? { color: this.agentColorMap.get(p.agent!) } : {}),
       }));
       const resolveRoster = (handle: string) => {
         const participant = session ? modelParticipantByHandle(session, handle) : undefined;
@@ -2001,7 +2076,7 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
       const nodes = this.timelineNodes(rows, (m) => {
         const row = renderRow(
           m, names, download, mode, mentions, agentNames,
-          this.threadable && sid ? sid : null,
+          this.threadable && sid ? sid : null, this.agentColorMap,
         );
         if (row && m._id === rootId) {
           row.classList.add('thread-root');
@@ -2262,6 +2337,10 @@ export function defineAgentChat(tagName: string = DEFAULT_TAG): CustomElementCon
         handle.className = 'suggestion-handle';
         handle.setAttribute('part', 'suggestion-handle');
         handle.textContent = `${this.suggestPrefix}${m.label ?? m.handle}`;
+        if (m.color) {
+          handle.style.setProperty('--mention-color', m.color);
+          handle.dataset.colored = '';
+        }
         row.append(handle);
         if (m.detail) {
           const detail = document.createElement('span');

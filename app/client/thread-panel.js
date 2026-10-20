@@ -18,7 +18,7 @@ const el = (tag, className, text) => {
 
 /**
  * host: { workspace, chat, pane, currentChat(), currentMission(), topicName(sessionId), recipientState(session),
- *   timeAgo(date), openInspector(), toast(message, kind), defineChat() }
+ *   timeAgo(date), openInspector(), toast(message, kind), defineChat(), prepareChat(chat) }
  */
 export function initializeThreads(host) {
   const { workspace, chat, pane } = host;
@@ -76,6 +76,7 @@ export function initializeThreads(host) {
     also.append(alsoBox, alsoText);
     threadChat.append(also);
     panel.append(threadChat);
+    host.prepareChat?.(threadChat);
     threadMode = 'ask';
     recipients = initializeMissionRecipients({
       chat: threadChat, onChange: () => {}, onModeChange: (mode) => { threadMode = mode; paint(); },
@@ -161,9 +162,16 @@ export function initializeThreads(host) {
       summaries.set(row._id, summary);
     }
     const stats = row.thread;
-    const names = (stats.repliers ?? []).map((id) => row.participants?.find((participant) => participant.id === id)?.displayName
-      ?? id.replace(/^m:/, '')).filter(Boolean);
-    summary.faces.replaceChildren(...names.slice(0, 3).map((name) => el('span', 'thread-summary-face', Array.from(name)[0] ?? '?')));
+    const repliers = (stats.repliers ?? []).map((id) => ({ id, name: row.participants?.find((participant) => participant.id === id)?.displayName
+      ?? id.replace(/^m:/, '') })).filter((replier) => replier.name);
+    const names = repliers.map((replier) => replier.name);
+    // Each face in its agent's crew colour; the summary line keeps its colour for the thread's state.
+    summary.faces.replaceChildren(...repliers.slice(0, 3).map(({ id, name }) => {
+      const face = el('span', 'thread-summary-face', Array.from(name)[0] ?? '?');
+      const color = id.startsWith('m:') ? chat.agentColors?.[id.slice(2)] : undefined;
+      if (color) { face.style.setProperty('--face-color', color); face.dataset.colored = ''; }
+      return face;
+    }));
     const replies = Number(stats.replies ?? 0);
     const working = BUSY.has(row.phase);
     summary.count.textContent = replies ? `${replies} ${replies === 1 ? 'reply' : 'replies'}` : 'Thread';

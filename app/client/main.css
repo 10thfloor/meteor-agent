@@ -15,6 +15,13 @@
   --blue: #76a9e9;
   --red: #e0786d;
   --violet: #ae91dc;
+  /* Crew colours as text: an agent's name wherever the app prints it. */
+  --crew-amber: #f2ae6a;
+  --crew-blue: #8ab5ea;
+  --crew-green: #92d4aa;
+  --crew-red: #e78a80;
+  --crew-violet: #c0a7e7;
+  --crew-steel: #bbc3c8;
   --rail-width: 78px;
   --sidebar-width: 270px;
   --inspector-width: 312px;
@@ -273,6 +280,8 @@ agent-chat::part(message user),agent-chat::part(message assistant) { margin-top:
 agent-chat::part(message user crew-note) { color: #c3c8c1; }
 agent-chat::part(speaker) { display: block; margin-bottom: 2px; color: #eef1ea; font-weight: 640; letter-spacing: 0; text-transform: none; opacity: 1; }
 agent-chat::part(source),agent-chat::part(recipient) { color: #80877f; font-weight: 400; }
+/* Each agent's name in its crew colour (set per chat from the crew configs; see agent-colors.js). */
+agent-chat::part(agent-name) { color: var(--agent-color, inherit); }
 /* Desktop is where everyone here is typing; only another surface is worth naming. */
 agent-chat::part(source source-desktop) { display: none; }
 agent-chat::part(crew-note-header) { display: flex; align-items: baseline; gap: 8px; margin-bottom: 2px; }
@@ -286,8 +295,8 @@ agent-chat::part(message note) { padding: 2px 12px; color: #80877f; font-size: 7
 agent-chat::part(message note approval) { color: #a3a9a2; }
 /* The mission header already shows whether the crew is working. */
 #mission-chat::part(header) { display: none; }
-agent-chat::part(mention) { border-radius: 5px; background: rgba(255,255,255,.06); }
-agent-chat::part(mention addressed) { background: rgba(240,163,90,.12); }
+agent-chat::part(mention) { border-radius: 5px; color: var(--mention-color, inherit); background: color-mix(in srgb, var(--mention-color, #fff) 7%, transparent); }
+agent-chat::part(mention addressed) { background: color-mix(in srgb, var(--mention-color, #f0a35a) 14%, transparent); }
 agent-chat::part(attachment) { border-color: rgba(240,163,90,.3); background: rgba(240,163,90,.08); color: #ffd2a5; }
 agent-chat::part(approval) { margin:0 var(--mission-chat-gutter) 12px; padding:15px 16px; border:1px solid rgba(240,163,90,.3); border-radius:13px; background:linear-gradient(135deg,rgba(240,163,90,.115),rgba(27,30,28,.98) 58%); box-shadow:0 16px 44px rgba(0,0,0,.3),inset 0 1px rgba(255,255,255,.025); }
 agent-chat::part(approval-signal) { width:34px; height:34px; border-color:rgba(240,163,90,.3); border-radius:9px; background:rgba(240,163,90,.1); color:var(--signal-bright); box-shadow:0 0 18px rgba(240,163,90,.09); font-size:12px; }

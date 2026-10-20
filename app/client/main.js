@@ -38,6 +38,7 @@ import { GENERAL_TOPIC, topicLabel } from '../imports/constellation/topics';
 import { createTopicMemory, renderMissionTree, wireMissionTree } from './mission-tree';
 import { initializeTopicMenu } from './topic-menu';
 import { initializeThreads } from './thread-panel';
+import { trackAgentColors } from './agent-colors';
 import './mission-tree.css';
 
 const SESSION_KEY = 'constellation.session';
@@ -56,6 +57,7 @@ const suspendedCodeCloseEvents = new WeakSet();
 const MISSION_PARTICIPANT_LIMIT = 16;
 const MissionConfigs = new Mongo.Collection('constellation_mission_configs');
 const CrewConfigs = new Mongo.Collection('constellation_crew_configs');
+const agentColors = trackAgentColors(() => CrewConfigs.find({}, { fields: { agent: 1, color: 1 } }).fetch());
 const ModelCatalog = new Mongo.Collection('constellation_model_catalog');
 const WorkspaceMembers = new Mongo.Collection('constellation_workspace_members');
 const MissionParticipation = new Mongo.Collection('constellation_mission_participation');
@@ -4922,6 +4924,7 @@ function openChildRun(sessionId, agentName, { nested = false, restoreScroll = nu
   const chat = document.createElement('agent-chat');
   chat.setAttribute('agent', agentName);
   chat.setAttribute('session-id', sessionId);
+  agentColors.color(chat);
   chat.setAttribute('verbosity', missionConfig()?.debugTraces ? 'debug' : 'clean');
   const header = document.createElement('span');
   header.slot = 'header';
@@ -8357,6 +8360,7 @@ async function initializeWorkspace() {
 
   const chat = $('mission-chat');
   chat.setAttribute('session-id', initialSession);
+  agentColors.color(chat);
   if (!applicationWired) {
     applicationWiringStarted = true;
     chat.addEventListener('agent-chat:session', (event) => {
@@ -8387,6 +8391,7 @@ async function initializeWorkspace() {
     });
     threadControls = initializeThreads({
       workspace, chat, pane: $('inspector-pane'), AgentSessions, timeAgo, toast,
+      prepareChat: (threadChat) => agentColors.color(threadChat),
       currentChat: () => { sessionChanged.depend(); return currentSessionId; },
       currentMission: () => { sessionChanged.depend(); return currentMissionId; },
       conversationIds: (missionId) => (missionId

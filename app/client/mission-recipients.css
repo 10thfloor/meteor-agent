@@ -5,6 +5,9 @@
 .mission-recipient-button:disabled { opacity:.55; cursor:default; }
 .mission-recipient-label { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .mission-recipient-avatar { display:inline-flex; align-items:center; justify-content:center; flex:none; width:27px; height:27px; border:1px solid var(--line-strong,#384033); border-radius:8px; color:var(--signal-bright,#f3b365); background:rgba(255,255,255,.025); font-size:12px; line-height:1; }
+/* An agent's avatar and name in its crew colour; crew notes and reply modes keep the default. */
+.mission-recipient-avatar[data-colored] { color:var(--recipient-color); border-color:color-mix(in srgb, var(--recipient-color) 32%, transparent); background:color-mix(in srgb, var(--recipient-color) 9%, transparent); }
+.mission-recipient-name[data-colored] { color:var(--recipient-color); }
 .mission-recipient-chevron { display:inline-flex; flex:none; color:var(--muted,#a2ac9c); }
 .mission-recipient svg { width:16px; height:16px; }
 .mission-recipient-note-hint { color:var(--muted,#a2ac9c); font-size:12px; }

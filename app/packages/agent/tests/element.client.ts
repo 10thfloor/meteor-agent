@@ -54,6 +54,7 @@ type ChatElement = HTMLElement & {
     deny(sessionId: string, reason?: string, expectedToolCallId?: string): Promise<void>;
   } | null;
   mentionSources: Record<string, any>;
+  agentColors: Record<string, string>;
 };
 
 /** A stand-in for a live collection: the two calls the element makes, and a
@@ -480,6 +481,68 @@ describe('<agent-chat>', () => {
     assert.notInclude(part(el, 'handoff').textContent, '"internal"');
     el.setAttribute('verbosity', 'debug');
     assert.include(part(el, 'tool-content').textContent, '"ok"', 'raw output remains explicitly opt-in');
+  });
+
+  it('colours every agent name it prints from agentColors, and only those agents', () => {
+    const el = mountTranscript([
+      {
+        _id: 'colour-ask', sessionId: 'colour-fixture', seq: 1, role: 'user', to: 'm:researcher',
+        from: { participant: 'u:owner', name: 'You' }, content: '@Signal please check',
+      },
+      {
+        _id: 'colour-reply', sessionId: 'colour-fixture', seq: 2, role: 'assistant',
+        from: { participant: 'm:orchestrator', name: 'orchestrator' }, content: 'Asking @Relay as well.',
+      },
+      {
+        _id: 'colour-handoff', sessionId: 'colour-fixture', seq: 3, role: 'tool', kind: 'handoff',
+        from: { participant: 'm:orchestrator', name: 'orchestrator' }, to: 'm:operator',
+        content: '{"ok":true}', transcriptContent: 'Over to you.',
+      },
+    ]);
+    el.agentInstance!.session = () => ({ participants: [
+      { id: 'm:orchestrator', kind: 'model', agent: 'orchestrator', displayName: 'Atlas' },
+      { id: 'm:researcher', kind: 'model', agent: 'researcher', displayName: 'Signal' },
+      { id: 'm:operator', kind: 'model', agent: 'operator', displayName: 'Relay' },
+    ] });
+    // Relay has no colour: its names render exactly as before.
+    el.agentColors = { orchestrator: 'rgb(240, 163, 90)', researcher: 'rgb(138, 181, 234)' };
+
+    const colourOf = (node: Element | null) => (node as HTMLElement | null)?.style.getPropertyValue('--agent-color');
+    const assistant = partsAll(el, 'assistant')[0];
+    const speaker = assistant.querySelector('[part~="speaker"]')!;
+    assert.equal(speaker.textContent, 'Atlas', 'the speaker line reads the same');
+    assert.equal(colourOf(speaker.querySelector('[part~="agent-name"]')), 'rgb(240, 163, 90)');
+
+    const recipient = part(el, 'recipient');
+    assert.include(recipient.textContent, 'To Signal');
+    assert.equal(colourOf(recipient.querySelector('[part~="agent-name"]')), 'rgb(138, 181, 234)');
+
+    const route = part(el, 'handoff-route');
+    assert.equal(route.textContent, 'Atlas → Relay');
+    const [from, to] = Array.from(route.querySelectorAll('[part~="agent-name"]'));
+    assert.equal(colourOf(from), 'rgb(240, 163, 90)');
+    assert.isFalse(to.hasAttribute('data-colored'), 'an agent without a colour is left alone');
+
+    const ask = part(el, 'user').querySelector('[part~="mention"]') as HTMLElement;
+    assert.equal(ask.style.getPropertyValue('--mention-color'), 'rgb(138, 181, 234)');
+    const named = assistant.querySelector('[part~="mention"]') as HTMLElement;
+    assert.equal(named.textContent, '@Relay');
+    assert.equal(named.style.getPropertyValue('--mention-color'), '');
+
+    el.agentColors = {};
+    assert.isNull(el.shadowRoot!.querySelector('[data-colored]'), 'clearing the map clears every colour');
+  });
+
+  it('keeps agentColors set before the element was defined', () => {
+    // An app may set it on <agent-chat> in its markup before defining the tag;
+    // that leaves an own property which would otherwise hide the setter.
+    const tag = `${TAG}-early-colours`;
+    const el = document.createElement(tag) as ChatElement;
+    el.agentColors = { orchestrator: 'rgb(240, 163, 90)' };
+    defineAgentChat(tag);
+    customElements.upgrade(el);
+    assert.isFalse(Object.prototype.hasOwnProperty.call(el, 'agentColors'));
+    assert.deepEqual(el.agentColors, { orchestrator: 'rgb(240, 163, 90)' });
   });
 
   it('parks on a gated tool and resolves it through the approval bar buttons', async function () {
