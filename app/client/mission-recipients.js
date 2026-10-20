@@ -53,6 +53,13 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
   const models = () => (state?.session?.participants ?? []).filter((row) => row.kind === 'model' && row.agent)
     .sort((a, b) => Number(b.agent === state.session.agent) - Number(a.agent === state.session.agent));
   const selected = () => models().find((row) => row.id === choice?.id);
+  // The chat carries each agent's crew colour (see agent-colors.js). Declarations, not consts: the menu is
+  // built above, before this point.
+  function colorOf(agent) { return agent ? chat.agentColors?.[agent] : undefined; }
+  function tint(node, color) {
+    if (color) { node.style.setProperty('--recipient-color', color); node.dataset.colored = ''; }
+    else { node.style.removeProperty('--recipient-color'); delete node.dataset.colored; }
+  }
   const isOpen = () => menu.matches(':popover-open');
   const items = () => [...menu.querySelectorAll('[data-recipient-choice]:not(:disabled)')];
   const unavailable = () => !state?.writable || busy() || !state.session?._id;
@@ -62,11 +69,12 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     remembered.set(key, choice);
     try { storage.setItem(key, JSON.stringify(choice)); } catch { /* In-memory preference still works. */ }
   };
-  function menuOption(value, name, role) {
+  function menuOption(value, name, role, color) {
     const item = document.createElement('button'); item.type = 'button'; item.className = 'mission-recipient-option'; item.tabIndex = -1;
     item.dataset.recipientChoice = value; item.dataset.recipientName = name;
     item.setAttribute('role', 'menuitemradio'); item.setAttribute('aria-checked', 'false');
     const icon = document.createElement('span'); icon.className = 'mission-recipient-avatar'; icon.setAttribute('aria-hidden', 'true');
+    tint(icon, color);
     if (value === 'note') icon.innerHTML = people;
     else if (REPLY_MODES[value]) icon.innerHTML = REPLY_MODES[value].icon;
     else icon.textContent = Array.from(name)[0] || '?';
@@ -105,8 +113,14 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     const isNote = state.mode === 'note', row = selected(), missing = !!choice && !row;
     const name = row?.displayName || choice?.label || state.primary?.label || 'agent';
     const threaded = !isNote && repliesOffered() && replyMode === 'reply:thread';
-    label.textContent = isNote ? 'Crew note' : `Ask ${name}`;
+    const color = isNote ? undefined : colorOf(row?.agent);
+    if (isNote) label.textContent = 'Crew note';
+    else {
+      const who = document.createElement('span'); who.className = 'mission-recipient-name'; who.textContent = name; tint(who, color);
+      label.replaceChildren('Ask ', who);
+    }
     if (isNote) avatar.innerHTML = people; else avatar.textContent = Array.from(name)[0] || '?';
+    tint(avatar, color);
     noteHint.hidden = !isNote && !threaded;
     noteHint.textContent = isNote ? 'No agent reply' : 'Reply in thread';
     control.dataset.replyIn = threaded ? 'thread' : 'chat';
@@ -121,7 +135,8 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     const options = models().map((participant) => {
       const definition = state.crew?.find((entry) => entry.agent === participant.agent);
       return { id: participant.id, label: participant.displayName || participant.agent,
-        role: definition?.role || (participant.agent === state.session.agent ? state.primary?.role : '') || '' };
+        role: definition?.role || (participant.agent === state.session.agent ? state.primary?.role : '') || '',
+        color: colorOf(participant.agent) };
     });
     if (missing) options.unshift({ id: choice.id, label: choice.label, role: 'No longer on this mission', disabled: true });
     const signature = JSON.stringify(options);
@@ -129,7 +144,7 @@ export function initializeMissionRecipients({ chat, storage = window.localStorag
     if (choices.dataset.options !== signature) {
       restoreFocus = choices.contains(document.activeElement) ? document.activeElement.dataset.recipientChoice : null;
       choices.replaceChildren(...options.map((option) => {
-        const item = menuOption(option.id, option.label, option.role);
+        const item = menuOption(option.id, option.label, option.role, option.color);
         item.dataset.unavailable = String(!!option.disabled); item.disabled = !!option.disabled; return item;
       }));
       if (!options.length) { const empty = document.createElement('p'); empty.className = 'mission-recipient-empty'; empty.textContent = 'Loading crew…'; choices.append(empty); }

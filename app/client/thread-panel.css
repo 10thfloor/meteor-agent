@@ -12,6 +12,7 @@
   background: #2a2e2b; color: #e3e5df; font-size: 10px; font-weight: 700;
 }
 .thread-summary-face:first-child { margin-left: 0; }
+.thread-summary-face[data-colored] { color: var(--face-color); background: color-mix(in srgb, var(--face-color) 16%, #1b1e1c); }
 .thread-summary-count { color: var(--blue); font-weight: 650; }
 .thread-summary[data-state="working"] .thread-summary-meta { color: var(--green); }
 .thread-summary[data-state="waiting"] .thread-summary-meta { color: var(--signal-bright); }

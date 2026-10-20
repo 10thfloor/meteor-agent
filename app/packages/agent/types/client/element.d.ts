@@ -57,6 +57,9 @@ export interface Mentionable {
     detail?: string;
     /** Non-@ references can open an app-owned detail view without sending. */
     actionable?: boolean;
+    /** Any CSS colour. Set as `--mention-color` on the chip and the typeahead
+     *  row; model participants take theirs from `agentColors`. */
+    color?: string;
 }
 /** A field name or a function derived from the record. */
 type Field<T> = string | ((record: never) => T | undefined);
@@ -77,6 +80,7 @@ interface MentionShape {
     /** Defaults to the handle. */
     label?: Field<string>;
     detail?: Field<string>;
+    color?: Field<string>;
     /** How many the typeahead offers at once. Default 8. */
     limit?: number;
     /** Ceiling on records pulled from a collection in one read. Default 1000 —

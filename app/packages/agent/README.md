@@ -1063,6 +1063,24 @@ is coalesced into one microtask**, so a run of synchronous writes re-subscribes
 exactly once, against the attributes as they finally stand — the intermediate
 combination never gets far enough to auto-start a session nothing will render.
 
+### Agent colours
+
+Give each agent a colour and the transcript uses it wherever it prints that
+agent's name: the speaker line, "To …" on an addressed message, handoff routes,
+delegated-work receipts and links, "… requested", `@` chips and the typeahead.
+
+```js
+chat.agentColors = { orchestrator: '#f2ae6a', researcher: 'var(--crew-blue)' };
+```
+
+Keys are agent ids, values any CSS colour (a `var()` resolves against your
+page, since custom properties inherit into the element). Agents without one
+render as before. Names are `::part(agent-name)` spans carrying
+`--agent-color`; chips and typeahead rows carry `--mention-color`, so your
+`::part()` rules can use either. On the default accent-filled user bubble the
+names keep the bubble's text colour. Setting the property before the tag is
+defined is fine.
+
 ### Mentions
 
 The element renders `@handle` as a chip and completes it in the composer.
@@ -1098,6 +1116,7 @@ For the first two, name the fields:
 | `label` | What the chip and the typeahead show. Defaults to the handle. Field name or function. |
 | `kind` | Free-form, becomes a `part` token: `::part(mention ticket)`. Model participants get `agent`. |
 | `detail` | A second line in the typeahead, and the chip's tooltip. |
+| `color` | Optional CSS colour for the chip and its typeahead row (`--mention-color`). Model participants take theirs from `agentColors`. |
 | `actionable` | Opt-in for non-`@` references: renders a keyboard-accessible button that emits `agent-chat:mention` with `{ prefix, handle, kind }`. The host can open details; no message is sent. Also supported per entry from `search`/`lookup`. |
 | `emptyText` | Optional visible feedback when the source has no suggestions, including loading or empty states. |
 | `limit` | How many the typeahead offers at once. Default 8. |
