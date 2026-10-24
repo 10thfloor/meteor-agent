@@ -12,6 +12,6 @@
     "check:desktop": "node --check desktop/main.cjs && node --check desktop/preload.cjs"
   },
   "devDependencies": {
-    "electron": "^44.0.0"
+    "electron": "^44.9.1"
   }
 }
